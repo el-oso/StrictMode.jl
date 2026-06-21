@@ -10,6 +10,12 @@ TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 [sources]
 StrictMode = {path = ".."}
 
+# Run the test suite with guarantees ENABLED so the failing-path items fire. Committed in
+# Project.toml (no separate LocalPreferences.toml needed) — the pattern we recommend to users.
+[preferences.StrictMode]
+checks_enabled = true
+fail_mode = "error"
+
 [compat]
 ReTestItems = "1"
 julia = "1.12"

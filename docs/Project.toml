@@ -8,6 +8,11 @@ TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 [sources]
 StrictMode = {path = ".."}
 
+# Build the docs with guarantees enabled so the live `@example` blocks really run the analysis.
+[preferences.StrictMode]
+checks_enabled = true
+fail_mode = "error"
+
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0.3"

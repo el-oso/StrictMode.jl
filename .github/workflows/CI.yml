@@ -24,8 +24,8 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
-      # The test environment ships LocalPreferences.toml with checks_enabled=true, so the
-      # failing-path test items actually exercise the guarantees in CI.
+      # test/Project.toml sets [preferences.StrictMode] checks_enabled=true, so the failing-path
+      # test items actually exercise the guarantees in CI.
       - run: julia --project=test -e 'import Pkg; Pkg.instantiate()'
       - run: julia --project=test --code-coverage=user test/runtests.jl
         env:

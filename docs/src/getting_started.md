@@ -16,10 +16,25 @@ expand to the bare call. Turn the checks on in development / CI:
 ```julia
 using StrictMode
 
-StrictMode.enable_checks!()    # writes LocalPreferences.toml; restart Julia to apply
+StrictMode.enable_checks!()    # writes the preference; **restart Julia** to apply
 # ... develop with guarantees active ...
 StrictMode.disable_checks!()   # back to the production default
 ```
+
+!!! note "The gate is compile-time"
+    `enable_checks!` only writes a preference — it does **not** affect the current session
+    (`checks_enabled()` stays `false` until you restart), so an enable-then-assert script in one
+    process silently checks nothing. To commit the setting for a package's dev/CI runs, add it to
+    the project's `Project.toml` (committed by default):
+
+    ```toml
+    [preferences.StrictMode]
+    checks_enabled = true
+    fail_mode = "error"
+    ```
+
+    (a `LocalPreferences.toml` next to `Project.toml` works too). Then run tests in a fresh
+    process — see the testing pattern below.
 
 You can choose whether a violation throws or just warns:
 

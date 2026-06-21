@@ -63,8 +63,9 @@ function enable_checks!(;
     else
         @warn "StrictMode checks will be ENABLED (fail_mode = :$fm, analysis = :$an) — but the " *
             "gate is compile-time, so THIS session is unaffected (`checks_enabled()` stays false " *
-            "and every `@assert_*` is still a no-op). Restart Julia to apply. For tests, commit " *
-            "`test/LocalPreferences.toml` with `checks_enabled = true` and run in a fresh process."
+            "and every `@assert_*` is still a no-op). Restart Julia to apply. To commit the " *
+            "setting, add `[preferences.StrictMode]` with `checks_enabled = true` to the project's " *
+            "`Project.toml` (or a `LocalPreferences.toml`), then run in a fresh process."
     end
     return nothing
 end

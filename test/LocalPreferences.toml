@@ -1,5 +1,0 @@
-# Tests run with StrictMode guarantees ENABLED so the failing-path items actually fire.
-# Production builds leave this unset (checks default to false → macros expand to bare calls).
-[StrictMode]
-checks_enabled = true
-fail_mode = "error"
