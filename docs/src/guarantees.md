@@ -139,6 +139,69 @@ end
 # ERROR: StrictViolation (@noalloc): guarantee not satisfied …
 ```
 
+## `@unroll` — force the fast path
+
+The assert macros *tell* you when you boxed; [`@unroll`](@ref) keeps you from boxing in the
+first place. It fully unrolls a loop whose trip count is known at macro time, replacing the loop
+variable with a **literal** each iteration — so `t[i]` becomes `t[1]; t[2]; …` and a
+heterogeneous tuple is indexed type-stably instead of boxing. It is not gated; the unrolling
+always applies.
+
+Here is the founding trap. The naive loop is *type-stable* (it returns a concrete `Float64`) yet
+still allocates, because the runtime tuple index boxes — exactly what `@assert_noalloc` exists to
+catch:
+
+```@example guide
+htup = (1, 2.0, 3.0f0)
+
+function naive(t)
+    acc = 0.0
+    for i in 1:3
+        acc += t[i]          # runtime index over a heterogeneous tuple → boxes
+    end
+    return acc
+end
+
+function unrolled(t)
+    acc = 0.0
+    @unroll for i in 1:3
+        acc += t[i]          # → acc += t[1]; t[2]; t[3]   (literal, no boxing)
+    end
+    return acc
+end
+
+(naive(htup), unrolled(htup), @allocated(naive(htup)), @allocated(unrolled(htup)))
+```
+
+Same answer, but the naive loop allocates while the unrolled one does not — so the guarantee
+passes only for the unrolled version:
+
+```@example guide
+@assert_noalloc unrolled(htup)
+```
+
+```julia
+@assert_noalloc naive(htup)
+# ERROR: StrictViolation (@noalloc): call provably allocates …
+#   [2] Allocating runtime call to "jl_get_nth_field_checked" in ./tuple.jl:33
+```
+
+When the size is known only from a *type*, lift it into the type domain with [`staticval`](@ref)
+and splice the literal into `@unroll` from a `@generated` method:
+
+```julia
+@generated function tuple_sum(t::Tuple)
+    N = length(t.parameters)
+    quote
+        acc = zero(promote_type(t.parameters...))
+        @unroll for i in 1:$N        # $N is a literal inside the generated body
+            acc += t[i]
+        end
+        acc
+    end
+end
+```
+
 ## `@explain` — tell me *why*
 
 When an assert fails you often want the diagnosis, not just the verdict. [`@explain`](@ref)

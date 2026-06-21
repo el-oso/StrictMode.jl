@@ -107,14 +107,15 @@ end
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |
 | `@verify_strict T begin … end` | verify an implementation's surface *and* performance |
 | `@explain f(args...)` | aggregate `@code_warntype` + JET + AllocCheck into one "why did it fail" report (never throws) |
+| `@unroll for i in lo:hi …` | fully unroll a fixed-count loop with literal indices (kills runtime-tuple-index boxing); not gated |
+| `staticval(n)` | lift a count into the type domain (`Val{n}`) for compile-time specialization |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
 See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Roadmap (v0.2)
-`@assert_inlined`, `@assert_noboxing`, and `@unroll` (+ `Val` helpers for compile-time
-specialization).
+`@assert_inlined` and `@assert_noboxing`.
 
 ## Installation
 

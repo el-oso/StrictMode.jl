@@ -69,9 +69,25 @@ When you want the *reason* rather than a thrown error, reach for `@explain` — 
 - **`@strict_function`** runs the no-alloc + concrete-return checks against the declared
   argument types at precompile/load time, so a violation stops the module from loading.
 
+## Force the fast path
+
+Don't just detect boxing — avoid it. `@unroll` fully unrolls a fixed-count loop with literal
+indices, so a heterogeneous tuple is indexed type-stably instead of boxing:
+
+```julia
+function tuple_sum(t)
+    s = 0.0
+    @unroll for i in 1:3
+        s += t[i]        # → s += t[1]; t[2]; t[3]   (no boxing; @assert_noalloc passes)
+    end
+    s
+end
+```
+
+For a size known only from a type, lift it with `staticval(n)` and splice the literal into
+`@unroll` from a `@generated` method.
+
 ## Not yet (v0.2)
 
 - `@assert_inlined` — fail unless a call is inlined.
 - `@assert_noboxing` — pinpoint the boxing / runtime-tuple-index class specifically.
-- `@unroll` + `Val` helpers — emit straight-line, literal-index code so you never hand-write the
-  avoid-boxing pattern.

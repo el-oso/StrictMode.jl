@@ -32,6 +32,16 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 registered_strict_contracts
 ```
 
+## Idioms (force the fast path)
+
+Make the fast path the *easy* path. Unlike the asserts, these are not gated — the unrolling
+always applies — and they emit straight-line code with literal indices.
+
+```@docs
+@unroll
+staticval
+```
+
 ## Diagnostics
 
 Where the assert macros fail loudly, [`@explain`](@ref) tells you *why* — without throwing.
