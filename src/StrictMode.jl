@@ -32,7 +32,8 @@ using Test: Test
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
-export @assert_noalloc, @assert_typestable, @assert_noboxing, @strict, @strict_function
+export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
+export @strict, @strict_function
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport
@@ -47,8 +48,6 @@ include("strict_function.jl")
 include("contracts.jl")
 include("explain.jl")
 include("idioms.jl")
-
-# v0.2 roadmap stub (documented, not yet exported).
 include("inlining.jl")
 
 # Warm the heavy analyzers into the precompile image (when checks are enabled).

@@ -13,6 +13,7 @@ away.
 | **Allocating hot loop** (`push!` into a fresh `Vector`, `collect`, slices) | heap traffic, GC pressure in inner loops | `@assert_noalloc` |
 | **Boxing, but buffers are fine** (must not box, may allocate scratch space) | runtime dispatch / `jl_get_nth_field_checked` only | `@assert_noboxing` (allows typed allocations) |
 | **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc` |
+| **A call that should inline but doesn't** (cost-model misfire, `@noinline`) | call overhead, lost cross-call optimization | `@assert_inlined` (best-effort) |
 | **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (combines the per-call guarantees) |
 | **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (fails at precompile / load) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
@@ -70,6 +71,8 @@ When you want the *reason* rather than a thrown error, reach for `@explain` — 
   calls, `Core.Box`), so legitimate typed allocations pass.
 - **`@assert_typestable`** combines `Test.@inferred` (the *return type* must be concrete) with
   `JET.@report_opt` (no *internal* instability or runtime dispatch).
+- **`@assert_inlined`** compiles a wrapper around the call and checks its optimized IR for a
+  surviving `:invoke` to the callee — best-effort, since inlining is a heuristic.
 - **`@strict_function`** runs the no-alloc + concrete-return checks against the declared
   argument types at precompile/load time, so a violation stops the module from loading.
 
@@ -90,7 +93,3 @@ end
 
 For a size known only from a type, lift it with `staticval(n)` and splice the literal into
 `@unroll` from a `@generated` method.
-
-## Not yet (v0.2)
-
-- `@assert_inlined` — fail unless a call is inlined.

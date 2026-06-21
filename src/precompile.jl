@@ -23,9 +23,10 @@ using PrecompileTools: @setup_workload, @compile_workload
                 _assert_noboxing("warmup", wk_dot, types)
             catch
             end
-            # Warm the :fast type-stability check (inference-only).
+            # Warm the :fast type-stability check (inference-only) and the inlining check.
             try
                 _typestable_fast("warmup", wk_dot, types)
+                _assert_inlined("warmup", (p, q) -> wk_dot(p, q), wk_dot, types)
             catch
             end
             # Warm JET (@report_opt) and the full @explain aggregation (+ @code_warntype).

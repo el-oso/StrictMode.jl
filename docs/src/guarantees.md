@@ -105,6 +105,25 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 #   reason:  return type is not concretely inferrable: …
 ```
 
+## `@assert_inlined` — keep the call on the fast path (best-effort)
+
+[`@assert_inlined`](@ref) fails unless the compiler inlined the call. StrictMode compiles a tiny
+wrapper around the call, inspects its optimized typed IR, and fails if the call survives as an
+`:invoke` (i.e. it was not absorbed).
+
+Because inlining is a compiler *heuristic*, this is explicitly best-effort: a failure means the
+compiler chose not to inline under the current settings, which may or may not be a problem. For
+that reason it is **not** part of [`@strict`](@ref).
+
+```julia
+@inline   hot(x) = x * x + 1
+@assert_inlined hot(3.0)        # ok: small, inlined
+
+@noinline cold(x) = x * x + 1
+@assert_inlined cold(3.0)
+# ERROR: StrictViolation (@inlined): call to `cold` was not inlined — it survives as an `:invoke` …
+```
+
 ## `@strict` — every per-call guarantee at once
 
 [`@strict`](@ref) checks type stability first (the usual root cause of surprise allocations),

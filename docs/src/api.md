@@ -16,6 +16,7 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 @assert_noalloc
 @assert_noboxing
 @assert_typestable
+@assert_inlined
 @strict
 ```
 
