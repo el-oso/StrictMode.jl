@@ -23,8 +23,9 @@ end
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; static::Bool) where {F}
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if static
+        _require_backend()
         try
-            results = check_allocs(f, types)
+            results = _be_check_allocs(f, types)
             if !isempty(results)
                 _fail(:noalloc, target, _format_allocs(results))
             end
@@ -90,30 +91,19 @@ macro assert_noalloc(args...)
 end
 
 # --- @assert_noboxing: the boxing/dispatch subclass of allocations specifically ---
-
-# Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
-# uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
-function _is_boxing(@nospecialize(inst))
-    inst isa AllocCheck.DynamicDispatch && return true
-    if inst isa AllocCheck.AllocatingRuntimeCall
-        n = inst.name
-        # e.g. jl_box_int64 (boxing a primitive), jl_get_nth_field_checked (runtime tuple/field
-        # index → boxing). Excludes array-grow / string runtime calls.
-        return occursin("box", lowercase(n)) || occursin("get_nth_field", n)
-    end
-    inst isa AllocCheck.AllocationSite && return inst.type === Core.Box   # captured-variable box
-    return false
-end
+# (Classifying an AllocCheck instance as boxing lives in the StrictModeAnalysisExt extension,
+# behind `_be_is_boxing`, since it pattern-matches AllocCheck's instance types.)
 
 function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
+    _require_backend()
     results = try
-        check_allocs(f, types)
+        _be_check_allocs(f, types)
     catch err
         err isa StrictViolation && rethrow()
         _fail(:noboxing, target, "AllocCheck could not analyze this call: $(sprint(showerror, err))")
         return nothing
     end
-    boxing = filter(_is_boxing, results)
+    boxing = filter(_be_is_boxing, results)
     if !isempty(boxing)
         _fail(:noboxing, target, _format_allocs(boxing; header = "call boxes / dynamically dispatches"))
     end

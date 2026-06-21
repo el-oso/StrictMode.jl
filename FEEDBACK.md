@@ -72,3 +72,31 @@ LLVM target. Cosmetic, but noisy.
   plan per routing path (fast, in the default suite; gated on `checks_enabled()`).
 - `bench/strictmode_audit.jl` — the broader hot-path `check` sweep (manual, mirrors `bench/alloccheck.jl`).
 - `test/LocalPreferences.toml` ships `checks_enabled = true` so CI runs the checks for real.
+
+---
+
+# Round 2 — exercising the whole-package check (after F1–F5 landed)
+
+Now using `audit(PureFFT; sweep = true, exempt = (...))` as the whole-package check (the F5 `exempt`/`only`
+scoping works well — the 9 plan-time/autotuner helpers exempt cleanly and the sweep reports the entire hot
+surface, 442 checks, type-stable + alloc-free). Adoption evolved: checks are now enabled via
+`[preferences.StrictMode]` in `Project.toml` (not LocalPreferences.toml), and the audit is a whole-package
+sweep (not a hand-listed hot-path sweep) so it auto-covers new kernels. Two new findings:
+
+### F6 — `only`/`exempt` don't match keyword-argument methods (kwsorter mangling)  *(fixed in this clone)*
+A function with a keyword arg, `foo(x; k=1)`, compiles a kwsorter bound in the module as `#foo#NN`, which
+`names(mod; all=true)` enumerates separately. `check_compiled`/`audit` matched `exempt` against the raw
+`nameof(f)`, so `exempt = (:foo,)` did **not** skip `#foo#NN` — the kwarg method still failed the sweep
+(e.g. PureFFT's `_recursive_factors(n; maxf)` → `#_recursive_factors#34` survived `exempt=(:_recursive_factors,)`).
+Since kwarg functions are everywhere, this makes `exempt`/`only` surprising.
+- *Fix applied* (`src/registry.jl`): added `_demangle(::Symbol)` (strips the `#name#NN` kwsorter mangling)
+  and match `_demangle(nameof(f))` against the `exempt`/`only` sets. Verified: `exempt=(:foo,)` now skips
+  `#foo#NN`; PureFFT's whole-package sweep goes from 2 residual failures → 0.
+
+### F7 — `analysis = "fast"` doesn't speed the `noalloc` pass (whole-package sweep still slow)
+`analysis` switches only the *typestable* check (`:full` JET+`@inferred` → `:fast` `return_types`). The
+`noalloc` pass (AllocCheck static analysis) is unaffected and dominates: PureFFT's whole-package sweep is
+~180 s even at `:fast` (≈220 methods × AllocCheck). Fine for a manual audit, too slow for a CI test gate.
+- *Suggestion:* let `analysis = :fast` also use a cheaper allocation check (e.g. a runtime `@allocated`
+  sample on a provided call, or skip `noalloc` unless requested), or document that `:fast` only affects
+  typestability and offer a `guarantees = (:typestable,)` fast-path for quick whole-module scans.

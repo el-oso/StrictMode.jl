@@ -22,6 +22,8 @@ end
 function _start_watch()
     StrictMode.checks_enabled() ||
         @info "StrictMode.watch: checks are disabled — run `StrictMode.enable_checks!()` (and restart) first."
+    StrictMode.backend_available() ||
+        @warn "StrictMode.watch: the analysis backend isn't loaded — `using AllocCheck, JET` so the re-checks can run."
     # `all = true` fires the callback before the next REPL command after *any* tracked edit.
     _KEY[] = Revise.add_callback(String[]; all = true, key = :strictmode_watch) do
         _on_revision()

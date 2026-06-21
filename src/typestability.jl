@@ -1,13 +1,9 @@
-# `@assert_typestable` — fail on type instability. Two analysis modes (see `analysis_mode`):
-#   :full — `Test.@inferred` (return type concrete) + `JET.@report_opt` (no *internal* dispatch /
-#           boxing / instability — catches the runtime-tuple-indexing trap even when the return
-#           type is fine). Rigorous; for CI.
-#   :fast — `Base.return_types` concreteness only (inference, sub-ms once warm). For a tight
-#           interactive loop; can miss internal-dispatch-with-concrete-return.
+# `@assert_typestable` — fail on type instability. Two layers:
+#   - return-type concreteness via `Base.return_types` (no heavy deps) — both modes.
+#   - internal optimization failures via JET (`:full` mode only), through the backend seam.
+# (Routing JET through the backend keeps it a weak dependency; `:fast` mode needs no backend.)
 
-_inferred_details(err) = "return type is not concretely inferrable:\n" * sprint(showerror, err)
-
-# Cheap (:fast) type-stability check: the inferred return type must be a single concrete type.
+# Cheap return-type check: the inferred return type must be a single concrete type.
 function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = Base.return_types(f, Tuple{types...})
     if length(rts) != 1 || !isconcretetype(only(rts))
@@ -17,24 +13,22 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
+# Internal-instability check via JET (`:full`). Requires the analysis backend.
+function _assert_opt(target, @nospecialize(f), @nospecialize(types::Tuple))
+    _require_backend()
+    r = _be_opt_result(f, types)
+    isempty(_be_opt_reports(r)) || _fail(:typestable, target, sprint(show, r))
+    return nothing
+end
+
 # The type-stability *check* expression (no value), branched on the active analysis mode. Shared
 # by `@assert_typestable` and `@strict`.
 function _typestable_check_expr(target, fe, litcall, types)
-    if ANALYSIS_MODE === :full
-        return quote
-            try
-                Test.@inferred $litcall
-            catch err
-                err isa StrictViolation && rethrow()
-                err isa UndefVarError && rethrow()   # name didn't resolve in caller scope — surface it, don't mislabel as instability
-                $(_fail)(:typestable, $target, $(_inferred_details)(err))
-            end
-            let _r = JET.@report_opt($litcall)
-                isempty(JET.get_reports(_r)) || $(_fail)(:typestable, $target, sprint(show, _r))
-            end
-        end
-    else
-        return :($(_typestable_fast)($target, $fe, $types))
+    base = :($(_typestable_fast)($target, $fe, $types))
+    ANALYSIS_MODE === :full || return base
+    return quote
+        $base
+        $(_assert_opt)($target, $fe, $types)
     end
 end
 
@@ -43,11 +37,11 @@ end
 
 Fail unless `f(args...)` is type stable.
 
-In the default `:full` [`analysis_mode`](@ref) this combines `Test.@inferred` (the return type
-must be concrete) with `JET.@report_opt` (no internal instability or runtime dispatch), and
-reports the offending variable / dispatch on failure. In `:fast` mode it does a cheap
-inference-only return-type concreteness check. Each argument is evaluated once; the macro
-evaluates to the call's value; disabled builds expand to the bare call.
+Both [`analysis_mode`](@ref)s check that the inferred return type is a single concrete type (via
+`Base.return_types`); `:full` additionally runs `JET`'s optimization analysis to catch internal
+instability / runtime dispatch (this is the part that needs the AllocCheck+JET backend). Each
+argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
+the bare call.
 
 ```julia
 @assert_typestable muladd(2.0, 3.0, 1.0)          # ok
@@ -62,31 +56,11 @@ macro assert_typestable(call)
     litcall = Expr(:call, fe, syms...)
     types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
 
-    # Mode-specific value capture, so `:full` does not execute the call twice (`@inferred`
-    # already runs it and yields the value).
-    checked = if ANALYSIS_MODE === :full
-        quote
-            $(binds...)
-            local _val = try
-                Test.@inferred $litcall
-            catch err
-                err isa StrictViolation && rethrow()
-                err isa UndefVarError && rethrow()   # name didn't resolve in caller scope — surface it, don't mislabel as instability
-                $(_fail)(:typestable, $target, $(_inferred_details)(err))
-                $litcall   # warn-mode: still produce the value
-            end
-            let _r = JET.@report_opt($litcall)
-                isempty(JET.get_reports(_r)) || $(_fail)(:typestable, $target, sprint(show, _r))
-            end
-            _val
-        end
-    else
-        quote
-            $(binds...)
-            local _val = $litcall
-            $(_typestable_fast)($target, $fe, $types)
-            _val
-        end
+    checked = quote
+        $(binds...)
+        local _val = $litcall
+        $(_typestable_check_expr(target, fe, litcall, types))
+        _val
     end
     return _gate(checked, esc(call))
 end

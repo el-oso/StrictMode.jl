@@ -30,7 +30,7 @@ end
 # Convenience predicates mirroring what the assert macros would conclude.
 would_fail_typestable(r::StrictReport) = !r.return_concrete || !isempty(r.opt_reports)
 would_fail_noalloc(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && !isempty(r.allocs)
-would_fail_noboxing(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && any(_is_boxing, r.allocs)
+would_fail_noboxing(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && any(_be_is_boxing, r.allocs)
 
 function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_result)
     rts = try
@@ -39,9 +39,9 @@ function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_res
         Any[Any]
     end
     rt = isempty(rts) ? Any : reduce((a, b) -> Union{a, b}, rts)
-    opt_reports = opt_result === nothing ? [] : JET.get_reports(opt_result)
+    opt_reports = opt_result === nothing ? [] : _be_opt_reports(opt_result)
     allocs, alloc_error = try
-        (check_allocs(f, types), nothing)
+        (_be_check_allocs(f, types), nothing)
     catch err
         err isa StrictViolation && rethrow()
         (nothing, sprint(showerror, err))
@@ -163,7 +163,7 @@ macro explain(call)
 
     checked = quote
         $(binds...)
-        $(_explain)($target, $fe, $types, JET.@report_opt($litcall))
+        $(_strict_report)($target, $fe, $types)   # builds the report via the analysis backend
     end
     return _gate(checked, esc(call))
 end

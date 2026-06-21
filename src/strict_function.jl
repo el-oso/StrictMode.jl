@@ -50,8 +50,9 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
         )
     end
     # Allocation-freedom (subsumes runtime dispatch / boxing, which show as allocations).
+    _require_backend()
     try
-        results = check_allocs(f, types)
+        results = _be_check_allocs(f, types)
         isempty(results) || _fail(:strict_function, target, _format_allocs(results))
     catch err
         err isa StrictViolation && rethrow()

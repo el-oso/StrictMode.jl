@@ -18,7 +18,7 @@ nfailures(fs)                                            # 0 = clean
 `exit_on_fail = true`, which sets the process status to the number of failures:
 
 ```bash
-julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_on_fail = true)'
+julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format = :json, exit_on_fail = true)'
 ```
 
 - `target` is `:registered` (the mark-once registry — "check what I promised") or a `Module` (its
@@ -75,7 +75,7 @@ The package provides the command; the harness wires it. A `Stop` (or `PostToolUs
         "hooks": [
           {
             "type": "command",
-            "command": "julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format=:json, exit_on_fail=true)'"
+            "command": "julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format=:json, exit_on_fail=true)'"
           }
         ]
       }

@@ -14,10 +14,12 @@ catch
     :Main
 end
 
-# Build the underlying `StrictReport` from `(f, types)`, calling JET in its function form.
+# Build the underlying `StrictReport` from `(f, types)`, calling JET (via the backend) in its
+# function form.
 function _strict_report(target, @nospecialize(f), @nospecialize(types::Tuple))
+    _require_backend()
     opt = try
-        JET.report_opt(f, types)
+        _be_opt_result(f, types)
     catch
         nothing
     end
@@ -28,7 +30,7 @@ end
 function _first_loc(allocs, boxing_only::Bool)
     allocs === nothing && return ("", 0)
     for a in allocs
-        boxing_only && !_is_boxing(a) && continue
+        boxing_only && !_be_is_boxing(a) && continue
         bt = a.backtrace
         isempty(bt) || return (string(bt[1].file), Int(bt[1].line))
     end

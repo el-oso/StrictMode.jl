@@ -80,7 +80,7 @@ after each edit, the strict registry is re-checked and violations print to the R
 "compiler shouts as you code" experience.
 
 ```julia
-using Revise, StrictMode
+using Revise, StrictMode, AllocCheck, JET   # Revise = live loop; AllocCheck+JET = the analysis backend
 StrictMode.enable_checks!()    # then restart
 # … using MyPkg, which marks its kernels strict …
 StrictMode.watch()             # start the loop

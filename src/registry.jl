@@ -128,6 +128,14 @@ end
 # Normalize a function or a name Symbol to its name Symbol (for the only/exempt filters).
 _asname(x) = x isa Symbol ? x : nameof(x)
 
+# Strip the keyword-sorter mangling (`#funcname#NN`) so `only`/`exempt` match keyword-argument methods by
+# their base name — a user who exempts `:foo` means `foo(...; kw...)` too (its kwsorter is `#foo#NN`).
+function _demangle(nm::Symbol)
+    s = String(nm)
+    m = match(r"^#(.+)#\d+$", s)
+    return m === nothing ? nm : Symbol(m.captures[1]::AbstractString)
+end
+
 """
     check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none,
                    only = nothing, exempt = ()) -> Vector{StrictFinding}
@@ -158,8 +166,9 @@ function check_compiled(
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
         (f isa Function && parentmodule(f) === mod) || continue
-        nameof(f) in exemptset && continue
-        onlyset === nothing || nameof(f) in onlyset || continue
+        fname = _demangle(nameof(f))
+        fname in exemptset && continue
+        onlyset === nothing || fname in onlyset || continue
         for mth in methods(f)
             for mi in _specializations(mth)
                 tt = try

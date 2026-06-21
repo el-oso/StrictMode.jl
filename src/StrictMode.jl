@@ -25,10 +25,8 @@ See the README and `docs/cookbook.md` for the trap → macro mapping.
 """
 module StrictMode
 
+# AllocCheck and JET are loaded only by the StrictModeAnalysisExt extension (weak deps).
 using Preferences: Preferences, @load_preference, @set_preferences!, @has_preference
-using AllocCheck: AllocCheck, check_allocs
-using JET: JET
-using Test: Test
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
@@ -38,10 +36,11 @@ export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport, StrictFinding
 export check, findings, check_all, check_compiled, audit, format_findings, nfailures, watch, unwatch
-export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode
+export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode, backend_available
 
 include("preferences.jl")
 include("report.jl")
+include("backend.jl")
 include("static_checks.jl")
 include("typestability.jl")
 include("macros.jl")
@@ -55,7 +54,7 @@ include("check.jl")
 include("registry.jl")
 include("audit.jl")
 
-# Warm the heavy analyzers into the precompile image (when checks are enabled).
-include("precompile.jl")
+# The heavy analysis (AllocCheck + JET) and its precompile warmup live in
+# ext/StrictModeAnalysisExt.jl, loaded when both weak deps are present.
 
 end # module StrictMode

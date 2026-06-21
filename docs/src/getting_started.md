@@ -7,6 +7,19 @@ using Pkg
 Pkg.add(url = "https://github.com/el-oso/StrictMode.jl")
 ```
 
+The analysis backend — [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
+[JET.jl](https://github.com/aviatesk/JET.jl) — is heavy, so it is a pair of **weak**
+dependencies. Add them only where you actually run checks:
+
+```julia
+# in your dev / test / CI environment, alongside StrictMode:
+Pkg.add(["AllocCheck", "JET"])
+```
+
+Loading them (`using AllocCheck, JET`) activates the backend; `StrictMode.backend_available()`
+reports whether it is on. Production code that depends on StrictMode with checks off needs
+neither. For the live human loop, also add `Revise`.
+
 ## Enable the checks
 
 Every guarantee is gated behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)

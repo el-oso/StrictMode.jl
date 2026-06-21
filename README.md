@@ -18,8 +18,22 @@ holds the property or fails — at test time, or even at module load.
 
 StrictMode does both halves of the job: the **forcing** (push code onto the fast path) and the
 **telling** (shout when you fell off). It is a thin, unified, failing-loud interface over
-[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl),
-[JET.jl](https://github.com/aviatesk/JET.jl), and `Test.@inferred` — it doesn't reinvent them.
+[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
+[JET.jl](https://github.com/aviatesk/JET.jl) — which are **optional, weak dependencies**, loaded
+only when you turn checks on, so a package can depend on StrictMode and ship neither.
+
+## Dependencies are weak
+
+AllocCheck and JET are heavy, so StrictMode keeps them as *weak* dependencies behind an
+extension. Pick what to add per environment:
+
+| Environment | Add | What you get |
+|---|---|---|
+| **Production** | nothing (just StrictMode) | lightweight; checks off → macros are bare calls |
+| **Dev (human)** | `Revise`, `AllocCheck`, `JET` | the live [`watch`](https://el-oso.github.io/StrictMode.jl/dev/automating) loop with real checks |
+| **CI / agent** | `AllocCheck`, `JET` | `audit` / the full check set |
+
+With checks enabled but the backend not loaded, StrictMode tells you to add them.
 
 ## Zero cost when disabled
 

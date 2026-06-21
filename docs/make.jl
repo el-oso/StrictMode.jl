@@ -1,6 +1,9 @@
 using Documenter
 using DocumenterVitepress
 using StrictMode
+# AllocCheck + JET are weak deps; load them so StrictModeAnalysisExt activates and the live
+# `@example` blocks that call `check`/`@explain` actually run the analysis.
+using AllocCheck, JET
 
 makedocs(;
     modules = [StrictMode],
