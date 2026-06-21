@@ -1,0 +1,19 @@
+# Julia
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+
+# DocumenterVitepress / Node
+/docs/node_modules/
+/docs/package-lock.json
+/docs/.vitepress/cache/
+/docs/.vitepress/.temp/
+/docs/.vitepress/dist/
+/docs/src/.vitepress/cache/
+/docs/src/.vitepress/.temp/
+/docs/src/.vitepress/dist/
+
+# Editor / OS
+.DS_Store

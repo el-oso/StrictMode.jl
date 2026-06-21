@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} – ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.11", "1.12"]
+        os: [ubuntu-latest]
+        include:
+          - version: "1.12"
+            os: macOS-latest
+          - version: "1.12"
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v3
+      # The test environment ships LocalPreferences.toml with checks_enabled=true, so the
+      # failing-path test items actually exercise the guarantees in CI.
+      - run: julia --project=test -e 'import Pkg; Pkg.instantiate()'
+      - run: julia --project=test test/runtests.jl
+        env:
+          JULIA_NUM_THREADS: 2

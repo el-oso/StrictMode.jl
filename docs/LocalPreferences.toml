@@ -1,0 +1,5 @@
+# The documentation builds with StrictMode guarantees ENABLED, so every live `@example` below
+# really runs the checks. (Production builds leave this unset → macros expand to bare calls.)
+[StrictMode]
+checks_enabled = true
+fail_mode = "error"
