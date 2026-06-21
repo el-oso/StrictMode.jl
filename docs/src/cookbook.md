@@ -6,12 +6,13 @@ away.
 
 | Performance trap | Symptom | Catch it with |
 |---|---|---|
-| **Runtime tuple indexing** (`t[i]`, `t` heterogeneous, `i` a runtime value) | `Union` return type, silent boxing, the classic 135× cliff | `@assert_typestable` / `@strict` |
+| **Runtime tuple indexing** (`t[i]`, `t` heterogeneous, `i` a runtime value) | `Union` return type, silent boxing, the classic 135× cliff | `@assert_noboxing` / `@unroll` to fix |
 | **Type-unstable return** (a branch returns `Int`, another `Float64`) | `Union{...}`/`Any` return; downstream boxing | `@assert_typestable` |
-| **Captured-variable boxing** (a closure mutates an outer local) | `Core.Box`, allocations, lost inference | `@assert_typestable` (flags via JET) → v0.2 `@assert_noboxing` |
+| **Captured-variable boxing** (a closure mutates an outer local) | `Core.Box`, allocations, lost inference | `@assert_noboxing` |
 | **Untyped accumulator** (`acc = []` / `acc = 0` later holding mixed types) | per-iteration allocation, dispatch | `@assert_noalloc` / `@strict` |
 | **Allocating hot loop** (`push!` into a fresh `Vector`, `collect`, slices) | heap traffic, GC pressure in inner loops | `@assert_noalloc` |
-| **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noalloc` (AllocCheck counts dispatch) |
+| **Boxing, but buffers are fine** (must not box, may allocate scratch space) | runtime dispatch / `jl_get_nth_field_checked` only | `@assert_noboxing` (allows typed allocations) |
+| **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc` |
 | **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (combines the per-call guarantees) |
 | **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (fails at precompile / load) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
@@ -64,6 +65,9 @@ When you want the *reason* rather than a thrown error, reach for `@explain` — 
 - **`@assert_noalloc`** asks AllocCheck to *prove* the call cannot allocate. Any reported site —
   including dynamic dispatch and boxing — fails the guarantee. If static analysis can't run, it
   falls back to an empirical `@allocated` measurement after a warmup call.
+- **`@assert_noboxing`** runs the same AllocCheck analysis but reports only the *boxing /
+  dynamic-dispatch* subclass (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime
+  calls, `Core.Box`), so legitimate typed allocations pass.
 - **`@assert_typestable`** combines `Test.@inferred` (the *return type* must be concrete) with
   `JET.@report_opt` (no *internal* instability or runtime dispatch).
 - **`@strict_function`** runs the no-alloc + concrete-return checks against the declared
@@ -90,4 +94,3 @@ For a size known only from a type, lift it with `staticval(n)` and splice the li
 ## Not yet (v0.2)
 
 - `@assert_inlined` — fail unless a call is inlined.
-- `@assert_noboxing` — pinpoint the boxing / runtime-tuple-index class specifically.

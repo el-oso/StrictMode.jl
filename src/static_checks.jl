@@ -3,9 +3,9 @@
 # about). Dynamic dispatch / boxing surface here too, since AllocCheck reports them as
 # allocating.
 
-function _format_allocs(results)
+function _format_allocs(results; header = "call provably allocates")
     io = IOBuffer()
-    println(io, "call provably allocates (", length(results), " site(s)):")
+    println(io, header, " (", length(results), " site(s)):")
     for (i, a) in enumerate(results)
         print(io, "  [", i, "] ")
         # AllocCheck instances `show` with their source location and reason; reuse that.
@@ -85,6 +85,71 @@ macro assert_noalloc(args...)
     checked = quote
         $(binds...)
         $(_assert_noalloc)($target, $(esc(fexpr)), $types, $thunk; static = $static)
+    end
+    return _gate(checked, esc(call))
+end
+
+# --- @assert_noboxing: the boxing/dispatch subclass of allocations specifically ---
+
+# Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
+# uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
+function _is_boxing(@nospecialize(inst))
+    inst isa AllocCheck.DynamicDispatch && return true
+    if inst isa AllocCheck.AllocatingRuntimeCall
+        n = inst.name
+        # e.g. jl_box_int64 (boxing a primitive), jl_get_nth_field_checked (runtime tuple/field
+        # index → boxing). Excludes array-grow / string runtime calls.
+        return occursin("box", lowercase(n)) || occursin("get_nth_field", n)
+    end
+    inst isa AllocCheck.AllocationSite && return inst.type === Core.Box   # captured-variable box
+    return false
+end
+
+function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
+    results = try
+        check_allocs(f, types)
+    catch err
+        err isa StrictViolation && rethrow()
+        _fail(:noboxing, target, "AllocCheck could not analyze this call: $(sprint(showerror, err))")
+        return nothing
+    end
+    boxing = filter(_is_boxing, results)
+    if !isempty(boxing)
+        _fail(:noboxing, target, _format_allocs(boxing; header = "call boxes / dynamically dispatches"))
+    end
+    return nothing
+end
+
+"""
+    @assert_noboxing f(args...)
+
+Fail if the call boxes or dynamically dispatches — the *type-uncertainty* subclass of
+allocations — while **allowing** legitimate typed heap allocations (a `Vector`, a `Memory`, …).
+
+This is the relaxed sibling of [`@assert_noalloc`](@ref): use it for a hot path that may
+allocate a buffer but must never box (the runtime-tuple-index trap, captured-variable `Core.Box`,
+or accidental dynamic dispatch). It is always a static [AllocCheck] analysis — it must classify
+each allocation — so it ignores the `:fast` [`analysis_mode`](@ref). Each argument is evaluated
+once; the macro evaluates to the call's value; disabled builds expand to the bare call.
+
+```julia
+@assert_noboxing fill_buffer!(buf, xs)        # ok: allocates a buffer, but no boxing
+@assert_noboxing sum_runtime_index(htuple)    # throws: jl_get_nth_field_checked (tuple boxing)
+```
+"""
+macro assert_noboxing(call)
+    target = string(call)
+    fexpr, argexprs = _callinfo(call)
+    syms, binds = _bind_args(argexprs)
+    fe = esc(fexpr)
+    litcall = Expr(:call, fe, syms...)
+    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+
+    checked = quote
+        $(binds...)
+        local _val = $litcall
+        $(_assert_noboxing)($target, $fe, $types)
+        _val
     end
     return _gate(checked, esc(call))
 end

@@ -14,6 +14,7 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 
 ```@docs
 @assert_noalloc
+@assert_noboxing
 @assert_typestable
 @strict
 ```

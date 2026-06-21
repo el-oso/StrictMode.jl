@@ -30,6 +30,7 @@ end
 # Convenience predicates mirroring what the assert macros would conclude.
 would_fail_typestable(r::StrictReport) = !r.return_concrete || !isempty(r.opt_reports)
 would_fail_noalloc(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && !isempty(r.allocs)
+would_fail_noboxing(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && any(_is_boxing, r.allocs)
 
 function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_result)
     rts = try
@@ -97,6 +98,14 @@ function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
             io, "    ", would_fail_noalloc(r) ? "✗ @assert_noalloc would fail" :
                 "✓ @assert_noalloc would pass"
         )
+        # Only worth mentioning the relaxed check when it differs from no-alloc (i.e. there are
+        # allocations, but are any of them *boxing*?).
+        if would_fail_noalloc(r)
+            println(
+                io, "    ", would_fail_noboxing(r) ? "✗ @assert_noboxing would fail (boxing / dispatch)" :
+                    "✓ @assert_noboxing would pass (allocations are not boxing)"
+            )
+        end
     end
 
     # Full @code_warntype, but only when there is an instability worth digging into.

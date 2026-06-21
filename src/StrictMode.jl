@@ -32,7 +32,7 @@ using Test: Test
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
-export @assert_noalloc, @assert_typestable, @strict, @strict_function
+export @assert_noalloc, @assert_typestable, @assert_noboxing, @strict, @strict_function
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport

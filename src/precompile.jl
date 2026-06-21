@@ -20,6 +20,7 @@ using PrecompileTools: @setup_workload, @compile_workload
             try
                 _assert_noalloc("warmup", wk_dot, types, () -> wk_dot(A, B); static = true)
                 _assert_noalloc("warmup", wk_dot, types, () -> wk_dot(A, B); static = false)
+                _assert_noboxing("warmup", wk_dot, types)
             catch
             end
             # Warm the :fast type-stability check (inference-only).

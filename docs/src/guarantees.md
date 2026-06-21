@@ -43,6 +43,44 @@ end
 #   reason:  call provably allocates (… site(s)): …
 ```
 
+## `@assert_noboxing` — forbid boxing, allow buffers
+
+[`@assert_noboxing`](@ref) is the relaxed sibling of `@assert_noalloc`: it fails only on the
+*type-uncertainty* subclass of allocations — boxing (the runtime-tuple-index trap, a
+captured-variable `Core.Box`) and dynamic dispatch — while **allowing** legitimate typed heap
+allocations. Use it for a hot path that may allocate a working buffer but must never box.
+
+```@example guide
+function fill_sum(n)
+    v = Vector{Float64}(undef, n)   # a real heap allocation …
+    for i in 1:n
+        @inbounds v[i] = i
+    end
+    return sum(v)
+end
+
+@assert_noboxing fill_sum(3)        # passes: it allocates, but it does not box
+```
+
+The same call fails `@assert_noalloc`, which forbids *all* allocations:
+
+```julia
+@assert_noalloc fill_sum(3)
+# ERROR: StrictViolation (@noalloc): call provably allocates … Vector{Float64} …
+```
+
+Boxing and dynamic dispatch are still rejected:
+
+```julia
+boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, runtime index
+@assert_noboxing boxy((1, 2.0, 3.0f0))
+# ERROR: StrictViolation (@noboxing): call boxes / dynamically dispatches …
+#   Allocating runtime call to "jl_get_nth_field_checked" …
+```
+
+It is always a static AllocCheck analysis (it must classify each allocation), so it ignores the
+`:fast` [`analysis_mode`](@ref).
+
 ## `@assert_typestable` — concrete, stable types
 
 Combines `Test.@inferred` (the *return* type must be concrete) with `JET.@report_opt` (no

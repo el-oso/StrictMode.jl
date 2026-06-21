@@ -101,6 +101,7 @@ end
 | Macro / function | Guarantee |
 |---|---|
 | `@assert_noalloc f(args...)` | call is allocation-free (AllocCheck; `@allocated` fallback) |
+| `@assert_noboxing f(args...)` | forbid boxing / dynamic dispatch, but **allow** legitimate buffer allocation |
 | `@assert_typestable f(args...)` | concrete return type + no internal instability/dispatch (JET + `@inferred`) |
 | `@strict f(args...)` | all per-call guarantees at once; returns the call's value |
 | `@strict_function def` | verify the definition's contract at precompile time |
@@ -115,7 +116,7 @@ See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Roadmap (v0.2)
-`@assert_inlined` and `@assert_noboxing`.
+`@assert_inlined` (best-effort inlining check) — the last remaining item.
 
 ## Installation
 
