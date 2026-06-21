@@ -32,6 +32,15 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 registered_strict_contracts
 ```
 
+## Diagnostics
+
+Where the assert macros fail loudly, [`@explain`](@ref) tells you *why* — without throwing.
+
+```@docs
+@explain
+StrictReport
+```
+
 ## Failure type
 
 ```@docs

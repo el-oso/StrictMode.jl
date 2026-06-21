@@ -138,3 +138,37 @@ score(::SlowMetric, xs::AbstractVector{<:Real}) = sum(collect(xs))   # allocates
 end
 # ERROR: StrictViolation (@noalloc): guarantee not satisfied …
 ```
+
+## `@explain` — tell me *why*
+
+When an assert fails you often want the diagnosis, not just the verdict. [`@explain`](@ref)
+aggregates `@code_warntype`, JET `@report_opt` and AllocCheck into one [`StrictReport`](@ref) —
+and, unlike the asserts, it never throws. It returns the report (the REPL prints it); assign it
+to inspect the fields.
+
+A clean call reports all green:
+
+```@example guide
+clean(a, b) = 0.5a + 0.5b
+
+@explain clean(2.0, 4.0)
+```
+
+The runtime tuple-index trap is dissected — non-concrete return type, the boxing allocation
+site, and the `@code_warntype` body — with a verdict for each guarantee:
+
+```julia
+state = (1, 2.0, "three")
+component(s, i) = s[i]
+
+@explain component(state, rand(1:3))
+# StrictMode @explain — component(state, rand(1:3))
+#
+#   Return type:    Union{Float64, Int64, String}  ✗ not concrete
+#   Allocations:    ✗ 1 site(s) (AllocCheck):
+#     [1] Allocating runtime call to "jl_get_nth_field_checked" in ./tuple.jl:33 …
+#
+#   Verdict:
+#     ✗ @assert_typestable would fail
+#     ✗ @assert_noalloc would fail
+```

@@ -44,6 +44,15 @@ away.
 StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of throwing
 ```
 
+### Diagnose instead of assert
+
+When you want the *reason* rather than a thrown error, reach for `@explain` — it aggregates
+`@code_warntype`, JET and AllocCheck into one `StrictReport` and never throws:
+
+```julia
+@explain component(state, rand(1:3))   # returns a report explaining each verdict
+```
+
 ## How each check works (so you can trust the failures)
 
 - **`@assert_noalloc`** asks AllocCheck to *prove* the call cannot allocate. Any reported site —
@@ -60,5 +69,3 @@ StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of thro
 - `@assert_noboxing` — pinpoint the boxing / runtime-tuple-index class specifically.
 - `@unroll` + `Val` helpers — emit straight-line, literal-index code so you never hand-write the
   avoid-boxing pattern.
-- `@explain f(args...)` — one human-readable report aggregating `@code_warntype`, JET, and
-  AllocCheck output, telling you *why* a guarantee failed.

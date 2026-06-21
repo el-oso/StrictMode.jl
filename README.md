@@ -106,15 +106,15 @@ end
 | `@strict_function def` | verify the definition's contract at precompile time |
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |
 | `@verify_strict T begin … end` | verify an implementation's surface *and* performance |
+| `@explain f(args...)` | aggregate `@code_warntype` + JET + AllocCheck into one "why did it fail" report (never throws) |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
 See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Roadmap (v0.2)
-`@assert_inlined`, `@assert_noboxing`, `@unroll` (+ `Val` helpers for compile-time
-specialization), and `@explain` (aggregate `@code_warntype` + JET + AllocCheck into one
-human-readable "why did it fail" report).
+`@assert_inlined`, `@assert_noboxing`, and `@unroll` (+ `Val` helpers for compile-time
+specialization).
 
 ## Installation
 

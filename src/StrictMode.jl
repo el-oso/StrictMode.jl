@@ -30,10 +30,12 @@ using AllocCheck: AllocCheck, check_allocs
 using JET: JET
 using Test: Test
 using TypeContracts: TypeContracts
+using InteractiveUtils: InteractiveUtils
 
 export @assert_noalloc, @assert_typestable, @strict, @strict_function
-export @strict_contract, @verify_strict
-export StrictViolation, enable_checks!, disable_checks!, checks_enabled, fail_mode
+export @strict_contract, @verify_strict, @explain
+export StrictViolation, StrictReport
+export enable_checks!, disable_checks!, checks_enabled, fail_mode
 
 include("preferences.jl")
 include("report.jl")
@@ -42,10 +44,10 @@ include("typestability.jl")
 include("macros.jl")
 include("strict_function.jl")
 include("contracts.jl")
+include("explain.jl")
 
 # v0.2 roadmap stubs (documented, not yet exported).
 include("inlining.jl")
 include("idioms.jl")
-include("explain.jl")
 
 end # module StrictMode
