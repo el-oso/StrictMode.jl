@@ -27,6 +27,16 @@ jobs:
       # The test environment ships LocalPreferences.toml with checks_enabled=true, so the
       # failing-path test items actually exercise the guarantees in CI.
       - run: julia --project=test -e 'import Pkg; Pkg.instantiate()'
-      - run: julia --project=test test/runtests.jl
+      - run: julia --project=test --code-coverage=user test/runtests.jl
         env:
           JULIA_NUM_THREADS: 2
+      # Collect & upload coverage from the Linux job only (avoids duplicate uploads and
+      # Windows path quirks).
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.os == 'ubuntu-latest'
+      - uses: codecov/codecov-action@v5
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
