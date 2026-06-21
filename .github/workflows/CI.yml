@@ -23,8 +23,6 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-        with:
-          version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       # The test environment ships LocalPreferences.toml with checks_enabled=true, so the
       # failing-path test items actually exercise the guarantees in CI.
