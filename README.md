@@ -2,7 +2,7 @@
 
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://el-oso.github.io/StrictMode.jl/dev/)
 [![CI](https://github.com/el-oso/StrictMode.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/el-oso/StrictMode.jl/actions/workflows/CI.yml)
-[![codecov](https://codecov.io/gh/el-oso/StrictMode.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/el-oso/StrictMode.jl)
+[![Coverage](https://coveralls.io/repos/github/el-oso/StrictMode.jl/badge.svg?branch=master)](https://coveralls.io/github/el-oso/StrictMode.jl?branch=master)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Make correct-and-fast the default; make falling off the fast path a loud error.**
