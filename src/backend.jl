@@ -35,3 +35,30 @@ function _be_check_allocs end   # (f, types) -> Vector of AllocCheck allocation 
 function _be_is_boxing end      # (alloc_instance) -> Bool  (boxing / dynamic-dispatch subclass)
 function _be_opt_result end     # (f, types) -> JET optimization-analysis result
 function _be_opt_reports end    # (result)   -> the result's reports
+
+# Whether the `:full` AllocCheck pass ignores allocations on never-taken throw branches (a
+# `BoundsError` construction, etc.). `true` (default) = hot-path semantics: a runtime-zero-alloc
+# kernel with bounds checks is *not* a false positive. Strict users can count them with
+# `set_ignore_throw!(false)`. (The `:fast` heuristic is already throw-path clean.)
+const _IGNORE_THROW = Ref(true)
+
+"""
+    StrictMode.ignore_throw() -> Bool
+
+Whether `:full` AllocCheck analysis ignores allocations on never-taken throw branches (default
+`true`). See [`set_ignore_throw!`](@ref).
+"""
+ignore_throw() = _IGNORE_THROW[]
+
+"""
+    StrictMode.set_ignore_throw!(b::Bool)
+
+Set whether `:full` AllocCheck ignores throw-branch allocations. `true` (default) gives hot-path
+semantics; `false` counts allocations on error branches that never execute. Clears the findings
+cache, since it changes `:full` `noalloc`/`noboxing` results.
+"""
+function set_ignore_throw!(b::Bool)
+    _IGNORE_THROW[] = b
+    clear_cache!()
+    return b
+end

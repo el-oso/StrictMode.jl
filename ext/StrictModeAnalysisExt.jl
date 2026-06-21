@@ -12,7 +12,11 @@ using PrecompileTools: @setup_workload, @compile_workload
 
 # --- backend seam implementations ---
 
-StrictMode._be_check_allocs(@nospecialize(f), @nospecialize(types)) = AllocCheck.check_allocs(f, types)
+# `ignore_throw` (default true via `StrictMode.set_ignore_throw!`): don't count allocations on
+# never-taken error/throw branches (BoundsError etc.) — they're not on the hot path and produce
+# false positives on runtime-zero-alloc code.
+StrictMode._be_check_allocs(@nospecialize(f), @nospecialize(types)) =
+    AllocCheck.check_allocs(f, types; ignore_throw = StrictMode._IGNORE_THROW[])
 
 StrictMode._be_opt_result(@nospecialize(f), @nospecialize(types)) = JET.report_opt(f, types)
 

@@ -33,7 +33,9 @@ extension. Pick what to add per environment:
 | **Dev (human)** | `Revise`, `AllocCheck`, `JET` | the live [`watch`](https://el-oso.github.io/StrictMode.jl/dev/automating) loop with real checks |
 | **CI / agent** | `AllocCheck`, `JET` | `audit` / the full check set |
 
-With checks enabled but the backend not loaded, StrictMode tells you to add them.
+They must be **loaded** (`using AllocCheck, JET`), not just listed as dependencies, for the
+analysis extension to activate — with checks enabled but the backend not loaded, `:full` checks
+tell you to add them (`:fast` triage needs no backend at all).
 
 ## Zero cost when disabled
 

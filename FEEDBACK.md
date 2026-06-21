@@ -100,3 +100,30 @@ Since kwarg functions are everywhere, this makes `exempt`/`only` surprising.
 - *Suggestion:* let `analysis = :fast` also use a cheaper allocation check (e.g. a runtime `@allocated`
   sample on a provided call, or skip `noalloc` unless requested), or document that `:fast` only affects
   typestability and offer a `guarantees = (:typestable,)` fast-path for quick whole-module scans.
+
+---
+
+# Round 3 — after the backend-extension + cheaper-sweep rework
+
+### F8 — `noalloc` false-positives on throw paths (counts never-taken error branches)  *(fix applied in clone)*
+`ext/StrictModeAnalysisExt.jl` calls `AllocCheck.check_allocs(f, types)` with AllocCheck's **default
+`ignore_throw = false`**, so it counts allocations on error/throw branches (e.g. `BoundsError`
+construction) that never execute on the hot path. On PureFFT this made the whole-package sweep report **61
+`noalloc` failures across 12 kernels that are runtime zero-alloc** — including primary `:fast` kernels
+(`_fft128_avx!`, `apply_unnormalized!`) as well as the `:recursive`/`:base`/`:soa` variants (`_ditrec!`,
+`_base_butterflies_*`, `recursive_fft!`, …). Evidence for `Radix4AvxPlan(128)`'s `apply_unnormalized!`:
+- runtime `@allocated` (warmed, `@noinline`, 50 reps): **0 B/call**
+- `check_allocs(f, types; ignore_throw = true)`: **0 sites**
+- `check_allocs(f, types; ignore_throw = false)`: **6 sites** ← what StrictMode currently reports
+
+Same for the per-call `@assert_noalloc` (it shares `_be_check_allocs`), so it now fails on runtime-clean
+hot paths too. This blocks both PureFFT's per-plan `@assert_noalloc` test and the whole-package sweep.
+- *Fix applied (clone):* `_be_check_allocs(...) = AllocCheck.check_allocs(f, types; ignore_throw = true)`.
+  Verified it returns 0 for the kernels above. Suggest threading `ignore_throw` as a kwarg through
+  `@assert_noalloc` / `check_compiled` / `audit` (default `true` — hot-path semantics; let strict users
+  opt into `false`).
+
+### Note — the cheaper sweep is much better (≈180 s → ≈69 s) and the weak-dep backend is clean
+The `StrictModeAnalysisExt` (AllocCheck+JET as a loaded extension) + `backend_available()` is a nice model.
+One adoption gotcha: a consumer must `using AllocCheck, JET` (not just have them as deps) for the backend
+to load, else `:full` checks error — the error message is clear, but worth a line in the README.

@@ -108,6 +108,8 @@ checks_enabled
 fail_mode
 analysis_mode
 backend_available
+ignore_throw
+set_ignore_throw!
 ```
 
 ### Incremental cache
