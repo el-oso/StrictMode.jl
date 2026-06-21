@@ -82,19 +82,27 @@ _gate(check_expr, passthrough_expr) = CHECKS_ENABLED ? check_expr : passthrough_
 
 # --- shared macro plumbing (runs at user macro-expansion time, never at module load) ---
 
-# Split a `f(args...)` call expression into (function-expr, [arg-exprs]). Errors loudly on
-# anything that is not a plain positional call, so the guarantee macros stay predictable.
+# Split a call expression into (function-expr, [arg-exprs]). Handles plain calls `f(a, b)` and
+# broadcasts `f.(a, b)` (rewritten to `broadcast(f, a, b)`). Anything else (keyword args, bare
+# macrocalls, blocks) gets a clear error pointing at the interference-proof `StrictMode.check`.
 function _callinfo(call)
+    # Broadcasting: `f.(xs...)` parses as `Expr(:., f, Expr(:tuple, xs...))`.
+    if Meta.isexpr(call, :., 2) && Meta.isexpr(call.args[2], :tuple)
+        return :broadcast, Any[call.args[1], call.args[2].args...]
+    end
     Meta.isexpr(call, :call) || throw(
         ArgumentError(
-            "StrictMode guarantee macros expect a function call `f(args...)`, got: $call"
+            "StrictMode guarantee macros expect a call `f(args...)` or broadcast `f.(args...)`, " *
+                "got: $call. For keyword args, blocks, or other forms, use the function API: " *
+                "`StrictMode.check(f, (T1, T2, …))`."
         )
     )
     fexpr = call.args[1]
     argexprs = call.args[2:end]
     any(a -> Meta.isexpr(a, (:parameters, :kw)), argexprs) && throw(
         ArgumentError(
-            "StrictMode guarantee macros do not support keyword arguments yet: $call"
+            "StrictMode guarantee macros don't support keyword arguments in `$call`. " *
+                "Use the function API instead: `StrictMode.check(f, (T1, T2, …))`."
         )
     )
     return fexpr, argexprs

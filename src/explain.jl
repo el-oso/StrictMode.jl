@@ -39,7 +39,7 @@ function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_res
         Any[Any]
     end
     rt = isempty(rts) ? Any : reduce((a, b) -> Union{a, b}, rts)
-    opt_reports = JET.get_reports(opt_result)
+    opt_reports = opt_result === nothing ? [] : JET.get_reports(opt_result)
     allocs, alloc_error = try
         (check_allocs(f, types), nothing)
     catch err

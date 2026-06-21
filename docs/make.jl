@@ -16,6 +16,8 @@ makedocs(;
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
         "Guarantees" => "guarantees.md",
+        "Automating checks" => "automating.md",
+        "Agentic feedback" => "agents.md",
         "Cookbook" => "cookbook.md",
         "API Reference" => "api.md",
     ],

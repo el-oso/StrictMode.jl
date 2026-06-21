@@ -40,6 +40,9 @@ to the bare call.
 x = @strict kernel(a, b) # use the result while still guaranteeing the fast path
 ```
 """
-macro strict(call)
-    return _strict_expr(call)
+macro strict(ex)
+    # `@strict module M … end` marks the whole module (see registry.jl); otherwise it's the
+    # per-call guarantee on `f(args...)`.
+    Meta.isexpr(ex, :module) && return _strict_module(ex)
+    return _strict_expr(ex)
 end

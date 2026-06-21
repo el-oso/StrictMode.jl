@@ -97,7 +97,24 @@ m = MyMetric(); xs = rand(100)
 end
 ```
 
-## API (v0.1)
+## Automation & agents
+
+Beyond per-call macros, StrictMode can check **automatically**:
+
+```julia
+check(f, (T1, T2))                 # function API — never collides with other macros/syntax
+@strict module Kernels … end       # mark a module; checked automatically when it loads
+check_compiled(MyPkg)              # usage-driven: check whatever actually compiled
+StrictMode.watch()                 # live re-checking on each edit (with `using Revise`)
+exit(audit(MyPkg; format = :json)) # one-shot, structured, exit-coded — for AI agents / CI
+```
+
+`audit` emits machine-readable findings (with a `file`, `line`, `reason`, and an actionable
+`suggestion` per violation) and returns the failure count. See
+[Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) and
+[Agentic feedback](https://el-oso.github.io/StrictMode.jl/dev/agents).
+
+## API
 
 | Macro / function | Guarantee |
 |---|---|
@@ -112,15 +129,20 @@ end
 | `@explain f(args...)` | aggregate `@code_warntype` + JET + AllocCheck into one "why did it fail" report (never throws) |
 | `@unroll for i in lo:hi …` | fully unroll a fixed-count loop with literal indices (kills runtime-tuple-index boxing); not gated |
 | `staticval(n)` | lift a count into the type domain (`Val{n}`) for compile-time specialization |
+| `check(f, types)` | function API — guarantees on a `(function, signature)`, no macro interference |
+| `@strict module … end` | mark a whole module; checked automatically at load |
+| `check_all` / `check_compiled` | re-check the registry / sweep what actually compiled |
+| `audit` / `watch` | structured one-shot report for agents / live Revise loop for humans |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
 See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Status
-The v0.2 roadmap is complete: `@explain`, `@unroll` + `staticval`, `@assert_noboxing`,
-`@assert_inlined`, a PrecompileTools warmup, and a `:fast` / `:full` analysis mode are all
-shipped.
+v0.3 adds the ergonomics layer: a function API (`check`), `@strict module` with automatic
+checking at load, a usage-driven `check_compiled` sweep, a Revise live loop (`watch`), and an
+`audit` path that emits structured findings for AI agents. v0.2 (the guarantee set, `@explain`,
+`@unroll`, PrecompileTools warmup, `:fast`/`:full`) is complete.
 
 ## Installation
 

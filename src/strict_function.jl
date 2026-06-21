@@ -39,6 +39,8 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
             "$(types); precompile guarantees skipped (call sites can still use @strict)."
         nothing
     end
+    # Record it so the automatic drivers (check_all, @strict module, the Revise loop) re-check it.
+    register_strict!(f, types)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
     if length(rts) != 1 || !isconcretetype(only(rts))

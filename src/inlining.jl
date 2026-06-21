@@ -4,30 +4,39 @@
 # `f` survives as an `:invoke` (i.e. it was *not* absorbed). A "not inlined" result is not
 # necessarily a bug — it reports the compiler's decision under the current settings.
 
-function _assert_inlined(target, wrapper::W, @nospecialize(f), @nospecialize(types::Tuple)) where {W}
+# Best-effort inlining detection from `(f, types)` alone (no values, no execution): compile a
+# wrapper that calls `f`, scan its optimized IR for a surviving `:invoke` to `f`'s method.
+# Returns `true` if the call was *not* inlined, `false` if it was, `nothing` if undeterminable
+# (e.g. a builtin/intrinsic with no resolvable method — effectively always inlined).
+function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     local m
     try
         m = which(f, types)
     catch
-        return nothing   # a builtin / intrinsic is effectively always inlined
+        return nothing
     end
+    wrapper = (args...) -> f(args...)
     cts = Base.code_typed(wrapper, types; optimize = true)
-    isempty(cts) && return _fail(:inlined, target, "could not obtain optimized IR for the call")
+    isempty(cts) && return nothing
     for stmt in first(cts).first.code
         if Meta.isexpr(stmt, :invoke)
             # On recent Julia the `:invoke` target is a `CodeInstance` (whose `.def` is the
             # `MethodInstance`); older Julia uses the `MethodInstance` directly.
             a1 = stmt.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
-            if mi isa Core.MethodInstance && mi.def === m
-                _fail(
-                    :inlined, target,
-                    "call to `$(m.name)` was not inlined — it survives as an `:invoke` at the " *
-                        "call site (inlining is a heuristic; this may be expected)."
-                )
-                return nothing
-            end
+            mi isa Core.MethodInstance && mi.def === m && return true
         end
+    end
+    return false
+end
+
+function _assert_inlined(target, @nospecialize(f), @nospecialize(types::Tuple))
+    if _inlined_survives(f, types) === true
+        _fail(
+            :inlined, target,
+            "call to `$(which(f, types).name)` was not inlined — it survives as an `:invoke` at " *
+                "the call site (inlining is a heuristic; this may be expected)."
+        )
     end
     return nothing
 end
@@ -61,13 +70,11 @@ macro assert_inlined(call)
     fe = esc(fexpr)
     litcall = Expr(:call, fe, syms...)
     types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
-    params = [gensym(:p) for _ in syms]
-    wrapper = Expr(:->, Expr(:tuple, params...), Expr(:call, fe, params...))
 
     checked = quote
         $(binds...)
         local _val = $litcall
-        $(_assert_inlined)($target, $wrapper, $fe, $types)
+        $(_assert_inlined)($target, $fe, $types)
         _val
     end
     return _gate(checked, esc(call))

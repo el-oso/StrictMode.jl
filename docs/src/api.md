@@ -26,6 +26,33 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 @strict_function
 ```
 
+## Automation
+
+The function API, the mark-once registry, and the usage-driven sweep. See
+[Automating checks](automating.md).
+
+```@docs
+check
+findings
+register_strict!
+registered_strict
+check_all
+check_compiled
+watch
+unwatch
+```
+
+## Agentic feedback
+
+One-shot, structured, exit-coded reporting for AI agents and CI. See
+[Agentic feedback](agents.md).
+
+```@docs
+audit
+StrictFinding
+format_findings
+```
+
 ## TypeContracts integration
 
 ```@docs

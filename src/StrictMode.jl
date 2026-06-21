@@ -36,7 +36,8 @@ export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
 export @strict, @strict_function
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
-export StrictViolation, StrictReport
+export StrictViolation, StrictReport, StrictFinding
+export check, findings, check_all, check_compiled, audit, format_findings, watch, unwatch
 export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode
 
 include("preferences.jl")
@@ -49,6 +50,10 @@ include("contracts.jl")
 include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
+include("findings.jl")
+include("check.jl")
+include("registry.jl")
+include("audit.jl")
 
 # Warm the heavy analyzers into the precompile image (when checks are enabled).
 include("precompile.jl")

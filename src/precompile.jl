@@ -26,13 +26,18 @@ using PrecompileTools: @setup_workload, @compile_workload
             # Warm the :fast type-stability check (inference-only) and the inlining check.
             try
                 _typestable_fast("warmup", wk_dot, types)
-                _assert_inlined("warmup", (p, q) -> wk_dot(p, q), wk_dot, types)
+                _assert_inlined("warmup", wk_dot, types)
             catch
             end
             # Warm JET (@report_opt) and the full @explain aggregation (+ @code_warntype).
             try
                 opt = JET.@report_opt wk_dot(A, B)
                 _explain("warmup", wk_dot, types, opt)
+            catch
+            end
+            # Warm the function API / findings engine (shared by check_all, audit, the Revise loop).
+            try
+                check(wk_dot, types; guarantees = (:typestable, :noalloc, :noboxing, :inlined), fail = :none)
             catch
             end
         end
