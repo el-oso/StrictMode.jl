@@ -1,7 +1,8 @@
 # StrictMode.jl
 
+[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://el-oso.github.io/StrictMode.jl/stable/)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://el-oso.github.io/StrictMode.jl/dev/)
 [![CI](https://github.com/el-oso/StrictMode.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/el-oso/StrictMode.jl/actions/workflows/CI.yml)
-[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://el-oso.github.io/StrictMode.jl/dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Make correct-and-fast the default; make falling off the fast path a loud error.**

@@ -1,7 +1,7 @@
 name = "StrictMode"
 uuid = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 authors = ["el_oso"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
