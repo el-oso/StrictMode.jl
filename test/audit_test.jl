@@ -48,3 +48,19 @@ end
     only_hot = check_compiled(Mixed; guarantees = (:noalloc,), only = [:hot])
     @test all(f -> f.func == "hot", only_hot)
 end
+
+@testitem "exempt/only match keyword-argument methods (kwsorter demangling)" begin
+    using StrictMode
+    empty!(StrictMode.exempt_strict())
+    @test StrictMode._demangle(Symbol("#foo#34")) === :foo
+    @test StrictMode._demangle(:foo) === :foo
+
+    module KW
+    kwf(x::Int; k::Int = 1) = collect(1:(x + k))   # allocates; kwargs → kwsorter `#kwf#NN`
+    end
+    KW.kwf(3; k = 2)                                    # compile the kwsorter
+
+    @test any(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,)))      # flagged
+    # exempt by the BASE name must skip the mangled kwsorter method too
+    @test isempty(filter(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,), exempt = [:kwf])))
+end
