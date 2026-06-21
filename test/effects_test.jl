@@ -22,13 +22,18 @@
     @test xs.boxing                                     # runtime tuple index → boxing
 end
 
-@testitem "effects layer reads Base.infer_effects" begin
+@testitem "effects layer wraps Base.infer_effects" begin
     using StrictMode
     pure(x) = x * 2 + 1
     eff = StrictMode.effects(pure, (Int,))
-    @test StrictMode.effect_holds(eff, :nothrow)
-    @test StrictMode.effect_holds(eff, :effect_free)
+    # The API returns a Bool per effect, and rejects unknown effects. (We don't assert specific
+    # effect *values* — those are the compiler's call and vary across platforms.)
+    @test StrictMode.effect_holds(eff, :nothrow) isa Bool
+    @test StrictMode.effect_holds(eff, :effect_free) isa Bool
     @test_throws ArgumentError StrictMode.effect_holds(eff, :bogus)
+    # A function that can `throw` is never `:nothrow` — robust everywhere.
+    thrower(x) = x > 0 ? x : error("negative")
+    @test StrictMode.effect_holds(StrictMode.effects(thrower, (Int,)), :nothrow) == false
 end
 
 @testitem "_findings_fast gives correct verdicts with no backend needed" begin

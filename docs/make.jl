@@ -21,7 +21,6 @@ makedocs(;
         "Guarantees" => "guarantees.md",
         "Automating checks" => "automating.md",
         "Agentic feedback" => "agents.md",
-        "Migration & cookbook" => "migration.md",
         "Cookbook" => "cookbook.md",
         "API Reference" => "api.md",
     ],
