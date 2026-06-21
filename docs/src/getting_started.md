@@ -141,15 +141,25 @@ per-call asserts to cheap inference-only checks:
 StrictMode.enable_checks!(analysis = "fast")   # default is "full"
 ```
 
-| Mode | Type stability | No-allocation | Warm cost |
-|---|---|---|---|
-| `:full` (default) | JET `@report_opt` + `@inferred` | AllocCheck static **proof** | tens of ms |
-| `:fast` | `Base.return_types` concreteness | empirical `@allocated` | sub-ms |
+| Mode | Type stability | No-allocation / no-boxing | Backend | Per-method cost |
+|---|---|---|---|---|
+| `:full` (default) | JET `@report_opt` | AllocCheck static **proof** | AllocCheck + JET | ~900 µs |
+| `:fast` | `Base.return_types` concreteness | `code_typed` IR + `infer_effects` **heuristic** | none needed | ~70 µs |
 
-`:fast` trades rigor for speed: it catches the common cases (non-concrete return, allocations on
-the measured path) but can miss internal-dispatch-with-concrete-return that `:full` proves, and
-its `@allocated` measurement reflects the call *in context* (e.g. reading a non-`const` global
-will register as an allocation). [`@explain`](@ref) and [`@strict_function`](@ref) always use
-the full analysis. A good split: `:fast` while iterating, `:full` in CI.
+`:fast` is now a quick *all-properties* triage — type stability **and** allocation/boxing — built
+only on Base inference, so it needs no AllocCheck/JET backend and runs **~10× cheaper per method**
+than `:full` (see `bench/timetax.jl`). It catches the common cases (explicit heap allocation,
+boxing / dynamic dispatch, non-concrete returns) but, being a heuristic, may rarely miss or
+over-flag where AllocCheck's LLVM-level proof would not. [`@explain`](@ref) and
+[`@strict_function`](@ref) always use the full analysis. A good split: `:fast` while iterating,
+`:full` in CI.
+
+### Incremental re-checks
+
+`findings`/`check`/`audit`/`check_all` cache results per `(method, world, signature, mode)`, so a
+re-run only re-analyzes methods that actually changed — editing one method and re-`audit`ing is
+near-instant (the rest are cache hits). `:fast` analysis also runs across threads when
+`Threads.nthreads() > 1`. Use [`cache_stats`](@ref) to see hits/misses and
+[`clear_cache!`](@ref) if you edited a *callee* of a checked method.
 
 Next: the [Guarantees](guarantees.md) guide walks through every macro with runnable examples.

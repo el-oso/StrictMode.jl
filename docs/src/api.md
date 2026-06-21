@@ -100,3 +100,10 @@ fail_mode
 analysis_mode
 backend_available
 ```
+
+### Incremental cache
+
+```@docs
+cache_stats
+clear_cache!
+```

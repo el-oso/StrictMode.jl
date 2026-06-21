@@ -36,11 +36,13 @@ export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport, StrictFinding
 export check, findings, check_all, check_compiled, audit, format_findings, nfailures, watch, unwatch
+export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode, backend_available
 
 include("preferences.jl")
 include("report.jl")
 include("backend.jl")
+include("effects.jl")
 include("static_checks.jl")
 include("typestability.jl")
 include("macros.jl")
@@ -50,6 +52,7 @@ include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
 include("findings.jl")
+include("cache.jl")
 include("check.jl")
 include("registry.jl")
 include("audit.jl")

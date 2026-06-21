@@ -68,9 +68,59 @@ Analyze `f` for the concrete signature `types` and return one [`StrictFinding`](
 requested guarantee. Pure analysis — `f` is never called.
 """
 function findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:typestable, :noalloc))
+    key = _cache_key(f, types, guarantees)
+    if key !== nothing
+        cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
+        if cached !== nothing
+            @lock _CACHE_LOCK (_CACHE_HITS[] += 1)
+            return copy(cached)
+        end
+    end
+    fs = _findings_uncached(f, types, guarantees)
+    if key !== nothing
+        @lock _CACHE_LOCK begin
+            _CACHE[key] = fs
+            _CACHE_MISSES[] += 1
+        end
+    end
+    return copy(fs)
+end
+
+function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
-    rep = _strict_report(fn * sg, f, types)
-    return StrictFinding[_build_finding(g, f, types, rep, md, fn, sg) for g in guarantees]
+    if ANALYSIS_MODE === :full
+        # Rigorous: AllocCheck proof + JET (needs the analysis backend).
+        rep = _strict_report(fn * sg, f, types)
+        return StrictFinding[_build_finding(g, f, types, rep, md, fn, sg) for g in guarantees]
+    end
+    # :fast — value-free inference heuristic; no AllocCheck/JET backend required.
+    return _findings_fast(f, types, guarantees, md, fn, sg)
+end
+
+# `:fast` per-guarantee findings from cheap Base-only analysis (`_alloc_signals`, `return_types`,
+# `_inlined_survives`). Triage speed for the edit loop; `:full` is the proof for CI.
+function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
+    sig = (:noalloc in guarantees || :noboxing in guarantees) ? _alloc_signals(f, types) : nothing
+    out = StrictFinding[]
+    for g in guarantees
+        if g === :typestable
+            rts = Base.return_types(f, Tuple{types...})
+            fail = length(rts) != 1 || !isconcretetype(only(rts))
+            push!(out, _mkfinding(md, fn, sg, g, fail, "return type is not concrete (inference)", "", 0))
+        elseif g === :noalloc
+            fail = sig.alloc || sig.boxing
+            push!(out, _mkfinding(md, fn, sg, g, fail, "allocates / boxes (fast heuristic)", sig.file, sig.line))
+        elseif g === :noboxing
+            fail = sig.boxing
+            push!(out, _mkfinding(md, fn, sg, g, fail, "boxing / dynamic dispatch (fast heuristic)", sig.file, sig.line))
+        elseif g === :inlined
+            fail = _inlined_survives(f, types) === true
+            push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
+        else
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, or :inlined"))
+        end
+    end
+    return out
 end
 
 """

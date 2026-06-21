@@ -28,6 +28,34 @@ The mark-once registry: `(f, types) => (; guarantees)` for everything tagged str
 """
 registered_strict() = STRICT_REGISTRY
 
+# Parallelize cheap (:fast) analysis across threads; keep :full serial by default since
+# AllocCheck/JET hold global compiler state. `findings` is itself cache-locked and thread-safe.
+_default_parallel() = ANALYSIS_MODE === :fast && Threads.nthreads() > 1
+
+function _map_findings(items::Vector, parallel::Bool)
+    if parallel && length(items) > 1
+        results = Vector{Vector{StrictFinding}}(undef, length(items))
+        Threads.@threads for i in eachindex(items)
+            f, types, gs = items[i]
+            results[i] = try
+                findings(f, types; guarantees = gs)
+            catch
+                StrictFinding[]
+            end
+        end
+        return reduce(vcat, results; init = StrictFinding[])
+    end
+    out = StrictFinding[]
+    for (f, types, gs) in items
+        try
+            append!(out, findings(f, types; guarantees = gs))
+        catch err
+            err isa StrictViolation && rethrow()
+        end
+    end
+    return out
+end
+
 function _run_and_report(fs::Vector{StrictFinding}, kind::Symbol, target, fail::Symbol)
     failed = filter(_failed, fs)
     if !isempty(failed) && fail !== :none
@@ -44,17 +72,12 @@ Re-check every entry in the mark-once registry and return all findings. `guarant
 uses each entry's own setting; pass a tuple to override. `fail = :error`/`:warn` raises/logs on
 any failure, `:none` just returns the findings (the default — it is a reporting driver).
 """
-function check_all(; guarantees = nothing, fail::Symbol = :none)
-    out = StrictFinding[]
-    for ((f, types), meta) in STRICT_REGISTRY
-        gs = guarantees === nothing ? meta.guarantees : guarantees
-        try
-            append!(out, findings(f, types; guarantees = gs))
-        catch err
-            err isa StrictViolation && rethrow()
-        end
-    end
-    return _run_and_report(out, :check_all, "registry", fail)
+function check_all(; guarantees = nothing, fail::Symbol = :none, parallel::Bool = _default_parallel())
+    items = Any[
+        (f, types, guarantees === nothing ? meta.guarantees : guarantees)
+            for ((f, types), meta) in STRICT_REGISTRY
+    ]
+    return _run_and_report(_map_findings(items, parallel), :check_all, "registry", fail)
 end
 
 # Automatic-at-load hook emitted by `@strict module`. Gated on CHECKS_ENABLED so production pays
@@ -158,10 +181,11 @@ function check_compiled(
         fail::Symbol = :none,
         only = nothing,
         exempt = (),
+        parallel::Bool = _default_parallel(),
     )
     exemptset = Set{Symbol}(_asname(x) for x in exempt)
     onlyset = only === nothing ? nothing : Set{Symbol}(_asname(x) for x in only)
-    out = StrictFinding[]
+    items = Any[]
     for nm in names(mod; all = true)
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
@@ -177,15 +201,11 @@ function check_compiled(
                     continue
                 end
                 all(isconcretetype, tt) || continue
-                try
-                    append!(out, findings(f, tt; guarantees))
-                catch err
-                    err isa StrictViolation && rethrow()
-                end
+                push!(items, (f, tt, guarantees))
             end
         end
     end
-    return _run_and_report(out, :check_compiled, string(nameof(mod)), fail)
+    return _run_and_report(_map_findings(items, parallel), :check_compiled, string(nameof(mod)), fail)
 end
 
 # --- Revise live loop plumbing (the extension fills these in) ----------------------------------
