@@ -15,9 +15,16 @@ using PrecompileTools: @setup_workload, @compile_workload
     types = (typeof(A), typeof(B))
     @compile_workload begin
         if CHECKS_ENABLED
-            # Warm AllocCheck (static no-alloc proof) and its empirical fallback.
+            # Warm AllocCheck (static :full) and the empirical @allocated path (:fast), so both
+            # analysis modes start warm regardless of which the preference selects.
             try
                 _assert_noalloc("warmup", wk_dot, types, () -> wk_dot(A, B); static = true)
+                _assert_noalloc("warmup", wk_dot, types, () -> wk_dot(A, B); static = false)
+            catch
+            end
+            # Warm the :fast type-stability check (inference-only).
+            try
+                _typestable_fast("warmup", wk_dot, types)
             catch
             end
             # Warm JET (@report_opt) and the full @explain aggregation (+ @code_warntype).

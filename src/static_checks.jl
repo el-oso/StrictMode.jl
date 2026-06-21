@@ -15,9 +15,12 @@ function _format_allocs(results)
     return String(take!(io))
 end
 
-_allocated(thunk) = @allocated thunk()
+# Force specialization on the thunk type (`where {F}`): otherwise calling a Function-typed
+# argument is a dynamic dispatch that itself allocates, producing a false positive in the
+# empirical path.
+@inline _allocated(thunk::F) where {F} = @allocated thunk()
 
-function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk; static::Bool)
+function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; static::Bool) where {F}
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if static
         try
@@ -44,11 +47,12 @@ end
 
 Fail unless the call `f(args...)` is allocation-free.
 
-By default StrictMode asks [AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) to *prove*
-the call cannot allocate; if the proof reports any allocation site (including dynamic dispatch
-or boxing) the guarantee fails with those sites. When static analysis cannot run, it falls back
-to an empirical `@allocated` measurement after a warmup call. Pass `static=false` to force the
-empirical path.
+In the default `:full` [`analysis_mode`](@ref) StrictMode asks
+[AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) to *prove* the call cannot allocate; if
+the proof reports any allocation site (including dynamic dispatch or boxing) the guarantee fails
+with those sites. When static analysis cannot run, it falls back to an empirical `@allocated`
+measurement after a warmup call. In `:fast` mode the empirical `@allocated` path is the default.
+Pass `static = true`/`false` to force a path regardless of mode.
 
 Each argument is evaluated exactly once. When checks are disabled (the production default) this
 expands to the bare call — zero overhead.
@@ -59,7 +63,9 @@ expands to the bare call — zero overhead.
 ```
 """
 macro assert_noalloc(args...)
-    static = true
+    # Default to AllocCheck's static proof in :full analysis, the empirical @allocated path in
+    # :fast; an explicit `static = …` always wins.
+    static = ANALYSIS_MODE === :full
     call = nothing
     for a in args
         if Meta.isexpr(a, :(=)) && a.args[1] === :static

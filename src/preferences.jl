@@ -24,17 +24,41 @@ fail_mode() = FAIL_MODE
 const FAIL_MODE = Symbol(@load_preference("fail_mode", "error"))::Symbol
 
 """
-    enable_checks!(; fail_mode::Union{Symbol,AbstractString} = "error")
+    analysis_mode() -> Symbol
 
-Turn StrictMode guarantee checks on for the active project and set the failure mode
-(`:error` or `:warn`). Writes a `LocalPreferences.toml` entry and **triggers recompilation**;
-restart the session (or re-`using`) for the change to take effect.
+How thoroughly the per-call asserts ([`@assert_typestable`](@ref), [`@assert_noalloc`](@ref),
+[`@strict`](@ref)) analyze a call:
+
+- `:full` (default) — rigorous proofs: JET `@report_opt` for type stability and AllocCheck's
+  static no-allocation proof. Best for CI.
+- `:fast` — cheap inference-only checks: `Base.return_types` concreteness and an empirical
+  `@allocated` measurement. Sub-millisecond once warm; best for a tight interactive loop on
+  large functions (it can miss internal-dispatch-with-concrete-return that `:full` catches).
+
+[`@explain`](@ref) and [`@strict_function`](@ref) always use the full analysis regardless of
+this setting. Controlled by the `analysis` preference; set it via [`enable_checks!`](@ref).
 """
-function enable_checks!(; fail_mode::Union{Symbol, AbstractString} = "error")
+analysis_mode() = ANALYSIS_MODE
+const ANALYSIS_MODE = Symbol(@load_preference("analysis", "full"))::Symbol
+
+"""
+    enable_checks!(; fail_mode = "error", analysis = "full")
+
+Turn StrictMode guarantee checks on for the active project, set the failure mode (`:error` or
+`:warn`) and the [`analysis_mode`](@ref) (`:full` or `:fast`). Writes a `LocalPreferences.toml`
+entry and **triggers recompilation**; restart the session (or re-`using`) for the change to
+take effect.
+"""
+function enable_checks!(;
+        fail_mode::Union{Symbol, AbstractString} = "error",
+        analysis::Union{Symbol, AbstractString} = "full",
+    )
     fm = String(fail_mode)
     fm in ("error", "warn") || throw(ArgumentError("fail_mode must be :error or :warn, got $fail_mode"))
-    @set_preferences!("checks_enabled" => true, "fail_mode" => fm)
-    @info "StrictMode checks ENABLED (fail_mode = :$fm). Restart Julia to apply."
+    an = String(analysis)
+    an in ("full", "fast") || throw(ArgumentError("analysis must be :full or :fast, got $analysis"))
+    @set_preferences!("checks_enabled" => true, "fail_mode" => fm, "analysis" => an)
+    @info "StrictMode checks ENABLED (fail_mode = :$fm, analysis = :$an). Restart Julia to apply."
     return nothing
 end
 

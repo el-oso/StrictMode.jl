@@ -104,4 +104,24 @@ In other words: the cost is a one-time precompile, not a per-call tax, and an ed
 (Revise) keeps the analyzer image warm across edits. Warm cost does scale with call-graph size,
 so these are best aimed at small hot kernels — exactly where the silent traps bite.
 
+### `:full` vs `:fast` analysis
+
+If even the warm per-call cost is too much (e.g. a large function in a tight loop), switch the
+per-call asserts to cheap inference-only checks:
+
+```julia
+StrictMode.enable_checks!(analysis = "fast")   # default is "full"
+```
+
+| Mode | Type stability | No-allocation | Warm cost |
+|---|---|---|---|
+| `:full` (default) | JET `@report_opt` + `@inferred` | AllocCheck static **proof** | tens of ms |
+| `:fast` | `Base.return_types` concreteness | empirical `@allocated` | sub-ms |
+
+`:fast` trades rigor for speed: it catches the common cases (non-concrete return, allocations on
+the measured path) but can miss internal-dispatch-with-concrete-return that `:full` proves, and
+its `@allocated` measurement reflects the call *in context* (e.g. reading a non-`const` global
+will register as an allocation). [`@explain`](@ref) and [`@strict_function`](@ref) always use
+the full analysis. A good split: `:fast` while iterating, `:full` in CI.
+
 Next: the [Guarantees](guarantees.md) guide walks through every macro with runnable examples.

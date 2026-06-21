@@ -14,20 +14,13 @@ function _strict_expr(call)
     types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
     thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
 
+    static = ANALYSIS_MODE === :full
     checked = quote
         $(binds...)
         # (1) type stability (root cause of most surprise allocations, so checked first)
-        try
-            Test.@inferred $litcall
-        catch err
-            err isa StrictViolation && rethrow()
-            $(_fail)(:typestable, $target, $(_inferred_details)(err))
-        end
-        let _r = JET.@report_opt($litcall)
-            isempty(JET.get_reports(_r)) || $(_fail)(:typestable, $target, sprint(show, _r))
-        end
+        $(_typestable_check_expr(target, fe, litcall, types))
         # (2) allocation-freedom (also returns the call's value)
-        $(_assert_noalloc)($target, $fe, $types, $thunk; static = true)
+        $(_assert_noalloc)($target, $fe, $types, $thunk; static = $static)
     end
     return _gate(checked, esc(call))
 end

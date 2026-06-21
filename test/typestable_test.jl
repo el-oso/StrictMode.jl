@@ -12,3 +12,18 @@ end
     pick(tup, i) = tup[i]
     @test_throws StrictViolation @assert_typestable pick(heterogeneous, rand(1:3))
 end
+
+@testitem "_typestable_fast (the :fast-mode check) passes/fails correctly" begin
+    using StrictMode
+    stable(x) = 2x + 1
+    @test StrictMode._typestable_fast("t", stable, (Float64,)) === nothing   # concrete return
+
+    heterogeneous = (1, 2.0, "three")
+    pick(tup, i) = tup[i]
+    @test_throws StrictViolation StrictMode._typestable_fast("t", pick, (typeof(heterogeneous), Int))
+end
+
+@testitem "analysis_mode defaults to :full in the test environment" begin
+    using StrictMode
+    @test analysis_mode() === :full
+end

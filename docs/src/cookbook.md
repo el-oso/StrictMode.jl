@@ -44,6 +44,12 @@ away.
 StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of throwing
 ```
 
+### Trade rigor for speed while iterating
+
+```julia
+StrictMode.enable_checks!(analysis = "fast")   # cheap inference-only checks (sub-ms); :full in CI
+```
+
 ### Diagnose instead of assert
 
 When you want the *reason* rather than a thrown error, reach for `@explain` — it aggregates

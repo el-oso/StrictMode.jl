@@ -35,7 +35,7 @@ using InteractiveUtils: InteractiveUtils
 export @assert_noalloc, @assert_typestable, @strict, @strict_function
 export @strict_contract, @verify_strict, @explain
 export StrictViolation, StrictReport
-export enable_checks!, disable_checks!, checks_enabled, fail_mode
+export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode
 
 include("preferences.jl")
 include("report.jl")
