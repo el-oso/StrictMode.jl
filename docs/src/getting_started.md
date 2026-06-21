@@ -88,4 +88,20 @@ pay for at runtime:
 @macroexpand @assert_noalloc f(x)   #  ->  :(f(x))
 ```
 
+## What the checks cost when enabled
+
+JET and AllocCheck are heavyweight analyzers, so it's worth knowing where the time goes:
+
+- **Checks off (production):** nothing. The macros are bare calls and the analyzers are never
+  compiled in. Precompiling StrictMode stays fast (~3 s here).
+- **Checks on (dev / CI):** the analyzers are warmed into StrictMode's precompiled image by a
+  `PrecompileTools` workload, so the one-time analyzer-compilation cost (~10–20 s) is paid
+  **once at precompile** (install / CI), not on your first interactive call. After that, the
+  first `@explain`/`@strict` in a session is ~0.1 s, and warm per-call analysis on a small
+  kernel is single-digit-to-tens of milliseconds.
+
+In other words: the cost is a one-time precompile, not a per-call tax, and an edit–rerun loop
+(Revise) keeps the analyzer image warm across edits. Warm cost does scale with call-graph size,
+so these are best aimed at small hot kernels — exactly where the silent traps bite.
+
 Next: the [Guarantees](guarantees.md) guide walks through every macro with runnable examples.

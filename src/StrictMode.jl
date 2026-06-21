@@ -50,4 +50,7 @@ include("explain.jl")
 include("inlining.jl")
 include("idioms.jl")
 
+# Warm the heavy analyzers into the precompile image (when checks are enabled).
+include("precompile.jl")
+
 end # module StrictMode
