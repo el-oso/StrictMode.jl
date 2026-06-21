@@ -136,6 +136,9 @@ audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-
 | `@assert_noboxing f(args...)` | forbid boxing / dynamic dispatch, but **allow** legitimate buffer allocation |
 | `@assert_typestable f(args...)` | concrete return type + no internal instability/dispatch (JET + `@inferred`) |
 | `@assert_inlined f(args...)` | fail unless the call is inlined (best-effort; not part of `@strict`) |
+| `@assert_vectorized f(args...)` | fail unless the loop SIMD-vectorized (best-effort, LLVM IR scan) |
+| `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
+| `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |
 | `@strict f(args...)` | all per-call guarantees at once; returns the call's value |
 | `@strict_function def` | verify the definition's contract at precompile time |
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |
@@ -153,10 +156,11 @@ See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Status
-v0.3 adds the ergonomics layer: a function API (`check`), `@strict module` with automatic
-checking at load, a usage-driven `check_compiled` sweep, a Revise live loop (`watch`), and an
-`audit` path that emits structured findings for AI agents. v0.2 (the guarantee set, `@explain`,
-`@unroll`, PrecompileTools warmup, `:fast`/`:full`) is complete.
+Closing the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps): the
+**time tax** (cheap `:fast` triage of all properties + incremental cache + threaded sweeps), being
+**opt-in** (`@strict module` checks everything automatically; `@strict_exempt` opts cold code out),
+and **scheduling visibility** (`@assert_vectorized`, `@assert_effects`, Cthulhu `descend`). Built
+on a v0.3 ergonomics layer (`check`, `audit`, `watch`) and the v0.2 guarantee set.
 
 ## Installation
 

@@ -17,7 +17,15 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 @assert_noboxing
 @assert_typestable
 @assert_inlined
+@assert_vectorized
+@assert_effects
 @strict
+```
+
+## Scheduling visibility
+
+```@docs
+descend
 ```
 
 ## Definition-level guarantees

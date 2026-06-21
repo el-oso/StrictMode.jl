@@ -31,6 +31,7 @@ using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
 export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
+export @assert_vectorized, @assert_effects, descend
 export @strict, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
@@ -51,6 +52,7 @@ include("contracts.jl")
 include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
+include("scheduling.jl")
 include("findings.jl")
 include("cache.jl")
 include("check.jl")
