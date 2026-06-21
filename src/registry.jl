@@ -59,18 +59,25 @@ end
 
 # Automatic-at-load hook emitted by `@strict module`. Gated on CHECKS_ENABLED so production pays
 # nothing; honors fail_mode.
-function _auto_check_module(mod::Module)
-    CHECKS_ENABLED || return nothing
+# Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
+# what I promised" scope, as opposed to the whole-module sweep.
+function _registered_findings_in(mod::Module; guarantees = nothing)
     out = StrictFinding[]
     for ((f, types), meta) in STRICT_REGISTRY
         _mod_sym(f) === nameof(mod) || continue
+        gs = guarantees === nothing ? meta.guarantees : guarantees
         try
-            append!(out, findings(f, types; guarantees = meta.guarantees))
+            append!(out, findings(f, types; guarantees = gs))
         catch err
             err isa StrictViolation && rethrow()
         end
     end
-    _run_and_report(out, :strict_module, string(nameof(mod)), FAIL_MODE)
+    return out
+end
+
+function _auto_check_module(mod::Module)
+    CHECKS_ENABLED || return nothing
+    _run_and_report(_registered_findings_in(mod), :strict_module, string(nameof(mod)), FAIL_MODE)
     return nothing
 end
 
@@ -118,20 +125,41 @@ function _specializations(mth::Method)
     return Any[]
 end
 
+# Normalize a function or a name Symbol to its name Symbol (for the only/exempt filters).
+_asname(x) = x isa Symbol ? x : nameof(x)
+
 """
-    check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none) -> Vector{StrictFinding}
+    check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none,
+                   only = nothing, exempt = ()) -> Vector{StrictFinding}
 
 Usage-driven sweep: check the concrete method instances `mod`'s functions have **actually
 compiled** (during your tests / a run / the precompile workload). No annotation needed, but
-coverage is whatever executed. Best-effort — it walks compiler reflection defensively and skips
-anything it cannot analyze.
+coverage is whatever executed, and a module that mixes hot and cold (plan-time) helpers will be
+noisy — cold helpers that legitimately allocate show up too. Scope it with:
+
+- `only` — a collection of functions or name `Symbol`s to *include* (skip everything else).
+- `exempt` — a collection of functions or name `Symbol`s to *exclude* (e.g. plan-time helpers).
+
+Prefer the *declared-guarantee* path ([`@strict_function`](@ref) / `@strict module` /
+[`check_all`](@ref)) for "check what I promised"; this sweep is "check what actually ran".
+Best-effort — it walks compiler reflection defensively and skips anything it cannot analyze.
 """
-function check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail::Symbol = :none)
+function check_compiled(
+        mod::Module;
+        guarantees = (:typestable, :noalloc),
+        fail::Symbol = :none,
+        only = nothing,
+        exempt = (),
+    )
+    exemptset = Set{Symbol}(_asname(x) for x in exempt)
+    onlyset = only === nothing ? nothing : Set{Symbol}(_asname(x) for x in only)
     out = StrictFinding[]
     for nm in names(mod; all = true)
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
         (f isa Function && parentmodule(f) === mod) || continue
+        nameof(f) in exemptset && continue
+        onlyset === nothing || nameof(f) in onlyset || continue
         for mth in methods(f)
             for mi in _specializations(mth)
                 tt = try

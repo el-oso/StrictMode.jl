@@ -26,6 +26,7 @@ function _typestable_check_expr(target, fe, litcall, types)
                 Test.@inferred $litcall
             catch err
                 err isa StrictViolation && rethrow()
+                err isa UndefVarError && rethrow()   # name didn't resolve in caller scope — surface it, don't mislabel as instability
                 $(_fail)(:typestable, $target, $(_inferred_details)(err))
             end
             let _r = JET.@report_opt($litcall)
@@ -70,6 +71,7 @@ macro assert_typestable(call)
                 Test.@inferred $litcall
             catch err
                 err isa StrictViolation && rethrow()
+                err isa UndefVarError && rethrow()   # name didn't resolve in caller scope — surface it, don't mislabel as instability
                 $(_fail)(:typestable, $target, $(_inferred_details)(err))
                 $litcall   # warn-mode: still produce the value
             end

@@ -58,7 +58,14 @@ function enable_checks!(;
     an = String(analysis)
     an in ("full", "fast") || throw(ArgumentError("analysis must be :full or :fast, got $analysis"))
     @set_preferences!("checks_enabled" => true, "fail_mode" => fm, "analysis" => an)
-    @info "StrictMode checks ENABLED (fail_mode = :$fm, analysis = :$an). Restart Julia to apply."
+    if CHECKS_ENABLED
+        @info "StrictMode checks ENABLED (fail_mode = :$fm, analysis = :$an)."
+    else
+        @warn "StrictMode checks will be ENABLED (fail_mode = :$fm, analysis = :$an) — but the " *
+            "gate is compile-time, so THIS session is unaffected (`checks_enabled()` stays false " *
+            "and every `@assert_*` is still a no-op). Restart Julia to apply. For tests, commit " *
+            "`test/LocalPreferences.toml` with `checks_enabled = true` and run in a fresh process."
+    end
     return nothing
 end
 

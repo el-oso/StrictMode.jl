@@ -33,6 +33,14 @@ function _suggestion(guarantee::Symbol)
 end
 
 _failed(f::StrictFinding) = f.status === :fail
+
+"""
+    nfailures(findings) -> Int
+
+The number of failing findings in a `Vector{StrictFinding}` (as returned by [`check`](@ref),
+[`check_all`](@ref), [`check_compiled`](@ref), or [`audit`](@ref)). Use it for the exit-code
+loop: `exit(nfailures(audit(MyPkg)))`.
+"""
 nfailures(fs::AbstractVector{StrictFinding}) = count(_failed, fs)
 
 # Single-line REPL display.
@@ -60,6 +68,14 @@ function format_findings(io::IO, findings::AbstractVector{StrictFinding}; format
     format === :jsonlines && return _fmt_jsonlines(io, fs)
     format === :github && return _fmt_github(io, fs)
     throw(ArgumentError("unknown format $format; expected one of $(_FORMATS)"))
+end
+
+# Convenience: no-IO method returns the rendered findings as a String (so callers can `println`/log
+# without building an IOBuffer). Mirrors the usual Julia `sprint`-style ergonomics for `format_*`.
+function format_findings(findings::AbstractVector{StrictFinding}; kwargs...)
+    io = IOBuffer()
+    format_findings(io, findings; kwargs...)
+    return String(take!(io))
 end
 
 function _fmt_text(io::IO, fs)

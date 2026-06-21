@@ -51,6 +51,7 @@ One-shot, structured, exit-coded reporting for AI agents and CI. See
 audit
 StrictFinding
 format_findings
+nfailures
 ```
 
 ## TypeContracts integration

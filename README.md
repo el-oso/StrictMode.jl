@@ -106,7 +106,7 @@ check(f, (T1, T2))                 # function API — never collides with other 
 @strict module Kernels … end       # mark a module; checked automatically when it loads
 check_compiled(MyPkg)              # usage-driven: check whatever actually compiled
 StrictMode.watch()                 # live re-checking on each edit (with `using Revise`)
-exit(audit(MyPkg; format = :json)) # one-shot, structured, exit-coded — for AI agents / CI
+audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-coded — for AI agents / CI
 ```
 
 `audit` emits machine-readable findings (with a `file`, `line`, `reason`, and an actionable

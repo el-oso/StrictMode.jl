@@ -9,20 +9,26 @@ the same findings as everything else, rendered for a machine.
 
 ```@example agents
 using StrictMode
-audit(:registered; format = :json, io = devnull)   # returns the number of failing findings (0 = clean)
+fs = audit(:registered; format = :json, io = devnull)   # returns Vector{StrictFinding}
+nfailures(fs)                                            # 0 = clean
 ```
 
-`audit` **never throws** on violations — it writes the findings and returns the failure count, so
-a caller sets the process exit status:
+`audit` **never throws** on violations — it writes the findings and returns them (the same
+`Vector{StrictFinding}` as [`check`](@ref) and the other drivers). For the exit-code loop, pass
+`exit_on_fail = true`, which sets the process status to the number of failures:
 
 ```bash
-julia --project -e 'using MyPkg, StrictMode; exit(StrictMode.audit(MyPkg))'
+julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_on_fail = true)'
 ```
 
-- `target` is `:registered` (the mark-once registry) or a `Module` (also runs the usage-driven
-  [`check_compiled`](@ref) sweep).
+- `target` is `:registered` (the mark-once registry — "check what I promised") or a `Module` (its
+  *declared* functions by default; add `sweep = true` for the usage-driven [`check_compiled`](@ref)
+  over everything it compiled).
+- A whole-module sweep can be noisy when hot and cold code mix — scope it with `only` / `exempt`
+  (functions or name `Symbol`s), e.g. `audit(MyPkg; sweep = true, exempt = [:_plan_helper])`.
 - `format` is `:json`, `:jsonlines`, `:github`, or `:text`.
-- `exit_on_fail = true` exits the process directly with the failure count.
+- `exit_on_fail = true` exits the process directly with the failure count;
+  [`nfailures`](@ref)`(fs)` gives the count programmatically.
 
 ## The JSON schema
 
@@ -69,7 +75,7 @@ The package provides the command; the harness wires it. A `Stop` (or `PostToolUs
         "hooks": [
           {
             "type": "command",
-            "command": "julia --project -e 'using MyPkg, StrictMode; exit(StrictMode.audit(MyPkg; format=:json))'"
+            "command": "julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format=:json, exit_on_fail=true)'"
           }
         ]
       }
