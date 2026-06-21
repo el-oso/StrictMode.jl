@@ -28,6 +28,21 @@ The mark-once registry: `(f, types) => (; guarantees)` for everything tagged str
 """
 registered_strict() = STRICT_REGISTRY
 
+# Function names explicitly opted *out* of checking (cold / intentionally-allocating code), via
+# `@strict_exempt`. Rust-like: in a `@strict module` everything is hot by default; you opt the
+# rare cold helper out, not the hot code in.
+const STRICT_EXEMPT = Set{Symbol}()
+
+_is_exempt(@nospecialize(f)) = _demangle(nameof(f)) in STRICT_EXEMPT
+_exempt!(name::Symbol) = (push!(STRICT_EXEMPT, name); nothing)
+
+"""
+    exempt_strict() -> Set{Symbol}
+
+The set of function names marked cold/exempt by `@strict_exempt`.
+"""
+exempt_strict() = STRICT_EXEMPT
+
 # Parallelize cheap (:fast) analysis across threads; keep :full serial by default since
 # AllocCheck/JET hold global compiler state. `findings` is itself cache-locked and thread-safe.
 _default_parallel() = ANALYSIS_MODE === :fast && Threads.nthreads() > 1
@@ -75,7 +90,7 @@ any failure, `:none` just returns the findings (the default — it is a reportin
 function check_all(; guarantees = nothing, fail::Symbol = :none, parallel::Bool = _default_parallel())
     items = Any[
         (f, types, guarantees === nothing ? meta.guarantees : guarantees)
-            for ((f, types), meta) in STRICT_REGISTRY
+            for ((f, types), meta) in STRICT_REGISTRY if !_is_exempt(f)
     ]
     return _run_and_report(_map_findings(items, parallel), :check_all, "registry", fail)
 end
@@ -84,13 +99,17 @@ end
 # nothing; honors fail_mode.
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
-function _registered_findings_in(mod::Module; guarantees = nothing)
+function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false)
     out = StrictFinding[]
     for ((f, types), meta) in STRICT_REGISTRY
         _mod_sym(f) === nameof(mod) || continue
+        _is_exempt(f) && continue                        # cold / @strict_exempt → skip
         gs = guarantees === nothing ? meta.guarantees : guarantees
         try
-            append!(out, findings(f, types; guarantees = gs))
+            fs = fast ?
+                _findings_fast(f, types, gs, _mod_sym(f), _func_name(f), _sig_string(types)) :
+                findings(f, types; guarantees = gs)
+            append!(out, fs)
         catch err
             err isa StrictViolation && rethrow()
         end
@@ -98,9 +117,12 @@ function _registered_findings_in(mod::Module; guarantees = nothing)
     return out
 end
 
+# Whole-module strict check at load. Always uses the cheap `:fast` triage (no AllocCheck/JET
+# backend needed), so opting a module into strict mode stays affordable on every load — the
+# rigorous `:full` proof is run explicitly via `audit`/`check_all` in CI.
 function _auto_check_module(mod::Module)
     CHECKS_ENABLED || return nothing
-    _run_and_report(_registered_findings_in(mod), :strict_module, string(nameof(mod)), FAIL_MODE)
+    _run_and_report(_registered_findings_in(mod; fast = true), :strict_module, string(nameof(mod)), FAIL_MODE)
     return nothing
 end
 
@@ -121,13 +143,43 @@ function _maybe_register_stmt(stmt)
     return :($(register_strict!)($fname, $argtypes))
 end
 
+# Is `stmt` a `@strict_exempt …` macrocall (bare or qualified)?
+function _is_strict_exempt_call(stmt)
+    Meta.isexpr(stmt, :macrocall) || return false
+    nm = stmt.args[1]
+    nm === Symbol("@strict_exempt") && return true
+    return nm isa Expr && nm.head === :. && nm.args[end] == QuoteNode(Symbol("@strict_exempt"))
+end
+
+# Statements to emit inside a `@strict module` for one body statement: plain defs are kept and
+# registered hot; `@strict_exempt …` is inlined (the module doesn't import StrictMode, so we
+# splice the exempt logic with interpolated function values instead of leaving the macrocall).
+function _rewrite_strict_stmt(stmt)
+    if _is_strict_exempt_call(stmt)
+        inner = stmt.args[end]
+        if Meta.isexpr(inner, (:function, :(=)))
+            sig = try
+                _strictdef_sig(inner)
+            catch
+                nothing
+            end
+            fname = (sig !== nothing && Meta.isexpr(sig, :call) && sig.args[1] isa Symbol) ? sig.args[1] : nothing
+            out = Any[inner]
+            fname === nothing || push!(out, :($(_exempt!)($(QuoteNode(fname)))))
+            return out
+        end
+        name = inner isa QuoteNode ? inner.value : inner
+        return name isa Symbol ? Any[:($(_exempt!)($(QuoteNode(name))))] : Any[stmt]
+    end
+    reg = _maybe_register_stmt(stmt)
+    return reg === nothing ? Any[stmt] : Any[stmt, reg]
+end
+
 function _strict_module(modexpr::Expr)
     body = modexpr.args[3]::Expr
     newstmts = Any[]
     for stmt in body.args
-        push!(newstmts, stmt)
-        reg = _maybe_register_stmt(stmt)
-        reg === nothing || push!(newstmts, reg)
+        append!(newstmts, _rewrite_strict_stmt(stmt))
     end
     push!(newstmts, :($(_auto_check_module)(@__MODULE__)))
     newmod = Expr(:module, modexpr.args[1], modexpr.args[2], Expr(:block, newstmts...))
@@ -183,7 +235,7 @@ function check_compiled(
         exempt = (),
         parallel::Bool = _default_parallel(),
     )
-    exemptset = Set{Symbol}(_asname(x) for x in exempt)
+    exemptset = union(STRICT_EXEMPT, Set{Symbol}(_asname(x) for x in exempt))   # also skip @strict_exempt names
     onlyset = only === nothing ? nothing : Set{Symbol}(_asname(x) for x in only)
     items = Any[]
     for nm in names(mod; all = true)

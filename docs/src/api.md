@@ -24,6 +24,7 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 
 ```@docs
 @strict_function
+@strict_exempt
 ```
 
 ## Automation

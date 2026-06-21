@@ -31,7 +31,7 @@ using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
 export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
-export @strict, @strict_function
+export @strict, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport, StrictFinding

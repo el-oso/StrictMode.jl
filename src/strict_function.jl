@@ -92,3 +92,33 @@ macro strict_function(def)
     end
     return _gate(checked, esc(def))
 end
+
+"""
+    @strict_exempt f(x::T, ...) = ...
+    @strict_exempt name
+
+Mark a function as **cold** — intentionally allocating / type-flexible setup or plan-time code
+that should be *exempt* from StrictMode's checks. This is the Rust-style opt-*out*: inside a
+`@strict module` every function is hot (checked) by default, and you wrap only the rare cold
+helper in `@strict_exempt` rather than annotating all the hot code.
+
+The definition form defines the function and records its name as exempt; the name form
+(`@strict_exempt foo` or `@strict_exempt :foo`) just records the name. Exempt functions are
+skipped by `check_all`, `audit`, the whole-module load check, and `check_compiled` sweeps. Never
+gated — the exemption always applies.
+"""
+macro strict_exempt(arg)
+    if Meta.isexpr(arg, (:function, :(=)))
+        sig = _strictdef_sig(arg)
+        fname = sig.args[1]
+        fname isa Symbol || throw(ArgumentError("@strict_exempt: unsupported definition $arg"))
+        return quote
+            $(esc(arg))
+            $(_exempt!)($(QuoteNode(fname)))
+            $(esc(fname))
+        end
+    end
+    name = arg isa QuoteNode ? arg.value : arg
+    name isa Symbol || throw(ArgumentError("@strict_exempt expects a definition or a function name, got $arg"))
+    return :($(_exempt!)($(QuoteNode(name))))
+end

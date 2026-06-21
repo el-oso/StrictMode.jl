@@ -29,21 +29,29 @@ check(kernel, (Matrix{Float64}, Vector{Float64});
 Nothing is executed — the analysis is purely from the types — so `check` works even for calls
 you would not want to actually run.
 
-## Mark once
+## Strict by default — one switch, not per-function
 
-Instead of annotating call sites, tag the definitions you care about and let the drivers check
-them.
-
-- [`@strict_function`](@ref) already registers each concrete definition it guards.
-- **`@strict module … end`** marks a whole module: every definition with a concrete signature is
-  registered, and the module is checked automatically when it loads.
+You should **not** have to annotate every function. `@strict module … end` makes the whole
+module strict *automatically*: every definition is hot (checked) by default, and you opt the rare
+**cold** helper *out* with [`@strict_exempt`](@ref) — the Rust discipline of opting out of safety,
+not into it.
 
 ```julia
-@strict module Kernels        # use at true top level (script / REPL / package)
-    dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) = a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
-    # a definition that boxes or allocates here makes the module fail to load (in :error mode)
+@strict module Kernels        # one declaration disciplines the whole module
+    dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) = a[1]*b[1] + a[2]*b[2] + a[3]*b[3]   # hot
+    saxpy(a::Float64, x::NTuple{4,Float64}, y::NTuple{4,Float64}) = a .* x .+ y            # hot
+
+    @strict_exempt plan(n::Int) = collect(1:n)   # cold setup code — intentionally allocates
 end
 ```
+
+A hot definition that boxes or allocates makes the module fail to load (in `:error` mode); the
+cold `plan` is skipped everywhere — by the load check, `check_all`, `audit`, and the sweep. The
+whole-module load check uses the cheap `:fast` triage, so it needs no AllocCheck/JET backend and
+stays affordable on every load.
+
+For a single function rather than a whole module, [`@strict_function`](@ref) registers and
+verifies one definition.
 
 ### Auto-check at load
 
