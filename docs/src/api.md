@@ -47,6 +47,7 @@ register_strict!
 registered_strict
 check_all
 check_compiled
+check_signatures
 watch
 unwatch
 ```

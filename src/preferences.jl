@@ -37,8 +37,24 @@ How thoroughly the per-call asserts ([`@assert_typestable`](@ref), [`@assert_noa
 
 [`@explain`](@ref) and [`@strict_function`](@ref) always use the full analysis regardless of
 this setting. Controlled by the `analysis` preference; set it via [`enable_checks!`](@ref).
+
+`analysis_mode()` reads the *current* preference at runtime (so it reflects a change without a
+restart, and is what `check`/`audit`/`findings` use by default). The per-call macros instead use
+the value **baked at precompile** (`ANALYSIS_MODE`); if a stale package image disagrees with the
+current preference, `analysis_mode()` warns once.
 """
-analysis_mode() = ANALYSIS_MODE
+function analysis_mode()
+    live = Symbol(@load_preference("analysis", "full"))
+    if live !== ANALYSIS_MODE && !_MODE_WARNED[]
+        _MODE_WARNED[] = true
+        @warn "StrictMode: this image was precompiled with analysis = :$ANALYSIS_MODE, but the " *
+            "preference is now :$live. `check`/`audit`/`findings` will use :$live; the per-call " *
+            "macros still use the baked :$ANALYSIS_MODE until you restart/recompile."
+    end
+    return live
+end
+const _MODE_WARNED = Ref(false)
+# Baked at precompile — used by the per-call macros (which branch at expansion time).
 const ANALYSIS_MODE = Symbol(@load_preference("analysis", "full"))::Symbol
 
 """

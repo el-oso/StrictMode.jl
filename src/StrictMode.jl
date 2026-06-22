@@ -36,7 +36,7 @@ export @strict, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport, StrictFinding
-export check, findings, check_all, check_compiled, audit, format_findings, nfailures, watch, unwatch
+export check, findings, check_all, check_compiled, check_signatures, audit, format_findings, nfailures, watch, unwatch
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode, backend_available
 

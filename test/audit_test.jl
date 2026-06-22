@@ -64,3 +64,37 @@ end
     # exempt by the BASE name must skip the mangled kwsorter method too
     @test isempty(filter(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,), exempt = [:kwf])))
 end
+
+@testitem "check_signatures checks an explicit (f, types) list (E2)" begin
+    using StrictMode
+    good(a, b) = a * b + 1.0
+    boxy(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+    fs = check_signatures([(good, (Float64, Float64))]; fail = :none, mode = :fast)
+    @test all(f -> f.status === :pass, fs)
+    @test_throws StrictViolation check_signatures(
+        [(boxy, (Tuple{Int, Float64, Float32},))]; guarantees = (:noboxing,), fail = :error, mode = :fast,
+    )
+end
+
+@testitem "check_compiled exempt accepts a regex and a predicate (E2)" begin
+    using StrictMode
+    module Mix2
+    hotk(x::Int) = x + 1
+    _planhelper(n::Int) = collect(1:n)        # allocates by design (cold)
+    end
+    Mix2.hotk(1); Mix2._planhelper(3)             # compile both
+
+    flagged(fs) = any(f -> f.func == "_planhelper" && f.status === :fail, fs)
+    @test flagged(check_compiled(Mix2; guarantees = (:noalloc,), mode = :fast))                  # no filter → flagged
+    @test !flagged(check_compiled(Mix2; guarantees = (:noalloc,), exempt = r"^_plan", mode = :fast))   # regex
+    @test !flagged(
+        check_compiled(
+            Mix2; guarantees = (:noalloc,),
+            exempt = f -> startswith(string(nameof(f)), "_"), mode = :fast
+        )
+    )                          # predicate
+end

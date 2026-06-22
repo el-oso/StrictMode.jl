@@ -130,6 +130,32 @@ audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-
 [Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) and
 [Agentic feedback](https://el-oso.github.io/StrictMode.jl/dev/agents).
 
+## Checking a library *without* depending on StrictMode
+
+To gate a library's performance from its **test suite** — without adding StrictMode to its `src`:
+
+1. Add `StrictMode`, `AllocCheck`, `JET` to the **test** `Project.toml`, and `using AllocCheck,
+   JET` in your tests (the backend only loads when those packages are *loaded*, not just listed).
+2. Commit the preference in the test `Project.toml` so CI runs the checks (`checks_enabled` must
+   be set at **precompile**):
+   ```toml
+   [preferences.StrictMode]
+   checks_enabled = true
+   analysis = "fast"        # quick whole-package triage; use "full" for the rigorous proof
+   ```
+3. List the guaranteed entry points — no `src` annotations needed:
+   ```julia
+   using StrictMode, AllocCheck, JET
+   check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel!, (Matrix{Float64},))]; fail = :error)
+   ```
+   Or sweep what actually compiled, scoping out cold/plan-time helpers with a regex or predicate:
+   ```julia
+   audit(MyPkg; sweep = true, mode = :fast, exempt = r"^_plan")
+   ```
+
+Per-call `@assert_*` (cheap, targeted) vs the whole-package `audit`/sweep (broad, needs scoping)
+is the main trade-off: assert the few hot kernels you care about, or sweep-and-exempt the rest.
+
 ## API
 
 | Macro / function | Guarantee |
@@ -151,6 +177,7 @@ audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-
 | `check(f, types)` | function API — guarantees on a `(function, signature)`, no macro interference |
 | `@strict module … end` | mark a whole module; checked automatically at load |
 | `check_all` / `check_compiled` | re-check the registry / sweep what actually compiled |
+| `check_signatures(pairs)` | check an explicit `(f, types)` list — no `src` annotations needed |
 | `audit` / `watch` | structured one-shot report for agents / live Revise loop for humans |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 

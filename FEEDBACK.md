@@ -148,3 +148,49 @@ allocates. So both noalloc paths over-report on this codebase: `:full` via throw
   constructors, `push!`/`append!`/growth) and genuine boxing (Union/Any). Until then `:fast` can't gate a
   pointer-based numeric library. Repro: `using PureFFT; check_compiled(PureFFT)` after warming a few
   `autoplan` sizes (see PureFFT `bench/strictmode_audit.jl`).
+
+### ✅ Resolved (verified on PureFFT)
+F8 (`_IGNORE_THROW=Ref(true)`) and F9 (the `:fast` heuristic no longer flagging buffer reads/writes) are
+both fixed. The cheap `:fast` whole-package sweep over PureFFT — a real pointer/SIMD numeric library —
+`audit(PureFFT; sweep=true)` (typestable + noalloc) is now **488 (method, guarantee) checks, 0 failures**,
+sweep ≈7s (`:full` ≈113s). All 12 previously-flagged kernels (`_fft128_avx!`, `_ditrec!`,
+`_base_butterflies_*`, `recursive_fft!`, the dispatchers, …) pass, matching their runtime `@allocated`=0.
+Net across the dogfooding: F6 (kwsorter `exempt` demangling), F7 (`:fast` doesn't speed `noalloc` →
+backend rework), F8, F9 — all surfaced by PureFFT and fixed; StrictMode now cleanly gates a pointer-based
+library in both per-call (`@assert_*`, `:full`) and whole-package (`:fast` sweep) modes.
+
+---
+
+# Round 4 — remaining ergonomics (non-blocking; nice-to-haves, not bugs)
+
+### E1 — `ANALYSIS_MODE` is a precompile-baked const → silent wrong mode  *(highest-value)*
+This bit me hard: a `.ji` precompiled before the `analysis="fast"` preference took effect kept running
+`:full`, so the "cheap" sweep silently ran the slow path (113s instead of 7s) with no indication — and
+`analysis_mode()` in a *fresh* process reported `:fast`, so the two disagreed. Suggest either reading the
+mode at runtime (a `Ref`/`Preferences` read, like `_IGNORE_THROW`), or, if it must stay a baked const,
+have `audit`/`check_compiled` print the active mode and warn when the loaded const ≠ the current
+preference. Right now there's no way to tell which mode actually ran.
+
+### E2 — `only`/`exempt` don't scale for a whole-package sweep on a mixed hot/cold library
+`check_compiled` is "whatever compiled," which on any real library includes cold plan-time / fallback
+helpers that allocate by design — so you maintain a growing hand-written `exempt = (:_besttime, …)` list
+(9 entries and counting for PureFFT). Two scaling options: (a) let `only`/`exempt` accept a **predicate or
+regex** (`exempt = f -> startswith(string(nameof(f)), "_plan")`), and/or (b) make the declarative path
+usable *without* `src` annotations — e.g. a `check_signatures([(f, types)…])` so a test suite can list the
+guaranteed entry points without touching the package source (we deliberately kept StrictMode out of `src`).
+
+### E3 — `@assert_noalloc` false-fails when the checked call captures a non-const global
+Several of my "allocation" scares were `@assert_noalloc P.apply!(p, x)` where `P`/`p`/`x` were non-const
+globals in a throwaway script: the macro's thunk closes over them, the global access boxes, and it reports
+a runtime allocation — even though the function is alloc-free. It's technically correct (non-const globals
+*do* allocate) but very confusing in practice. A targeted hint in the failure message ("the checked call
+captures non-const global `P` — allocation may be from the binding, not the function; use `const`/locals")
+would save a lot of head-scratching.
+
+### E4 — a short "adopt StrictMode in your test suite" guide would smooth the on-ramp
+The test-only adoption path (no `src` dependency) has several non-obvious steps that I only found by trial:
+must `using AllocCheck, JET` to load the backend extension (not just have them as deps); set
+`[preferences.StrictMode]` in `Project.toml` (not a separate LocalPreferences.toml) so it's committed and
+CI runs the checks; `checks_enabled` needs the right value at *precompile*; per-call `@assert_*` vs the
+whole-package `audit`/sweep have different cost/scope trade-offs. A 20-line README section ("checking a
+library you don't want to depend on StrictMode from") capturing this would make first adoption much easier.

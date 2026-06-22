@@ -37,7 +37,12 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
     end
     n = _allocated(thunk)         # measure the steady-state call
     if n > 0
-        _fail(:noalloc, target, "call allocated $n bytes at runtime (@allocated fallback)")
+        _fail(
+            :noalloc, target,
+            "call allocated $n bytes at runtime (@allocated fallback). If the checked call " *
+                "references a non-`const` global, the allocation may be from the *binding* (global " *
+                "access boxes), not the function — make it `const` or a local, or use `:full` mode."
+        )
     end
     return val
 end

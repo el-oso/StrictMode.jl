@@ -98,6 +98,22 @@ function check_all(;
     return _run_and_report(_map_findings(items, parallel, mode), :check_all, "registry", fail)
 end
 
+"""
+    check_signatures(pairs; guarantees = (:typestable, :noalloc), fail = :none, mode = analysis_mode())
+
+Check an explicit list of `(f, types)` pairs — the declarative "check what I promise" path that
+needs **no `src` annotations**. A test suite can list a library's guaranteed entry points without
+the library itself depending on StrictMode:
+
+```julia
+check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel, (Matrix{Float64},))]; fail = :error)
+```
+"""
+function check_signatures(pairs; guarantees = (:typestable, :noalloc), fail::Symbol = :none, mode::Symbol = analysis_mode())
+    items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
+    return _run_and_report(_map_findings(items, _default_parallel(mode), mode), :check_signatures, "signatures", fail)
+end
+
 # Automatic-at-load hook emitted by `@strict module`. Gated on CHECKS_ENABLED so production pays
 # nothing; honors fail_mode.
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
@@ -214,6 +230,17 @@ function _demangle(nm::Symbol)
     return m === nothing ? nm : Symbol(m.captures[1]::AbstractString)
 end
 
+# Build a `f -> Bool` predicate from an `only`/`exempt` spec, so a mixed hot/cold library can be
+# scoped without a growing hand-listed set: a `Function` is used as-is, a `Regex` matches the
+# (demangled) function name, and a collection matches by name / function. `nothing` → no filter.
+function _name_matcher(spec)
+    spec === nothing && return nothing
+    spec isa Function && return spec
+    spec isa Regex && return f -> occursin(spec, string(_demangle(nameof(f))))
+    set = Set{Symbol}(_asname(x) for x in spec)
+    return f -> _demangle(nameof(f)) in set
+end
+
 """
     check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none,
                    only = nothing, exempt = ()) -> Vector{StrictFinding}
@@ -223,8 +250,10 @@ compiled** (during your tests / a run / the precompile workload). No annotation 
 coverage is whatever executed, and a module that mixes hot and cold (plan-time) helpers will be
 noisy — cold helpers that legitimately allocate show up too. Scope it with:
 
-- `only` — a collection of functions or name `Symbol`s to *include* (skip everything else).
-- `exempt` — a collection of functions or name `Symbol`s to *exclude* (e.g. plan-time helpers).
+- `only` / `exempt` — each a collection of functions / name `Symbol`s, a **`Regex`** matched
+  against the (demangled) name, or a **predicate** `f -> Bool`. `@strict_exempt` names are always
+  excluded. So `exempt = r"^_plan"` or `exempt = f -> startswith(string(nameof(f)), "_")` scales
+  a mixed hot/cold library without a hand-listed set.
 
 Prefer the *declared-guarantee* path ([`@strict_function`](@ref) / `@strict module` /
 [`check_all`](@ref)) for "check what I promised"; this sweep is "check what actually ran".
@@ -239,16 +268,15 @@ function check_compiled(
         mode::Symbol = analysis_mode(),
         parallel::Bool = _default_parallel(mode),
     )
-    exemptset = union(STRICT_EXEMPT, Set{Symbol}(_asname(x) for x in exempt))   # also skip @strict_exempt names
-    onlyset = only === nothing ? nothing : Set{Symbol}(_asname(x) for x in only)
+    exemptpred = _name_matcher(exempt)
+    onlypred = _name_matcher(only)
     items = Any[]
     for nm in names(mod; all = true)
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
         (f isa Function && parentmodule(f) === mod) || continue
-        fname = _demangle(nameof(f))
-        fname in exemptset && continue
-        onlyset === nothing || fname in onlyset || continue
+        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue   # @strict_exempt + the kwarg
+        onlypred === nothing || onlypred(f) || continue
         for mth in methods(f)
             for mi in _specializations(mth)
                 tt = try
