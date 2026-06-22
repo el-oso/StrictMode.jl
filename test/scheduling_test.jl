@@ -44,3 +44,26 @@ end
     @test addllvm(2, 3) == 5
     @test (@assert_noalloc addllvm(2, 3)) == 5      # the hand-written kernel is allocation-free
 end
+
+@testitem "scheduling asserts validate a real SIMD.jl Vec kernel (item 4)" begin
+    using StrictMode
+    using SIMD: Vec, vload, vstore
+    # Explicit SIMD.jl `Vec` ops emit `<N x double>` in the LLVM IR *regardless of CPU target*
+    # (unlike `@simd` auto-vectorization, which is target-gated) — this mirrors PureFFT's
+    # vload/vstore-over-preallocated-scratch hot kernels, the real pattern we validated against.
+    function vscale!(dst::Vector{Float64}, src::Vector{Float64})
+        @inbounds for i in 1:8:length(src)
+            v = vload(Vec{8, Float64}, src, i)
+            vstore(v * 2.0, dst, i)
+        end
+        return dst
+    end
+    D = zeros(64); S = rand(64); vscale!(D, S)
+
+    @test StrictMode._vectorized(vscale!, (Vector{Float64}, Vector{Float64}))   # explicit Vec → vector IR
+    @test (@assert_vectorized vscale!(D, S)) === D                             # passes on a real SIMD kernel
+    @test (@assert_noalloc vscale!(D, S)) === D                                # and stays allocation-free
+    # @assert_effects API works (we don't assert platform-specific effect *values*).
+    eff = StrictMode.effects(vscale!, (Vector{Float64}, Vector{Float64}))
+    @test StrictMode.effect_holds(eff, :terminates) isa Bool
+end

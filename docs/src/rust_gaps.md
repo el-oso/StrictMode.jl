@@ -43,6 +43,30 @@ this section is honest about the ceiling. What it *can* do is make the layer vis
 - **[`descend`](@ref)`(f, types)`** — drop into [Cthulhu](https://github.com/JuliaDebug/Cthulhu.jl)
   to *see* inlining, effects, type-stability, and the LLVM/native code (optional weak dependency).
 
+!!! note "Validated on real SIMD kernels"
+    `@assert_vectorized` works on the explicit-vector pattern that hand-tuned numeric code actually
+    uses — `SIMD.jl` `Vec` `vload`/`vstore` over a preallocated buffer — whose `<N x double>` ops
+    are emitted regardless of the build's CPU target (unlike `@simd` auto-vectorization, which is
+    target-gated):
+
+    ```julia
+    using SIMD
+    function vscale!(dst::Vector{Float64}, src::Vector{Float64})
+        @inbounds for i in 1:8:length(src)
+            vstore(vload(Vec{8,Float64}, src, i) * 2.0, dst, i)
+        end
+        return dst
+    end
+    @assert_vectorized vscale!(dst, src)   # passes — the loop emitted vector ops
+    @assert_noalloc    vscale!(dst, src)   # …and stayed on the fast path
+    ```
+
+    Dogfooded against PureFFT.jl: `@assert_vectorized` confirms the leaf AVX compute kernels
+    (`_base_butterflies_avx!`, `_fft128_avx!`) emit vector ops, and correctly reports that the
+    top-level dispatcher (`apply_unnormalized!`) does *not* vectorize directly — it routes to those
+    kernels — an honest, informative signal rather than a false positive. `@assert_noalloc`
+    confirms the kernels stay allocation-free.
+
 ### The ceiling, and the escape hatch
 
 When the compiler's scheduling decisions are the bottleneck, the levers — in increasing order of
