@@ -15,11 +15,38 @@ function _vectorized(@nospecialize(f), @nospecialize(types::Tuple))
     return occursin(r"<\d+ x (float|double|half|i\d+)>", String(take!(io)))
 end
 
+# Names of the non-inlined callees (`:invoke` targets) in `f`'s optimized body — where SIMD may
+# live if it isn't in `f` itself (a thin dispatcher). Used to make `@assert_vectorized`'s failure
+# point at the leaf kernels.
+function _invoke_callees(@nospecialize(f), @nospecialize(types::Tuple))
+    out = String[]
+    cts = try
+        Base.code_typed(f, Tuple{types...}; optimize = true)
+    catch
+        return out
+    end
+    isempty(cts) && return out
+    for st in first(cts).first.code
+        if Meta.isexpr(st, :invoke)
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            mi isa Core.MethodInstance && push!(out, string(mi.def.name))
+        end
+    end
+    return unique!(out)
+end
+
 function _assert_vectorized(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _vectorized(f, types) || _fail(
+    _vectorized(f, types) && return nothing
+    # `@assert_vectorized` inspects the *leaf* compiled body. A thin dispatcher has no vector ops of
+    # its own — point the user at the non-inlined callees where the SIMD actually is (F11).
+    callees = _invoke_callees(f, types)
+    hint = isempty(callees) ? "" :
+        " The SIMD may be in non-inlined callee(s) — assert on those directly: $(join(callees, ", "))."
+    _fail(
         :vectorized, target,
-        "loop did not SIMD-vectorize — no `<N x …>` vector ops in the LLVM IR (best-effort; try " *
-            "`@inbounds @simd`, `@simd ivdep`, or `descend` to see why)."
+        "no `<N x …>` vector ops in this method body (best-effort)." * hint *
+            " (Try `@inbounds @simd`/`@simd ivdep`, or `descend` to see why.)"
     )
     return nothing
 end
@@ -31,6 +58,11 @@ Fail unless `f(args...)` compiled to SIMD vector instructions (**best-effort**):
 the method's LLVM IR for vector types (`<N x …>`). A failure means the compiler did not vectorize
 the loop under the current settings — informative, not a proof, so it is **not** part of
 [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call.
+
+It inspects the **leaf compiled body**: a thin dispatcher that forwards to non-inlined kernels has
+no vector ops of its own, so assert on the kernels where the SIMD lives (the failure message names
+the non-inlined callees to help). See also [`kernel_report`](@ref) for *why-not-fast-enough*
+diagnostics when a loop vectorizes but is still slow.
 
 ```julia
 @inbounds @simd_dot(a, b)          # vectorizes → ok
@@ -110,4 +142,97 @@ function descend(@nospecialize(f), @nospecialize(types))
     _CTHULHU_DESCEND[] === nothing &&
         return @info "StrictMode.descend needs Cthulhu — run `using Cthulhu` first (it's an optional weak dependency)."
     return _CTHULHU_DESCEND[](f, types)
+end
+
+# --- kernel_report: a *performance-quality* diagnostic (not a pass/fail guarantee) -------------
+#
+# The correctness-style guarantees (`@assert_vectorized`/`@assert_noalloc`/`@assert_typestable`)
+# are NECESSARY but NOT SUFFICIENT for speed: a naive `Vec` loop and a register-blocked microkernel
+# both pass them identically, yet differ ~2–6×. What separates a toy SIMD loop from a microkernel is
+# arithmetic intensity (FLOP : memory traffic) — reuse of loaded data across many FMAs. This reads
+# that signal from the LLVM IR (FP vector ops : memory vector ops), so a green-but-slow kernel can be
+# *seen* to be memory-bound. Heuristic and advisory — it does not replace a profiler or a roofline.
+
+struct KernelReport
+    target::String
+    vectorized::Bool
+    width::Int         # widest vector seen (N in `<N x …>`)
+    fp_ops::Int        # vector FP arithmetic ops (fmul/fadd/fsub/fdiv + fma/fmuladd intrinsics)
+    mem_ops::Int       # vector loads + stores
+    intensity::Float64 # fp_ops / mem_ops — an arithmetic-intensity proxy (∞ when no memory ops)
+end
+
+function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
+    io = IOBuffer()
+    try
+        InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
+    catch
+        return ""
+    end
+    return String(take!(io))
+end
+
+_kr_bound(r::KernelReport) =
+    !r.vectorized ? :scalar : (r.intensity ≥ 2.0 ? :compute : (r.intensity ≥ 0.75 ? :balanced : :memory))
+
+"""
+    kernel_report(f, types) -> KernelReport
+
+A **performance-quality diagnostic** for a numeric kernel — the layer *beneath* the pass/fail
+guarantees. `@assert_vectorized`/`@assert_noalloc` confirm a loop is vectorized and allocation-free,
+but say nothing about whether it's a *good* microkernel: a naive `Vec` loop and a register-blocked
+one both pass them, yet can differ several-fold. `kernel_report` reads the **arithmetic intensity**
+(FP vector ops : memory vector ops) from the LLVM IR, so a green-but-slow kernel can be *seen* to be
+memory-bound — pointing straight at register/cache blocking rather than discovered by benchmarking.
+
+Fields: `vectorized`, `width`, `fp_ops`, `mem_ops`, `intensity` (= `fp_ops/mem_ops`). **Heuristic
+and advisory** — it never fails, and does not replace a profiler/roofline.
+
+```julia
+kernel_report(syrk_naive!, (Matrix{Float64},))   # intensity ≈ 0.7 → memory-bound (add blocking)
+kernel_report(syrk_tiled!, (Matrix{Float64},))   # intensity ≈ 1.3 → balanced
+```
+"""
+function kernel_report(@nospecialize(f), @nospecialize(types::Tuple))
+    target = _func_name(f) * _sig_string(types)
+    s = _llvm_ir(f, types)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0)
+    width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half)>", s)); init = 0)
+    vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
+    fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
+    fp = vop("fmul") + vop("fadd") + vop("fsub") + vop("fdiv") + fma
+    mem = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x (?:float|double|half)>", s))
+    intensity = mem == 0 ? (fp == 0 ? 0.0 : Inf) : fp / mem
+    return KernelReport(target, width > 0, width, fp, mem, intensity)
+end
+
+function Base.show(io::IO, r::KernelReport)
+    printstyled(io, "KernelReport"; bold = true)
+    print(io, ": ", r.target, "\n")
+    if !r.vectorized
+        printstyled(io, "  not vectorized"; color = :red)
+        print(io, " — no `<N x …>` ops (see `@assert_vectorized`).")
+        return
+    end
+    printstyled(io, "  vectorized"; color = :green)
+    print(io, " — `<", r.width, " x>`\n")
+    print(
+        io, "  FP vector ops : memory vector ops = ", r.fp_ops, " : ", r.mem_ops,
+        "  → arithmetic intensity ", round(r.intensity; digits = 2), "\n"
+    )
+    b = _kr_bound(r)
+    if b === :memory
+        printstyled(io, "  → memory-bound"; color = :yellow)
+        print(
+            io, ": streams more than it computes. Reuse loaded vectors across more FMAs ",
+            "(register blocking) and tile the reduction dimension (cache blocking)."
+        )
+    elseif b === :balanced
+        printstyled(io, "  → balanced"; color = :cyan)
+        print(io, ": some data reuse; more register/cache blocking may still help.")
+    else
+        printstyled(io, "  → compute-bound"; color = :green)
+        print(io, ": good FLOP:byte balance.")
+    end
+    return
 end

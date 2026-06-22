@@ -57,10 +57,12 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
+    elseif g === :vectorized
+        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, or :trimsafe"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, or :trimsafe"))
 end
 
 # `:trimsafe` finding — value-free `juliac --trim=safe` compatibility scan (TypeContracts, no
@@ -137,10 +139,12 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :inlined
             fail = _inlined_survives(f, types) === true
             push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
+        elseif g === :vectorized
+            push!(out, _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0))
         elseif g === :trimsafe
             push!(out, _trimsafe_finding(f, types, md, fn, sg))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, or :trimsafe"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, or :trimsafe"))
         end
     end
     return out

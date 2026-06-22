@@ -94,6 +94,33 @@ descend(addll, (Int64, Int64))  # …and see exactly what it compiled to
 except raw instruction scheduling* — which remains rustc's domain, reachable here only through
 hand-written IR.
 
+### Necessary, but not sufficient — `kernel_report`
+
+Dogfooding a faer-style blocked Cholesky made the ceiling concrete. Three trailing-update (`syrk`)
+kernels — a naive `Vec` loop, a register-blocked one, and a `@turbo` one — **pass
+`@assert_vectorized` + `@assert_noalloc` + `@assert_typestable` identically**, yet differ ~2× (and
+~6× vs the base kernel). The correctness-style guarantees are *necessary but not sufficient*: they
+confirm `<N x double>` is emitted, but say nothing about **register blocking, cache blocking, or
+FLOP:byte ratio** — exactly what separates a toy SIMD loop from a microkernel.
+
+[`kernel_report`](@ref) is the answer: a *non-failing* performance diagnostic that reads the
+**arithmetic intensity** (FP vector ops : memory vector ops) from the LLVM IR, so a green-but-slow
+kernel can be *seen* to be memory-bound — pointing at the lever instead of leaving you to find it by
+benchmarking:
+
+```julia
+julia> kernel_report(syrk_naive!, (Matrix{Float64},))
+KernelReport: syrk_naive!(Matrix{Float64})
+  vectorized — `<8 x>`
+  FP vector ops : memory vector ops = 8 : 12  → arithmetic intensity 0.67
+  → memory-bound: streams more than it computes. Reuse loaded vectors across more FMAs
+    (register blocking) and tile the reduction dimension (cache blocking).
+```
+
+It is heuristic and advisory — not a profiler or a roofline — but it surfaces the *kind* of problem
+(memory- vs compute-bound) that the pass/fail guarantees structurally cannot. This is the diagnostic
+layer *beneath* the guarantees.
+
 ## Bonus: trim-safety (the static-binary story)
 
 Rust's other predictability win is *ahead-of-time compilation to a small static binary*. Julia's

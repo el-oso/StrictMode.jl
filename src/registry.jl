@@ -289,6 +289,11 @@ function check_compiled(
             end
         end
     end
+    if isempty(items)
+        @warn "check_compiled: no compiled method specializations matched in `$(nameof(mod))` " *
+            "(0 checks). Warm the kernels first — call them once so a concrete specialization exists " *
+            "— and note `only`/`exempt` and generically-typed signatures can also exclude everything."
+    end
     return _run_and_report(_map_findings(items, parallel, mode), :check_compiled, string(nameof(mod)), fail)
 end
 

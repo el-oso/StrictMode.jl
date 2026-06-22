@@ -27,6 +27,7 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 
 ```@docs
 descend
+kernel_report
 ```
 
 ## Trim-safety (juliac --trim)
