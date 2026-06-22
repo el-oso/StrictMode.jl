@@ -46,3 +46,18 @@ end
     @test err isa ArgumentError
     @test occursin("StrictMode.check", sprint(showerror, err))
 end
+
+@testitem "mode override forces the analysis mode at runtime (sidesteps the baked const)" begin
+    using StrictMode
+    boxy(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+    T = (Tuple{Int, Float64, Float32},)
+    # Force :fast regardless of the precompile-baked ANALYSIS_MODE; the heuristic still catches boxing.
+    fs = findings(boxy, T; guarantees = (:noboxing,), mode = :fast)
+    @test any(f -> f.status === :fail, fs)
+    # check honors the override too.
+    @test_throws StrictViolation check(boxy, T; guarantees = (:noboxing,), mode = :fast)
+end

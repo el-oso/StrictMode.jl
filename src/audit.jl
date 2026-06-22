@@ -36,15 +36,16 @@ function audit(
         sweep::Bool = false,
         only = nothing,
         exempt = (),
+        mode::Symbol = analysis_mode(),
     )
     fs = StrictFinding[]
     if target === :registered
-        append!(fs, check_all(; guarantees, fail = :none))
+        append!(fs, check_all(; guarantees, fail = :none, mode))
     elseif target isa Module
-        append!(fs, _registered_findings_in(target; guarantees))   # declared scope (quiet)
+        append!(fs, _registered_findings_in(target; guarantees, mode))   # declared scope (quiet)
         if sweep
             gs = guarantees === nothing ? (:typestable, :noalloc) : guarantees
-            append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt))
+            append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt, mode))
         end
     else
         throw(ArgumentError("audit target must be :registered or a Module, got $(target)"))

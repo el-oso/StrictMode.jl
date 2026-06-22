@@ -51,3 +51,13 @@ end
     bf = StrictMode._findings_fast(boxy, (Tuple{Int, Float64, Float32},), (:noalloc, :noboxing), :M, "boxy", "()")
     @test all(f -> f.status === :fail, bf)              # boxes → both noalloc and noboxing fail
 end
+
+@testitem "_alloc_signals doesn't flag union-split :invoke as boxing (F9)" begin
+    using StrictMode
+    @noinline g(x::Int) = x > 0 ? 1.0 : 1        # resolved call returning a small Union
+    f(x::Int) = (y = g(x); y + 1.0)              # type-stable union-split use → no heap box
+    f(2)                                          # warm
+    sig = StrictMode._alloc_signals(f, (Int,))
+    @test !sig.boxing && !sig.alloc              # not a false positive (was flagged before the fix)
+    @test @allocated(f(2)) == 0                  # genuinely zero-alloc
+end

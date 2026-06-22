@@ -162,4 +162,13 @@ near-instant (the rest are cache hits). `:fast` analysis also runs across thread
 `Threads.nthreads() > 1`. Use [`cache_stats`](@ref) to see hits/misses and
 [`clear_cache!`](@ref) if you edited a *callee* of a checked method.
 
+The analysis mode is read from the `analysis` preference, which is **baked at precompile** — a
+stale package image can run `:full` even after you switch the preference to `fast`. To force the
+mode for a single run without recompiling, pass `mode`:
+
+```julia
+audit(MyPkg; sweep = true, mode = :fast)   # quick whole-package scan, regardless of the baked default
+check(f, types; mode = :fast)
+```
+
 Next: the [Guarantees](guarantees.md) guide walks through every macro with runnable examples.

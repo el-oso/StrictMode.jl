@@ -11,13 +11,13 @@ const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
 
-function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
+function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees, mode::Symbol)
     m = try
         which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    return (objectid(m), m.primary_world, types, Tuple(guarantees), ANALYSIS_MODE)
+    return (objectid(m), m.primary_world, types, Tuple(guarantees), mode, _IGNORE_THROW[])
 end
 
 """

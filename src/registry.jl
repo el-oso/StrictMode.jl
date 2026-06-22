@@ -45,15 +45,15 @@ exempt_strict() = STRICT_EXEMPT
 
 # Parallelize cheap (:fast) analysis across threads; keep :full serial by default since
 # AllocCheck/JET hold global compiler state. `findings` is itself cache-locked and thread-safe.
-_default_parallel() = ANALYSIS_MODE === :fast && Threads.nthreads() > 1
+_default_parallel(mode::Symbol) = mode === :fast && Threads.nthreads() > 1
 
-function _map_findings(items::Vector, parallel::Bool)
+function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
     if parallel && length(items) > 1
         results = Vector{Vector{StrictFinding}}(undef, length(items))
         Threads.@threads for i in eachindex(items)
             f, types, gs = items[i]
             results[i] = try
-                findings(f, types; guarantees = gs)
+                findings(f, types; guarantees = gs, mode)
             catch
                 StrictFinding[]
             end
@@ -63,7 +63,7 @@ function _map_findings(items::Vector, parallel::Bool)
     out = StrictFinding[]
     for (f, types, gs) in items
         try
-            append!(out, findings(f, types; guarantees = gs))
+            append!(out, findings(f, types; guarantees = gs, mode))
         catch err
             err isa StrictViolation && rethrow()
         end
@@ -87,19 +87,22 @@ Re-check every entry in the mark-once registry and return all findings. `guarant
 uses each entry's own setting; pass a tuple to override. `fail = :error`/`:warn` raises/logs on
 any failure, `:none` just returns the findings (the default — it is a reporting driver).
 """
-function check_all(; guarantees = nothing, fail::Symbol = :none, parallel::Bool = _default_parallel())
+function check_all(;
+        guarantees = nothing, fail::Symbol = :none,
+        mode::Symbol = analysis_mode(), parallel::Bool = _default_parallel(mode),
+    )
     items = Any[
         (f, types, guarantees === nothing ? meta.guarantees : guarantees)
             for ((f, types), meta) in STRICT_REGISTRY if !_is_exempt(f)
     ]
-    return _run_and_report(_map_findings(items, parallel), :check_all, "registry", fail)
+    return _run_and_report(_map_findings(items, parallel, mode), :check_all, "registry", fail)
 end
 
 # Automatic-at-load hook emitted by `@strict module`. Gated on CHECKS_ENABLED so production pays
 # nothing; honors fail_mode.
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
-function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false)
+function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false, mode::Symbol = analysis_mode())
     out = StrictFinding[]
     for ((f, types), meta) in STRICT_REGISTRY
         _mod_sym(f) === nameof(mod) || continue
@@ -108,7 +111,7 @@ function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool =
         try
             fs = fast ?
                 _findings_fast(f, types, gs, _mod_sym(f), _func_name(f), _sig_string(types)) :
-                findings(f, types; guarantees = gs)
+                findings(f, types; guarantees = gs, mode)
             append!(out, fs)
         catch err
             err isa StrictViolation && rethrow()
@@ -233,7 +236,8 @@ function check_compiled(
         fail::Symbol = :none,
         only = nothing,
         exempt = (),
-        parallel::Bool = _default_parallel(),
+        mode::Symbol = analysis_mode(),
+        parallel::Bool = _default_parallel(mode),
     )
     exemptset = union(STRICT_EXEMPT, Set{Symbol}(_asname(x) for x in exempt))   # also skip @strict_exempt names
     onlyset = only === nothing ? nothing : Set{Symbol}(_asname(x) for x in only)
@@ -257,7 +261,7 @@ function check_compiled(
             end
         end
     end
-    return _run_and_report(_map_findings(items, parallel), :check_compiled, string(nameof(mod)), fail)
+    return _run_and_report(_map_findings(items, parallel, mode), :check_compiled, string(nameof(mod)), fail)
 end
 
 # --- Revise live loop plumbing (the extension fills these in) ----------------------------------

@@ -33,7 +33,11 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple))
         elseif Meta.isexpr(st, :new)
             nt = st.args[1]
             (nt isa Type && (ismutabletype(nt) || nt <: Array || nt <: Memory || nt === Core.Box)) && (alloc = true)
-        elseif (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) && _nonconcrete(T)
+        elseif Meta.isexpr(st, :call) && _nonconcrete(T)
+            # A *dynamic* call / builtin (e.g. a runtime `getfield` on a heterogeneous tuple, or
+            # an `Any`-typed dispatch) with a non-concrete result genuinely boxes. A resolved
+            # `:invoke` returning a small `Union` is union-split, not boxing — don't flag it
+            # (that over-reported on type-stable SIMD/pointer kernels).
             boxing = true
         end
         alloc && boxing && break

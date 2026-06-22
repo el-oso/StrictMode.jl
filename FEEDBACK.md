@@ -127,3 +127,24 @@ hot paths too. This blocks both PureFFT's per-plan `@assert_noalloc` test and th
 The `StrictModeAnalysisExt` (AllocCheck+JET as a loaded extension) + `backend_available()` is a nice model.
 One adoption gotcha: a consumer must `using AllocCheck, JET` (not just have them as deps) for the backend
 to load, else `:full` checks error — the error message is clear, but worth a line in the README.
+
+Also confirmed `:fast` is genuinely cheap: `check_compiled(PureFFT)` in `:fast` = **5.1 s** vs `:full` = **113 s**
+(in-process; note `ANALYSIS_MODE` is a precompile-baked const, so a stale `.ji` can run `:full` even when the
+pref says `fast` — worth documenting, or reading the mode at runtime).
+
+### F9 — the `:fast` `noalloc` heuristic false-positives on runtime-zero-alloc code
+With `analysis_mode = :fast`, `check_compiled(PureFFT)` reports **53 `noalloc` failures** across 12
+functions — reason `"allocates / boxes (fast heuristic)"` — every one of which is **runtime zero-alloc**
+(verified `@allocated`, warmed + `@noinline`, 50 reps → 0 B/call): the radix-4 AVX kernels (`_fft128_avx!`),
+the recursive/base/soa kernels (`_ditrec!`, `_base_butterflies_*`, `recursive_fft!`, `_leaf_soa!`,
+`_batched_dit!`), and the dispatchers (`apply_unnormalized!`, `_execute!`, `_pfft_run!`). These use raw
+`pointer()` + `vload`/`vstore` over a *preallocated* scratch buffer (SIMD.jl), so inference sees `Array`/
+`Memory`/pointer ops and the value-free heuristic conservatively flags them — but nothing actually
+allocates. So both noalloc paths over-report on this codebase: `:full` via throw branches (F8, fixed) and
+`:fast` via the inference heuristic (F9).
+- *Suggestion:* the `:fast` heuristic needs to distinguish "touches an array/pointer" from "allocates a new
+  array" — e.g. don't flag `unsafe_*`/`pointer`/`vload`/`vstore`/`GC.@preserve` patterns or calls that only
+  *read/write* preallocated buffers; only flag actual allocation builtins (`jl_gc_alloc`, `Array`/`Memory`
+  constructors, `push!`/`append!`/growth) and genuine boxing (Union/Any). Until then `:fast` can't gate a
+  pointer-based numeric library. Repro: `using PureFFT; check_compiled(PureFFT)` after warming a few
+  `autoplan` sizes (see PureFFT `bench/strictmode_audit.jl`).

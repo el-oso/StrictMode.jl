@@ -62,13 +62,18 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
 end
 
 """
-    findings(f, types; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+    findings(f, types; guarantees = (:typestable, :noalloc), mode = analysis_mode()) -> Vector{StrictFinding}
 
 Analyze `f` for the concrete signature `types` and return one [`StrictFinding`](@ref) per
-requested guarantee. Pure analysis — `f` is never called.
+requested guarantee. Pure analysis — `f` is never called. `mode` overrides [`analysis_mode`](@ref)
+for this call (`:fast` heuristic vs `:full` proof), so you can force a quick scan at runtime
+without changing the preference (`ANALYSIS_MODE` is baked at precompile).
 """
-function findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:typestable, :noalloc))
-    key = _cache_key(f, types, guarantees)
+function findings(
+        @nospecialize(f), @nospecialize(types::Tuple);
+        guarantees = (:typestable, :noalloc), mode::Symbol = analysis_mode(),
+    )
+    key = _cache_key(f, types, guarantees, mode)
     if key !== nothing
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
         if cached !== nothing
@@ -76,7 +81,7 @@ function findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:
             return copy(cached)
         end
     end
-    fs = _findings_uncached(f, types, guarantees)
+    fs = _findings_uncached(f, types, guarantees, mode)
     if key !== nothing
         @lock _CACHE_LOCK begin
             _CACHE[key] = fs
@@ -86,9 +91,9 @@ function findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:
     return copy(fs)
 end
 
-function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
+function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees, mode::Symbol)
     fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
-    if ANALYSIS_MODE === :full
+    if mode === :full
         # Rigorous: AllocCheck proof + JET (needs the analysis backend).
         rep = _strict_report(fn * sg, f, types)
         return StrictFinding[_build_finding(g, f, types, rep, md, fn, sg) for g in guarantees]
@@ -139,8 +144,11 @@ check(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))          # ok → all :pass
 check(boxy, (Tuple{Int,Float64,Float32},); guarantees=(:noboxing,))   # throws StrictViolation
 ```
 """
-function check(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:typestable, :noalloc), fail::Symbol = fail_mode())
-    fs = findings(f, types; guarantees)
+function check(
+        @nospecialize(f), @nospecialize(types::Tuple);
+        guarantees = (:typestable, :noalloc), fail::Symbol = fail_mode(), mode::Symbol = analysis_mode(),
+    )
+    fs = findings(f, types; guarantees, mode)
     failed = filter(_failed, fs)
     if !isempty(failed) && fail !== :none
         msg = sprint(io -> format_findings(io, failed; format = :text))
