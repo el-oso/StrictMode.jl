@@ -57,8 +57,24 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
+    elseif g === :trimsafe
+        return _trimsafe_finding(f, types, md, fn, sg)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, or :inlined"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, or :trimsafe"))
+end
+
+# `:trimsafe` finding — value-free `juliac --trim=safe` compatibility scan (TypeContracts, no
+# backend), so it's identical in `:fast` and `:full`.
+function _trimsafe_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
+    r = _trim_report(f, types)
+    m = try
+        which(f, types)
+    catch
+        nothing
+    end
+    file = m === nothing ? "" : string(m.file)
+    line = m === nothing ? 0 : Int(m.line)
+    return _mkfinding(md, fn, sg, :trimsafe, !r.passed, "trim-unsafe: " * join(r.findings, "; "), file, line)
 end
 
 """
@@ -121,8 +137,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :inlined
             fail = _inlined_survives(f, types) === true
             push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
+        elseif g === :trimsafe
+            push!(out, _trimsafe_finding(f, types, md, fn, sg))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, or :inlined"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, or :trimsafe"))
         end
     end
     return out

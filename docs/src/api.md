@@ -19,6 +19,7 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 @assert_inlined
 @assert_vectorized
 @assert_effects
+@assert_trim_safe
 @strict
 ```
 
@@ -26,6 +27,12 @@ they are drop-in wrappers. When checks are disabled they expand to the bare call
 
 ```@docs
 descend
+```
+
+## Trim-safety (juliac --trim)
+
+```@docs
+explain_trim
 ```
 
 ## Definition-level guarantees

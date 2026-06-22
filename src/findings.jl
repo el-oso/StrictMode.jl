@@ -29,6 +29,7 @@ function _suggestion(guarantee::Symbol)
     guarantee === :typestable && return "type instability: annotate the unstable variable, split the method, or push sizes/flags into the type domain (Val)."
     guarantee === :noalloc && return "allocation in a hot path: preallocate the buffer, use @views for slices, or @unroll to avoid boxing."
     guarantee === :inlined && return "not inlined: add @inline to the callee, or accept it (inlining is a heuristic)."
+    guarantee === :trimsafe && return "trim-unsafe call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/which/methods). juliac --trim=safe is authoritative."
     return ""
 end
 

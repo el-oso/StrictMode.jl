@@ -166,7 +166,9 @@ is the main trade-off: assert the few hot kernels you care about, or sweep-and-e
 | `@assert_inlined f(args...)` | fail unless the call is inlined (best-effort; not part of `@strict`) |
 | `@assert_vectorized f(args...)` | fail unless the loop SIMD-vectorized (best-effort, LLVM IR scan) |
 | `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
+| `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee) |
 | `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |
+| `explain_trim(output)` | translate raw `juliac --trim` verifier output into a source-mapped explanation |
 | `@strict f(args...)` | all per-call guarantees at once; returns the call's value |
 | `@strict_function def` | verify the definition's contract at precompile time |
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |

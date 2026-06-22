@@ -93,3 +93,21 @@ descend(addll, (Int64, Int64))  # …and see exactly what it compiled to
 **The honest summary:** Julia + StrictMode is now as easy to optimize as Rust for *everything
 except raw instruction scheduling* — which remains rustc's domain, reachable here only through
 hand-written IR.
+
+## Bonus: trim-safety (the static-binary story)
+
+Rust's other predictability win is *ahead-of-time compilation to a small static binary*. Julia's
+analogue is `juliac --trim=safe`, which rejects dynamic dispatch and runtime reflection. StrictMode
+surfaces this as one more guarantee (powered by [TypeContracts](https://github.com/el-oso/TypeContracts.jl),
+already a dependency — no backend needed):
+
+- **Proactive** — `@assert_trim_safe f(args...)`, or the `:trimsafe` guarantee in `check`/`audit`,
+  scans the typed IR for the patterns the trimmer rejects *before* the slow build:
+  ```julia
+  audit(MyPkg; sweep = true, guarantees = (:typestable, :noalloc, :trimsafe))
+  ```
+- **Reactive** — when a real `juliac --trim` run fails, [`explain_trim`](@ref) translates its cryptic
+  verifier dump into a source-mapped explanation with per-site hints.
+
+(`@assert_trim_safe`/`:trimsafe` are advisory — juliac's whole-program verifier is authoritative —
+so, like `@assert_vectorized`, they're opt-in and not part of `@strict`.)
