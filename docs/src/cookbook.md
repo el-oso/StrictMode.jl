@@ -1,8 +1,8 @@
 # StrictMode cookbook: trap → macro
 
-A quick reference mapping common Julia performance traps to the StrictMode guarantee that
-catches them. Enable checks first (`StrictMode.enable_checks!()`); in production they compile
-away.
+A quick lookup table from the usual Julia performance traps to the StrictMode guarantee that
+catches each one. Turn the checks on first with `StrictMode.enable_checks!()`; in production they
+compile away to nothing.
 
 | Performance trap | Symptom | Catch it with |
 |---|---|---|
@@ -54,8 +54,8 @@ StrictMode.enable_checks!(analysis = "fast")   # cheap inference-only checks (su
 
 ### Diagnose instead of assert
 
-When you want the *reason* rather than a thrown error, reach for `@explain` — it aggregates
-`@code_warntype`, JET and AllocCheck into one `StrictReport` and never throws:
+When you want the reason rather than a thrown error, reach for `@explain`. It gathers
+`@code_warntype`, JET, and AllocCheck into one `StrictReport`, and it never throws:
 
 ```julia
 @explain component(state, rand(1:3))   # returns a report explaining each verdict
@@ -78,8 +78,8 @@ When you want the *reason* rather than a thrown error, reach for `@explain` — 
 
 ## Force the fast path
 
-Don't just detect boxing — avoid it. `@unroll` fully unrolls a fixed-count loop with literal
-indices, so a heterogeneous tuple is indexed type-stably instead of boxing:
+Better than detecting boxing is not boxing at all. `@unroll` fully unrolls a fixed-count loop with
+literal indices, so a heterogeneous tuple gets indexed type-stably instead of boxing:
 
 ```julia
 function tuple_sum(t)

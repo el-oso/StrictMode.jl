@@ -9,8 +9,9 @@ CurrentModule = StrictMode
 
 ## Per-call guarantees
 
-Attach these at a call site. Each evaluates the arguments once and returns the call's value, so
-they are drop-in wrappers. When checks are disabled they expand to the bare call.
+These go at a call site. Each one evaluates its arguments once and hands back the call's value, so
+you can wrap an expression and leave the rest of your code alone. With checks disabled they expand
+to the bare call.
 
 ```@docs
 @assert_noalloc
@@ -82,8 +83,8 @@ registered_strict_contracts
 
 ## Idioms (force the fast path)
 
-Make the fast path the *easy* path. Unlike the asserts, these are not gated — the unrolling
-always applies — and they emit straight-line code with literal indices.
+These make the fast path the easy one. Unlike the asserts they aren't gated, so the unrolling
+always happens, and they produce straight-line code with literal indices.
 
 ```@docs
 @unroll
@@ -92,7 +93,7 @@ staticval
 
 ## Diagnostics
 
-Where the assert macros fail loudly, [`@explain`](@ref) tells you *why* — without throwing.
+Where the assert macros fail loudly, [`@explain`](@ref) quietly tells you why, without throwing.
 
 ```@docs
 @explain

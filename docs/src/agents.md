@@ -1,9 +1,9 @@
 # Agentic feedback
 
-A human watches a live REPL stream ([`watch`](@ref)); an AI coding agent needs something
-different: a **one-shot, structured, exit-coded** result it can read and act on, slotting into an
-edit→check→fix loop like a linter or test runner. That is [`audit`](@ref) — the same checks and
-the same findings as everything else, rendered for a machine.
+A human can sit and watch a live REPL stream ([`watch`](@ref)). An AI coding agent needs something
+it can read in one shot: a structured, exit-coded result it can act on, the way it would use a
+linter or a test runner inside an edit-check-fix loop. That's [`audit`](@ref). Same checks, same
+findings as everywhere else, just rendered for a machine.
 
 ## `audit`
 
@@ -13,9 +13,9 @@ fs = audit(:registered; format = :json, io = devnull)   # returns Vector{StrictF
 nfailures(fs)                                            # 0 = clean
 ```
 
-`audit` **never throws** on violations — it writes the findings and returns them (the same
-`Vector{StrictFinding}` as [`check`](@ref) and the other drivers). For the exit-code loop, pass
-`exit_on_fail = true`, which sets the process status to the number of failures:
+`audit` never throws on a violation. It writes the findings out and returns them, the same
+`Vector{StrictFinding}` you get from [`check`](@ref) and the other drivers. For the exit-code loop,
+pass `exit_on_fail = true` and the process status becomes the number of failures:
 
 ```bash
 julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format = :json, exit_on_fail = true)'
@@ -48,10 +48,10 @@ Each finding is one object (here pretty-printed):
 }
 ```
 
-`guarantee` ∈ `typestable | noalloc | noboxing | inlined`; `status` ∈ `fail | pass | skip`. The
-`suggestion` is the structured equivalent of what [`@explain`](@ref) tells a human — an agent can
-act on it directly. The fields come from the [`StrictFinding`](@ref) record, which you can also
-collect programmatically with [`findings`](@ref).
+`guarantee` is one of `typestable | noalloc | noboxing | inlined`, and `status` is one of
+`fail | pass | skip`. The `suggestion` field is the structured version of what [`@explain`](@ref)
+would tell a person, so an agent can act on it as-is. All of it comes from the
+[`StrictFinding`](@ref) record, which you can also gather directly with [`findings`](@ref).
 
 ## `:github` format for CI
 
@@ -64,8 +64,9 @@ GitHub Actions renders these as inline annotations on the offending lines.
 
 ## Wiring it into Claude Code
 
-The package provides the command; the harness wires it. A `Stop` (or `PostToolUse`) hook in
-`settings.json` that audits after edits and feeds failures back to the agent:
+StrictMode gives you the command; your harness decides when to run it. Here's a `Stop` (or
+`PostToolUse`) hook in `settings.json` that audits after each round of edits and feeds any failures
+back to the agent:
 
 ```json
 {
@@ -84,5 +85,5 @@ The package provides the command; the harness wires it. A `Stop` (or `PostToolUs
 }
 ```
 
-A non-zero exit surfaces the JSON findings to the agent, which fixes the kernel and re-runs — the
-agentic counterpart to a developer watching Revise.
+A non-zero exit puts the JSON findings in front of the agent, which fixes the kernel and runs
+again. It's the agent's version of a developer watching Revise.

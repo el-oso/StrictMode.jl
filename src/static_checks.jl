@@ -53,15 +53,15 @@ end
 
 Fail unless the call `f(args...)` is allocation-free.
 
-In the default `:full` [`analysis_mode`](@ref) StrictMode asks
-[AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) to *prove* the call cannot allocate; if
-the proof reports any allocation site (including dynamic dispatch or boxing) the guarantee fails
-with those sites. When static analysis cannot run, it falls back to an empirical `@allocated`
-measurement after a warmup call. In `:fast` mode the empirical `@allocated` path is the default.
-Pass `static = true`/`false` to force a path regardless of mode.
+In the default `:full` [`analysis_mode`](@ref), StrictMode hands the call to
+[AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) and asks it to prove the call cannot
+allocate. If the proof turns up any allocation site, dynamic dispatch and boxing included, the
+guarantee fails and lists them. When static analysis can't run, it falls back to measuring with
+`@allocated` after a warmup call, and in `:fast` mode that empirical path is the default. Pass
+`static = true`/`false` to force one path regardless of mode.
 
-Each argument is evaluated exactly once. When checks are disabled (the production default) this
-expands to the bare call — zero overhead.
+Each argument is evaluated exactly once. With checks disabled (the production default) this expands
+to the bare call, with no overhead left behind.
 
 ```julia
 @assert_noalloc sum(rand(100))         # ok

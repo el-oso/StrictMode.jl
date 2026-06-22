@@ -37,10 +37,10 @@ end
 
 Fail unless `f(args...)` is type stable.
 
-Both [`analysis_mode`](@ref)s check that the inferred return type is a single concrete type (via
-`Base.return_types`); `:full` additionally runs `JET`'s optimization analysis to catch internal
-instability / runtime dispatch (this is the part that needs the AllocCheck+JET backend). Each
-argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
+Both [`analysis_mode`](@ref)s check that the inferred return type is a single concrete type, using
+`Base.return_types`. On top of that, `:full` runs JET's optimization analysis to catch instability
+or runtime dispatch hiding inside the call, which is the part that needs the AllocCheck+JET backend.
+Each argument is evaluated once, the macro returns the call's value, and disabled builds expand to
 the bare call.
 
 ```julia

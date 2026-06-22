@@ -41,19 +41,19 @@ end
         body
     end
 
-Fully unroll a loop whose trip count is known at macro-expansion time, emitting straight-line
-code with the loop variable replaced by a **literal** in each iteration. This eliminates the
-runtime-tuple-indexing boxing class: `s += t[i]` becomes `s += t[1]; s += t[2]; …`, so a
-heterogeneous tuple is indexed type-stably instead of producing a `Union` and boxing (the trap
-that cost a measured 135× in the FFT work).
+Fully unroll a loop whose trip count is known at macro-expansion time, emitting straight-line code
+with the loop variable replaced by a literal on each pass. That removes the whole
+runtime-tuple-indexing boxing problem: `s += t[i]` becomes `s += t[1]; s += t[2]; …`, so a
+heterogeneous tuple is indexed type-stably instead of producing a `Union` and boxing. (This is the
+trap that cost a measured 135× in the FFT work.)
 
-Because the loop variable is *substituted* (not captured in a closure), a mutated accumulator
-stays a plain local — no `Core.Box`. `@unroll` is not gated by `checks_enabled`; the unrolling
-always applies. Pair it with [`@assert_noalloc`](@ref) / [`@assert_typestable`](@ref) to prove
-the result is on the fast path.
+Because the loop variable is substituted rather than captured in a closure, a mutated accumulator
+stays an ordinary local, with no `Core.Box`. `@unroll` isn't gated by `checks_enabled`; the
+unrolling always happens. Pair it with [`@assert_noalloc`](@ref) or [`@assert_typestable`](@ref) to
+confirm the result really is on the fast path.
 
-The iteration must be statically known: a literal integer range or a tuple literal. For a size
-known only from a type, write a `@generated` wrapper and splice the count in — see
+The iteration has to be statically known: a literal integer range or a tuple literal. For a size
+that lives only in a type, write a `@generated` wrapper and splice the count in; see
 [`staticval`](@ref) and the docs.
 
 ```julia

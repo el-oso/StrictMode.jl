@@ -5,7 +5,7 @@ layout: home
 hero:
   name: StrictMode.jl
   text: Loud guarantees for fast Julia
-  tagline: Make correct-and-fast the default; make falling off the fast path a loud error.
+  tagline: Fast by default, and loud the moment you slip off it — not something you discover by profiling.
   actions:
     - theme: brand
       text: Getting Started
@@ -21,24 +21,27 @@ hero:
       link: https://github.com/el-oso/StrictMode.jl
 
 features:
-  - title: Force the fast path
-    details: Declarative macros assert no-alloc and type-stable at a call site or a definition — fail loudly when the property does not hold.
-  - title: Tell you when you fell off
-    details: A thin, unified interface over AllocCheck, JET and @inferred — the silent traps (boxing, instability, hot-loop allocations) become explicit errors.
+  - title: Ask for the fast path
+    details: Say what you want at a call site or a definition — this call should not allocate, this one should stay type-stable — and get an error the moment it doesn't.
+  - title: Catch the silent traps
+    details: A thin layer over AllocCheck, JET, and @inferred. The things Julia normally lets slide, like boxing or a hot loop that quietly allocates, become errors you can actually see.
   - title: Zero cost when disabled
-    details: Every check is gated behind a Preferences compile-time flag. Off by default, macros expand to the bare call. Production pays nothing.
+    details: Every check sits behind a Preferences flag, off by default. When it's off the macros vanish into the bare call, so a production build carries none of it.
 ---
 ```
 
 ## Why
 
-Julia stays *silent* when your code boxes, fails to inline, becomes type-unstable, or allocates
-in a hot loop — Rust errors instead. Each trap is invisible until you profile. StrictMode turns
-them into **loud, declarable, opt-in guarantees**.
+Julia will happily let your code box a value, miss an inline, drift into a type instability, or
+allocate inside a hot loop, and it won't say a word. Rust would have stopped you at compile time.
+In Julia each of these stays invisible until you go hunting for it with a profiler. StrictMode lets
+you ask for those properties out loud: declare what you expect, and hear about it right away when
+something breaks the promise.
 
-> This package is the sequel to the JuliaCon 2024 talk *"Why do we need a stricter Julia mode?"*
-> The motivating traps came from optimizing a SIMD FFT, where runtime tuple indexing silently
-> boxed and cost a **measured 135× slowdown** — invisible until profiled.
+> StrictMode grew out of a JuliaCon 2024 talk, *"Why do we need a stricter Julia mode?"* The traps
+> that motivated it turned up while tuning a SIMD FFT, where indexing a tuple with a runtime value
+> quietly boxed and cost a measured **135× slowdown** — the kind of thing you only ever find by
+> profiling.
 
 ```julia
 using StrictMode
@@ -48,5 +51,5 @@ using StrictMode
 @strict            dot(u, v)              # all per-call guarantees at once
 ```
 
-Head to [Getting Started](getting_started.md), browse the [Guarantees](guarantees.md) guide, or
-jump to the [API Reference](api.md).
+From here you can follow [Getting Started](getting_started.md) for a walkthrough, read through the
+[Guarantees](guarantees.md) one by one, or skip to the [API Reference](api.md).

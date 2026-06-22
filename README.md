@@ -5,27 +5,28 @@
 [![Coverage](https://coveralls.io/repos/github/el-oso/StrictMode.jl/badge.svg?branch=master)](https://coveralls.io/github/el-oso/StrictMode.jl?branch=master)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Make correct-and-fast the default; make falling off the fast path a loud error.**
+**The fast path should be the default, and leaving it should be loud, not something you discover
+later with a profiler.**
 
-Julia stays *silent* when your code boxes, fails to inline, becomes type-unstable, or allocates
-in a hot loop — Rust errors instead. Each of these is invisible until you profile. StrictMode
-turns them into **loud, declarable, opt-in guarantees**: attach a macro and the code either
-holds the property or fails — at test time, or even at module load.
+Julia will happily let your code box a value, miss an inline, drift into a type instability, or
+allocate inside a hot loop, and say nothing about it. Rust would have stopped you at compile time.
+StrictMode lets you ask for those properties out loud: attach a macro, and the code either holds
+the property or fails, at test time or even at module load.
 
-> This package is the sequel to the JuliaCon 2024 talk *"Why do we need a stricter Julia mode?"*
-> The recurring traps that motivated it came from optimizing a SIMD FFT, where runtime tuple
-> indexing silently boxed and cost a **measured 135× slowdown** — invisible until profiled.
+> StrictMode grew out of a JuliaCon 2024 talk, *"Why do we need a stricter Julia mode?"* The traps
+> that kept coming up turned up while tuning a SIMD FFT, where indexing a tuple with a runtime value
+> quietly boxed and cost a measured **135× slowdown** — the kind of thing you only find by profiling.
 
-StrictMode does both halves of the job: the **forcing** (push code onto the fast path) and the
-**telling** (shout when you fell off). It is a thin, unified, failing-loud interface over
-[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
-[JET.jl](https://github.com/aviatesk/JET.jl) — which are **optional, weak dependencies**, loaded
-only when you turn checks on, so a package can depend on StrictMode and ship neither.
+It covers both halves of the job. There's the forcing half, which pushes your code onto the fast
+path, and the telling half, which speaks up when you've fallen off it. Underneath, it's a thin,
+failing-loud layer over [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
+[JET.jl](https://github.com/aviatesk/JET.jl). Those two are optional, weak dependencies, pulled in
+only when you turn the checks on, so a package can depend on StrictMode and ship neither.
 
 ## Dependencies are weak
 
-AllocCheck and JET are heavy, so StrictMode keeps them as *weak* dependencies behind an
-extension. Pick what to add per environment:
+AllocCheck and JET are heavy, so StrictMode keeps them as weak dependencies behind an extension.
+Add whichever ones suit each environment:
 
 | Environment | Add | What you get |
 |---|---|---|
@@ -33,15 +34,15 @@ extension. Pick what to add per environment:
 | **Dev (human)** | `Revise`, `AllocCheck`, `JET` | the live [`watch`](https://el-oso.github.io/StrictMode.jl/dev/automating) loop with real checks |
 | **CI / agent** | `AllocCheck`, `JET` | `audit` / the full check set |
 
-They must be **loaded** (`using AllocCheck, JET`), not just listed as dependencies, for the
-analysis extension to activate — with checks enabled but the backend not loaded, `:full` checks
-tell you to add them (`:fast` triage needs no backend at all).
+For the extension to switch on, those packages need to be loaded (`using AllocCheck, JET`), not
+just listed as dependencies. If checks are enabled but the backend isn't loaded, the `:full` checks
+will tell you to add them; the `:fast` triage needs no backend at all.
 
 ## Zero cost when disabled
 
-Every check is gated behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
-compile-time flag. By default the flag is **off**, and every guarantee macro expands to the
-*bare call* — production builds pay nothing. Turn the checks on in CI/dev:
+Every check sits behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
+compile-time flag, and by default that flag is off. With it off, every guarantee macro expands to
+the bare call, so production builds pay nothing. Turn the checks on in CI or while developing:
 
 ```julia
 using StrictMode
@@ -66,14 +67,15 @@ using StrictMode   # (with checks enabled)
 
 ## Before / after
 
-**Before** — a hot kernel that silently boxes. Nothing warns you; you only notice in a profile:
+**Before:** a hot kernel that boxes behind your back. Nothing warns you, and you only notice once
+you profile:
 
 ```julia
 component(state, i) = state[i]        # state::Tuple{Int,Float64,String}, i is a runtime value
 #                     ^ runtime tuple index → Union return → boxing → 135× slower, silently
 ```
 
-**After** — the same kernel, guarded. The violation is now *loud* and points at the cause:
+**After:** the same kernel, guarded. The violation is loud now, and it points right at the cause:
 
 ```julia
 @assert_typestable component(state, rand(1:3))
@@ -84,9 +86,9 @@ component(state, i) = state[i]        # state::Tuple{Int,Float64,String}, i is a
 
 ## The "won't load if it's wrong" guarantee
 
-`@strict_function` checks a definition's contract at **precompile time** against its declared
-argument types. If the contract is violated, the module fails to load — the same forcing
-function Rust's compiler gives you:
+`@strict_function` checks a definition against its declared argument types at precompile time. If
+the contract is broken, the module won't load. It's the same forcing function Rust's compiler gives
+you:
 
 ```julia
 @strict_function dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) =
@@ -99,8 +101,8 @@ function Rust's compiler gives you:
 ## Interfaces + performance, together
 
 Pair a [TypeContracts.jl](https://github.com/el-oso/TypeContracts) interface with StrictMode's
-performance guarantees: `@contract` verifies the *method surface*, StrictMode verifies that
-those methods are *fast*.
+performance guarantees. `@contract` checks that the right methods are there; StrictMode checks that
+they're fast.
 
 ```julia
 @strict_contract AbstractMetric begin
@@ -115,7 +117,7 @@ end
 
 ## Automation & agents
 
-Beyond per-call macros, StrictMode can check **automatically**:
+Per-call macros aren't the only way in. StrictMode can also check on its own:
 
 ```julia
 check(f, (T1, T2))                 # function API — never collides with other macros/syntax
@@ -132,7 +134,8 @@ audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-
 
 ## Checking a library *without* depending on StrictMode
 
-To gate a library's performance from its **test suite** — without adding StrictMode to its `src`:
+You can gate a library's performance from its test suite, without ever adding StrictMode to its
+`src`:
 
 1. Add `StrictMode`, `AllocCheck`, `JET` to the **test** `Project.toml`, and `using AllocCheck,
    JET` in your tests (the backend only loads when those packages are *loaded*, not just listed).
@@ -153,8 +156,9 @@ To gate a library's performance from its **test suite** — without adding Stric
    audit(MyPkg; sweep = true, mode = :fast, exempt = r"^_plan")
    ```
 
-Per-call `@assert_*` (cheap, targeted) vs the whole-package `audit`/sweep (broad, needs scoping)
-is the main trade-off: assert the few hot kernels you care about, or sweep-and-exempt the rest.
+The choice between the two is the main trade-off. Per-call `@assert_*` is cheap and targeted; the
+whole-package `audit`/sweep is broad but needs scoping. Assert the few hot kernels you care about,
+or sweep everything and exempt the rest.
 
 ## API
 
@@ -187,11 +191,12 @@ See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Status
-Closing the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps): the
-**time tax** (cheap `:fast` triage of all properties + incremental cache + threaded sweeps), being
-**opt-in** (`@strict module` checks everything automatically; `@strict_exempt` opts cold code out),
-and **scheduling visibility** (`@assert_vectorized`, `@assert_effects`, Cthulhu `descend`). Built
-on a v0.3 ergonomics layer (`check`, `audit`, `watch`) and the v0.2 guarantee set.
+Working through the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps):
+the time tax (a cheap `:fast` triage over all properties, an incremental cache, and threaded
+sweeps), staying opt-in (`@strict module` checks everything automatically, and `@strict_exempt`
+opts cold code out), and scheduling visibility (`@assert_vectorized`, `@assert_effects`, and
+Cthulhu's `descend`). It all sits on a v0.3 ergonomics layer (`check`, `audit`, `watch`) over the
+v0.2 guarantee set.
 
 ## Installation
 

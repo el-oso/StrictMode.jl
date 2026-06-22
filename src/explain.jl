@@ -127,14 +127,14 @@ end
 """
     @explain f(args...)
 
-Diagnose `f(args...)` without throwing: aggregate `@code_warntype`, JET `@report_opt` and
-AllocCheck into a single [`StrictReport`](@ref) that explains *why* a guarantee would fail
-(non-concrete return type, runtime dispatch / boxing, allocation sites) and a verdict for what
-[`@assert_typestable`](@ref) / [`@assert_noalloc`](@ref) would conclude.
+Diagnose `f(args...)` without throwing. It gathers `@code_warntype`, JET's `@report_opt`, and
+AllocCheck into a single [`StrictReport`](@ref) that explains why a guarantee would fail (a
+non-concrete return type, runtime dispatch or boxing, allocation sites), along with a verdict for
+what [`@assert_typestable`](@ref) and [`@assert_noalloc`](@ref) would conclude.
 
-This is the "tell me why" companion to the fail-loud assert macros: reach for it when a
-[`StrictViolation`](@ref) needs explaining. It returns the report (the REPL prints it); assign
-it to inspect the fields programmatically. Like the asserts it is gated by `checks_enabled` and
+Think of it as the "tell me why" companion to the fail-loud asserts: reach for it when a
+[`StrictViolation`](@ref) needs explaining. It returns the report, which the REPL prints; assign it
+if you'd rather read the fields yourself. Like the asserts, it's gated by `checks_enabled` and
 expands to the bare call when disabled.
 
 ```julia

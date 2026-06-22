@@ -1,8 +1,8 @@
 # Guarantees
 
-Every example on this page is **live** — the documentation is built with checks enabled, so the
-analysis actually runs. Passing calls are shown as executed `@example` blocks; failing calls are
-shown as annotated code so the docs build stays green.
+Every example here is live. The docs are built with checks enabled, so the analysis runs as the
+page is generated. Calls that pass are shown as real `@example` blocks; calls that are meant to
+fail are shown as annotated code, so the build itself stays green.
 
 ```@example guide
 using StrictMode
@@ -10,8 +10,9 @@ using StrictMode
 
 ## `@assert_noalloc` — no heap allocations
 
-StrictMode asks [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) to *prove* the call
-cannot allocate. Dynamic dispatch and boxing count as allocations, so they are caught here too.
+For this one, StrictMode hands the call to [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl)
+and asks it to prove there's no way the call can allocate. Dynamic dispatch and boxing both show up
+as allocations, so they get caught here as well.
 
 ```@example guide
 dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
@@ -19,14 +20,14 @@ dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 @assert_noalloc dot3((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 ```
 
-If static analysis cannot run on a call, pass `static = false` to measure empirically with
-`@allocated` after a warmup:
+When static analysis can't run on a call, `static = false` falls back to measuring it directly
+with `@allocated`, after a warmup pass:
 
 ```julia
 @assert_noalloc static = false stream_step!(buffer, x)   # measures @allocated, not a static proof
 ```
 
-An **allocating hot loop** is rejected:
+An allocating hot loop gets turned away:
 
 ```julia
 function grow_and_sum(n)
@@ -45,10 +46,10 @@ end
 
 ## `@assert_noboxing` — forbid boxing, allow buffers
 
-[`@assert_noboxing`](@ref) is the relaxed sibling of `@assert_noalloc`: it fails only on the
-*type-uncertainty* subclass of allocations — boxing (the runtime-tuple-index trap, a
-captured-variable `Core.Box`) and dynamic dispatch — while **allowing** legitimate typed heap
-allocations. Use it for a hot path that may allocate a working buffer but must never box.
+[`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It only objects to the
+allocations that come from type uncertainty: boxing (the runtime-tuple-index trap, or a captured
+variable wrapped in a `Core.Box`) and dynamic dispatch. Honest typed heap allocations are fine by
+it. Reach for it on a hot path that's allowed to allocate a working buffer but must never box.
 
 ```@example guide
 function fill_sum(n)
@@ -62,14 +63,14 @@ end
 @assert_noboxing fill_sum(3)        # passes: it allocates, but it does not box
 ```
 
-The same call fails `@assert_noalloc`, which forbids *all* allocations:
+That same call doesn't get past `@assert_noalloc`, which forbids allocation of any kind:
 
 ```julia
 @assert_noalloc fill_sum(3)
 # ERROR: StrictViolation (@noalloc): call provably allocates … Vector{Float64} …
 ```
 
-Boxing and dynamic dispatch are still rejected:
+Boxing and dynamic dispatch, though, are still out:
 
 ```julia
 boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, runtime index
@@ -78,13 +79,13 @@ boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, ru
 #   Allocating runtime call to "jl_get_nth_field_checked" …
 ```
 
-It is always a static AllocCheck analysis (it must classify each allocation), so it ignores the
-`:fast` [`analysis_mode`](@ref).
+Because it has to classify each allocation, it always runs the static AllocCheck analysis, and so
+it ignores the `:fast` [`analysis_mode`](@ref).
 
 ## `@assert_typestable` — concrete, stable types
 
-Combines `Test.@inferred` (the *return* type must be concrete) with `JET.@report_opt` (no
-*internal* instability or runtime dispatch).
+This one pairs two checks: `Test.@inferred` insists the return type is concrete, and
+`JET.@report_opt` insists there's no instability or runtime dispatch hiding inside.
 
 ```@example guide
 affine(x) = 2x + 1
@@ -92,8 +93,8 @@ affine(x) = 2x + 1
 @assert_typestable affine(3.0)
 ```
 
-The classic trap — **runtime tuple indexing** — produces a `Union` return type and boxes. It is
-rejected:
+Runtime tuple indexing, the trap that keeps coming up, produces a `Union` return type and boxes.
+It doesn't pass:
 
 ```julia
 state = (1, 2.0, "three")     # heterogeneous tuple
@@ -107,13 +108,13 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 
 ## `@assert_inlined` — keep the call on the fast path (best-effort)
 
-[`@assert_inlined`](@ref) fails unless the compiler inlined the call. StrictMode compiles a tiny
-wrapper around the call, inspects its optimized typed IR, and fails if the call survives as an
-`:invoke` (i.e. it was not absorbed).
+[`@assert_inlined`](@ref) fails unless the compiler actually inlined the call. To find out,
+StrictMode compiles a tiny wrapper around it and reads the optimized IR: if the call is still
+sitting there as an `:invoke`, it wasn't absorbed, and the assert fails.
 
-Because inlining is a compiler *heuristic*, this is explicitly best-effort: a failure means the
-compiler chose not to inline under the current settings, which may or may not be a problem. For
-that reason it is **not** part of [`@strict`](@ref).
+Inlining is a heuristic, not a promise, so this one is best-effort by nature. A failure only means
+the compiler chose not to inline under the current settings, which may or may not matter to you.
+That's why it isn't part of [`@strict`](@ref).
 
 ```julia
 @inline   hot(x) = x * x + 1
@@ -126,8 +127,9 @@ that reason it is **not** part of [`@strict`](@ref).
 
 ## `@strict` — every per-call guarantee at once
 
-[`@strict`](@ref) checks type stability first (the usual root cause of surprise allocations),
-then allocation-freedom. It evaluates to the call's value, so it is a drop-in wrapper:
+[`@strict`](@ref) checks type stability first, since that's usually what's behind a surprise
+allocation, and then allocation-freedom. It returns the call's value, so you can drop it in around
+an expression you already have:
 
 ```@example guide
 saxpy(a, x, y) = a .* x .+ y
@@ -137,8 +139,8 @@ result = @strict saxpy(2.0, (1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 
 ## `@strict_function` — verify a definition at load time
 
-Annotate a definition and StrictMode verifies its contract against the **declared argument
-types** at precompile / module-load time. A clean definition loads normally:
+Put it on a definition and StrictMode checks that definition against its declared argument types,
+at precompile or module-load time. A clean one loads like any other:
 
 ```@example guide
 @strict_function scaled(a::Float64, x::NTuple{3, Float64}) = a .* x
@@ -146,8 +148,8 @@ types** at precompile / module-load time. A clean definition loads normally:
 scaled(2.0, (1.0, 2.0, 3.0))
 ```
 
-If a later edit makes it allocate or go unstable, the **module fails to load** — the same
-forcing function Rust's compiler gives you:
+If some later edit makes it allocate or go unstable, the module won't load at all. It's the same
+forcing function you'd get from Rust's compiler:
 
 ```julia
 @strict_function leaky(n::Int) = sum(collect(1:n))   # collect allocates
@@ -157,14 +159,14 @@ forcing function Rust's compiler gives you:
 # ERROR: StrictViolation (@strict_function): return type is not concrete …
 ```
 
-Signatures with abstract argument types or varargs cannot be checked statically; they emit a
-one-time warning and are left to call-site [`@strict`](@ref) checks.
+Signatures with abstract argument types or varargs can't be pinned down statically. Those emit a
+one-time warning and fall back to call-site [`@strict`](@ref) checks instead.
 
 ## Interfaces + performance with TypeContracts
 
 [`@strict_contract`](@ref) declares a [TypeContracts.jl](https://github.com/el-oso/TypeContracts)
-interface that carries performance guarantees, and [`@verify_strict`](@ref) checks an
-implementation's *method surface* **and** that those methods are *fast*.
+interface that also carries performance guarantees, and [`@verify_strict`](@ref) checks both sides
+of an implementation: that it has the right methods, and that those methods are fast.
 
 ```@example guide
 using TypeContracts
@@ -184,7 +186,7 @@ xs = [1.5, 2.5, 3.5]
 end
 ```
 
-An implementation that satisfies the interface but **allocates** is rejected:
+An implementation that has the right methods but allocates is turned down:
 
 ```julia
 struct SlowMetric end
@@ -198,15 +200,15 @@ end
 
 ## `@unroll` — force the fast path
 
-The assert macros *tell* you when you boxed; [`@unroll`](@ref) keeps you from boxing in the
-first place. It fully unrolls a loop whose trip count is known at macro time, replacing the loop
-variable with a **literal** each iteration — so `t[i]` becomes `t[1]; t[2]; …` and a
-heterogeneous tuple is indexed type-stably instead of boxing. It is not gated; the unrolling
-always applies.
+The assert macros tell you after the fact that you boxed. [`@unroll`](@ref) keeps it from
+happening in the first place. When a loop's trip count is known at macro time, it unrolls the loop
+completely and swaps the loop variable for a literal on each pass, so `t[i]` becomes
+`t[1]; t[2]; …`. A heterogeneous tuple then gets indexed type-stably, with no boxing. Unlike the
+asserts it isn't gated behind the checks flag; the unrolling always happens.
 
-Here is the founding trap. The naive loop is *type-stable* (it returns a concrete `Float64`) yet
-still allocates, because the runtime tuple index boxes — exactly what `@assert_noalloc` exists to
-catch:
+This is the trap that started the whole project. The naive loop is type-stable, returning a
+concrete `Float64`, and it still allocates, because the runtime tuple index boxes. It's the exact
+thing `@assert_noalloc` is there to catch:
 
 ```@example guide
 htup = (1, 2.0, 3.0f0)
@@ -230,8 +232,8 @@ end
 (naive(htup), unrolled(htup), @allocated(naive(htup)), @allocated(unrolled(htup)))
 ```
 
-Same answer, but the naive loop allocates while the unrolled one does not — so the guarantee
-passes only for the unrolled version:
+Both give the same answer, but only the naive loop allocates, so the guarantee passes for the
+unrolled version and not the other:
 
 ```@example guide
 @assert_noalloc unrolled(htup)
@@ -243,7 +245,7 @@ passes only for the unrolled version:
 #   [2] Allocating runtime call to "jl_get_nth_field_checked" in ./tuple.jl:33
 ```
 
-When the size is known only from a *type*, lift it into the type domain with [`staticval`](@ref)
+When the size lives only in a type, you can lift it into the type domain with [`staticval`](@ref)
 and splice the literal into `@unroll` from a `@generated` method:
 
 ```julia
@@ -261,12 +263,12 @@ end
 
 ## `@explain` — tell me *why*
 
-When an assert fails you often want the diagnosis, not just the verdict. [`@explain`](@ref)
-aggregates `@code_warntype`, JET `@report_opt` and AllocCheck into one [`StrictReport`](@ref) —
-and, unlike the asserts, it never throws. It returns the report (the REPL prints it); assign it
-to inspect the fields.
+When an assert fails, you usually want to know why, not just that it did. [`@explain`](@ref)
+gathers `@code_warntype`, JET's `@report_opt`, and AllocCheck into a single [`StrictReport`](@ref),
+and unlike the asserts it never throws. It just returns the report, which the REPL prints for you;
+assign it if you want to poke at the individual fields.
 
-A clean call reports all green:
+A clean call comes back all green:
 
 ```@example guide
 clean(a, b) = 0.5a + 0.5b
@@ -274,8 +276,8 @@ clean(a, b) = 0.5a + 0.5b
 @explain clean(2.0, 4.0)
 ```
 
-The runtime tuple-index trap is dissected — non-concrete return type, the boxing allocation
-site, and the `@code_warntype` body — with a verdict for each guarantee:
+And the runtime tuple-index trap gets pulled apart: the non-concrete return type, the boxing
+allocation site, the `@code_warntype` body, and a verdict for each guarantee:
 
 ```julia
 state = (1, 2.0, "three")

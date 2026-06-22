@@ -19,12 +19,12 @@ const STRICT_CONTRACTS = Set{Any}()
         ...
     end
 
-Declare `AbstractIface` as a TypeContracts interface (via `TypeContracts.@contract`) **and**
-register it as carrying StrictMode performance guarantees. Implementations should be verified
-with [`@verify_strict`](@ref), which checks the method surface *and* that the methods are
+Declare `AbstractIface` as a TypeContracts interface (through `TypeContracts.@contract`) and record
+that it carries StrictMode performance guarantees too. Verify implementations with
+[`@verify_strict`](@ref), which checks both the method surface and that those methods are
 type-stable and allocation-free.
 
-The body uses the same syntax as `TypeContracts.@contract` (`::Self`, `:optional`, etc.).
+The body uses the same syntax as `TypeContracts.@contract` (`::Self`, `:optional`, and so on).
 """
 macro strict_contract(T, block)
     # Plain block (no `quote`) so the forwarded `@contract` macrocall expands with its own
@@ -45,12 +45,12 @@ end
         ...
     end
 
-Verify that type `T` implements its [`@strict_contract`](@ref) interface (via
-`TypeContracts.@verify`) *and* that each listed representative call satisfies StrictMode's
-per-call guarantees ([`@strict`](@ref): type-stable + non-allocating). The calls run against
-instances/values you bind in the surrounding scope.
+Verify that type `T` implements its [`@strict_contract`](@ref) interface (through
+`TypeContracts.@verify`), and that each representative call you list satisfies StrictMode's per-call
+guarantees ([`@strict`](@ref), so type-stable and non-allocating). The calls run against the
+instances and values you bind in the surrounding scope.
 
-The interface (`@verify`) check always runs; the per-call performance checks self-gate on the
+The interface check always runs. The per-call performance checks gate themselves on the
 `checks_enabled` preference, so a production build only pays for the interface verification.
 
 ```julia

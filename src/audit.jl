@@ -7,25 +7,25 @@
     audit(target = :registered; format = :json, io = stdout, exit_on_fail = false,
           guarantees = nothing, sweep = false, only = nothing, exempt = ()) -> Vector{StrictFinding}
 
-Run the strict checks once, write the findings to `io` in a machine-readable `format`, and
-return the findings (consistent with [`check`](@ref) / [`check_all`](@ref) /
-[`check_compiled`](@ref)). Use [`nfailures`](@ref) for the count, or `exit_on_fail = true` to set
-the process exit status to the number of failures — the agent / CI entry point:
+Run the strict checks once, write the findings to `io` in a machine-readable `format`, and return
+them, the same `Vector{StrictFinding}` you get from [`check`](@ref), [`check_all`](@ref), and
+[`check_compiled`](@ref). [`nfailures`](@ref) gives you the count, and `exit_on_fail = true` sets
+the process exit status to the number of failures. That's the entry point for an agent or for CI:
 
 ```bash
 julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_on_fail = true)'
 ```
 
 `target`:
-- `:registered` — the mark-once registry ([`check_all`](@ref)). The "check what I promised" scope.
-- a `Module` — the registered functions *declared* in that module by default. Pass `sweep = true`
-  to also run the usage-driven [`check_compiled`](@ref) over everything the module compiled
-  (noisier; scope it with `only` / `exempt`).
+- `:registered` — the mark-once registry ([`check_all`](@ref)), the "check what I promised" scope.
+- a `Module` — by default, the registered functions declared in that module. Pass `sweep = true` to
+  also run the usage-driven [`check_compiled`](@ref) over everything the module compiled. That's
+  noisier, so scope it with `only` / `exempt`.
 
 `format` is `:json`, `:jsonlines`, `:github`, or `:text`. Each JSON finding carries `guarantee`,
 `status`, `file`, `line`, `reason`, and an actionable `suggestion`.
 
-This is the agent-facing path; for live human feedback while editing, use [`watch`](@ref).
+This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
 function audit(
         target = :registered;

@@ -1,15 +1,16 @@
 # Automating checks
 
-Sprinkling `@assert_*` macros at call sites is precise but tedious. This page covers the easier
-paths: a function API that never interferes with other macros, marking a whole module once,
-automatic checking at load, and a live Revise loop. (For AI agents, see [Agentic feedback](agents.md).)
+Scattering `@assert_*` macros across call sites is precise, but it gets tedious fast. This page is
+about the gentler routes: a function API that stays out of the way of other macros, a way to mark a
+whole module once, automatic checking when it loads, and a live loop with Revise. (If you're wiring
+this up for an AI agent, head to [Agentic feedback](agents.md).)
 
 ## The function API — `check`
 
-[`check`](@ref) runs the guarantees on a `(function, signature)` pair. It is a plain function
-call, so unlike the macros it can never collide with broadcasting, nested macros, or keyword
-arguments — reach for it whenever a macro would get in the way, and as the programmatic entry
-point for tooling.
+[`check`](@ref) runs the guarantees on a `(function, signature)` pair. It's an ordinary function
+call, so it can't collide with broadcasting, nested macros, or keyword arguments the way a macro
+might. Reach for it whenever a macro would get in the way, and use it as the programmatic entry
+point when you're building tooling on top.
 
 ```@example auto
 using StrictMode
@@ -26,15 +27,15 @@ check(kernel, (Matrix{Float64}, Vector{Float64});
       fail = :error)          # :error throws, :warn logs, :none just returns the findings
 ```
 
-Nothing is executed — the analysis is purely from the types — so `check` works even for calls
-you would not want to actually run.
+Nothing actually runs here; the analysis works purely from the types. That means `check` is happy
+even with calls you wouldn't want to execute for real.
 
 ## Strict by default — one switch, not per-function
 
-You should **not** have to annotate every function. `@strict module … end` makes the whole
-module strict *automatically*: every definition is hot (checked) by default, and you opt the rare
-**cold** helper *out* with [`@strict_exempt`](@ref) — the Rust discipline of opting out of safety,
-not into it.
+You shouldn't have to annotate every function by hand. `@strict module … end` makes the whole
+module strict on its own: every definition is checked by default, and you opt the occasional cold
+helper out with [`@strict_exempt`](@ref). It's the Rust posture of opting out of safety rather than
+opting into it.
 
 ```julia
 @strict module Kernels        # one declaration disciplines the whole module
@@ -45,20 +46,20 @@ not into it.
 end
 ```
 
-A hot definition that boxes or allocates makes the module fail to load (in `:error` mode); the
-cold `plan` is skipped everywhere — by the load check, `check_all`, `audit`, and the sweep. The
-whole-module load check uses the cheap `:fast` triage, so it needs no AllocCheck/JET backend and
-stays affordable on every load.
+A hot definition that boxes or allocates stops the module from loading (in `:error` mode), while
+the cold `plan` is skipped everywhere: by the load check, by `check_all`, by `audit`, and by the
+sweep. The load check itself uses the cheap `:fast` triage, so it needs no AllocCheck or JET
+backend and stays affordable to run on every load.
 
-For a single function rather than a whole module, [`@strict_function`](@ref) registers and
-verifies one definition.
+If you'd rather mark a single function than a whole module, [`@strict_function`](@ref) registers
+and verifies one definition at a time.
 
 ### Auto-check at load
 
-When a strict-marked module loads **and** checks are enabled, StrictMode runs its checks
-automatically and reports per [`fail_mode`](@ref) (`:error` → the module won't load; `:warn` →
-logs). This is the "automatic when compiling" behavior. It is gated on `checks_enabled`, so a
-production build pays nothing, and the analyzers are pre-warmed by the PrecompileTools workload.
+When a strict-marked module loads and checks are enabled, StrictMode runs its checks on its own and
+reports according to [`fail_mode`](@ref): `:error` stops the module from loading, `:warn` just logs.
+This is the "checks happen as you compile" behavior. It's gated on `checks_enabled`, so a production
+build pays nothing, and the analyzers are already warmed by the PrecompileTools workload.
 
 ### Re-check on demand
 
@@ -69,8 +70,8 @@ registered_strict()           # the registry: (f, types) => (; guarantees)
 
 ## Usage-driven sweep — `check_compiled`
 
-The hybrid half: check whatever concrete method instances a module **actually compiled** (during
-your tests, a run, or precompilation) — no annotation needed.
+This is the hybrid option: check whatever concrete method instances a module actually compiled,
+whether that was during your tests, a run, or precompilation. No annotations needed.
 
 ```julia
 using MyPkg
@@ -78,14 +79,14 @@ using MyPkg
 check_compiled(MyPkg; guarantees = (:noalloc, :noboxing))
 ```
 
-Coverage is whatever executed, and it is best-effort (it walks compiler reflection defensively),
-but it needs zero marks.
+Coverage is only as good as what actually ran, and the walk through compiler reflection is
+best-effort and defensive. In return, it needs no marks at all.
 
 ## Live feedback with Revise — `watch`
 
-Loading [Revise](https://github.com/timholy/Revise.jl) alongside StrictMode enables a live loop:
-after each edit, the strict registry is re-checked and violations print to the REPL — the
-"compiler shouts as you code" experience.
+Load [Revise](https://github.com/timholy/Revise.jl) next to StrictMode and you get a live loop:
+after each edit, the strict registry is re-checked and any violations print straight to the REPL.
+It's the closest thing to a compiler looking over your shoulder as you type.
 
 ```julia
 using Revise, StrictMode, AllocCheck, JET   # Revise = live loop; AllocCheck+JET = the analysis backend
@@ -99,5 +100,6 @@ StrictMode.watch()             # start the loop
 StrictMode.unwatch()           # stop
 ```
 
-`watch` is the *human* feedback path. An AI agent wants a one-shot, structured result instead —
-that is [`audit`](@ref), covered in [Agentic feedback](agents.md).
+`watch` is the feedback path for a human at a REPL. An AI agent wants something different: a
+one-shot, structured result it can parse. That's [`audit`](@ref), and it has its own page in
+[Agentic feedback](agents.md).

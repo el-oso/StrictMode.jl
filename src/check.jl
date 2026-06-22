@@ -153,13 +153,13 @@ end
 """
     check(f, types; guarantees = (:typestable, :noalloc), fail = fail_mode()) -> Vector{StrictFinding}
 
-Check the guarantees for `f`'s concrete signature `types` and return the findings. A plain
-function call — it never parses syntax, so unlike the macros it cannot collide with broadcasting,
-nested macros, or keyword arguments. Use it as the robust escape hatch and as the programmatic
-entry point for automation.
+Check the guarantees for `f`'s concrete signature `types` and return the findings. It's an
+ordinary function call rather than a macro, so it never parses syntax and can't collide with
+broadcasting, nested macros, or keyword arguments. Use it as the robust escape hatch, and as the
+programmatic entry point when you're automating.
 
-`fail = :error` (the default outside `:warn` mode) throws a [`StrictViolation`](@ref) aggregating
-the failures; `:warn` logs them; `:none` returns the findings without raising.
+`fail = :error` (the default outside `:warn` mode) throws a [`StrictViolation`](@ref) that collects
+the failures together; `:warn` logs them; `:none` just returns the findings without raising.
 
 ```julia
 check(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))          # ok → all :pass

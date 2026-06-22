@@ -65,14 +65,14 @@ end
     @strict_function function f(x::T, ...) ... end
     @strict_function f(x::T, ...) = ...
 
-Define `f` and, when checks are enabled, **verify its contract at precompile time** against the
-declared argument types: the return type must be concrete and the body must not allocate
-(runtime dispatch / boxing count as allocations). If the contract is violated the enclosing
-module fails to load — the same "won't compile if it's wrong" guarantee Rust gives.
+Define `f` and, when checks are enabled, verify its contract at precompile time against the
+declared argument types. The return type must be concrete and the body must not allocate, with
+runtime dispatch and boxing counting as allocations. Break the contract and the enclosing module
+won't load. It's the same "won't compile if it's wrong" guarantee Rust gives you.
 
-Only *concrete* signatures are verified statically; signatures with abstract types or varargs
-emit a one-time warning and are left to call-site [`@strict`](@ref) checks. When checks are
-disabled this expands to the plain definition.
+Only concrete signatures are verified this way. Signatures with abstract types or varargs emit a
+one-time warning and fall back to call-site [`@strict`](@ref) checks. With checks disabled this is
+just the plain definition.
 
 ```julia
 @strict_function dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) =
@@ -97,15 +97,15 @@ end
     @strict_exempt f(x::T, ...) = ...
     @strict_exempt name
 
-Mark a function as **cold** — intentionally allocating / type-flexible setup or plan-time code
-that should be *exempt* from StrictMode's checks. This is the Rust-style opt-*out*: inside a
-`@strict module` every function is hot (checked) by default, and you wrap only the rare cold
-helper in `@strict_exempt` rather than annotating all the hot code.
+Mark a function as cold: setup or plan-time code that's meant to allocate or stay type-flexible,
+and should be exempt from StrictMode's checks. This is the Rust-style opt-out. Inside a
+`@strict module` every function is checked by default, and you wrap only the occasional cold helper
+in `@strict_exempt`, rather than annotating all the hot code.
 
 The definition form defines the function and records its name as exempt; the name form
-(`@strict_exempt foo` or `@strict_exempt :foo`) just records the name. Exempt functions are
-skipped by `check_all`, `audit`, the whole-module load check, and `check_compiled` sweeps. Never
-gated — the exemption always applies.
+(`@strict_exempt foo` or `@strict_exempt :foo`) just records the name. Exempt functions are skipped
+by `check_all`, `audit`, the whole-module load check, and `check_compiled` sweeps. It's never
+gated; the exemption always applies.
 """
 macro strict_exempt(arg)
     if Meta.isexpr(arg, (:function, :(=)))

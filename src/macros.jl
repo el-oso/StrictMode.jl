@@ -28,12 +28,12 @@ end
 """
     @strict f(args...)
 
-Assert *all* StrictMode per-call guarantees for `f(args...)`: type stability
-([`@assert_typestable`](@ref)) and allocation-freedom ([`@assert_noalloc`](@ref)). Type
-stability is checked first, since instability is the usual root cause of surprise allocations.
+Ask for all of StrictMode's per-call guarantees on `f(args...)` at once: type stability
+([`@assert_typestable`](@ref)) and allocation-freedom ([`@assert_noalloc`](@ref)). Type stability
+comes first, since instability is usually what's behind a surprise allocation.
 
-Arguments are evaluated once; the macro evaluates to the call's value. Disabled builds expand
-to the bare call.
+Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
+bare call.
 
 ```julia
 @strict dot(u, v)        # ok: stable + non-allocating

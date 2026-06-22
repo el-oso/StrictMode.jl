@@ -60,10 +60,10 @@ const ANALYSIS_MODE = Symbol(@load_preference("analysis", "full"))::Symbol
 """
     enable_checks!(; fail_mode = "error", analysis = "full")
 
-Turn StrictMode guarantee checks on for the active project, set the failure mode (`:error` or
-`:warn`) and the [`analysis_mode`](@ref) (`:full` or `:fast`). Writes a `LocalPreferences.toml`
-entry and **triggers recompilation**; restart the session (or re-`using`) for the change to
-take effect.
+Turn StrictMode's guarantee checks on for the active project, and set the failure mode (`:error`
+or `:warn`) and the [`analysis_mode`](@ref) (`:full` or `:fast`) while you're at it. This writes a
+`LocalPreferences.toml` entry and triggers recompilation, so restart the session (or re-`using`)
+before the change takes effect.
 """
 function enable_checks!(;
         fail_mode::Union{Symbol, AbstractString} = "error",
