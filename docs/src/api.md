@@ -22,6 +22,7 @@ to the bare call.
 @assert_effects
 @assert_trim_safe
 @strict
+@kernel
 ```
 
 ## Scheduling visibility
