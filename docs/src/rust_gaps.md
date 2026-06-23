@@ -35,9 +35,10 @@ StrictMode now works the same way:
 ## 3. Scheduling and vectorization (surfaced, not controlled)
 
 The gap that's left is instruction scheduling and vectorization, the layer that lives below your
-code. StrictMode can't match rustc's instruction scheduler, and that's a deliberate non-goal
-rather than a missing feature, so this section stays honest about the ceiling. What it can do is
-make that layer visible and reachable:
+code. StrictMode doesn't try to *control* instruction scheduling — that's a deliberate non-goal,
+not a missing feature. (How high that ceiling actually is turned out to be a pleasant surprise —
+see the honest summary below, where pure `SIMD.jl` beat a Rust library's hand-written assembly.)
+What it can do is make that layer visible and reachable:
 
 - `@assert_vectorized f(args...)` asks, best-effort, whether the loop actually emitted SIMD vector
   ops (`<N x …>` in the LLVM IR), and fails loudly if it didn't.
@@ -93,9 +94,26 @@ addll(x::Int64, y::Int64) = Base.llvmcall("%z = add i64 %0, %1\nret i64 %z", Int
 descend(addll, (Int64, Int64))  # …and see exactly what it compiled to
 ```
 
-The honest summary: Julia with StrictMode is now about as easy to optimize as Rust for everything
-except raw instruction scheduling, which stays rustc's domain and is reachable here only through
-hand-written IR.
+The honest summary: with StrictMode, idiomatic Julia is about as predictable to optimize as Rust —
+and the ceiling is higher than this page first assumed. A later QR-factorization port found that
+pure `SIMD.jl`, lowered by LLVM with **no** hand-written IR, matched and then **beat** a
+state-of-the-art Rust library's hand-written **assembly** gemm (73 vs 70 GFLOP/s, single-thread)
+once the kernel's memory orchestration matched. So raw instruction scheduling is not reliably
+rustc's private domain: LLVM-from-idiomatic-`SIMD.jl` reached the same ceiling, and the residual
+gap was **algorithmic** — how the surrounding code blocks and streams memory — which is human
+roofline reasoning, not a language or codegen limit. The `Base.llvmcall` escape hatch stays
+available and verifiable, but in that case it proved unnecessary (an inline-asm version was *slower*
+than the SIMD.jl one).
+
+!!! note "Scope of that claim"
+    This is parity of *ceiling* on a specific kernel and machine — evidence that the
+    language/codegen is not the bottleneck — **not** a claim that Julia is faster than Rust in
+    general. The defensible statement is: where the Rust library was ahead, the cause was an
+    algorithmic orchestration choice (portable to either language), not Rust, LLVM, or the
+    algorithm; pure Julia reproduced it and pulled ahead. Most kernels matched the reference
+    *bit-for-bit*; one SIMD reduction (`inner_prod`) did not, because reduction order is
+    LLVM-codegen-defined — see [the promise scope](guarantees.md) on why bit-reproducibility is
+    not a StrictMode guarantee.
 
 ### Necessary, but not sufficient: `kernel_report`
 
@@ -132,7 +150,11 @@ GFLOP/s). The difference was an orchestration choice: one version read the large
 the other packed it first to improve cache reuse. `@assert_vectorized` and `kernel_report` reported
 identical results for both. The guarantees confirmed that each kernel was healthy at the LLVM-IR
 level, but the performance gap lived above the per-kernel view, in how the surrounding code accessed
-memory.
+memory. (That faster, read-in-place version is the one that went on to beat the reference Rust
+library's hand-written assembly — see the honest summary above. The point here is that StrictMode's
+guarantees correctly certified *both* kernels as healthy and, rightly, stayed silent about the
+orchestration choice that actually decided the race: that decision is the human's, and it sits above
+what per-kernel IR inspection can see.)
 
 The division of labor is worth stating plainly. The asserts defend the **floor**: the necessary
 properties (vectorized, allocation-free, type-stable) whose loss costs you 2–100× silently. Staying
