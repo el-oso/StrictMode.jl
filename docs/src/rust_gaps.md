@@ -125,6 +125,15 @@ It's heuristic and advisory, not a profiler or a roofline, but it surfaces the k
 (memory- versus compute-bound) that the pass/fail guarantees structurally can't. Think of it as the
 diagnostic layer sitting just beneath the guarantees.
 
+The ceiling also shows up in algorithmic choices that sit above the per-kernel view. In a QR
+factorization port, two versions of the same panel-gemm accumulation kernel were fully green on
+every guarantee — vectorized, allocation-free, type-stable — yet differed by ~25% (58 vs 73
+GFLOP/s). The difference was an orchestration choice: one version read the large operand in place;
+the other packed it first to improve cache reuse. `@assert_vectorized` and `kernel_report` reported
+identical results for both. The guarantees confirmed that each kernel was healthy at the LLVM-IR
+level, but the performance gap lived above the per-kernel view, in how the surrounding code accessed
+memory.
+
 The division of labor is worth stating plainly. The asserts defend the **floor**: the necessary
 properties (vectorized, allocation-free, type-stable) whose loss costs you 2–100× silently. Staying
 above that floor is necessary but not sufficient for peak performance — the **sufficiency** layer,
