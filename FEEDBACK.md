@@ -17,6 +17,32 @@ unified API is a genuine improvement over the three separate ad-hoc tools. `@ass
 distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check_compiled`, and
 `audit(...; format=:json)` all work.
 
+## Resolution status (all addressed on master)
+
+Every finding below has landed in StrictMode `master`. Status added 2026-06-23.
+
+| # | Finding | Status | Where |
+|---|---------|--------|-------|
+| F1 | `enable_checks!` needs a restart | ✅ messaging + docs | clearer `enable_checks!` warning; `[preferences.StrictMode]` pattern documented (inherent to the compile-time gate) |
+| F2 | `@assert_typestable` mislabeled a name error | ✅ fixed | rethrows `UndefVarError` |
+| F3 | `audit` return type varied by kwargs | ✅ fixed | always returns `Vector{StrictFinding}`; `nfailures` exported |
+| F4 | `format_findings` had no no-IO method | ✅ fixed | String-returning method added |
+| F5 | whole-module audit too broad | ✅ fixed | `audit` defaults to declared scope; `sweep=true` + `only`/`exempt` to opt in |
+| F6 | `only`/`exempt` missed kwsorter names | ✅ fixed + test | `_demangle` strips `#foo#NN` (commit `48ef9db`) |
+| F7 | `:fast` didn't speed `noalloc` | ✅ fixed | mode-aware engine; `:fast` uses the value-free `_alloc_signals` heuristic, no backend (commit `75210a8`) |
+| F8 | throw-path `noalloc` false positives | ✅ fixed | `ignore_throw=true` default + `set_ignore_throw!` (commit `6e1996b`) |
+| F9 | `:fast` flagged runtime-zero-alloc SIMD | ✅ fixed | boxing signal restricted to dynamic `:call`; verified vs PureFFT (commit `99147bb`) |
+| E1 | `ANALYSIS_MODE` baked → silent wrong mode | ✅ fixed | `analysis_mode()` reads the live pref + warns; runtime `mode=` override (commit `9ab4207`) |
+| E2 | `only`/`exempt` don't scale | ✅ fixed | regex/predicate `only`/`exempt` + `check_signatures` (commit `9ab4207`) |
+| E3 | `@assert_noalloc` + non-const global | ✅ fixed | failure message now hints at the global-binding allocation (commit `9ab4207`) |
+| E4 | test-suite adoption guide | ✅ added | README "Checking a library without depending on StrictMode" (commit `9ab4207`) |
+| F10 | guarantees necessary-but-not-sufficient | ✅ new lever | `kernel_report(f, types)` arithmetic-intensity diagnostic (commit `b53cdd8`) |
+| F11 | `@assert_vectorized` blind to non-inlined callees | ✅ fixed | failure names the `:invoke` callees; docstring documents leaf-targeting (commit `b53cdd8`) |
+| F12 | `audit(sweep=true)` found 0 methods | ✅ fixed | 0-method warning + `:vectorized` made a real guarantee (commit `b53cdd8`) |
+
+(Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
+via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
+
 ## Findings
 
 ### F1 — `enable_checks!` / `disable_checks!` need a Julia restart (load-time Preference)
@@ -194,3 +220,127 @@ must `using AllocCheck, JET` to load the backend extension (not just have them a
 CI runs the checks; `checks_enabled` needs the right value at *precompile*; per-call `@assert_*` vs the
 whole-package `audit`/sweep have different cost/scope trade-offs. A 20-line README section ("checking a
 library you don't want to depend on StrictMode from") capturing this would make first adoption much easier.
+
+---
+
+# Round 5 — BlazingPorts.jl: faithful faer Cholesky port (the microkernel/tiling ceiling)
+
+Second dogfooding project (`BlazingPorts.jl`): reimplement fast Rust crates in Julia, gated by StrictMode.
+The campaign's Tiers 1–4 mostly confirmed Julia already wins; the one real gap is **faer** (dense
+Cholesky/QR at n≥256 beat OpenBLAS/MKL single-threaded). We're now hand-porting faer's Cholesky and
+pushing it to parity — which has produced the sharpest StrictMode finding so far.
+
+## F10 — guarantees are NECESSARY-BUT-NOT-SUFFICIENT for performance *(the headline; needs a new lever)*
+
+We have **three** trailing-update (`syrk`) kernels for the blocked Cholesky, all in pure Julia:
+naive `Vec{W}`, hand-tiled register-blocked `Vec{W}` (NC=4 cols × W rows), and a LoopVectorization
+`@turbo` version. **All three pass `@assert_vectorized` + `@assert_noalloc` + `@assert_typestable`
+identically.** Yet their single-threaded performance vs faer at n=256 spans:
+
+| kernel (all pass every StrictMode guarantee) | n=256 vs faer |
+|----------------------------------------------|---------------|
+| naive `Vec{W}`            | 0.24× |
+| hand-tiled register-block | 0.43× |
+| `@turbo` (auto tiling)    | 0.47× |
+| faer (target)             | 1.00× |
+
+A **2× spread** (and vs the base kernel, which *beats* faer, a ~6× spread) — completely invisible to
+StrictMode. `@assert_vectorized` confirms `<W x double>` is emitted, but says nothing about **register
+blocking, cache blocking, FLOP:byte ratio, or load/FMA balance** — exactly the things that separate a
+toy SIMD loop from a microkernel. So a kernel can be "green" on every StrictMode guarantee and still be
+4× off the hardware.
+
+**This is the instruction-scheduling/microkernel ceiling from `docs/src/rust_gaps.md`, now quantified
+with a concrete reproducer.** It argues for a **new class of lever** beyond correctness-style
+guarantees — a *performance-quality diagnostic*, e.g. one or more of:
+- `@assert_register_blocked` / a report of the FLOP:load(byte) ratio of the hot loop (memory- vs
+  compute-bound) — the naive kernel has ratio ≈0.8 (memory-bound), the tiled ≈1.3; StrictMode could
+  surface this from the LLVM/loop structure.
+- a **vector-register-pressure / spill** check (are accumulators living in registers across the
+  reduction, or spilling?) — the difference between our tiled and naive is exactly accumulator reuse.
+- a **cache-blocking presence** heuristic (does the loop nest tile the reduction dimension, or stream
+  the whole trailing matrix?) — this is why `@turbo` beats hand-tiled at n=512.
+
+Even a *non-failing diagnostic* (`@explain`-style: "vectorized ✓, but FLOP:byte 0.8 → memory-bound; no
+register blocking detected") would be hugely valuable — it would have pointed us straight at the lever
+instead of us discovering it by benchmarking. This is the single most useful thing StrictMode could
+add for numerical-kernel work.
+
+## F11 — `@assert_vectorized` doesn't see SIMD in non-inlined callees *(usability)*
+
+Our public `cholesky_llt!(A)` is a thin wrapper that dispatches to the recursive driver, which calls
+three pointer kernels (`_chol_base!`, `_trsm_right_lower!`, `_syrk_lower!`) where the SIMD actually
+lives. `@assert_vectorized cholesky_llt!(A)` **fails** — the wrapper's own LLVM has no `<W x double>`
+(the vector ops are in the callees, not inlined into it). We had to point `@assert_vectorized` at each
+leaf kernel instead. Reasonable, but surprising. Suggestions: (a) document that `@assert_vectorized`
+targets the *leaf* compiled body, not a dispatcher; or (b) optionally follow `:invoke`/inlined callees
+and report "vectorization found in callee `_syrk_lower!`"; or (c) a clearer failure message ("no vector
+ops in this method body; the SIMD may be in non-inlined callees X, Y — assert on those").
+
+## F12 — `audit(mod; sweep=true)` finds 0 methods for `AbstractMatrix`-signature kernels *(discovery)*
+
+`audit(BlazingPorts.Factorizations; sweep=true, guarantees=(:typestable,:noalloc,:vectorized))` reports
+**0 (method,guarantee) checks** even though `cholesky_llt!(::AbstractMatrix{Float64})` was compiled
+(warmed) in-process. The usage-driven sweep didn't pick up the specialization (likely the
+`AbstractMatrix` signature / how the specialization is keyed). The per-call `@assert_*` path worked
+fine, so this is a sweep-discovery gap, not an analysis gap — but it means the whole-package audit
+silently under-reports coverage for generically-typed kernels. A warning ("0 methods matched in `mod` —
+no compiled specializations found; did you warm them?") would at least flag the blind spot.
+
+## What worked well (keep) ✓
+- **Bit-exact-friendly**: per-call `@assert_*` and the audit never interfere with numerics; we verified
+  the kernel bit-exact vs faer golden *and* StrictMode-clean in the same test suite.
+- **Generic-ISA confirmation**: `@assert_vectorized` passing + `@code_llvm` showing `<8 x double>`
+  (AVX-512) / `<4 x double>` (AVX2) from one source is a great, real guarantee — it caught nothing
+  wrong here, which is the point.
+- `@assert_noalloc` correctly held across the pointer/`GC.@preserve` kernels (0 bytes) — solid.
+- The `:fast` vs `:full` split + JSON `audit` remain well-suited to the test-suite + agent workflow.
+
+---
+
+# Round 6 — `kernel_report` in the loop (validation + two refinements)
+
+After F10 shipped as `kernel_report`, we used it to actually drive the Cholesky parity push. Findings:
+
+## ✅ F10 validated — `kernel_report` *steers* optimization, not just diagnoses
+Across four successive syrk kernels, its arithmetic-intensity number moved **in lockstep with measured
+speed vs faer**, and each "more blocking helps" hint pointed at a real next lever:
+
+| syrk kernel | `kernel_report` intensity | measured (n=256 vs faer) |
+|-------------|---------------------------|--------------------------|
+| naive 1-col            | 0.82 | 0.24× |
+| reg-blocked MR=1×NC=4   | 1.61 | 0.71× |
+| MR=2×NC=4 (8 acc)       | 1.89 | 0.80× |
+| MR=3×NC=4 (12 acc)      | 1.99 | 0.83× |
+
+This is exactly the lever the campaign was missing — `@assert_vectorized` was green on all four. Keep it;
+it's the most useful numerical-kernel feature StrictMode has.
+
+## F13 — intensity is blind to **alignment / tile regularity** (a green-looking change can regress)
+We tried a "triangular for free" syrk (start each column block's row sweep at the diagonal `i=j` to skip
+the upper blocks — **fewer flops**). By flop count and likely by `kernel_report` it should look ≥ the
+full version, but it **regressed n=256 0.83→0.74×**: starting at `i=j` makes the vector loads unaligned
+and the row tiles irregular/variable-length, and that overhead beat the flop saving. So intensity
+(FP:mem-vector-ops) doesn't capture **memory-access alignment** or **loop-trip regularity** — both
+first-order for microkernels. A complementary signal would help: e.g. flag unaligned `vload`/`vstore`
+(or `vload`-without-alignment-assumption) and highly variable inner-loop trip counts. Lesson for users:
+fewer flops ≠ faster; the metric needs an alignment/regularity companion.
+
+## F14 — read intensity with **cache-residency** context
+Our base kernel reports intensity **0.77** (looks memory-bound) yet **beats faer at n≤64** — because the
+whole working set is L1-resident, so low intensity is fine there. Intensity only predicts speed once the
+working set spills cache. `kernel_report` could either (a) note "low intensity is acceptable if the
+working set fits L1/L2" in its memory-bound message, or (b) take an optional problem-size/working-set
+hint and estimate residency. Otherwise the "memory-bound → add blocking" advice misfires on small,
+cache-resident kernels (where it's already optimal).
+
+## F15 — intensity can't weigh the register-tile ↔ cache-locality trade-off
+Final n=512 push: an i-outer **cache-blocked** syrk (keeps `L10[panel]` L1-resident) *should* cut L2
+traffic, but to restructure i-outer I had to shrink the register tile MR=3→MR=2 (12→8 accumulators).
+`kernel_report` correctly shows MR=2 (1.89) < MR=3 (1.99) — and indeed the cache-blocked MR=2 **regressed**
+(n=256 1.04→0.99×, n=512 0.70→0.65×): the lost register intensity beat the cache-locality gain (which,
+without **packing** of `L10`, never fully materialized). So the intensity number guided the *register*
+dimension perfectly but can't tell you whether trading it for locality is net-positive — that needs a
+memory-traffic / cache-miss estimate alongside intensity. Net: reaching faer at n=512 needs BLIS-style
+packing + 3-level blocking, which is beyond what per-kernel LLVM-IR inspection can guide. (Through n=256,
+the intensity lever + register tiling + aligned-triangular got pure Julia to **beat faer**.)
