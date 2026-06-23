@@ -17,9 +17,7 @@ unified API is a genuine improvement over the three separate ad-hoc tools. `@ass
 distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check_compiled`, and
 `audit(...; format=:json)` all work.
 
-## Resolution status (all addressed on master)
-
-Every finding below has landed in StrictMode `master`. Status added 2026-06-23.
+## Resolution status
 
 | # | Finding | Status | Where |
 |---|---------|--------|-------|
@@ -39,6 +37,14 @@ Every finding below has landed in StrictMode `master`. Status added 2026-06-23.
 | F10 | guarantees necessary-but-not-sufficient | ✅ new lever | `kernel_report(f, types)` arithmetic-intensity diagnostic (commit `b53cdd8`) |
 | F11 | `@assert_vectorized` blind to non-inlined callees | ✅ fixed | failure names the `:invoke` callees; docstring documents leaf-targeting (commit `b53cdd8`) |
 | F12 | `audit(sweep=true)` found 0 methods | ✅ fixed | 0-method warning + `:vectorized` made a real guarantee (commit `b53cdd8`) |
+| F13 | `kernel_report` intensity blind to alignment/tile regularity | 🔲 open | no implementation yet; see Round 6 notes |
+| F14 | intensity needs cache-residency context (low intensity fine for L1-resident) | 🔲 open | no implementation yet; see Round 6 notes |
+| F15 | intensity can't weigh register-tile ↔ cache-locality trade-off | 🔲 open | no implementation yet; needs packing-aware memory-traffic model |
+| F16 | `@assert_noalloc` reflex missing on `@generated`/SIMD kernels | ✅ `@kernel` macro + docs | bundled macro + QuickStart note (commit `5cd972d`) |
+| F17 | guarantees necessary-but-not-sufficient above per-kernel view (QR example) | ✅ docs | `rust_gaps.md` "Necessary, but not sufficient" extended with QR orchestration case (commit `5cd972d`) |
+| F18 | bit-exactness not enforceable (SIMD reduction order LLVM-defined) | ✅ docs | "Promise scope" section in `guarantees.md` (commit `5cd972d`) |
+| F19 | golden-harness methodology not documented | ✅ docs | cookbook.md "Numeric kernel workflow → Port against a golden reference" (commit `5cd972d`; `@golden` macro deferred) |
+| F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs | cookbook.md "Numeric kernel workflow → Annotate every hot loop" (commit `5cd972d`; auto scalar-loop scan deferred) |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)

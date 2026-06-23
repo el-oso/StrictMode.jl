@@ -95,7 +95,12 @@ end
 For a size known only from a type, lift it with `staticval(n)` and splice the literal into
 `@unroll` from a `@generated` method.
 
-## Audit coverage: only what you annotate
+## Numeric kernel workflow
+
+Practical guidance for SIMD/`@generated` kernel development: audit reflexes, coverage, and
+correctness verification against a reference.
+
+### Annotate every hot loop — not just the obvious ones
 
 StrictMode audits the kernels you point it at — it does not scan for hot loops automatically.
 A scalar floating-point hot loop in the "glue" between two audited kernels will not trigger any
@@ -108,14 +113,13 @@ never pointed at the auditor, so it was invisible until a wall-clock profiler fo
 simple once seen: it had the same shape as an already-vectorized kernel and could reuse it — but
 `@assert_vectorized` only tells you what you ask about.
 
-**Practice:** annotate every numeric hot loop, not just the obvious entry points. Use `@strict` or
-`@kernel` during development as you write each loop, not only as a post-hoc check. When something
-is slow and all the audited kernels pass, look at the unaudited glue.
+Use `@strict` or `@kernel` as you write each numeric loop, not only as a post-hoc check. When
+something is slow and all audited kernels pass, look at the unaudited glue.
 
 !!! note
     An automatic whole-function scalar-loop IR scan is a planned future feature, not yet available.
 
-## Golden-harness methodology (recommended practice)
+### Port against a golden reference
 
 When porting a numeric kernel from a reference implementation (Rust, C, Fortran), a layer-by-layer
 bit-exact comparison is the most reliable way to verify correctness and catch subtle semantic
@@ -141,10 +145,10 @@ differences.
    that shifts a value beyond tolerance is a real signal worth investigating.
 
 ```julia
-# example: bit-exact check for a deterministic kernel
-@test my_norm(x) === ref_norm   # exact, since it's a non-reduction kernel
+# bit-exact check for a deterministic kernel
+@test my_norm(x) === ref_norm
 
-# example: tolerance for a SIMD reduction
+# tolerance for a SIMD reduction
 @test abs(my_dot(a, b) - ref_dot) ≤ eps(ref_dot)
 ```
 
