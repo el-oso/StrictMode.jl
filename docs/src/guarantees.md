@@ -1,5 +1,12 @@
 # Guarantees
 
+A quick way to hold these in your head: they're guardrails. Each one pins a *necessary* property of
+a hot kernel — vectorized, allocation-free, type-stable — and fails loudly the moment an edit breaks
+it. Once an assert is in place it fences every future edit, so you can refactor freely and trust
+you'll be told the instant you cross the line. They keep you on the fast path; they don't promise
+you've found the *fastest* path. (For where that boundary lies, and the diagnostics that start to
+address it, see [Closing the gaps with Rust](rust_gaps.md).)
+
 Every example here is live. The docs are built with checks enabled, so the analysis runs as the
 page is generated. Calls that pass are shown as real `@example` blocks; calls that are meant to
 fail are shown as annotated code, so the build itself stays green.

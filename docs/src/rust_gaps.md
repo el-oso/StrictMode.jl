@@ -125,6 +125,14 @@ It's heuristic and advisory, not a profiler or a roofline, but it surfaces the k
 (memory- versus compute-bound) that the pass/fail guarantees structurally can't. Think of it as the
 diagnostic layer sitting just beneath the guarantees.
 
+The division of labor is worth stating plainly. The asserts defend the **floor**: the necessary
+properties (vectorized, allocation-free, type-stable) whose loss costs you 2–100× silently. Staying
+above that floor is necessary but not sufficient for peak performance — the **sufficiency** layer,
+cache and register blocking and microkernel scheduling, still takes human roofline reasoning.
+`kernel_report` is the first locality/intensity diagnostic aimed at that layer, and it's meant to
+*complement* the guardrails, not replace them: keep asserting the invariants, and reach for the
+diagnostic when something is green but still slow.
+
 ## Bonus: trim-safety (the static-binary story)
 
 Rust's other predictability win is ahead-of-time compilation to a small static binary. Julia's

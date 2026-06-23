@@ -84,6 +84,36 @@ component(state, i) = state[i]        # state::Tuple{Int,Float64,String}, i is a
 #   reason:  return type is not concretely inferrable: ... Union{Int64,Float64,String}
 ```
 
+## What it guarantees, and what it doesn't
+
+Think of StrictMode as **guardrails**, not a performance oracle. The asserts defend the *necessary*
+properties of a hot kernel, the floor below which you're definitely leaving time on the table:
+
+- `@assert_vectorized` — the loop still emits `<W x double>`
+- `@assert_noalloc` — no heap traffic on the hot path
+- `@assert_typestable` — concrete types, no boxing
+
+These are the failures that cost 2–100× silently and that you'd otherwise catch commits later in a
+noisy benchmark: a tuple indexed by a runtime variable that starts boxing, a type instability that
+creeps in, a refactor that quietly breaks SIMD codegen. StrictMode turns each one into a loud
+failure at the moment you introduce it. Three things follow:
+
+1. **Silent becomes loud.** A regression throws where it's written, not in production.
+2. **The invariant gets pinned.** Once an assert is in place it fences every future edit, so you
+   can experiment aggressively — tile, block, rewrite the kernel — and hear about it the instant you
+   cross the line.
+3. **Intent lands on the page.** An assert says "this is a load-bearing hot kernel, and these
+   properties must hold," for whoever reads it next.
+
+What it does **not** do is promise you're fast. These properties are necessary, not sufficient.
+Dogfooding a pure-Julia Cholesky against [faer](https://github.com/sarah-quinones/faer-rs) made the
+boundary concrete: naive, hand-tiled, and `@turbo` versions of the same trailing-update kernel *all*
+passed the same asserts, yet spanned roughly **0.24×–0.47×** of faer, because no per-call assert can
+see cache and register blocking, leading-dimension conflicts, or microkernel scheduling. That
+sufficiency layer still needs human roofline reasoning. [`kernel_report`](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps)
+is the first diagnostic aimed at it — it reads arithmetic intensity from the IR, so a green-but-slow
+kernel shows up as memory-bound — and it's meant to *complement* the guardrails, not replace them.
+
 ## The "won't load if it's wrong" guarantee
 
 `@strict_function` checks a definition against its declared argument types at precompile time. If
