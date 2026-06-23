@@ -344,3 +344,51 @@ dimension perfectly but can't tell you whether trading it for locality is net-po
 memory-traffic / cache-miss estimate alongside intensity. Net: reaching faer at n=512 needs BLIS-style
 packing + 3-level blocking, which is beyond what per-kernel LLVM-IR inspection can guide. (Through n=256,
 the intensity lever + register tiling + aligned-triangular got pure Julia to **beat faer**.)
+
+---
+
+# QR campaign feedback (2026-06-23) — pure Julia now beats faer at QR for all n (512–2048)
+
+Context: mechanical, golden-verified port of faer 0.24.1 QR, then optimized to beat it at every size.
+Hard-confirms StrictMode's thesis and surfaced five new items.
+
+## F16 — `@assert_noalloc` is the highest-value guarantee; push it onto EVERY `@generated`/SIMD kernel
+A `@generated` microkernel with `ntuple`-of-`ntuple` accumulators ran at **0.1 GFLOP/s** — it heap-allocated
+(boxed the nested tuples) each iteration despite looking like clean SIMD. Same class as PureFFT's 135×
+tuple-index bug. Exactly what StrictMode exists to catch, and `@assert_noalloc` would have flagged it
+instantly — but I found it by benchmark because the kernel wasn't under audit during exploration.
+Suggestion: make "run `@assert_noalloc` first" reflexive (QuickStart emphasis, or a `@kernel` macro bundling
+noalloc+vectorized+typestable so a dev can't forget). The detector earns its keep; people just run it late.
+
+## F17 — strongest evidence yet for "the language is not the gap" — and a precise statement of its limit
+Pure SIMD.jl (LLVM, **no inline asm**) matched faer bit-for-bit on the deterministic kernels (`norm_l2`
+135/135, `make_householder` 90/90, gemm accumulation 57/57), hit the same in-L1 microkernel peak, and once
+the orchestration matched **beat faer's hand-written x86 assembly gemm (73 vs 70 GFLOP/s)**. So Julia ==
+Rust at the kernel/IR ceiling — premise holds. **Limit:** the 58→73 jump was an *algorithmic orchestration*
+choice (read the large operand in place vs packing it); `@assert_vectorized` and `kernel_report` intensity
+were **green/identical on both the slow (58) and fast (73) versions**. The guarantees are necessary-not-
+sufficient — a fully-green kernel can still be 25% off for reasons above the per-kernel view (the QR analogue
+of F12–F15's roofline gap).
+
+## F18 — bit-exactness is NOT enforceable (reduction order is codegen-dependent) — don't promise it
+The dot (`inner_prod`) uses a 4-way SIMD reduction whose lane-combine order **LLVM chooses**; I could not
+bit-reproduce faer's last ULP (brute-forced 34/54 accumulation models). Everything deterministic matched
+(norm, reflector, gemm-order), the SIMD reduction did not. Keep promising **alloc / vectorization /
+type-stability**, explicitly **not** bit-reproducibility — and say so in docs, so a 1-ULP cross-codegen
+difference isn't read as a StrictMode failure.
+
+## F19 — recommend a bit-exact golden-harness *methodology* (with a ~1-ULP escape per F18)
+The layer-by-layer "bit-exact vs the reference's own output" port is what made the conversion trustworthy:
+it caught three deviations a human reading the source would miss (`abs2_add` is FMA not mul+add; faer's norm
+kernel is single-accumulator not the 2-way its source reads as; faer's `hypot` is its own overflow-safe
+`abs_impl`, not libm). Worth a StrictMode-adjacent helper/pattern (`@golden`-style gated regression) — exact
+for deterministic ops, ~1-ULP tolerance for SIMD reductions (F18).
+
+## F20 — a scalar hot-loop *between* the audited kernels escaped the audit and dominated
+The real small-n lever was not any audited kernel: it was `Y = TᵀW` (the compact-WY `T` apply), a **scalar
+triangular triple-loop** between the gemms — ~12% of QR-1024 (more via cache), while the panel reduction
+everyone suspected was only 3–5%. `@assert_vectorized` was green on the *named* kernels; this plain scalar
+loop was never pointed at the auditor, so it hid. Suggestion: an audit mode that scans a whole
+function/factorization for scalar FP hot loops in a numeric path (not just dev-annotated kernels), or at
+least a doc warning that StrictMode guards only what you point it at — the unaudited glue is where time
+leaks. (Fix: it had the same shape as `W=VᵀC`, so it reused that kernel — which flipped all sizes to a beat.)
