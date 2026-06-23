@@ -46,3 +46,59 @@ macro strict(ex)
     Meta.isexpr(ex, :module) && return _strict_module(ex)
     return _strict_expr(ex)
 end
+
+# Build the gated expression for `@kernel f(args...)`: type-stable + non-allocating + vectorized.
+function _kernel_expr(call)
+    target = string(call)
+    fexpr, argexprs = _callinfo(call)
+    syms, binds = _bind_args(argexprs)
+    fe = esc(fexpr)
+    litcall = Expr(:call, fe, syms...)
+    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
+
+    static = ANALYSIS_MODE === :full
+    checked = quote
+        $(binds...)
+        # (1) type stability
+        $(_typestable_check_expr(target, fe, litcall, types))
+        # (2) allocation-freedom (returns the call's value)
+        local _kval = $(_assert_noalloc)($target, $fe, $types, $thunk; static = $static)
+        # (3) vectorization
+        $(_assert_vectorized)($target, $fe, $types)
+        _kval
+    end
+    return _gate(checked, esc(call))
+end
+
+"""
+    @kernel f(args...)
+
+Apply all three SIMD-kernel guarantees to `f(args...)` at once: type stability
+([`@assert_typestable`](@ref)), allocation-freedom ([`@assert_noalloc`](@ref)), and
+vectorization ([`@assert_vectorized`](@ref)).
+
+Use this on every `@generated`/SIMD kernel during development — it catches the single most
+common footgun early: a tuple-of-`Vec` accumulator reassigned in a loop boxes and runs ~100×
+slower despite looking like clean SIMD (also a 135× FFT regression in the wild). `@assert_noalloc`
+is the signal that exposes it; `@kernel` makes that check reflexive so it is not forgotten during
+early exploration.
+
+Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
+bare call.
+
+```julia
+@kernel vscale!(dst, src)       # vectorized + allocation-free + type-stable, or it throws
+x = @kernel dot_kernel(a, b)   # use the result while still guaranteeing the fast path
+```
+
+!!! note
+    [`@assert_vectorized`](@ref) inspects the *leaf compiled body*. A thin dispatcher whose SIMD
+    lives in non-inlined callees will fail it — point `@kernel` at the kernels where the vector
+    ops are, not at an entry-point wrapper.
+
+See also [`@strict`](@ref) for the subset without the vectorization check.
+"""
+macro kernel(ex)
+    return _kernel_expr(ex)
+end

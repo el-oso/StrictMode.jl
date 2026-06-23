@@ -15,6 +15,7 @@ compile away to nothing.
 | **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc` |
 | **A call that should inline but doesn't** (cost-model misfire, `@noinline`) | call overhead, lost cross-call optimization | `@assert_inlined` (best-effort) |
 | **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (combines the per-call guarantees) |
+| **A `@generated`/SIMD kernel that must vectorize and stay on the fast path** | silent ~100× regression from boxing, or vectorization silently disabled — easy to miss during exploration | `@kernel` (bundles `@assert_noalloc` + `@assert_vectorized` + `@assert_typestable`; makes the boxing check reflexive) |
 | **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (fails at precompile / load) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
 
@@ -93,3 +94,60 @@ end
 
 For a size known only from a type, lift it with `staticval(n)` and splice the literal into
 `@unroll` from a `@generated` method.
+
+## Audit coverage: only what you annotate
+
+StrictMode audits the kernels you point it at — it does not scan for hot loops automatically.
+A scalar floating-point hot loop in the "glue" between two audited kernels will not trigger any
+guarantee and can silently dominate runtime.
+
+In a QR factorization port, a scalar triangular triple-loop (`Y = TᵀW`) accounted for ~12% of
+total runtime (more via cache effects), while the suspected bottleneck — the panel reduction — was
+only 3–5%. The two surrounding gemm kernels were audited and green; the scalar loop between them was
+never pointed at the auditor, so it was invisible until a wall-clock profiler found it. The fix was
+simple once seen: it had the same shape as an already-vectorized kernel and could reuse it — but
+`@assert_vectorized` only tells you what you ask about.
+
+**Practice:** annotate every numeric hot loop, not just the obvious entry points. Use `@strict` or
+`@kernel` during development as you write each loop, not only as a post-hoc check. When something
+is slow and all the audited kernels pass, look at the unaudited glue.
+
+!!! note
+    An automatic whole-function scalar-loop IR scan is a planned future feature, not yet available.
+
+## Golden-harness methodology (recommended practice)
+
+When porting a numeric kernel from a reference implementation (Rust, C, Fortran), a layer-by-layer
+bit-exact comparison is the most reliable way to verify correctness and catch subtle semantic
+differences.
+
+1. **Port one layer at a time.** Implement a single kernel (e.g. a Householder reflector), run it
+   against the reference's *own output* for the same input, and assert bit-exact agreement before
+   moving on. Do not wait until the full algorithm is assembled — errors compound.
+
+2. **Bit-exact where possible.** Pure arithmetic (multiply-add chains, memory copies, index
+   arithmetic) can be matched exactly. Reference-output comparison caught three deviations in a QR
+   port that a source-reading pass would have missed: a norm kernel that was single-accumulator
+   rather than the 2-way its source appeared to be; an `abs2_add` implemented as FMA rather than
+   `mul + add`; and a `hypot` that used a custom overflow-safe path rather than `libm`.
+
+3. **Allow ~1 ULP for SIMD reductions.** The lane-combine order for vector reductions is
+   LLVM-codegen-defined (see [Promise scope](guarantees.md) in the Guarantees guide). Brute-forcing
+   accumulation models showed that the last ULP of a 4-way reduction cannot always be reproduced
+   cross-codegen. Use a tolerance of 1–2 ULP for reduction-shaped operations; require exact match
+   for everything else.
+
+4. **Keep the harness alive.** The bit-exact tests become a regression suite. A later optimization
+   that shifts a value beyond tolerance is a real signal worth investigating.
+
+```julia
+# example: bit-exact check for a deterministic kernel
+@test my_norm(x) === ref_norm   # exact, since it's a non-reduction kernel
+
+# example: tolerance for a SIMD reduction
+@test abs(my_dot(a, b) - ref_dot) ≤ eps(ref_dot)
+```
+
+!!! note
+    A `@golden`-style gated-regression macro (exact for deterministic ops, tolerance-aware for SIMD
+    reductions) is a planned future feature. For now, implement the pattern with standard `@test`.

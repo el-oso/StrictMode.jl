@@ -268,6 +268,23 @@ and splice the literal into `@unroll` from a `@generated` method:
 end
 ```
 
+## Promise scope
+
+StrictMode's guarantees cover **allocation-freedom**, **type-stability**, and **vectorization**
+(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)). One property is
+explicitly out of scope: **bit-reproducibility**.
+
+SIMD reduction order is LLVM-codegen-defined. The lane-combine order for a vector reduction —
+for example, how four `<4 x double>` lanes are collapsed to a scalar — is chosen by the compiler
+and may differ from a reference implementation, even when both produce IEEE-correct results. A
+~1-ULP difference between your kernel and a Rust or C reference is expected behavior and is *not*
+a StrictMode failure.
+
+If you are testing numerical correctness against a reference, use tolerance-aware comparisons for
+SIMD reductions. Exact matching remains valid for deterministic operations (non-reduction
+arithmetic, memory copies, index computations). See also [the golden-harness methodology](cookbook.md)
+in the cookbook for a practical port workflow.
+
 ## `@explain` — tell me *why*
 
 When an assert fails, you usually want to know why, not just that it did. [`@explain`](@ref)

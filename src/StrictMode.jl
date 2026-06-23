@@ -32,7 +32,7 @@ using InteractiveUtils: InteractiveUtils
 
 export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
 export @assert_vectorized, @assert_effects, @assert_trim_safe, descend, explain_trim, kernel_report
-export @strict, @strict_function, @strict_exempt
+export @strict, @kernel, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export StrictViolation, StrictReport, StrictFinding
