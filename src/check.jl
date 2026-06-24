@@ -60,7 +60,7 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
     elseif g === :vectorized
         return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
     elseif g === :no_scalar_loops
-        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar FP loop did not vectorize (best-effort: `phi double` + scalar ops, no `<N x …>`)", "", 0)
+        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
     end
@@ -130,7 +130,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
     for g in guarantees
         if g === :typestable
             rts = Base.return_types(f, Tuple{types...})
-            fail = length(rts) != 1 || !isconcretetype(only(rts))
+            fail = length(rts) != 1 || !_is_typestable_return(only(rts))
             push!(out, _mkfinding(md, fn, sg, g, fail, "return type is not concrete (inference)", "", 0))
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing
@@ -144,7 +144,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :vectorized
             push!(out, _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0))
         elseif g === :no_scalar_loops
-            push!(out, _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar FP loop did not vectorize (best-effort)", "", 0))
+            push!(out, _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort)", "", 0))
         elseif g === :trimsafe
             push!(out, _trimsafe_finding(f, types, md, fn, sg))
         else

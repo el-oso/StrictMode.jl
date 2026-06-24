@@ -51,7 +51,7 @@ function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_res
     catch err
         "(@code_warntype unavailable: $(sprint(showerror, err)))"
     end
-    return StrictReport(target, rt, isconcretetype(rt), opt_result, opt_reports, allocs, alloc_error, warntype)
+    return StrictReport(target, rt, _is_typestable_return(rt), opt_result, opt_reports, allocs, alloc_error, warntype)
 end
 
 _indent(io, text, prefix) = foreach(ln -> println(io, prefix, ln), eachline(IOBuffer(text)))

@@ -165,6 +165,9 @@ struct KernelReport
     masked_mem_ops::Int             # @llvm.masked.* ops → irregular/variable-length trips
     # F14/F15
     working_set_bytes::Union{Nothing,Int}   # user-supplied; enables cache-residency annotation
+    # F22
+    int_ops::Int        # vector integer arithmetic ops (add/sub/mul/and/or/xor/shl/icmp on <N x iN>)
+    int_mem_ops::Int    # vector integer loads + stores
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -177,8 +180,20 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
     return String(take!(io))
 end
 
-_kr_bound(r::KernelReport) =
-    !r.vectorized ? :scalar : (r.intensity ≥ 2.0 ? :compute : (r.intensity ≥ 0.75 ? :balanced : :memory))
+function _kr_bound(r::KernelReport)
+    !r.vectorized && return :scalar
+    # Use FP intensity if available; fall back to integer intensity for integer-only kernels
+    eff = if r.fp_ops > 0
+        r.intensity
+    elseif r.int_mem_ops > 0
+        r.int_ops / r.int_mem_ops
+    else
+        0.0
+    end
+    eff >= 2.0 && return :compute
+    eff >= 0.75 && return :balanced
+    return :memory
+end
 
 # Defaults; overwritten at load time by StrictModeCpuIdExt when `using CpuId` is in scope.
 # Override for non-standard hardware: StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
@@ -215,8 +230,8 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
                        working_set_bytes::Union{Nothing,Int} = nothing)
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes)
-    width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half)>", s)); init = 0)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0)
+    width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half|i\d+)>", s)); init = 0)
     vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
     fp = vop("fmul") + vop("fadd") + vop("fsub") + vop("fdiv") + fma
@@ -231,7 +246,14 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     end
     # F13 — masking signal: @llvm.masked.* → variable-length / remainder tiles
     masked = count(_ -> true, eachmatch(r"@llvm\.masked\.(load|store|gather|scatter)", s))
-    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes)
+    # F22 — integer vector ops: arithmetic on <N x iN>
+    ivop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x i\d+>"), s))
+    int_arith = ivop("add") + ivop("sub") + ivop("mul") + ivop("and") + ivop("or") +
+                ivop("xor") + ivop("shl") + ivop("lshr") + ivop("ashr")
+    int_icmp_count = count(_ -> true, eachmatch(r"icmp \w+ <\d+ x i\d+>", s))
+    int_ops_val = int_arith + int_icmp_count
+    int_mem_val = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x i\d+>", s))
+    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val)
 end
 
 # --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
@@ -248,6 +270,10 @@ const _SCALAR_FP_RE = r"(?:fadd|fmul|fsub|fdiv) double|(?:fadd|fmul|fsub|fdiv) f
 # loop-carried FP variable. More portable than `!llvm.loop` (which LLVM emits inconsistently
 # across Julia versions and opt levels).
 const _LOOP_RE = r"\bphi (?:double|float)\b"
+
+# F22 — scalar integer loop indicators
+const _SCALAR_INT_RE = r"\b(?:add|sub|mul|and|or|xor|shl|lshr|ashr) i(?:8|16|32|64)\b"
+const _LOOP_INT_RE   = r"\bphi i(?:8|16|32|64)\b"
 
 """
     scalar_fp_loops(f, types::Tuple) -> Bool
@@ -268,17 +294,16 @@ enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
 function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     s = _llvm_ir(f, types)
     isempty(s) && return false
-    # Quick negative: if the whole IR vectorized, no scalar FP loops by definition.
     _vectorized(f, types) && return false
-    # Positive: a loop back-edge AND at least one scalar FP op.
-    occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)
+    (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
+    (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
 end
 
 function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::Tuple))
     scalar_fp_loops(f, types) || return nothing
     _fail(
         :no_scalar_loops, target,
-        "scalar floating-point loop detected in a numeric path that did not vectorize. " *
+        "scalar hot loop (FP or integer) detected in a numeric path that did not vectorize. " *
         "Wrap the hot loop in a separate kernel and annotate it with `@assert_vectorized` / " *
         "`@kernel`, or add `@inbounds @simd` / SIMD.jl to the loop body."
     )
@@ -288,7 +313,7 @@ end
 """
     @assert_no_scalar_loops f(args...)
 
-Fail if `f(args...)` contains a **scalar floating-point loop** that did not vectorize
+Fail if `f(args...)` contains a **scalar hot loop (FP or integer)** that did not vectorize
 (**best-effort** IR scan). A scalar hot loop between two audited kernels can silently dominate
 runtime — this macro surfaces it.
 
@@ -332,6 +357,11 @@ function Base.show(io::IO, r::KernelReport)
         io, "  FP vector ops : memory vector ops = ", r.fp_ops, " : ", r.mem_ops,
         "  → arithmetic intensity ", round(r.intensity; digits = 2), "\n"
     )
+    if r.fp_ops == 0 && r.int_ops > 0
+        int_intensity = r.int_mem_ops > 0 ? r.int_ops / r.int_mem_ops : Inf
+        print(io, "  integer vector ops : integer memory ops = ", r.int_ops, " : ", r.int_mem_ops,
+              "  → integer intensity ", round(int_intensity; digits = 2), "\n")
+    end
     b = _kr_bound(r)
     if b === :memory
         printstyled(io, "  → memory-bound"; color = :yellow)

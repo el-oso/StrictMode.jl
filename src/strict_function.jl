@@ -43,7 +43,7 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
     register_strict!(f, types)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
-    if length(rts) != 1 || !isconcretetype(only(rts))
+    if length(rts) != 1 || !_is_typestable_return(only(rts))
         _fail(
             :strict_function, target,
             "return type is not concrete for ($(join(types, ", "))): inferred $(rts)"

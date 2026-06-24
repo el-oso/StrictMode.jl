@@ -3,12 +3,15 @@
 #   - internal optimization failures via JET (`:full` mode only), through the backend seam.
 # (Routing JET through the backend keeps it a weak dependency; `:fast` mode needs no backend.)
 
+# Union{T,Nothing} and other small isbits unions don't box; treat as type-stable (F21).
+_is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(T)
+
 # Cheap return-type check: the inferred return type must be a single concrete type.
 function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = Base.return_types(f, Tuple{types...})
-    if length(rts) != 1 || !isconcretetype(only(rts))
+    if length(rts) != 1 || !_is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
-        _fail(:typestable, target, "return type is not concrete (inference): $rt")
+        _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")
     end
     return nothing
 end

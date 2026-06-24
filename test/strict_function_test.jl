@@ -13,9 +13,9 @@ end
 
 @testitem "@strict_function rejects a type-unstable definition" begin
     using StrictMode
-    # Return type Union{Int,Float64} for a concrete Int signature.
+    # Return type Union{Int,String} is a heap-boxing union — not accepted (F21).
     @test_throws StrictViolation begin
-        @strict_function maybe(x::Int) = x > 0 ? x : 1.0
+        @strict_function maybe(x::Int) = x > 0 ? x : "nope"
     end
 end
 

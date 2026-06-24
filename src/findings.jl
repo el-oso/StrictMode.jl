@@ -26,11 +26,11 @@ end
 # Actionable fix hint per guarantee — the structured equivalent of what `@explain` tells a human.
 function _suggestion(guarantee::Symbol)
     guarantee === :noboxing && return "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter."
-    guarantee === :typestable && return "type instability: annotate the unstable variable, split the method, or push sizes/flags into the type domain (Val)."
+    guarantee === :typestable && return "type instability: annotate the unstable variable, split the method, or push sizes/flags into the type domain (Val). Note: small isbits unions (Union{T,Nothing}, Union{T,Missing}) are accepted — only heap-allocating unions fail."
     guarantee === :noalloc && return "allocation in a hot path: preallocate the buffer, use @views for slices, or @unroll to avoid boxing."
     guarantee === :inlined && return "not inlined: add @inline to the callee, or accept it (inlining is a heuristic)."
     guarantee === :vectorized && return "did not vectorize: try @inbounds @simd / @simd ivdep, or assert on the leaf kernel (SIMD may be in a non-inlined callee). Use kernel_report for arithmetic-intensity diagnostics."
-    guarantee === :no_scalar_loops && return "scalar floating-point loop in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels (F20)."
+    guarantee === :no_scalar_loops && return "scalar hot loop (FP or integer) in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels (F20/F22)."
     guarantee === :trimsafe && return "trim-unsafe call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/which/methods). juliac --trim=safe is authoritative."
     return ""
 end

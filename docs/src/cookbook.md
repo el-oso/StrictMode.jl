@@ -116,9 +116,8 @@ simple once seen: it had the same shape as an already-vectorized kernel and coul
 Use `@strict` or `@kernel` as you write each numeric loop, not only as a post-hoc check. When
 something is slow and all audited kernels pass, look at the unaudited glue.
 
-Use [`scalar_fp_loops`](@ref) / [`@assert_no_scalar_loops`](@ref) to scan a function's LLVM IR
-for scalar FP loops that escaped vectorization — a best-effort triage signal that surfaces the
-unaudited glue before a profiler has to find it.
+!!! note
+    An automatic whole-function scalar-loop IR scan is a planned future feature, not yet available.
 
 ### Port against a golden reference
 
@@ -153,5 +152,34 @@ differences.
 @test abs(my_dot(a, b) - ref_dot) ≤ eps(ref_dot)
 ```
 
-Use [`@golden`](@ref) to automate this pattern: it records the result on first run and compares
-on subsequent runs — exact by default, ULP-tolerant for SIMD reductions (pass `ulps=1` or `ulps=2`).
+!!! note
+    A `@golden`-style gated-regression macro (exact for deterministic ops, tolerance-aware for SIMD
+    reductions) is a planned future feature. For now, implement the pattern with standard `@test`.
+
+### Guarantee the kernel, smoke-test the entry
+
+Public functions often can't carry whole-method guarantees:
+
+- **Union-returning entries**: a function returning `Union{Int,Nothing}` — the canonical Julia
+  idiom for "index or not found" (`findfirst`, `iterate`, `tryparse`). Since F21, `@assert_typestable`
+  accepts small isbits unions, so this case is now handled directly.
+
+- **Base-delegating entries**: the public wrapper forwards edge cases to Base (e.g.
+  `length(needle) ≤ 1 && return findfirst(...)`), which may allocate or dispatch dynamically
+  across the full call graph. Whole-method `@assert_noalloc` can't be placed on such entries.
+
+The pattern for Base-delegating entries: assert on the **inner kernel** (concrete return,
+alloc-free), and empirically smoke-test the **public entry** with a runtime `@allocated` check:
+
+```julia
+# Inner pointer kernel: concrete return, fully assertable
+@kernel _find_substr(ph, lh, pn, ln)   # noalloc + vectorized + typestable
+
+# Public entry: delegates to Base for edge cases — empirical check only
+@test @allocated(find_substr(haystack, needle)) == 0   # runtime zero-alloc on the hot path
+@test find_substr(haystack, needle) == expected         # correctness
+```
+
+This mirrors the F11 principle: assert on the leaf where the guarantees actually hold; the thin
+dispatcher is smoke-tested empirically. The audit covers the performance-critical path; edge-case
+branches stay outside the guarantee boundary.
