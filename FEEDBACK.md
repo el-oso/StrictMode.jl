@@ -48,6 +48,8 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F21 | `Union{T,Nothing}` (found-or-nothing idiom) fails `@assert_typestable` | 🔴 open | `isconcretetype` (`check.jl:133`) rejects small isbits unions; Base `findfirst`/`iterate`/`tryparse` all return these — a false positive on idiomatic code |
 | F22 | perf diagnostics are FP-centric, blind to integer-SIMD kernels | 🔴 open | `scalar_fp_loops` catches only scalar *float* loops; `kernel_report` intensity counts only FP ops (≡0 for integer kernels). GP crates (memchr/itoa/hashbrown/fxhash) are integer |
 | F23 | whole-method guarantees can't target a delegating / union-returning entry | 🔴 open | recurs as "assert the inner pointer-kernel, `@allocated` the entry" (StringSearch, Factorizations) |
+| F24 | branch misprediction is invisible to every guarantee (perf trap) | 🔴 open | a data-dependent `if x<0` (50/50 signs) cost ~4× while `@assert_noalloc`/`@assert_typestable`/`@assert_vectorized` all stayed green — itoa port. Extends F10/F17 "necessary-not-sufficient" |
+| F25 | kernel *measurement* must defeat DCE on both sides | 🔴 open | the golden/benchmark workflow (F19) needs `Base.donotdelete`/`black_box` discipline — a `.len()`-only reference elided the work and inverted a verdict (itoa "8.7×" was a DCE artifact) |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -448,3 +450,34 @@ can't be placed on it — you assert the inner pointer-kernel and `@allocated` t
 F11 (assert on the leaf kernel) but is worth a documented idiom — "guarantee the kernel, smoke-test the
 entry" — or a path/entry-scoped annotation, so the recommended structure is explicit rather than folklore
 rediscovered per port.
+
+## F24 — branch misprediction is invisible to every guarantee (a perf trap, like F10/F17)
+Porting itoa (BlazingPorts `IntFormat.format_int!`): the kernel passed `@assert_noalloc`,
+`@assert_typestable`, and the integer-SIMD-aware `@assert_vectorized` — all green — yet ran ~4× slower
+than it should on realistic (mixed-sign) input. The cause was a single **data-dependent branch**: `if
+x < 0` to handle the sign, which at ~50/50 positive/negative mispredicts on essentially every call
+(adding negatives jumped 2.0 ns → 5.4 ns/int; full-range Int64 was paying ~2.3 ns of pure mispredict).
+The fix was branchless sign handling (`ifelse`/cmov: compute `|x|` unconditionally, always write `-`,
+let the first digit overwrite it for positives) — which flipped a 0.92× "loss" into a 1.5× **beat** of
+the itoa crate. No StrictMode guarantee models control flow, so a mispredicting hot branch is completely
+invisible — the same "necessary-but-not-sufficient" gap as F10 (tiling) and F17 (orchestration), now in
+a third dimension (branch prediction). Suggestion: a best-effort `kernel_report` signal that counts
+data-dependent branches inside a hot loop (from the IR, like the scalar-loop scan) and flags them as a
+mispredict risk; and a cookbook entry on branchless idioms (`ifelse`/cmov, table lookup, predication)
+for hot kernels. Can't be proven statically (mispredict depends on data distribution), but the *presence*
+of an unpredictable branch in a numeric/serialization hot path is exactly the kind of thing the auditor
+should surface.
+
+## F25 — kernel *measurement* must defeat dead-code elimination on both sides
+StrictMode's golden/numeric-kernel workflow (F19, cookbook) is about validating a port against a
+reference. The itoa port exposed a measurement hazard that silently inverted the verdict: the Rust
+reference shim timed `buf.format(x).len()`, and because only the *length* was observed, the optimizer
+**eliminated the digit-writes entirely** — it was timing `ndigits`, not formatting (the "itoa is 1.83 ns
+/ 8.7× faster" number was fake; real is ~7.5 ns). The symmetric trap exists on the Julia side: a
+formatter whose output buffer is never read can have its stores DCE'd. The fix is a sink on *both*
+sides — `Base.donotdelete(buf)` / `std::hint::black_box(result)` — so the work is actually performed.
+This belongs in the golden-harness methodology as a hard rule: **every measured kernel needs an
+explicit sink that consumes its output, or the timing is meaningless.** It also cost two false
+"plateau" calls before fair measurement showed parity-then-beat — a concrete argument for baking the
+sink discipline (and an `@golden`-adjacent timing helper that supplies it) into the documented workflow
+rather than leaving it to per-probe rediscovery.
