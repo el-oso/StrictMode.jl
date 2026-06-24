@@ -234,6 +234,90 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes)
 end
 
+# --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
+#
+# `@assert_vectorized` audits only kernels you point it at. A scalar floating-point loop in
+# the "glue" between audited kernels can silently dominate runtime. `scalar_fp_loops` scans
+# the optimized LLVM IR for the co-presence of a loop back-edge (`!llvm.loop` metadata or a
+# labeled branch) and scalar (non-vector) FP arithmetic on `double`/`float`.
+
+# Scalar FP op patterns in optimized IR (non-vector forms only).
+const _SCALAR_FP_RE = r"(?:fadd|fmul|fsub|fdiv) double|(?:fadd|fmul|fsub|fdiv) float|call double @llvm\.(?:fma|fmuladd)\.f64|call float @llvm\.(?:fma|fmuladd)\.f32"
+
+# Loop-carried FP accumulator: a `phi double`/`phi float` node indicates a loop with a
+# loop-carried FP variable. More portable than `!llvm.loop` (which LLVM emits inconsistently
+# across Julia versions and opt levels).
+const _LOOP_RE = r"\bphi (?:double|float)\b"
+
+"""
+    scalar_fp_loops(f, types::Tuple) -> Bool
+
+**Best-effort** detection: returns `true` if `f`'s optimized LLVM IR shows a loop (back-edge
+branch tagged with `!llvm.loop`) alongside scalar (non-`<N x>` vector) floating-point
+arithmetic on `double`/`float`, AND the function did not vectorize as a whole.
+
+This is intentionally coarse — it operates on text IR, not a structured IR graph. The loop
+indicator is the presence of a `phi double`/`phi float` node (a loop-carried FP accumulator);
+this is more portable than `!llvm.loop` metadata, which LLVM emits inconsistently across
+optimization levels. A false-negative is possible when the optimizer eliminates all loop-carried
+FP variables (e.g. pure store loops, full unrolls with no accumulator). Use it as a triage
+signal: a `true` result means "look here for a vectorization opportunity"; a `false` result does
+not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for per-kernel vectorization
+enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
+"""
+function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
+    s = _llvm_ir(f, types)
+    isempty(s) && return false
+    # Quick negative: if the whole IR vectorized, no scalar FP loops by definition.
+    _vectorized(f, types) && return false
+    # Positive: a loop back-edge AND at least one scalar FP op.
+    occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)
+end
+
+function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::Tuple))
+    scalar_fp_loops(f, types) || return nothing
+    _fail(
+        :no_scalar_loops, target,
+        "scalar floating-point loop detected in a numeric path that did not vectorize. " *
+        "Wrap the hot loop in a separate kernel and annotate it with `@assert_vectorized` / " *
+        "`@kernel`, or add `@inbounds @simd` / SIMD.jl to the loop body."
+    )
+    return nothing
+end
+
+"""
+    @assert_no_scalar_loops f(args...)
+
+Fail if `f(args...)` contains a **scalar floating-point loop** that did not vectorize
+(**best-effort** IR scan). A scalar hot loop between two audited kernels can silently dominate
+runtime — this macro surfaces it.
+
+On failure, the message names the target and instructs you to either wrap the loop in a kernel
+annotated with [`@assert_vectorized`](@ref) / [`@kernel`](@ref), or add `@inbounds @simd` /
+SIMD.jl. The detection is coarse — it scans LLVM text IR for a loop back-edge and scalar
+FP ops — so a `false` result does not guarantee every loop vectorized. Disabled builds expand
+to the bare call.
+
+```julia
+@assert_no_scalar_loops apply_T!(Y, T, W)   # throws if TᵀW is a scalar triple-loop
+```
+"""
+macro assert_no_scalar_loops(call)
+    target = string(call)
+    fexpr, argexprs = _callinfo(call)
+    syms, binds = _bind_args(argexprs)
+    fe = esc(fexpr)
+    litcall = Expr(:call, fe, syms...)
+    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    checked = quote
+        $(binds...)
+        local _val = $litcall
+        $(_assert_no_scalar_loops)($target, $fe, $types)
+        _val
+    end
+    return _gate(checked, esc(call))
+end
+
 function Base.show(io::IO, r::KernelReport)
     printstyled(io, "KernelReport"; bold = true)
     print(io, ": ", r.target, "\n")
