@@ -45,6 +45,9 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F18 | bit-exactness not enforceable (SIMD reduction order LLVM-defined) | ✅ docs | "Promise scope" section in `guarantees.md` (commit `5cd972d`) |
 | F19 | golden-harness methodology not documented | ✅ docs + code | cookbook.md "Port against a golden reference" (commit `5cd972d`); `@golden` macro implemented in `src/golden.jl` |
 | F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs + code | cookbook.md "Annotate every hot loop" (commit `5cd972d`); `scalar_fp_loops` + `@assert_no_scalar_loops` in `src/scheduling.jl`; wired as a batch `:no_scalar_loops` guarantee in `findings`/`check`/`audit` |
+| F21 | `Union{T,Nothing}` (found-or-nothing idiom) fails `@assert_typestable` | 🔴 open | `isconcretetype` (`check.jl:133`) rejects small isbits unions; Base `findfirst`/`iterate`/`tryparse` all return these — a false positive on idiomatic code |
+| F22 | perf diagnostics are FP-centric, blind to integer-SIMD kernels | 🔴 open | `scalar_fp_loops` catches only scalar *float* loops; `kernel_report` intensity counts only FP ops (≡0 for integer kernels). GP crates (memchr/itoa/hashbrown/fxhash) are integer |
+| F23 | whole-method guarantees can't target a delegating / union-returning entry | 🔴 open | recurs as "assert the inner pointer-kernel, `@allocated` the entry" (StringSearch, Factorizations) |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -408,3 +411,40 @@ least a doc warning that StrictMode guards only what you point it at — the una
 leaks. (Fix: it had the same shape as `W=VᵀC`, so it reused that kernel — which flipped all sizes to a beat.)
 
 *Implemented:* `scalar_fp_loops(f, types)::Bool` and `@assert_no_scalar_loops f(args...)` in `src/scheduling.jl`. Detects a loop-carried `phi double`/`phi float` node alongside scalar FP ops absent `<N x>` vector ops (best-effort; false-negatives possible on fully-unrolled store-only loops). Follows the same `_gate`/`_fail` pattern as `@assert_vectorized`. Also wired into the batch path as a first-class guarantee: `findings`/`check`/`audit` accept `guarantees=(:no_scalar_loops,)` (value-free, so identical in `:fast`/`:full`), with a `_suggestion` entry — so a whole-module sweep can flag unaudited scalar glue, not just dev-annotated calls.
+
+## F21 — the `Union{T,Nothing}` "found-or-nothing" idiom trips `@assert_typestable`
+Ported memchr's substring search (BlazingPorts `StringSearch.find_substr`). Its public API returns
+`Union{Int,Nothing}` — the canonical Julia idiom for "index, or not found", exactly what Base
+`findfirst`/`findnext`/`iterate`/`tryparse` return. `@assert_typestable` **fails** on it: the check is
+`!isconcretetype(only(return_types))` (`check.jl:133` and the `:full` path), and `Union{Int,Nothing}`
+is a small isbits union — type-stable *in practice* (no boxing, no dynamic dispatch, branch-predicted
+return), but not `isconcretetype`. Workaround we used: assert the guarantees on the inner pointer-kernel
+`_find_substr` (returns concrete `Int`, 0 = miss) and `@allocated` the public entry. Suggestion: treat a
+small isbits `Union` (esp. `Union{T,Nothing}`, `Base.isbitsunion`) as type-stable, or add an opt-in
+(`@assert_typestable f(x) allow_small_union=true`). Otherwise the guarantee can't be put on the idiomatic
+function a user actually calls.
+
+## F22 — StrictMode's *performance* diagnostics are FP-centric; integer-SIMD kernels are invisible
+The campaign has moved from numeric crates (faer) to general-purpose ones (memchr, itoa, hashbrown,
+fxhash) — all **integer** kernels (byte compares, hashing, formatting), no floating point. Two perf tools
+go blind there:
+- `scalar_fp_loops` / `@assert_no_scalar_loops` (F20) detect only scalar *floating-point* loops
+  (`phi double`, scalar `fadd/fmul double`). A scalar *integer* hot loop — e.g. a naive byte-search or
+  the kind of unaudited glue F20 was built to catch — escapes entirely.
+- `kernel_report`'s arithmetic intensity counts only FP vector ops (`fp_ops`), so for an integer-SIMD
+  kernel `fp_ops ≡ 0` ⇒ intensity 0 ⇒ always classified `:memory`. It cannot distinguish a well-vectorized
+  integer kernel from a poor one.
+`@assert_vectorized` is fine — its regex already includes `<N x iN>`, and it correctly passed on
+`_find_substr`'s `<64 x i8>` compares. Suggestion: an integer mode — count integer vector arithmetic
+(`add/sub/mul/and/or/xor/shl/icmp` on `<N x iN>`) in `kernel_report`, and an integer variant of the
+scalar-loop scan (`phi iN` + scalar integer ops). Without it, half the GP-crate frontier can't be audited
+for *why-not-fast*, only for *is-it-vectorized*.
+
+## F23 — whole-method guarantees can't target a delegating / union-returning entry
+Recurring pattern (StringSearch and `Factorizations`): the public entry either returns a small union
+(F21) or delegates edge cases to Base (`find_substr` sends `m ≤ 1` to Base `findfirst`, which may
+allocate / be analyzed across all branches), so whole-method `@assert_noalloc` / `@assert_typestable`
+can't be placed on it — you assert the inner pointer-kernel and `@allocated` the entry. This overlaps
+F11 (assert on the leaf kernel) but is worth a documented idiom — "guarantee the kernel, smoke-test the
+entry" — or a path/entry-scoped annotation, so the recommended structure is explicit rather than folklore
+rediscovered per port.
