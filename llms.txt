@@ -1,0 +1,165 @@
+# StrictMode.jl — LLM quick reference
+
+StrictMode.jl makes Julia performance guarantees (no allocations, type stability,
+vectorization) enforceable at dev/CI time and zero-cost in production. Every macro
+expands to the bare call when checks are off; it runs JET + AllocCheck analysis when on.
+
+## Setup
+
+```julia
+# Add to your dev/test/CI environment (not production deps):
+Pkg.add(["StrictMode", "AllocCheck", "JET"])
+
+# Enable checks (writes Preferences; requires Julia restart to take effect):
+using StrictMode
+StrictMode.enable_checks!()
+
+# Or commit to Project.toml so CI always runs them:
+# [preferences.StrictMode]
+# checks_enabled = true
+# fail_mode = "error"   # or "warn"
+
+# Load the backend in your test/runtests.jl or REPL:
+using AllocCheck, JET   # activates StrictModeAnalysisExt
+```
+
+## Per-call guarantee macros
+
+All macros evaluate arguments once, return the call's value, and are no-ops when checks are off.
+
+```julia
+@assert_noalloc f(args...)          # static proof: f cannot heap-allocate
+@assert_noboxing f(args...)         # same, but allows typed allocations — only flags boxing/dispatch
+@assert_typestable f(args...)       # concrete return type + no internal dispatch (JET)
+@assert_inlined f(args...)          # best-effort: f inlined into its caller (heuristic)
+@assert_vectorized f(args...)       # LLVM IR contains <N x …> vector ops (leaf body only)
+@assert_effects f(args...) (:nothrow, :effect_free)  # compiler-inferred effects
+@assert_trim_safe f(args...)        # safe under juliac --trim=safe
+
+@strict f(args...)                  # combines noalloc + noboxing + typestable
+@kernel f(args...)                  # combines noalloc + vectorized + typestable (for SIMD kernels)
+```
+
+### Empirical fallback for @assert_noalloc
+
+```julia
+@assert_noalloc static = false f(args...)   # measures @allocated; use when static analysis can't prove it
+```
+
+## Persistent guarantees
+
+```julia
+# Fails at module load time if the function ever violates the contract:
+@strict_function axpy(a::Float64, x::NTuple{4,Float64}, y::NTuple{4,Float64}) = a .* x .+ y
+
+# Interface contract: all implementations must be strict:
+@strict_contract fast_dot(a::AbstractVector{Float64}, b::AbstractVector{Float64})
+@verify_strict fast_dot(x, y)   # checks the concrete method that will be called
+```
+
+## Diagnosis (never throws)
+
+```julia
+r = @explain f(args...)   # returns StrictReport with warntype + JET + AllocCheck in one shot
+r.return_concrete         # Bool
+r.allocs                  # Vector of AllocCheck sites (or nothing if backend not loaded)
+would_fail_typestable(r)  # Bool
+would_fail_noalloc(r)     # Bool
+
+kernel_report(f, types)   # KernelReport: arithmetic intensity from LLVM IR (heuristic, never fails)
+# fields: vectorized, width, fp_ops, mem_ops, intensity, unaligned_mem_ops, masked_mem_ops, working_set_bytes
+kernel_report(f, types; working_set_bytes = 8*256*256)  # adds L1/L2/L3/DRAM cache-residency note
+```
+
+`kernel_report` signals:
+- `intensity` = fp_ops / mem_ops — high → compute-bound, low → memory-bound (add register/cache blocking)
+- `unaligned_mem_ops > 0` — vector loads/stores with align < vector width; ensure buffers are aligned
+- `masked_mem_ops > 0` — variable-length inner loops (remainder masking); prefer fixed-width tiles
+- `working_set_bytes` + compute-bound + spills L2 → warns that BLIS-style packing is needed (F15 ceiling)
+
+Tune cache thresholds: `StrictMode._CACHE_BYTES[] = (l1 = 32768, l2 = 524288, l3 = 16777216)`
+
+## Batch / audit drivers
+
+```julia
+# check a single function against concrete types:
+findings = check(f, (T1, T2); guarantees = (:typestable, :noalloc), mode = :fast)
+
+# audit the registered @strict_function registry:
+fs = audit(:registered; format = :json)
+nfailures(fs)   # 0 = clean
+
+# whole-package sweep (everything that compiled):
+fs = audit(MyPkg; sweep = true, exempt = [:_plan_helper], mode = :fast)
+
+# a hand-listed set of (function, types) pairs (no src annotation needed):
+fs = check_signatures([(dot3, (Float64, Float64)), (axpy!, (Float64,))])
+
+format_findings(fs; format = :github)  # ::error file=… for GitHub Actions annotations
+```
+
+### Agentic loop (CI / Claude Code hook)
+
+```bash
+julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format=:json, exit_on_fail=true)'
+```
+
+Non-zero exit = number of failures. JSON findings on stdout; agent reads and fixes.
+
+Each `StrictFinding` JSON object:
+```json
+{ "module": "Kernels", "function": "dot3", "signature": "(Float64, Float64)",
+  "guarantee": "noboxing", "status": "fail", "file": "kernels.jl", "line": 42,
+  "reason": "boxing / dynamic dispatch",
+  "suggestion": "use @unroll for fixed-size loops, or dispatch size into Val{N}" }
+```
+
+`guarantee` ∈ `typestable | noalloc | noboxing | inlined | vectorized | trimsafe`
+`status` ∈ `fail | pass | skip`
+
+## Analysis modes
+
+| Mode | Type stability | Allocation | Backend | Cost |
+|---|---|---|---|---|
+| `:full` (default) | JET `@report_opt` | AllocCheck static proof | AllocCheck + JET | ~900 µs |
+| `:fast` | `Base.return_types` | `code_typed` IR heuristic | none | ~70 µs |
+
+Pass `mode = :fast` to `check` / `audit` / `check_compiled` for quick sweeps.
+The baked-in mode comes from the `analysis` preference (set at precompile). Override per-call with `mode=`.
+
+## Trap → macro lookup
+
+| Trap | Macro |
+|---|---|
+| Runtime tuple indexing (`t[i]`, heterogeneous `t`) — 135× cliff | `@assert_noboxing` + `@unroll` |
+| Type-unstable branch (`Int` vs `Float64`) | `@assert_typestable` |
+| Captured-variable boxing (closure mutates outer local) | `@assert_noboxing` |
+| Allocating hot loop (`push!`, `collect`, slices) | `@assert_noalloc` |
+| Boxing but typed allocs OK (scratch buffers fine) | `@assert_noboxing` |
+| Accidental dynamic dispatch (abstract field types) | `@assert_noboxing` / `@assert_noalloc` |
+| Call should inline but doesn't | `@assert_inlined` |
+| Whole kernel on the fast path | `@strict` |
+| `@generated`/SIMD kernel must vectorize + stay fast | `@kernel` |
+| Function must never regress | `@strict_function` |
+| Interface: all impls must be fast | `@strict_contract` + `@verify_strict` |
+
+## Misc
+
+```julia
+StrictMode.backend_available()   # true if AllocCheck+JET extension is loaded
+StrictMode.checks_enabled()      # true if checks will run (compile-time gate)
+StrictMode.analysis_mode()       # :full or :fast (reads live preference + warns if stale image)
+clear_cache!()                   # invalidate findings cache (needed after editing a callee)
+cache_stats()                    # hits / misses
+
+descend(f, types)                # drop into Cthulhu interactive descent (requires `using Cthulhu`)
+explain_trim(f, types)           # juliac --trim failure details (requires TypeContracts)
+
+@unroll for i in staticval(1):staticval(4); ...; end   # unroll to fix heterogeneous-tuple boxing
+```
+
+## Promises NOT made
+
+- **Bit-reproducibility**: SIMD reduction order is LLVM-defined; don't assert last-ULP matches.
+- **Scheduling**: instruction scheduling is rustc's domain; `kernel_report` surfaces intensity but can't enforce it.
+- **Register-tile ↔ cache-locality trade-off**: good `kernel_report` intensity at large n still requires BLIS-style packing — beyond per-kernel IR inspection.
