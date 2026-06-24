@@ -44,7 +44,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F17 | guarantees necessary-but-not-sufficient above per-kernel view (QR example) | ✅ docs | `rust_gaps.md` "Necessary, but not sufficient" extended with QR orchestration case (commit `5cd972d`) |
 | F18 | bit-exactness not enforceable (SIMD reduction order LLVM-defined) | ✅ docs | "Promise scope" section in `guarantees.md` (commit `5cd972d`) |
 | F19 | golden-harness methodology not documented | ✅ docs + code | cookbook.md "Port against a golden reference" (commit `5cd972d`); `@golden` macro implemented in `src/golden.jl` |
-| F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs + code | cookbook.md "Annotate every hot loop" (commit `5cd972d`); `scalar_fp_loops` + `@assert_no_scalar_loops` in `src/scheduling.jl` |
+| F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs + code | cookbook.md "Annotate every hot loop" (commit `5cd972d`); `scalar_fp_loops` + `@assert_no_scalar_loops` in `src/scheduling.jl`; wired as a batch `:no_scalar_loops` guarantee in `findings`/`check`/`audit` |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -407,4 +407,4 @@ function/factorization for scalar FP hot loops in a numeric path (not just dev-a
 least a doc warning that StrictMode guards only what you point it at — the unaudited glue is where time
 leaks. (Fix: it had the same shape as `W=VᵀC`, so it reused that kernel — which flipped all sizes to a beat.)
 
-*Implemented:* `scalar_fp_loops(f, types)::Bool` and `@assert_no_scalar_loops f(args...)` in `src/scheduling.jl`. Detects a loop-carried `phi double`/`phi float` node alongside scalar FP ops absent `<N x>` vector ops (best-effort; false-negatives possible on fully-unrolled store-only loops). Follows the same `_gate`/`_fail` pattern as `@assert_vectorized`.
+*Implemented:* `scalar_fp_loops(f, types)::Bool` and `@assert_no_scalar_loops f(args...)` in `src/scheduling.jl`. Detects a loop-carried `phi double`/`phi float` node alongside scalar FP ops absent `<N x>` vector ops (best-effort; false-negatives possible on fully-unrolled store-only loops). Follows the same `_gate`/`_fail` pattern as `@assert_vectorized`. Also wired into the batch path as a first-class guarantee: `findings`/`check`/`audit` accept `guarantees=(:no_scalar_loops,)` (value-free, so identical in `:fast`/`:full`), with a `_suggestion` entry — so a whole-module sweep can flag unaudited scalar glue, not just dev-annotated calls.

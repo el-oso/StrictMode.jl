@@ -59,10 +59,12 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
     elseif g === :vectorized
         return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
+    elseif g === :no_scalar_loops
+        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar FP loop did not vectorize (best-effort: `phi double` + scalar ops, no `<N x …>`)", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, or :trimsafe"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, or :trimsafe"))
 end
 
 # `:trimsafe` finding — value-free `juliac --trim=safe` compatibility scan (TypeContracts, no
@@ -141,10 +143,12 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
         elseif g === :vectorized
             push!(out, _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0))
+        elseif g === :no_scalar_loops
+            push!(out, _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar FP loop did not vectorize (best-effort)", "", 0))
         elseif g === :trimsafe
             push!(out, _trimsafe_finding(f, types, md, fn, sg))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, or :trimsafe"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, or :trimsafe"))
         end
     end
     return out
