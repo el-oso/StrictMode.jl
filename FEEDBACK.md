@@ -52,6 +52,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F25 | kernel *measurement* must defeat DCE on both sides | 🔴 open | the golden/benchmark workflow (F19) needs `Base.donotdelete`/`black_box` discipline — a `.len()`-only reference elided the work and inverted a verdict (itoa "8.7×" was a DCE artifact) |
 | F26 | performance is value-distribution-dependent; one input isn't a verdict | 🔴 open | ryu swung 0.76×→2.05× on the *same* code path by input shape (full-mantissa vs integer-valued floats), flipping "gap"↔"2× win". No static guarantee/`kernel_report` models the data domain |
 | F27 | golden bit-exact fails for multi-valid-output problems | 🔴 open | `@golden` (F19) assumes a canonical reference; ryu/shortest-float emit different *valid* forms (`1.0` vs `1`) → need a semantic invariant (round-trip `parse===x`), not byte-equality |
+| F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | 🔴 open | recurs: itoa's `÷100` chain, `Base.Ryu`'s digit-trim `while` (`shortest.jl:146`, serial `div`-by-10). Latency-bound even with perfect prediction; integer; passes every guarantee; `:no_scalar_loops` is FP-only (F22). Evidence: Base.Ryu −20% on full-mantissa floats (trim loop) vs +2× on integer-valued (fast path, no loop) |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -508,3 +509,36 @@ lossy encoders, hash-set iteration order, floating-point up to a tolerance. Sugg
 take an optional `invariant=` / `equiv=` predicate (round-trip, set-equality, ULP tolerance) instead of
 forcing byte-equality, and document in the cookbook that a golden reference needs a *defined
 equivalence relation*, which is byte-equality only for deterministic single-valued kernels.
+
+## F28 — a serial loop-carried dependency through a high-latency op is an invisible scalar perf trap
+Investigating *why* `Base.Ryu.writeshortest` runs ~20% slower than the `ryu` crate on full-mantissa
+floats (F26) located it in the **digit-trimming loop** (`base/ryu/shortest.jl:~146`):
+```julia
+while true
+    c_div10 = div(c, 10); a_div10 = div(a, 10)
+    c_div10 <= a_div10 && break
+    b_div10 = div(b, 10); ...; b = b_div10; c = c_div10; a = a_div10   # next iter depends on this
+    e10 += 1
+end
+```
+Each iteration's `c/a/b` are derived from the previous iteration's → a **serial dependency chain
+through `div`** (a ~10–20-cycle op), so the loop is *latency-bound* regardless of branch prediction,
+and its trip count is value-dependent. This is structurally identical to itoa's original serial `÷100`
+loop — which we beat by **breaking the chain** (divide-and-conquer into independent chunks + jeaiii
+division-free extraction). The same lever plausibly speeds Base.Ryu's trimming (trim two digits per
+step via `÷100`, or restructure to shorten the chain) — a concrete upstream-Julia opportunity.
+
+Why it matters to StrictMode: this trap is **invisible to every existing guarantee**. It allocates
+nothing, is type-stable, and isn't a vectorization candidate (inherently scalar), so
+`@assert_noalloc`/`@assert_typestable`/`@assert_vectorized` are all green; and the F20 `:no_scalar_loops`
+scan is FP-only (F22), so an integer `div` loop escapes it entirely. It is **distinct from F24** (branch
+misprediction): even with a perfectly predicted trip count, the serial high-latency dependency chain
+caps throughput. The recurring evidence across three ports — itoa formatting, Ryu trimming, and (earlier)
+the QR `Y=TᵀW` scalar glue — argues this is a *named pattern*, not a one-off.
+
+Suggestion: a `kernel_report` / scan signal for **a loop-carried dependency chain through a high-latency
+instruction** (`div`/`rem`/`sqrt`/`fdiv`, and serial reductions) in a hot loop — detectable from the IR
+as a `phi` whose update feeds the next iteration through such an op — flagged as a *serialization* risk
+with the suggested fix ("break the dependency chain: process N elements/digits independently per step").
+This is the integer/latency complement to F20 (scalar FP loops) and F10 (tiling): three different ways a
+guarantee-green kernel still leaves performance on the table, all now with concrete dogfooded cases.
