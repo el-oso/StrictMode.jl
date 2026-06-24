@@ -43,8 +43,8 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F16 | `@assert_noalloc` reflex missing on `@generated`/SIMD kernels | ✅ `@kernel` macro + docs | bundled macro + QuickStart note (commit `5cd972d`) |
 | F17 | guarantees necessary-but-not-sufficient above per-kernel view (QR example) | ✅ docs | `rust_gaps.md` "Necessary, but not sufficient" extended with QR orchestration case (commit `5cd972d`) |
 | F18 | bit-exactness not enforceable (SIMD reduction order LLVM-defined) | ✅ docs | "Promise scope" section in `guarantees.md` (commit `5cd972d`) |
-| F19 | golden-harness methodology not documented | ✅ docs | cookbook.md "Numeric kernel workflow → Port against a golden reference" (commit `5cd972d`; `@golden` macro deferred) |
-| F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs | cookbook.md "Numeric kernel workflow → Annotate every hot loop" (commit `5cd972d`; auto scalar-loop scan deferred) |
+| F19 | golden-harness methodology not documented | ✅ docs + code | cookbook.md "Port against a golden reference" (commit `5cd972d`); `@golden` macro implemented in `src/golden.jl` |
+| F20 | scalar hot-loop between audited kernels escaped audit | ✅ docs + code | cookbook.md "Annotate every hot loop" (commit `5cd972d`); `scalar_fp_loops` + `@assert_no_scalar_loops` in `src/scheduling.jl` |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -396,6 +396,8 @@ kernel is single-accumulator not the 2-way its source reads as; faer's `hypot` i
 `abs_impl`, not libm). Worth a StrictMode-adjacent helper/pattern (`@golden`-style gated regression) — exact
 for deterministic ops, ~1-ULP tolerance for SIMD reductions (F18).
 
+*Implemented:* `@golden name expr [ulps=N] [dir=path]` in `src/golden.jl`. Record mode writes a typed golden file; compare mode does exact or ULP-tolerant comparison and throws `StrictViolation` on mismatch. Supports `Real` scalars, `AbstractArray{<:Real}`, and `AbstractArray{<:Complex}`. Always runs regardless of `checks_enabled`.
+
 ## F20 — a scalar hot-loop *between* the audited kernels escaped the audit and dominated
 The real small-n lever was not any audited kernel: it was `Y = TᵀW` (the compact-WY `T` apply), a **scalar
 triangular triple-loop** between the gemms — ~12% of QR-1024 (more via cache), while the panel reduction
@@ -404,3 +406,5 @@ loop was never pointed at the auditor, so it hid. Suggestion: an audit mode that
 function/factorization for scalar FP hot loops in a numeric path (not just dev-annotated kernels), or at
 least a doc warning that StrictMode guards only what you point it at — the unaudited glue is where time
 leaks. (Fix: it had the same shape as `W=VᵀC`, so it reused that kernel — which flipped all sizes to a beat.)
+
+*Implemented:* `scalar_fp_loops(f, types)::Bool` and `@assert_no_scalar_loops f(args...)` in `src/scheduling.jl`. Detects a loop-carried `phi double`/`phi float` node alongside scalar FP ops absent `<N x>` vector ops (best-effort; false-negatives possible on fully-unrolled store-only loops). Follows the same `_gate`/`_fail` pattern as `@assert_vectorized`.

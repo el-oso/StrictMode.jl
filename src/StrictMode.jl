@@ -35,6 +35,7 @@ export @assert_vectorized, @assert_no_scalar_loops, @assert_effects, @assert_tri
 export @strict, @kernel, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
+export @golden
 export StrictViolation, StrictReport, StrictFinding
 export check, findings, check_all, check_compiled, check_signatures, audit, format_findings, nfailures, watch, unwatch
 export clear_cache!, cache_stats
@@ -59,6 +60,7 @@ include("cache.jl")
 include("check.jl")
 include("registry.jl")
 include("audit.jl")
+include("golden.jl")
 
 # The heavy analysis (AllocCheck + JET) and its precompile warmup live in
 # ext/StrictModeAnalysisExt.jl, loaded when both weak deps are present.
