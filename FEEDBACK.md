@@ -99,6 +99,12 @@ module with mixed hot/cold functions makes whole-module audit noisy.
 Emitted twice while precompiling StrictMode (+ the Revise ext) on a Zen5 host — from the AllocCheck/JET
 LLVM target. Cosmetic, but noisy.
 
+### Side fix — `_CACHE_BYTES` hardcoded defaults replaced by `CpuId` weak dep
+`kernel_report`'s cache-residency annotation (F14/F15) used hardcoded L1/L2/L3 defaults (32/512/16384 KiB).
+Added `CpuId` as a weak dep; `StrictModeCpuIdExt.__init__` calls `CpuId.cachesize()` and writes the
+actual values into `_CACHE_BYTES[]` at load time (x86 only; defaults remain for non-x86). Manual override
+still available: `StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)`.
+
 ## How PureFFT adopted StrictMode
 - `test/strictmode_tests.jl` — a `@testitem` asserting `@assert_typestable` + `@assert_noalloc` on one
   plan per routing path (fast, in the default suite; gated on `checks_enabled()`).
