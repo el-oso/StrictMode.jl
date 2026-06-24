@@ -77,7 +77,8 @@ kernel_report(f, types; working_set_bytes = 8*256*256)  # adds L1/L2/L3/DRAM cac
 - `masked_mem_ops > 0` — variable-length inner loops (remainder masking); prefer fixed-width tiles
 - `working_set_bytes` + compute-bound + spills L2 → warns that BLIS-style packing is needed (F15 ceiling)
 
-Tune cache thresholds: `StrictMode._CACHE_BYTES[] = (l1 = 32768, l2 = 524288, l3 = 16777216)`
+Cache thresholds auto-populate from `CpuId.cachesize()` when `using CpuId` is in scope (x86 only);
+otherwise defaults to 32 KiB / 512 KiB / 16 MiB. Override: `StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)`
 
 ## Batch / audit drivers
 

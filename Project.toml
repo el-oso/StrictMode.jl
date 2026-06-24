@@ -12,17 +12,20 @@ TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 [weakdeps]
 AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Cthulhu = "f68482b8-f384-11e8-15f7-abe071a5a75f"
+CpuId = "adafc99b-e345-5852-983c-f28acb93d879"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 
 [extensions]
 StrictModeAnalysisExt = ["AllocCheck", "JET"]
 StrictModeCthulhuExt = "Cthulhu"
+StrictModeCpuIdExt = "CpuId"
 StrictModeReviseExt = "Revise"
 
 [compat]
 AllocCheck = "0.2"
 Cthulhu = "3"
+CpuId = "0.3"
 InteractiveUtils = "1"
 JET = "0.11.4"
 Preferences = "1"

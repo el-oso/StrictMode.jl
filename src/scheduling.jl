@@ -180,7 +180,8 @@ end
 _kr_bound(r::KernelReport) =
     !r.vectorized ? :scalar : (r.intensity ≥ 2.0 ? :compute : (r.intensity ≥ 0.75 ? :balanced : :memory))
 
-# ponytail: typical desktop/server values; tune with StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
+# Defaults; overwritten at load time by StrictModeCpuIdExt when `using CpuId` is in scope.
+# Override for non-standard hardware: StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
 const _CACHE_BYTES = Ref((l1 = 32_768, l2 = 524_288, l3 = 16_777_216))
 
 """
