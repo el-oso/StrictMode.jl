@@ -160,6 +160,11 @@ struct KernelReport
     fp_ops::Int        # vector FP arithmetic ops (fmul/fadd/fsub/fdiv + fma/fmuladd intrinsics)
     mem_ops::Int       # vector loads + stores
     intensity::Float64 # fp_ops / mem_ops — an arithmetic-intensity proxy (∞ when no memory ops)
+    # F13
+    unaligned_mem_ops::Int          # vector loads/stores where recorded align < vector width
+    masked_mem_ops::Int             # @llvm.masked.* ops → irregular/variable-length trips
+    # F14/F15
+    working_set_bytes::Union{Nothing,Int}   # user-supplied; enables cache-residency annotation
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -175,6 +180,9 @@ end
 _kr_bound(r::KernelReport) =
     !r.vectorized ? :scalar : (r.intensity ≥ 2.0 ? :compute : (r.intensity ≥ 0.75 ? :balanced : :memory))
 
+# ponytail: typical desktop/server values; tune with StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
+const _CACHE_BYTES = Ref((l1 = 32_768, l2 = 524_288, l3 = 16_777_216))
+
 """
     kernel_report(f, types) -> KernelReport
 
@@ -185,25 +193,44 @@ one both pass them, yet can differ several-fold. `kernel_report` reads the **ari
 (FP vector ops : memory vector ops) from the LLVM IR, so a green-but-slow kernel can be *seen* to be
 memory-bound — pointing straight at register/cache blocking rather than discovered by benchmarking.
 
-Fields: `vectorized`, `width`, `fp_ops`, `mem_ops`, `intensity` (= `fp_ops/mem_ops`). **Heuristic
-and advisory** — it never fails, and does not replace a profiler/roofline.
+Fields: `vectorized`, `width`, `fp_ops`, `mem_ops`, `intensity` (= `fp_ops/mem_ops`),
+`unaligned_mem_ops` (vector loads/stores with alignment < vector width — a proxy for unaligned
+access), `masked_mem_ops` (masked/variable-length memory ops — a proxy for irregular trip counts).
+**Heuristic and advisory** — it never fails, and does not replace a profiler/roofline.
+
+Pass `working_set_bytes` to get a cache-residency annotation: if the working set fits L1/L2,
+low intensity is expected and acceptable; if it spills L2 and the kernel is already
+compute-bound, the report notes the cache-blocking (packing) gap that per-kernel IR analysis
+cannot close (F15 ceiling).
 
 ```julia
 kernel_report(syrk_naive!, (Matrix{Float64},))   # intensity ≈ 0.7 → memory-bound (add blocking)
 kernel_report(syrk_tiled!, (Matrix{Float64},))   # intensity ≈ 1.3 → balanced
+kernel_report(syrk_tiled!, (Matrix{Float64},); working_set_bytes = 8*512*512)
+# → compute-bound with note about packing at this problem size
 ```
 """
-function kernel_report(@nospecialize(f), @nospecialize(types::Tuple))
+function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
+                       working_set_bytes::Union{Nothing,Int} = nothing)
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes)
     width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half)>", s)); init = 0)
     vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
     fp = vop("fmul") + vop("fadd") + vop("fsub") + vop("fdiv") + fma
     mem = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x (?:float|double|half)>", s))
     intensity = mem == 0 ? (fp == 0 ? 0.0 : Inf) : fp / mem
-    return KernelReport(target, width > 0, width, fp, mem, intensity)
+    # F13 — alignment signal: count vector loads/stores where recorded align < vector width in bytes
+    _elem_bytes = Dict("double" => 8, "float" => 4, "half" => 2)
+    unaligned = 0
+    for m in eachmatch(r"(?:load|store) <(\d+) x (float|double|half)>.*?align (\d+)", s)
+        vb = parse(Int, m[1]) * get(_elem_bytes, m[2], 8)
+        parse(Int, m[3]) < vb && (unaligned += 1)
+    end
+    # F13 — masking signal: @llvm.masked.* → variable-length / remainder tiles
+    masked = count(_ -> true, eachmatch(r"@llvm\.masked\.(load|store|gather|scatter)", s))
+    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes)
 end
 
 function Base.show(io::IO, r::KernelReport)
@@ -233,6 +260,31 @@ function Base.show(io::IO, r::KernelReport)
     else
         printstyled(io, "  → compute-bound"; color = :green)
         print(io, ": good FLOP:byte balance.")
+    end
+    # F13 alignment hint
+    if r.unaligned_mem_ops > 0
+        print(io, "\n")
+        printstyled(io, "  unaligned vector memory ops: $(r.unaligned_mem_ops)"; color = :yellow)
+        print(io, " — recorded alignment < vector width; may stall on wide SIMD. Ensure buffers are $(r.width * 8)-byte aligned.")
+    end
+    if r.masked_mem_ops > 0
+        print(io, "\n")
+        printstyled(io, "  masked/variable-length ops: $(r.masked_mem_ops)"; color = :yellow)
+        print(io, " — loop has irregular trip counts (remainder masking). Prefer fixed-width tiles.")
+    end
+    # F14/F15 cache-residency annotation
+    if !isnothing(r.working_set_bytes)
+        cb = _CACHE_BYTES[]
+        ws = r.working_set_bytes
+        level = ws ≤ cb.l1 ? "L1" : ws ≤ cb.l2 ? "L2" : ws ≤ cb.l3 ? "L3" : "DRAM"
+        print(io, "\n  working set $(Base.format_bytes(ws)) → $level-resident. ")
+        if level == "L1" || level == "L2"
+            print(io, "Low intensity is acceptable at this size; memory-bound advice applies as n grows.")
+        elseif _kr_bound(r) === :compute
+            print(io, "Good register intensity, but working set spills $level — BLIS-style packing needed for the cache-locality leg (beyond per-kernel IR analysis).")
+        else
+            print(io, "Consider cache-blocking (tiling the reduction dimension) to reduce $level traffic.")
+        end
     end
     return
 end

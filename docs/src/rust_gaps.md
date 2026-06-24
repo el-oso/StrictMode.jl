@@ -143,6 +143,34 @@ It's heuristic and advisory, not a profiler or a roofline, but it surfaces the k
 (memory- versus compute-bound) that the pass/fail guarantees structurally can't. Think of it as the
 diagnostic layer sitting just beneath the guarantees.
 
+Two additional signals complement intensity (F13):
+
+- **Alignment** (`unaligned_mem_ops`): vector loads/stores whose recorded `align` annotation is
+  less than the vector width in bytes — a proxy for buffer-alignment issues that can stall wide
+  SIMD. A triangular loop that starts at the diagonal instead of the column base, for example,
+  will show up here.
+- **Masking** (`masked_mem_ops`): `@llvm.masked.*` intrinsics — a proxy for variable-length
+  inner-loop trip counts (remainder tiling). Fixed-width tiles eliminate these.
+
+For cache-residency context (F14/F15), pass `working_set_bytes`:
+
+```julia
+julia> kernel_report(syrk_naive!, (Matrix{Float64},); working_set_bytes = 8*64*64)
+# → "L1-resident. Low intensity is acceptable at this size; memory-bound advice applies as n grows."
+
+julia> kernel_report(syrk_tiled!, (Matrix{Float64},); working_set_bytes = 8*512*512)
+# → "Good register intensity, but working set spills L3 — BLIS-style packing needed
+#    for the cache-locality leg (beyond per-kernel IR analysis)."
+```
+
+The second case (F15) is the limit of what per-kernel IR inspection can guide: once the working
+set exceeds L2 and register blocking is already good, closing the gap requires BLIS-style packing
+of the panel operand — a memory-traffic decision above the single-kernel view. `kernel_report`
+names the ceiling; the human has to cross it.
+
+The default cache thresholds (L1=32 KiB, L2=512 KiB, L3=16 MiB) match a typical desktop/server.
+Tune them with `StrictMode._CACHE_BYTES[] = (l1 = …, l2 = …, l3 = …)`.
+
 The ceiling also shows up in algorithmic choices that sit above the per-kernel view. In a QR
 factorization port, two versions of the same panel-gemm accumulation kernel were fully green on
 every guarantee — vectorized, allocation-free, type-stable — yet differed by ~25% (58 vs 73

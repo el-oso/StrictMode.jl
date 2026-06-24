@@ -37,9 +37,9 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F10 | guarantees necessary-but-not-sufficient | ✅ new lever | `kernel_report(f, types)` arithmetic-intensity diagnostic (commit `b53cdd8`) |
 | F11 | `@assert_vectorized` blind to non-inlined callees | ✅ fixed | failure names the `:invoke` callees; docstring documents leaf-targeting (commit `b53cdd8`) |
 | F12 | `audit(sweep=true)` found 0 methods | ✅ fixed | 0-method warning + `:vectorized` made a real guarantee (commit `b53cdd8`) |
-| F13 | `kernel_report` intensity blind to alignment/tile regularity | 🔲 open | no implementation yet; see Round 6 notes |
-| F14 | intensity needs cache-residency context (low intensity fine for L1-resident) | 🔲 open | no implementation yet; see Round 6 notes |
-| F15 | intensity can't weigh register-tile ↔ cache-locality trade-off | 🔲 open | no implementation yet; needs packing-aware memory-traffic model |
+| F13 | `kernel_report` intensity blind to alignment/tile regularity | ✅ fixed | `unaligned_mem_ops` + `masked_mem_ops` fields; alignment regex + `@llvm.masked.*` scan |
+| F14 | intensity needs cache-residency context (low intensity fine for L1-resident) | ✅ fixed | `working_set_bytes` kwarg → L1/L2/L3/DRAM annotation with "acceptable at this size" note |
+| F15 | intensity can't weigh register-tile ↔ cache-locality trade-off | ✅ docs + diagnostic | compute-bound + spills L2 → "BLIS-style packing needed" note; ceiling documented in `rust_gaps.md` |
 | F16 | `@assert_noalloc` reflex missing on `@generated`/SIMD kernels | ✅ `@kernel` macro + docs | bundled macro + QuickStart note (commit `5cd972d`) |
 | F17 | guarantees necessary-but-not-sufficient above per-kernel view (QR example) | ✅ docs | `rust_gaps.md` "Necessary, but not sufficient" extended with QR orchestration case (commit `5cd972d`) |
 | F18 | bit-exactness not enforceable (SIMD reduction order LLVM-defined) | ✅ docs | "Promise scope" section in `guarantees.md` (commit `5cd972d`) |
