@@ -50,6 +50,8 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F23 | whole-method guarantees can't target a delegating / union-returning entry | 🔴 open | recurs as "assert the inner pointer-kernel, `@allocated` the entry" (StringSearch, Factorizations) |
 | F24 | branch misprediction is invisible to every guarantee (perf trap) | 🔴 open | a data-dependent `if x<0` (50/50 signs) cost ~4× while `@assert_noalloc`/`@assert_typestable`/`@assert_vectorized` all stayed green — itoa port. Extends F10/F17 "necessary-not-sufficient" |
 | F25 | kernel *measurement* must defeat DCE on both sides | 🔴 open | the golden/benchmark workflow (F19) needs `Base.donotdelete`/`black_box` discipline — a `.len()`-only reference elided the work and inverted a verdict (itoa "8.7×" was a DCE artifact) |
+| F26 | performance is value-distribution-dependent; one input isn't a verdict | 🔴 open | ryu swung 0.76×→2.05× on the *same* code path by input shape (full-mantissa vs integer-valued floats), flipping "gap"↔"2× win". No static guarantee/`kernel_report` models the data domain |
+| F27 | golden bit-exact fails for multi-valid-output problems | 🔴 open | `@golden` (F19) assumes a canonical reference; ryu/shortest-float emit different *valid* forms (`1.0` vs `1`) → need a semantic invariant (round-trip `parse===x`), not byte-equality |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -481,3 +483,28 @@ explicit sink that consumes its output, or the timing is meaningless.** It also 
 "plateau" calls before fair measurement showed parity-then-beat — a concrete argument for baking the
 sink discipline (and an `@golden`-adjacent timing helper that supplies it) into the documented workflow
 rather than leaving it to per-probe rediscovery.
+
+## F26 — performance is value-distribution-dependent; one benchmark input is not a verdict
+Re-probing `ryu` (float→string) fairly, `Base.Ryu.writeshortest` vs the `ryu` crate measured **0.76×**
+on `rand()` (uniform [0,1), full mantissa), **0.81×** on `randn`, but **2.05×** on integer-valued floats
+(`1000.0` etc.) — the *same code path*, swinging 2.7× purely on the input distribution, flipping the
+disposition between "20% gap" and "2× win". Every StrictMode guarantee and `kernel_report` is
+static/type-based (analyses the method over argument *types*), so none of them — and no single
+benchmark — capture that the *work itself* (digit count, algorithm branch) varies with the value. This
+is a distinct axis from F24 (a mispredicting branch): even with perfect prediction, a formatter does
+genuinely different work per value. Suggestion for the golden/perf methodology (F19/F25): require
+measuring across **representative value classes** (small/large, dense/sparse, typical/worst-case) and
+reporting the spread, not a single median — and warn that a one-distribution number can invert a
+verdict. A `@golden`-adjacent perf helper could take a *set* of input generators and report per-class.
+
+## F27 — golden bit-exact comparison fails for problems with multiple valid outputs
+The `@golden` workflow (F19) compares a port against a reference **byte-for-byte** (exact, or ~1-ULP
+for SIMD reductions per F18). That assumes a single canonical output. It breaks for `ryu`: `Base.Ryu`
+and the crate both emit *shortest round-tripping* decimals, but **different valid ones** (`1.0` vs `1`,
+differing exponent thresholds / trailing-zero conventions) — bit-equality would reject a correct port.
+The right oracle is a **semantic invariant**: `parse(Float64, out) === x` (round-trips to the same
+value). This generalises — shortest-representation, any normalized/canonical-but-non-unique output,
+lossy encoders, hash-set iteration order, floating-point up to a tolerance. Suggestion: let `@golden`
+take an optional `invariant=` / `equiv=` predicate (round-trip, set-equality, ULP tolerance) instead of
+forcing byte-equality, and document in the cookbook that a golden reference needs a *defined
+equivalence relation*, which is byte-equality only for deterministic single-valued kernels.
