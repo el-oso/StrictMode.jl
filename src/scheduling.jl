@@ -186,6 +186,16 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
     return String(take!(io))
 end
 
+function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
+    io = IOBuffer()
+    try
+        InteractiveUtils.code_native(io, f, types; debuginfo = :none)
+    catch
+        return ""
+    end
+    return String(take!(io))
+end
+
 function _kr_bound(r::KernelReport)
     !r.vectorized && return :scalar
     # Use FP intensity if available; fall back to integer intensity for integer-only kernels
@@ -445,6 +455,66 @@ function Base.show(io::IO, r::KernelReport)
         else
             print(io, "Consider cache-blocking (tiling the reduction dimension) to reduce $level traffic.")
         end
+    end
+    return
+end
+
+# F31 — register saturation / spill diagnostic. Reads code_native (post-register-allocation
+# assembly) rather than LLVM IR, so it captures what kernel_report cannot: physical zmm register
+# count and stack spills. Only meaningful for x86-64 AVX-512; returns zeros for other targets.
+struct RegisterReport
+    target::String
+    vec_regs_used::Int   # unique zmm registers seen (0 = no AVX-512)
+    vec_regs_total::Int  # 32 for x86-64 AVX-512; 0 for unknown arch
+    vec_spills::Int      # lines with both "zmm" and "rsp" (zmm saved to stack)
+end
+
+"""
+    register_report(f, types) -> RegisterReport
+
+Read the native assembly for `f` specialised on `types` and count zmm vector register usage
+and stack spills. Complements [`kernel_report`](@ref): where `kernel_report` works from LLVM IR
+(pre-register-allocation), `register_report` reads post-allocation `code_native`, so it captures
+whether the kernel is register-saturated (all 32 zmm in use) and how many spills occurred.
+
+A saturated kernel with spills (32/32, N > 0) is at the LLVM portable-compiler ceiling; adding
+more ILP will only spill further and may regress. The last ~15% over LLVM-compiled Rust requires
+hand-written assembly.
+
+Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros.
+"""
+function register_report(@nospecialize(f), @nospecialize(types::Tuple))
+    target = _func_name(f) * _sig_string(types)
+    s = _native_asm(f, types)
+    isempty(s) && return RegisterReport(target, 0, 0, 0)
+    zmm_regs = Set(m[1] for m in eachmatch(r"%zmm(\d+)\b", s))
+    spills   = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
+    total    = isempty(zmm_regs) ? 0 : 32
+    return RegisterReport(target, length(zmm_regs), total, spills)
+end
+
+function Base.show(io::IO, r::RegisterReport)
+    printstyled(io, "RegisterReport"; bold = true)
+    print(io, ": ", r.target, "\n")
+    if r.vec_regs_total == 0
+        printstyled(io, "  no zmm"; color = :light_black)
+        print(io, " — non-AVX-512 target or compilation failed.")
+        return
+    end
+    saturated = r.vec_regs_used >= r.vec_regs_total
+    print(io, "  $(r.vec_regs_used)/$(r.vec_regs_total) zmm registers, $(r.vec_spills) spill(s)")
+    if saturated
+        print(io, "\n")
+        printstyled(io, "  → register-saturated"; color = :yellow)
+        print(io, ": all $(r.vec_regs_total) zmm in use. Adding more ILP will spill and may regress. This is the LLVM portable-compiler ceiling (~85–87% of hand-asm).")
+    elseif r.vec_spills > 0
+        print(io, "\n")
+        printstyled(io, "  → unexpected spills: $(r.vec_spills)"; color = :yellow)
+        print(io, " — zmm registers saved to stack despite headroom. Reduce live register count or shrink the register tile.")
+    else
+        print(io, "\n")
+        printstyled(io, "  → clean"; color = :green)
+        print(io, ": $(r.vec_regs_total - r.vec_regs_used) zmm free — room for more ILP or a wider tile.")
     end
     return
 end

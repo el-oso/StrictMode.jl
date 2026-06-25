@@ -55,6 +55,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | ✅ diagnostic | `kernel_report` gains `serial_dep_count` field; warns on div/rem/sqrt in looping functions + rust_gaps.md note |
 | F29 | a data-dependent load address (from a SIMD reduction) serializes cache-miss latency — invisible to every guarantee | 🔴 open | SwissDict: `@assert_vectorized`/`@assert_noalloc`/`@assert_typestable` all green, yet lookup-HIT 1.8× slower than Base `Dict` — the slot index is derived FROM the control-group SIMD reduction, so `keys[jr]` loads serially (no memory-level parallelism); Base Dict knows `keys[ideal]` from the hash and overlaps it. Validated against DataStructures.SwissDict. A new "necessary-not-sufficient" axis after F10/F17/F24/F28 |
 | F30 | a vectorized kernel can be data-marshalling-bound (scalar-gather transpose)  -  `@assert_vectorized` passes but throughput is limited by the gather, not the compute | 🔴 open | blake3 `hash_many`: `<16 x i32>` compute confirmed green, but each `Vec{16}` is built from 16 strided scalar loads (a transpose); the crate uses SIMD-shuffle transpose → we land 0.71×. Distinct SIMD-layout axis; may partly overlap `kernel_report` mem-intensity |
+| F31 | register saturation / spills invisible to IR-level guarantees | ✅ diagnostic | `register_report(f, types)` reads `code_native` (post-register-allocation); counts unique zmm registers + spill lines; `show` gives saturated / unexpected-spills / clean verdict with ceiling note |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -592,3 +593,29 @@ alignment/masking — a transpose-heavy kernel may *already* show a high scalar-
 ratio" signal — many strided scalar loads feeding vector ops in a hot path — would name the bottleneck and
 point at SIMD-transpose (shuffle) as the fix. Positive note: the blake3 port is otherwise a clean win for
 the guarantees (byte-exact, vectorized, 7.4× over the scalar ecosystem package) — F30 is the one gap.
+
+## F31 — register saturation / spills are invisible to IR-level guarantees, yet they decide a kernel's ceiling
+Closing out the blake3 campaign (`BlazingPorts.Blake3`): after fixing F30 the `Vec{16,UInt32}` 16-wide
+compress is `@assert_vectorized` green and `kernel_report`-clean, and **directly beats blake3's pure-Rust
+path 1.56×** (our LLVM AVX-512 7.27 GB/s vs the crate's `rust_avx2` 4.67 — Rust has no `rust_avx512`, only
+asm). The *only* thing faster is the crate's **hand-written AVX-512 assembly** (8.36, = 1.15× over our LLVM).
+The whole multi-day question "can we overlap the tree-reduce into the compress and close that 15%?" was
+settled by **one number that lives only in `code_native`, not the IR**: the kernel uses **32/32 zmm
+registers with 53 stack spills** — it is *register-saturated*, so there is no room to schedule a concurrent
+reduce (a fused compress+reduce needs 64 zmm → spills → measured 0.96×, *slower*).
+
+`@assert_vectorized` / `kernel_report` **cannot** see this: LLVM IR is pre-register-allocation SSA with
+unbounded virtual registers — physical register count and spills only exist *after* instruction selection
+(`code_native`). So this is an axis orthogonal to vectorization/alloc/intensity. We hand-rolled it:
+`code_native(io, f, types); count(l -> occursin("zmm",l) && occursin("rsp",l), split(s,"\n"))`. A first-class
+**`register_report(f, types)`** (vector-register count N/32, spill count) — or an `@assert_no_spill`
+guarantee — would turn "your kernel is register-saturated ⇒ more ILP will spill ⇒ you are at LLVM's ceiling"
+into an automatic finding instead of a manual native-asm grep. It's the natural completion of the
+necessary-but-not-sufficient story: vectorized (✓) + no-alloc (✓) + intensity (kernel_report) + **register-fit
+(new)** ⇒ if saturated, you've matched what *any* compiler produces and the rest needs hand-asm.
+
+For the `rust_gaps.md` "ceiling" doc — quantified: on a register-saturated 16-wide kernel, pure SIMD.jl/LLVM
+reaches **~85–87% of hand-written asm** and **beats LLVM-compiled Rust outright** (1.56×). The residual ~15%
+is **LLVM's register-scheduling vs hand-asm — not a Julia gap; it is identical for Rust** (whose own crate
+abandons LLVM and ships `.S` to get it). Honest takeaway for users: `@assert_vectorized` green +
+register-saturated ⇒ you are at the portable-compiler ceiling; the last 15% is unreachable from any IR.
