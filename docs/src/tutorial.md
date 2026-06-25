@@ -5,6 +5,29 @@ kernel goes from "works correctly" to "guaranteed fast and regression-proof."
 
 Assumes checks are enabled — see [Getting Started](getting_started.md) if not.
 
+## If you're coming from C, C++, or Java
+
+Think of `@strict_function` as a `static_assert` for performance properties. In C++ you might
+write `static_assert(std::is_trivially_copyable_v<T>)` to enforce a type constraint at compile
+time; `@strict_function` enforces "no heap allocation, concrete return type" at precompile time.
+A violation stops the module from loading — the same feedback loop you get from a compiler
+error, but for runtime performance properties the Julia compiler can't express as type
+constraints.
+
+The boxing and dispatch failures you'll see in this tutorial are equivalent to Java autoboxing
+in a hot loop (`int` silently promoted to `Integer`) or a C++ vtable call where the compiler
+couldn't devirtualize. StrictMode makes those silent regressions loud.
+
+## If you're coming from Python or MATLAB
+
+The thing to keep in mind: Julia compiles your code to native machine instructions, the same
+kind NumPy dispatches to BLAS for. When a Julia function is type-stable, the JIT produces code
+as fast as pre-compiled C. When it isn't, it silently falls back to something as slow as a
+Python loop — and the source code looks identical either way.
+
+This tutorial demonstrates how StrictMode tells you which path you're actually on, and how to
+lock in the fast path so a future edit can't silently knock you back to the slow one.
+
 ## The starting point
 
 A dot product over a fixed-size tuple:
