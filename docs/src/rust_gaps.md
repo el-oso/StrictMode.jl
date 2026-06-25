@@ -192,9 +192,9 @@ cache and register blocking and microkernel scheduling, still takes human roofli
 *complement* the guardrails, not replace them: keep asserting the invariants, and reach for the
 diagnostic when something is green but still slow.
 
-### Three more dimensions: branches, serial dependencies, and data distribution (F24/F28/F26)
+### Four more dimensions: branches, serial dependencies, data distribution, and register saturation (F24/F28/F26/F31)
 
-The same "guarantees are necessary-but-not-sufficient" gap recurs in three additional forms,
+The same "guarantees are necessary-but-not-sufficient" gap recurs in four additional forms,
 all confirmed by the GP-crate porting campaign:
 
 **Branch misprediction (F24)**: a data-dependent `if x < 0` (50/50 signs) in a numeric kernel
@@ -217,7 +217,20 @@ loop-carried integers as a serialization signal (`serial_dep_count`).
 No static analysis or single benchmark captures data-domain variation. Require measuring
 across representative value classes and reporting the spread (see cookbook).
 
-These three join register tiling (F13), cache-locality (F15), and algorithmic orchestration
+**Register saturation (F31)**: the blake3 `hash_many` kernel — a genuine 16-wide `<16 x i32>`
+AVX-512 compute path — passed `@assert_vectorized` and `kernel_report` (correct vectorization,
+clean intensity). The bottleneck was invisible to both because it lives *after* register
+allocation: the kernel used 32/32 zmm registers with 53 stack spills, leaving no room to
+schedule additional ILP. [`register_report`](@ref)`(f, types)` surfaces this by reading
+`code_native` rather than LLVM IR — it reports the zmm register count, spill count, and a
+verdict: saturated / unexpected-spills / clean. A saturated result means the kernel is at
+the LLVM portable-compiler ceiling. Quantified on blake3: pure `SIMD.jl` reached ~85–87% of
+the crate's hand-written AVX-512 assembly and beat LLVM-compiled Rust outright (1.56×); the
+last ~15% requires hand-written `.S`. Saturation is not a failure — it means the compiler has
+done everything it can, and `register_report` turns that boundary from a manual native-asm
+grep into a named diagnostic.
+
+These four join register tiling (F13), cache-locality (F15), and algorithmic orchestration
 (F17) as the known "above-the-guarantee" performance levers that per-kernel IR analysis
 cannot close.
 
