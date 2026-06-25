@@ -164,6 +164,7 @@ end
     @golden name expr ulps=N
     @golden name expr dir=some_path
     @golden name expr ulps=N dir=some_path
+    @golden name expr validator=f
 
 Gated bit-exact (or ~ULP-tolerant) regression harness for numeric kernels.
 
@@ -177,6 +178,11 @@ write the result to a golden file, log `@info`, and return the result.
 
 On mismatch throws [`StrictViolation`](@ref) naming `name`, the first failing index, the
 expected and actual values, and the ULP distance.
+
+- `validator = f`: semantic invariant predicate. If provided, no golden file is written or
+  compared — `f(result)` is called instead, and a `StrictViolation` is thrown if it returns
+  `false`. Use for problems with multiple valid outputs (e.g. shortest-float formatters where
+  `parse(Float64, out) === x` is the right oracle, not byte-equality against one reference).
 
 **Supported result types:** `Real` scalars, `AbstractArray{<:Real}`, `AbstractArray{<:Complex}`.
 Other types throw a clear "unsupported golden type" error.
@@ -197,21 +203,27 @@ result = @golden "dot_result" my_dot(a, b) ulps=1
 
 # Custom golden directory (useful in tests with mktempdir)
 result = @golden "kernel_out" kernel!(y, x) dir=tmpdir
+
+# Semantic invariant for a shortest-float formatter
+result = @golden "ryu_out" format_float(x) validator=s->parse(Float64,s)===x
 ```
 """
 macro golden(name, expr, kwargs...)
-    # Parse optional keyword arguments: ulps=N and dir=<path>.
+    # Parse optional keyword arguments: ulps=N, dir=<path>, validator=f.
     ulps_val = 0
     dir_expr = nothing
+    validator_expr = nothing
     for kw in kwargs
-        Meta.isexpr(kw, :(=), 2) || throw(ArgumentError("@golden: unexpected argument $kw; expected `ulps=N` or `dir=<path>`"))
+        Meta.isexpr(kw, :(=), 2) || throw(ArgumentError("@golden: unexpected argument $kw; expected `ulps=N`, `dir=<path>`, or `validator=f`"))
         k, v = kw.args
         if k === :ulps
             ulps_val = v  # may be a literal or expression
         elseif k === :dir
             dir_expr = v
+        elseif k === :validator
+            validator_expr = v
         else
-            throw(ArgumentError("@golden: unknown keyword `$k`; expected `ulps` or `dir`"))
+            throw(ArgumentError("@golden: unknown keyword `$k`; expected `ulps`, `dir`, or `validator`"))
         end
     end
 
@@ -225,6 +237,7 @@ macro golden(name, expr, kwargs...)
     name_esc = esc(name)
     expr_esc = esc(expr)
     ulps_esc = esc(ulps_val)
+    validator_esc = esc(validator_expr === nothing ? :nothing : validator_expr)
 
     return quote
         let _golden_name = $(name_esc),
@@ -233,12 +246,21 @@ macro golden(name, expr, kwargs...)
             _golden_path = joinpath(_golden_dir, string(_golden_name) * ".golden"),
             _golden_result = $(expr_esc)
 
-            if !isfile(_golden_path) || get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1"
-                mkpath(_golden_dir)
-                StrictMode._write_golden(_golden_path, _golden_result)
-                @info "StrictMode @golden: recorded golden for \"$_golden_name\" at $_golden_path"
+            if $(validator_esc) !== nothing
+                # Semantic invariant path: call validator(result) instead of byte comparison.
+                # No golden file is written or read — the invariant IS the oracle.
+                $(validator_esc)(_golden_result) || throw(StrictViolation(
+                    :golden, string(_golden_name),
+                    "semantic invariant failed for \"$_golden_name\": validator returned false."
+                ))
             else
-                StrictMode._compare_golden(string(_golden_name), _golden_result, _golden_path, _golden_ulps)
+                if !isfile(_golden_path) || get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1"
+                    mkpath(_golden_dir)
+                    StrictMode._write_golden(_golden_path, _golden_result)
+                    @info "StrictMode @golden: recorded golden for \"$_golden_name\" at $_golden_path"
+                else
+                    StrictMode._compare_golden(string(_golden_name), _golden_result, _golden_path, _golden_ulps)
+                end
             end
             _golden_result
         end

@@ -48,11 +48,11 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F21 | `Union{T,Nothing}` (found-or-nothing idiom) fails `@assert_typestable` | ✅ fixed | `_is_typestable_return` helper accepts `isbitsunion(T)` at all 4 check sites; `Union{Int,String}` still fails |
 | F22 | perf diagnostics are FP-centric, blind to integer-SIMD kernels | ✅ fixed | `KernelReport` gains `int_ops`/`int_mem_ops`; `_kr_bound` falls back to integer intensity; `scalar_fp_loops` gains `_SCALAR_INT_RE`/`_LOOP_INT_RE` for integer hot loops |
 | F23 | whole-method guarantees can't target a delegating / union-returning entry | ✅ docs | cookbook.md "Guarantee the kernel, smoke-test the entry" subsection |
-| F24 | branch misprediction is invisible to every guarantee (perf trap) | 🔴 open | a data-dependent `if x<0` (50/50 signs) cost ~4× while `@assert_noalloc`/`@assert_typestable`/`@assert_vectorized` all stayed green — itoa port. Extends F10/F17 "necessary-not-sufficient" |
-| F25 | kernel *measurement* must defeat DCE on both sides | 🔴 open | the golden/benchmark workflow (F19) needs `Base.donotdelete`/`black_box` discipline — a `.len()`-only reference elided the work and inverted a verdict (itoa "8.7×" was a DCE artifact) |
-| F26 | performance is value-distribution-dependent; one input isn't a verdict | 🔴 open | ryu swung 0.76×→2.05× on the *same* code path by input shape (full-mantissa vs integer-valued floats), flipping "gap"↔"2× win". No static guarantee/`kernel_report` models the data domain |
-| F27 | golden bit-exact fails for multi-valid-output problems | 🔴 open | `@golden` (F19) assumes a canonical reference; ryu/shortest-float emit different *valid* forms (`1.0` vs `1`) → need a semantic invariant (round-trip `parse===x`), not byte-equality |
-| F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | 🔴 open | recurs: itoa's `÷100` chain, `Base.Ryu`'s digit-trim `while` (`shortest.jl:146`, serial `div`-by-10). Latency-bound even with perfect prediction; integer; passes every guarantee; `:no_scalar_loops` is FP-only (F22). Evidence: Base.Ryu −20% on full-mantissa floats (trim loop) vs +2× on integer-valued (fast path, no loop) |
+| F24 | branch misprediction is invisible to every guarantee (perf trap) | ✅ diagnostic | `kernel_report` gains `branch_count` field; show warns on branches in vectorized kernels + cookbook branchless idioms |
+| F25 | kernel *measurement* must defeat DCE on both sides | ✅ docs | cookbook "Defeat DCE before measuring" subsection |
+| F26 | performance is value-distribution-dependent; one input isn't a verdict | ✅ docs | cookbook "Measure across representative value classes" + rust_gaps.md note |
+| F27 | golden bit-exact fails for multi-valid-output problems | ✅ fixed | `@golden` gains `validator=` kwarg for semantic invariant; no golden file required |
+| F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | ✅ diagnostic | `kernel_report` gains `serial_dep_count` field; warns on div/rem/sqrt in looping functions + rust_gaps.md note |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
