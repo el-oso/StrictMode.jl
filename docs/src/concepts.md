@@ -96,21 +96,46 @@ usually triggers it: once a value is boxed, everything downstream dispatches dyn
 
 ## SIMD vectorization
 
-Modern CPUs can process multiple values in a single instruction. This is **SIMD** — Single
-Instruction, Multiple Data. AVX2 handles 4 doubles at once; AVX-512 handles 8.
+Modern CPUs have special **vector registers** that are wider than a single number. Instead of
+holding one `Float64`, they hold 4 or 8 at once. A single CPU instruction can then operate on
+all values simultaneously. This is **SIMD** — Single Instruction, Multiple Data.
+
+The two common widths on modern x86 CPUs:
+- **AVX2** (most laptops and servers since ~2013): 256-bit registers → 4 doubles or 8 floats per instruction
+- **AVX-512** (newer server and desktop CPUs): 512-bit registers → 8 doubles or 16 floats per instruction
 
 ```text
-Scalar loop (one value per step):         SIMD loop (AVX2: 4 doubles per step):
+Scalar loop — one value per CPU instruction:
+  step 1:  a[0] × b[0] → c[0]
+  step 2:  a[1] × b[1] → c[1]   ← 4 separate multiply instructions
+  step 3:  a[2] × b[2] → c[2]
+  step 4:  a[3] × b[3] → c[3]
 
-step 1:  a[0] × b[0] → c[0]              step 1:  ┌a[0]┐   ┌b[0]┐   ┌c[0]┐
-step 2:  a[1] × b[1] → c[1]                       │a[1]│ × │b[1]│ = │c[1]│
-step 3:  a[2] × b[2] → c[2]                       │a[2]│   │b[2]│   │c[2]│
-step 4:  a[3] × b[3] → c[3]                       └a[3]┘   └b[3]┘   └c[3]┘
+SIMD loop (AVX2) — 4 values per CPU instruction:
+  step 1:  ┌a[0]┐   ┌b[0]┐   ┌c[0]┐
+           │a[1]│ × │b[1]│ = │c[1]│   ← 1 vmulpd instruction, same clock cost
+           │a[2]│   │b[2]│   │c[2]│
+           └a[3]┘   └b[3]┘   └c[3]┘
 
-4 steps to process 4 values               1 step to process 4 values (4× throughput)
+Result: 4× the arithmetic done in the same number of clock cycles.
 ```
 
-Julia's compiler generates these instructions automatically — but only when the loop structure
+**Why SIMD matters independently of multi-threading.** Adding threads spreads work across
+CPU cores — but each core still processes one value at a time without SIMD. SIMD makes *each
+core* faster; threading runs more cores in parallel. They multiply:
+
+```text
+4-core CPU with AVX2 (4 doubles/instruction):
+
+  Without SIMD, with 4 threads:   4 cores × 1 double/instr  =  4 doubles per clock
+  With SIMD, 1 thread:            1 core  × 4 doubles/instr =  4 doubles per clock
+  With SIMD, 4 threads:           4 cores × 4 doubles/instr = 16 doubles per clock  ← full throughput
+```
+
+A program that uses threads but not SIMD, running on a 4-core AVX2 machine, is leaving 75% of
+its compute unused. Threads and SIMD are complementary — you need both to saturate the hardware.
+
+Julia's compiler generates SIMD instructions automatically — but only when the loop structure
 allows it: no data-dependent branches, sequential memory access, no unresolved function calls,
 and type-stable element types. A loop that looks vectorized often isn't.
 
