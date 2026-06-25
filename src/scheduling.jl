@@ -265,10 +265,20 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     has_loop_phi = occursin(r"\bphi i(?:8|16|32|64|128)\b", s)
     high_lat = count(_ -> true, eachmatch(r"\b(?:s|u)div\b|\b(?:s|u)rem\b|\b@llvm\.sqrt\b", s))
     serial_dep_val = has_loop_phi ? high_lat : 0
-    # F29 — noalias missing: pointer params in the define line without noalias attribute
-    define_line = first(eachline(IOBuffer(s)))   # first line of IR is the define
-    total_ptr = count(_ -> true, eachmatch(r"\{\}\*", define_line))
-    noalias_ptr = count(_ -> true, eachmatch(r"noalias", define_line))
+    # F29 — noalias missing: pointer params in the define line without noalias attribute.
+    # Julia 1.12+ emits opaque `ptr` types. The first line is a comment; search for "define".
+    define_line = let found = ""
+        for l in eachline(IOBuffer(s))
+            startswith(l, "define") && (found = l; break)
+        end
+        found
+    end
+    # Count `ptr` tokens only in the parameter section (after the first `(`).
+    param_section = let idx = findfirst('(', define_line)
+        idx === nothing ? "" : define_line[idx:end]
+    end
+    total_ptr = count(_ -> true, eachmatch(r"\bptr\b", param_section))
+    noalias_ptr = count(_ -> true, eachmatch(r"\bnoalias\b", param_section))
     noalias_missing_val = max(0, total_ptr - noalias_ptr)
     return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val)
 end
