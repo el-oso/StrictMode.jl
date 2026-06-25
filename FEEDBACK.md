@@ -53,6 +53,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F26 | performance is value-distribution-dependent; one input isn't a verdict | ✅ docs | cookbook "Measure across representative value classes" + rust_gaps.md note |
 | F27 | golden bit-exact fails for multi-valid-output problems | ✅ fixed | `@golden` gains `validator=` kwarg for semantic invariant; no golden file required |
 | F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | ✅ diagnostic | `kernel_report` gains `serial_dep_count` field; warns on div/rem/sqrt in looping functions + rust_gaps.md note |
+| F29 | a data-dependent load address (from a SIMD reduction) serializes cache-miss latency — invisible to every guarantee | 🔴 open | SwissDict: `@assert_vectorized`/`@assert_noalloc`/`@assert_typestable` all green, yet lookup-HIT 1.8× slower than Base `Dict` — the slot index is derived FROM the control-group SIMD reduction, so `keys[jr]` loads serially (no memory-level parallelism); Base Dict knows `keys[ideal]` from the hash and overlaps it. Validated against DataStructures.SwissDict. A new "necessary-not-sufficient" axis after F10/F17/F24/F28 |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -542,3 +543,33 @@ as a `phi` whose update feeds the next iteration through such an op — flagged 
 with the suggested fix ("break the dependency chain: process N elements/digits independently per step").
 This is the integer/latency complement to F20 (scalar FP loops) and F10 (tiling): three different ways a
 guarantee-green kernel still leaves performance on the table, all now with concrete dogfooded cases.
+
+## F29 — a data-dependent load address (from a SIMD reduction) serializes cache-miss latency, invisible to the guarantees
+Porting hashbrown to `BlazingPorts.SwissDict` (a SwissTable: SIMD 16-control-byte group probe). It is
+`@assert_noalloc` + `@assert_typestable` + `@assert_vectorized` **all green** — and lookup-**miss** is 2.5×
+*faster* than Base `Dict`. But lookup-**hit** is ~1.8× **slower**. Root cause, found by measurement after
+refuting three other hypotheses (cache-line straddling → an aligned-load fix didn't help; prefetch →
+DataStructures.jl's prefetch-using SwissDict has the *same* profile; hash cost → Julia `hash(::UInt64)` is
+~0.2 ns): the matching slot index `jr` is computed **from** the control-group SIMD reduction
+(`vload` → `bitmask` → `trailing_zeros`), so the DRAM load `keys[jr]` cannot issue until that reduction
+finishes — its latency is fully serialized/exposed, with no memory-level parallelism. Base `Dict`'s scalar
+probe knows `keys[ideal]` straight from the hash, so that load overlaps the control check. Independently
+validated: DataStructures.jl's mature SwissDict (group-aligned, prefetch-using) shows the identical hit
+regression — so it is inherent to the design, not our bug.
+
+This is a **new dimension** of "necessary-but-not-sufficient" (after F10 tiling, F17 orchestration, F24
+branch misprediction, F28 *arithmetic* loop-carried deps): a guarantee-green, vectorized kernel can still
+be slower because a **data-dependent load address kills memory-level parallelism**. None of the per-call
+guarantees model it, and `kernel_report` (FLOP:byte intensity, even with the new `serial_dep_count`) won't
+catch it either — `serial_dep_count` keys on arithmetic high-latency ops (div/rem/sqrt); this is a *load*
+whose address depends on a prior vector reduction.
+
+Suggestions:
+1. **`kernel_report` signal:** flag a load whose address is computed from a vector-reduction result
+   (`bitmask`/`trailing_zeros`/`movemask` feeding a GEP) inside a hot path — "address-dependent load:
+   cache-miss latency is serialized; the value load can't overlap the probe." Best-effort, from the IR.
+2. **Doc note** in the perf-diagnostic story: prefer load addresses known early (Base `Dict`'s scalar
+   probe is genuinely better for hits *because* of this), or prefetch the likely address speculatively.
+3. **Mitigation-gap flag:** the standard fix is software prefetch, and **Julia has no built-in prefetch
+   intrinsic** (verified; DataStructures/VectorizationBase/LoopVectorization/CUDA each roll their own via
+   `llvmcall`). Worth noting in the docs, and there's a standalone Base proposal for `Base.prefetch`.
