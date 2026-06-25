@@ -54,6 +54,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F27 | golden bit-exact fails for multi-valid-output problems | ✅ fixed | `@golden` gains `validator=` kwarg for semantic invariant; no golden file required |
 | F28 | serial loop-carried dependency through a high-latency op is an invisible scalar trap | ✅ diagnostic | `kernel_report` gains `serial_dep_count` field; warns on div/rem/sqrt in looping functions + rust_gaps.md note |
 | F29 | a data-dependent load address (from a SIMD reduction) serializes cache-miss latency — invisible to every guarantee | 🔴 open | SwissDict: `@assert_vectorized`/`@assert_noalloc`/`@assert_typestable` all green, yet lookup-HIT 1.8× slower than Base `Dict` — the slot index is derived FROM the control-group SIMD reduction, so `keys[jr]` loads serially (no memory-level parallelism); Base Dict knows `keys[ideal]` from the hash and overlaps it. Validated against DataStructures.SwissDict. A new "necessary-not-sufficient" axis after F10/F17/F24/F28 |
+| F30 | a vectorized kernel can be data-marshalling-bound (scalar-gather transpose)  -  `@assert_vectorized` passes but throughput is limited by the gather, not the compute | 🔴 open | blake3 `hash_many`: `<16 x i32>` compute confirmed green, but each `Vec{16}` is built from 16 strided scalar loads (a transpose); the crate uses SIMD-shuffle transpose → we land 0.71×. Distinct SIMD-layout axis; may partly overlap `kernel_report` mem-intensity |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -573,3 +574,21 @@ Suggestions:
 3. **Mitigation-gap flag:** the standard fix is software prefetch, and **Julia has no built-in prefetch
    intrinsic** (verified; DataStructures/VectorizationBase/LoopVectorization/CUDA each roll their own via
    `llvmcall`). Worth noting in the docs, and there's a standalone Base proposal for `Base.prefetch`.
+
+## F30 — a vectorized kernel can be data-marshalling-bound (scalar-gather transpose)
+The blake3 port (`BlazingPorts.Blake3`, hashbrown... no — blake3 probe) hashes via a `Vec{16,UInt32}`
+`hash_many` kernel. `@assert_vectorized` is green (the 7-round G mixing compiles to `<16 x i32>`, and the
+BLAKE3 rotations lower to native `vprold` — verified), yet throughput is **0.71×** the Rust crate. The
+residual is **not the compute** — it's the message **transpose**: each of the 16 state words is built as a
+`Vec{16,UInt32}` from **16 strided scalar loads** (`ntuple(k -> unsafe_load(ptrs[k]+off), Val(16))`), one
+per parallel chunk. The crate transposes with SIMD shuffles (vpunpck/vperm). So a guarantee-green,
+genuinely-vectorized kernel is **bottlenecked by scalar data-marshalling**, which `@assert_vectorized`
+(compute-only) does not surface.
+
+This is a SIMD-*layout* axis of "necessary-but-not-sufficient" (distinct from the compute-focused F10/F24/
+F28 and the memory-latency F29). Honest caveat: `kernel_report` already counts mem-ops and (post-F13)
+alignment/masking — a transpose-heavy kernel may *already* show a high scalar-load : vector-op ratio, so
+**verify whether `kernel_report` surfaces this before adding anything**. If it doesn't, a "gather/transpose
+ratio" signal — many strided scalar loads feeding vector ops in a hot path — would name the bottleneck and
+point at SIMD-transpose (shuffle) as the fix. Positive note: the blake3 port is otherwise a clean win for
+the guarantees (byte-exact, vectorized, 7.4× over the scalar ecosystem package) — F30 is the one gap.
