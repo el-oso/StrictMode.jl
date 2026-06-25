@@ -221,6 +221,38 @@ These three join register tiling (F13), cache-locality (F15), and algorithmic or
 (F17) as the known "above-the-guarantee" performance levers that per-kernel IR analysis
 cannot close.
 
+### Aliasing and effects: what Julia doesn't tell LLVM (Issues 2 and 3)
+
+Two structural information gaps widen the Julia–Rust codegen margin beyond what any per-kernel
+guarantee can close:
+
+**Aliasing (Issue 2)**: Rust's `&mut T` tells LLVM that the reference is exclusively owned for
+the duration of the call — LLVM receives `noalias` on every `&mut` parameter for free. In
+Julia, `Array` arguments are conservatively assumed potentially aliasing unless the user
+explicitly asserts otherwise. This lets LLVM reorder and vectorize across iterations in Rust
+but forces conservative dependency tracking in Julia.
+
+The workaround:
+```julia
+# Without: LLVM may be conservative about alias-dependent reordering
+@inbounds for i in eachindex(a, b); a[i] += b[i]; end
+
+# With: explicit no-alias / no-loop-carried-dep assertion
+@inbounds @simd ivdep for i in eachindex(a, b); a[i] += b[i]; end
+```
+
+`kernel_report` now surfaces `noalias_missing_count` — the number of pointer parameters in the
+function's LLVM IR that lack the `noalias` attribute — as an advisory signal on vectorized
+functions. This is filed upstream as a Julia compiler improvement request (automatic `noalias`
+emission where the type system can prove exclusive ownership).
+
+**Effect inference (Issue 3)**: Rust's type system lets rustc infer that a function is
+effect-free (no side effects, no heap allocation, terminates) from its type signature and body.
+In Julia, the compiler needs manual `Base.@assume_effects` to unlock the same optimizations
+(constant folding, inlining at constant arguments). `@assert_effects` is the StrictMode verify
+side — it checks that `Base.infer_effects` agrees with a declared guarantee. Extending Julia's
+automatic effects inference to pure `@inbounds` SIMD loops is an open upstream improvement.
+
 ## Bonus: trim-safety (the static-binary story)
 
 Rust's other predictability win is ahead-of-time compilation to a small static binary. Julia's
