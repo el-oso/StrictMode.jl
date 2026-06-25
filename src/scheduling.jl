@@ -172,6 +172,8 @@ struct KernelReport
     branch_count::Int   # conditional branches (br i1) coexisting with vector ops — mispredict risk (F24)
     # F28
     serial_dep_count::Int # high-latency ops (div/rem/sqrt) in functions with loop-carried phi — serialization risk (F28)
+    # F29
+    noalias_missing_count::Int  # pointer params without noalias in LLVM IR define line — aliasing risk (F29)
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -234,7 +236,7 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
                        working_set_bytes::Union{Nothing,Int} = nothing)
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0, 0)
     width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half|i\d+)>", s)); init = 0)
     vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
@@ -263,7 +265,12 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     has_loop_phi = occursin(r"\bphi i(?:8|16|32|64|128)\b", s)
     high_lat = count(_ -> true, eachmatch(r"\b(?:s|u)div\b|\b(?:s|u)rem\b|\b@llvm\.sqrt\b", s))
     serial_dep_val = has_loop_phi ? high_lat : 0
-    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val)
+    # F29 — noalias missing: pointer params in the define line without noalias attribute
+    define_line = first(eachline(IOBuffer(s)))   # first line of IR is the define
+    total_ptr = count(_ -> true, eachmatch(r"\{\}\*", define_line))
+    noalias_ptr = count(_ -> true, eachmatch(r"noalias", define_line))
+    noalias_missing_val = max(0, total_ptr - noalias_ptr)
+    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val)
 end
 
 # --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
@@ -408,6 +415,12 @@ function Base.show(io::IO, r::KernelReport)
         print(io, "\n")
         printstyled(io, "  serial high-latency ops: $(r.serial_dep_count)"; color = :yellow)
         print(io, " — div/rem/sqrt in a loop with a loop-carried variable creates a serial dependency chain. Break the chain: process multiple elements per step, or use division-free extraction (e.g. jeaiii-style).")
+    end
+    # F29 noalias missing
+    if r.noalias_missing_count > 0 && r.vectorized
+        print(io, "\n")
+        printstyled(io, "  noalias missing: $(r.noalias_missing_count) pointer param(s)"; color = :yellow)
+        print(io, " — LLVM may conservatively assume aliasing across iterations. Use `@simd ivdep` to assert no loop-carried deps, or restructure to pass by value.")
     end
     # F14/F15 cache-residency annotation
     if !isnothing(r.working_set_bytes)

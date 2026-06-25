@@ -67,7 +67,7 @@ would_fail_typestable(r)  # Bool
 would_fail_noalloc(r)     # Bool
 
 kernel_report(f, types)   # KernelReport: arithmetic intensity from LLVM IR (heuristic, never fails)
-# fields: vectorized, width, fp_ops, mem_ops, intensity, unaligned_mem_ops, masked_mem_ops, working_set_bytes
+# fields: vectorized, width, fp_ops, mem_ops, intensity, unaligned_mem_ops, masked_mem_ops, working_set_bytes, + int_ops, int_mem_ops, branch_count, serial_dep_count, noalias_missing_count
 kernel_report(f, types; working_set_bytes = 8*256*256)  # adds L1/L2/L3/DRAM cache-residency note
 ```
 
@@ -76,6 +76,7 @@ kernel_report(f, types; working_set_bytes = 8*256*256)  # adds L1/L2/L3/DRAM cac
 - `unaligned_mem_ops > 0` — vector loads/stores with align < vector width; ensure buffers are aligned
 - `masked_mem_ops > 0` — variable-length inner loops (remainder masking); prefer fixed-width tiles
 - `working_set_bytes` + compute-bound + spills L2 → warns that BLIS-style packing is needed (F15 ceiling)
+- `noalias_missing_count > 0` — pointer params without `noalias` in LLVM IR; LLVM may conservatively assume aliasing across loop iterations. Use `@simd ivdep` to assert independence (F29)
 
 Cache thresholds auto-populate from `CpuId.cachesize()` when `using CpuId` is in scope (x86 only);
 otherwise defaults to 32 KiB / 512 KiB / 16 MiB. Override: `StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)`
