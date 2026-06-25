@@ -18,8 +18,10 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
-        "Performance diagnostics" => "performance_diagnostics.md",
+        "Key Concepts" => "concepts.md",
+        "Tutorial" => "tutorial.md",
         "Guarantees" => "guarantees.md",
+        "Performance diagnostics" => "performance_diagnostics.md",
         "Automating checks" => "automating.md",
         "Agentic feedback" => "agents.md",
         "Cookbook" => "cookbook.md",

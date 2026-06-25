@@ -68,7 +68,7 @@ end
 Define `f` and, when checks are enabled, verify its contract at precompile time against the
 declared argument types. The return type must be concrete and the body must not allocate, with
 runtime dispatch and boxing counting as allocations. Break the contract and the enclosing module
-won't load. It's the same "won't compile if it's wrong" guarantee Rust gives you.
+won't load, rather than being discovered at the next profiling session.
 
 Only concrete signatures are verified this way. Signatures with abstract types or varargs emit a
 one-time warning and fall back to call-site [`@strict`](@ref) checks. With checks disabled this is
@@ -98,7 +98,7 @@ end
     @strict_exempt name
 
 Mark a function as cold: setup or plan-time code that's meant to allocate or stay type-flexible,
-and should be exempt from StrictMode's checks. This is the Rust-style opt-out. Inside a
+and should be exempt from StrictMode's checks. Inside a
 `@strict module` every function is checked by default, and you wrap only the occasional cold helper
 in `@strict_exempt`, rather than annotating all the hot code.
 

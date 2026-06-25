@@ -25,6 +25,7 @@ If these terms are unfamiliar, a quick definition before diving in:
 
 Allocation-free code avoids all three. Type-stable code avoids instability (and usually boxing
 too). The macros below enforce each property separately so you can be precise about what you need.
+See [Key Concepts](concepts.md) for worked examples of each.
 
 Every example here is live. The docs are built with checks enabled, so the analysis runs as the
 page is generated. Calls that pass are shown as real `@example` blocks; calls that are meant to

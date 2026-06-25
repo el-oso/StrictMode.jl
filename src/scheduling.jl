@@ -233,7 +233,7 @@ access), `masked_mem_ops` (masked/variable-length memory ops — a proxy for irr
 Pass `working_set_bytes` to get a cache-residency annotation: if the working set fits L1/L2,
 low intensity is expected and acceptable; if it spills L2 and the kernel is already
 compute-bound, the report notes the cache-blocking (packing) gap that per-kernel IR analysis
-cannot close (F15 ceiling).
+cannot close.
 
 ```julia
 kernel_report(syrk_naive!, (Matrix{Float64},))   # intensity ≈ 0.7 → memory-bound (add blocking)

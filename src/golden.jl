@@ -174,7 +174,7 @@ write the result to a golden file, log `@info`, and return the result.
 **Compare mode** (golden file present): evaluate `expr`, compare against the stored golden.
 - `ulps=0` (default): exact bit equality (`===` per element).
 - `ulps=N>0`: allow up to N ULPs per element (per-element signed-magnitude integer-rep
-  distance), useful for SIMD reductions whose lane-combine order is codegen-defined (F18).
+  distance), useful for SIMD reductions whose lane-combine order is codegen-defined.
 
 On mismatch throws [`StrictViolation`](@ref) naming `name`, the first failing index, the
 expected and actual values, and the ULP distance.
