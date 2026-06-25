@@ -77,24 +77,6 @@ When you want the reason rather than a thrown error, reach for `@explain`. It ga
 - **`@strict_function`** runs the no-alloc + concrete-return checks against the declared
   argument types at precompile/load time, so a violation stops the module from loading.
 
-## Force the fast path
-
-Better than detecting boxing is not boxing at all. `@unroll` fully unrolls a fixed-count loop with
-literal indices, so a heterogeneous tuple gets indexed type-stably instead of boxing:
-
-```julia
-function tuple_sum(t)
-    s = 0.0
-    @unroll for i in 1:3
-        s += t[i]        # → s += t[1]; t[2]; t[3]   (no boxing; @assert_noalloc passes)
-    end
-    s
-end
-```
-
-For a size known only from a type, lift it with `staticval(n)` and splice the literal into
-`@unroll` from a `@generated` method.
-
 ## SIMD kernel workflow
 
 Practical guidance for SIMD/`@generated` kernel development: audit reflexes, coverage, and
