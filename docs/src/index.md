@@ -33,10 +33,9 @@ features:
 ## Why
 
 Julia will happily let your code box a value, miss an inline, drift into a type instability, or
-allocate inside a hot loop, and it won't say a word. Rust would have stopped you at compile time.
-In Julia each of these stays invisible until you go hunting for it with a profiler. StrictMode lets
-you ask for those properties out loud: declare what you expect, and hear about it right away when
-something breaks the promise.
+allocate inside a hot loop — and it won't say a word. Each of these stays invisible until you go
+hunting for it with a profiler. StrictMode lets you ask for those properties out loud: declare what
+you expect, and hear about it right away when something breaks the promise.
 
 > StrictMode grew out of a JuliaCon 2024 talk, *"Why do we need a stricter Julia mode?"* The traps
 > that motivated it turned up while tuning a SIMD FFT, where indexing a tuple with a runtime value

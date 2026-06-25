@@ -6,7 +6,7 @@ compile away to nothing.
 
 | Performance trap | Symptom | Catch it with |
 |---|---|---|
-| **Runtime tuple indexing** (`t[i]`, `t` heterogeneous, `i` a runtime value) | `Union` return type, silent boxing, the classic 135× cliff | `@assert_noboxing` / `@unroll` to fix |
+| **Runtime tuple indexing** (`t[i]`, `t` heterogeneous, `i` a runtime value) | `Union` return type, silent boxing | `@assert_noboxing` / `@unroll` to fix |
 | **Type-unstable return** (a branch returns `Int`, another `Float64`) | `Union{...}`/`Any` return; downstream boxing | `@assert_typestable` |
 | **Captured-variable boxing** (a closure mutates an outer local) | `Core.Box`, allocations, lost inference | `@assert_noboxing` |
 | **Untyped accumulator** (`acc = []` / `acc = 0` later holding mixed types) | per-iteration allocation, dispatch | `@assert_noalloc` / `@strict` |
@@ -95,29 +95,23 @@ end
 For a size known only from a type, lift it with `staticval(n)` and splice the literal into
 `@unroll` from a `@generated` method.
 
-## Numeric kernel workflow
+## SIMD kernel workflow
 
 Practical guidance for SIMD/`@generated` kernel development: audit reflexes, coverage, and
 correctness verification against a reference.
 
 ### Annotate every hot loop — not just the obvious ones
 
-StrictMode audits the kernels you point it at — it does not scan for hot loops automatically.
-A scalar floating-point hot loop in the "glue" between two audited kernels will not trigger any
-guarantee and can silently dominate runtime.
-
-In a QR factorization port, a scalar triangular triple-loop (`Y = TᵀW`) accounted for ~12% of
-total runtime (more via cache effects), while the suspected bottleneck — the panel reduction — was
-only 3–5%. The two surrounding gemm kernels were audited and green; the scalar loop between them was
-never pointed at the auditor, so it was invisible until a wall-clock profiler found it. The fix was
-simple once seen: it had the same shape as an already-vectorized kernel and could reuse it — but
-`@assert_vectorized` only tells you what you ask about.
+StrictMode audits the kernels you point it at — it does not scan for hot loops automatically. A
+scalar loop in the "glue" between two audited kernels will not trigger any guarantee and can
+silently dominate runtime.
 
 Use `@strict` or `@kernel` as you write each numeric loop, not only as a post-hoc check. When
-something is slow and all audited kernels pass, look at the unaudited glue.
+something is slow and all audited kernels pass, look at the unaudited glue between them.
 
-!!! note
-    An automatic whole-function scalar-loop IR scan is a planned future feature, not yet available.
+[`@assert_no_scalar_loops`](@ref) can help: it checks that a function's compiled body contains no
+scalar FP or integer hot loops (loop-carried `phi` with no vector ops). Apply it to any function
+where you expect auto-vectorization to have kicked in.
 
 ### Port against a golden reference
 
@@ -152,17 +146,28 @@ differences.
 @test abs(my_dot(a, b) - ref_dot) ≤ eps(ref_dot)
 ```
 
-!!! note
-    A `@golden`-style gated-regression macro (exact for deterministic ops, tolerance-aware for SIMD
-    reductions) is a planned future feature. For now, implement the pattern with standard `@test`.
+StrictMode provides [`@golden`](@ref) for this pattern. Record mode writes a typed golden file;
+compare mode does exact or ULP-tolerant comparison and throws `StrictViolation` on mismatch:
+
+```julia
+@golden norm_check my_norm(x)            # exact comparison (deterministic kernel)
+@golden dot_check my_dot(a, b) ulps=2    # tolerance-aware (SIMD reduction)
+```
+
+For problems with multiple valid outputs (e.g. "any shortest round-trip decimal"), pass a
+`validator=` predicate instead of a golden file:
+
+```julia
+@golden ryu_check ryu_format(x) validator = s -> parse(Float64, s) === x
+```
 
 ### Guarantee the kernel, smoke-test the entry
 
 Public functions often can't carry whole-method guarantees:
 
 - **Union-returning entries**: a function returning `Union{Int,Nothing}` — the canonical Julia
-  idiom for "index or not found" (`findfirst`, `iterate`, `tryparse`). Since F21, `@assert_typestable`
-  accepts small isbits unions, so this case is now handled directly.
+  idiom for "index or not found" (`findfirst`, `iterate`, `tryparse`). `@assert_typestable`
+  accepts small isbits unions like this, so this case is handled directly.
 
 - **Base-delegating entries**: the public wrapper forwards edge cases to Base (e.g.
   `length(needle) ≤ 1 && return findfirst(...)`), which may allocate or dispatch dynamically
@@ -180,17 +185,14 @@ alloc-free), and empirically smoke-test the **public entry** with a runtime `@al
 @test find_substr(haystack, needle) == expected         # correctness
 ```
 
-This mirrors the F11 principle: assert on the leaf where the guarantees actually hold; the thin
-dispatcher is smoke-tested empirically. The audit covers the performance-critical path; edge-case
-branches stay outside the guarantee boundary.
+The pattern: assert on the leaf kernel where the guarantees actually hold; the thin dispatcher
+is smoke-tested empirically. The audit covers the performance-critical path; edge-case branches
+stay outside the guarantee boundary.
 
-### Defeat dead-code elimination before measuring (F25)
+### Defeat dead-code elimination before measuring
 
 A benchmark that only observes a derived value (a length, a checksum) lets the optimizer
-eliminate the actual work — the timing then measures the derived value alone. The itoa
-reference shim timed `buf.format(x).len()`, and because only the *length* was consumed,
-LLVM eliminated the digit-writes entirely: the "8.7× faster" number was measuring `ndigits`,
-not formatting.
+eliminate the actual work — the timing then measures the derived value alone, not the kernel.
 
 The rule: **every measured kernel needs an explicit sink that consumes its output.**
 
@@ -202,16 +204,15 @@ The rule: **every measured kernel needs an explicit sink that consumes its outpu
 @btime (format_int!(buf, x); Base.donotdelete(buf))
 ```
 
-This applies on both sides of a Rust/Julia comparison: ensure the reference shim sinks its
-output (e.g. `std::hint::black_box(buf)` in Rust) and the Julia version sinks its buffer.
-`Base.donotdelete` is available in Julia 1.8+.
+If benchmarking against a reference implementation, ensure the reference also sinks its output
+(e.g. `std::hint::black_box(buf)` in Rust, `volatile` write in C). `Base.donotdelete` is
+available in Julia 1.8+.
 
-### Measure across representative value classes (F26)
+### Measure across representative value classes
 
-A single benchmark input can flip a "gap" verdict into a "2× win". Re-probing `ryu` (float→
-string) showed **0.76×** on `rand()` (full mantissa) vs **2.05×** on integer-valued floats
-(`1000.0`) — the same code path, swinging 2.7× on input distribution alone. A one-distribution
-number is not a verdict.
+A single benchmark input can be misleading when the kernel does different amounts of work
+depending on the value — a formatter, search function, or compression codec may run several times
+faster on "easy" inputs than on "hard" ones. A one-distribution number is not a verdict.
 
 Required: measure across the value classes your kernel will actually see, and report the spread:
 

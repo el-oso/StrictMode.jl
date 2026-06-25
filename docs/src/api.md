@@ -19,23 +19,43 @@ to the bare call.
 @assert_typestable
 @assert_inlined
 @assert_vectorized
+@assert_no_scalar_loops
 @assert_effects
 @assert_trim_safe
 @strict
 @kernel
 ```
 
-## Scheduling visibility
+## Performance diagnostics
+
+Non-failing diagnostics that help you understand why a kernel is fast or slow. `kernel_report`
+and `register_report` read the compiled output (LLVM IR and native assembly respectively) and
+report intensity, register pressure, and signals like alignment, masking, and serial dependencies.
+`descend` drops you into an interactive code inspector. `scalar_fp_loops` is the programmatic
+version of `@assert_no_scalar_loops`.
 
 ```@docs
-descend
 kernel_report
+register_report
+scalar_fp_loops
+descend
 ```
 
-## Trim-safety (juliac --trim)
+## Static-binary compatibility
+
+Tools for checking compatibility with `juliac --trim=safe`. See [Performance diagnostics](performance_diagnostics.md).
 
 ```@docs
 explain_trim
+```
+
+## Testing
+
+Golden-file regression for numeric kernels: record exact or ULP-tolerant reference outputs and
+assert on them in future runs. See the [SIMD kernel workflow](cookbook.md) in the cookbook.
+
+```@docs
+@golden
 ```
 
 ## Definition-level guarantees
@@ -82,10 +102,11 @@ nfailures
 registered_strict_contracts
 ```
 
-## Idioms (force the fast path)
+## Avoiding boxing
 
-These make the fast path the easy one. Unlike the asserts they aren't gated, so the unrolling
-always happens, and they produce straight-line code with literal indices.
+These make the fast path the easy one. `@unroll` fully unrolls a fixed-count loop and replaces
+the loop variable with a literal on each pass, so a heterogeneous tuple gets indexed type-stably
+without boxing. Unlike the asserts these are not gated — the unrolling always happens.
 
 ```@docs
 @unroll
@@ -94,7 +115,8 @@ staticval
 
 ## Diagnostics
 
-Where the assert macros fail loudly, [`@explain`](@ref) quietly tells you why, without throwing.
+Where the assert macros fail loudly, `@explain` quietly tells you why, without throwing. It
+gathers `@code_warntype`, JET, and AllocCheck into a single `StrictReport`.
 
 ```@docs
 @explain
@@ -109,8 +131,9 @@ StrictViolation
 
 ## Configuration
 
-Checks are gated behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
-compile-time flag. Toggling it writes `LocalPreferences.toml` and triggers recompilation.
+Checks are gated behind a compile-time setting. Toggling it writes `LocalPreferences.toml` and
+takes effect on the next Julia start. See [Getting Started](getting_started.md) for the recommended
+`Project.toml` pattern.
 
 ```@docs
 enable_checks!

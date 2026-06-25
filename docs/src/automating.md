@@ -1,9 +1,18 @@
 # Automating checks
 
-Scattering `@assert_*` macros across call sites is precise, but it gets tedious fast. This page is
-about the gentler routes: a function API that stays out of the way of other macros, a way to mark a
-whole module once, automatic checking when it loads, and a live loop with Revise. (If you're wiring
-this up for an AI agent, head to [Agentic feedback](agents.md).)
+Scattering `@assert_*` macros across call sites is precise, but it gets tedious fast. This page
+covers the higher-level options. Quick reference for which to reach for:
+
+| I want to… | Use |
+|---|---|
+| Check one call at a call site | `@assert_*` / `@strict` / `@kernel` |
+| Check one function against its declared types | `@strict_function` |
+| Mark a whole module strict | `@strict module … end` |
+| Programmatically check `(f, types)` | `check` / `findings` |
+| Whole-package CI sweep | `audit` |
+| Live feedback while editing | `watch` + Revise |
+
+(For wiring `audit` into an AI agent or CI pipeline, see [Agentic feedback](agents.md).)
 
 ## The function API — `check`
 
@@ -34,8 +43,7 @@ even with calls you wouldn't want to execute for real.
 
 You shouldn't have to annotate every function by hand. `@strict module … end` makes the whole
 module strict on its own: every definition is checked by default, and you opt the occasional cold
-helper out with [`@strict_exempt`](@ref). It's the Rust posture of opting out of safety rather than
-opting into it.
+helper out with [`@strict_exempt`](@ref).
 
 ```julia
 @strict module Kernels        # one declaration disciplines the whole module
@@ -59,7 +67,7 @@ and verifies one definition at a time.
 When a strict-marked module loads and checks are enabled, StrictMode runs its checks on its own and
 reports according to [`fail_mode`](@ref): `:error` stops the module from loading, `:warn` just logs.
 This is the "checks happen as you compile" behavior. It's gated on `checks_enabled`, so a production
-build pays nothing, and the analyzers are already warmed by the PrecompileTools workload.
+build pays nothing, and the analyzers are already warmed.
 
 ### Re-check on demand
 

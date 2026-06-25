@@ -1,11 +1,30 @@
 # Guarantees
 
-A quick way to hold these in your head: they're guardrails. Each one pins a *necessary* property of
-a hot kernel — vectorized, allocation-free, type-stable — and fails loudly the moment an edit breaks
-it. Once an assert is in place it fences every future edit, so you can refactor freely and trust
-you'll be told the instant you cross the line. They keep you on the fast path; they don't promise
-you've found the *fastest* path. (For where that boundary lies, and the diagnostics that start to
-address it, see [Closing the gaps with Rust](rust_gaps.md).)
+Each guarantee pins a *necessary* property of a hot kernel — allocation-free, type-stable,
+vectorized — and fails loudly the moment an edit breaks it. Once an assert is in place it fences
+every future edit: refactor freely and get told the instant something crosses the line. They keep
+you on the fast path; they don't promise you've found the *fastest* path. For diagnostics that
+address the gap between "passing" and "fast," see [Performance diagnostics](performance_diagnostics.md).
+
+## Key concepts
+
+If these terms are unfamiliar, a quick definition before diving in:
+
+- **Type stability** — the compiler can predict a function's return type without running it. A
+  stable function always returns `Float64`, say; an unstable one might return `Float64` or `Int`
+  depending on a runtime condition. Instability forces the compiler to generate slower, more
+  general code downstream.
+
+- **Boxing** — wrapping a value in a generic heap-allocated container because its type can't be
+  predicted at compile time. A runtime index into a heterogeneous tuple (e.g. `t[i]` where `t`
+  holds mixed types) causes boxing. Each box costs a heap allocation and prevents SIMD vectorization.
+
+- **Dynamic dispatch** — resolving which method to call at runtime rather than at compile time.
+  Happens when the compiler can't pin down the type of a receiver, and adds a function-table lookup
+  to every call.
+
+Allocation-free code avoids all three. Type-stable code avoids instability (and usually boxing
+too). The macros below enforce each property separately so you can be precise about what you need.
 
 Every example here is live. The docs are built with checks enabled, so the analysis runs as the
 page is generated. Calls that pass are shown as real `@example` blocks; calls that are meant to
@@ -155,8 +174,8 @@ at precompile or module-load time. A clean one loads like any other:
 scaled(2.0, (1.0, 2.0, 3.0))
 ```
 
-If some later edit makes it allocate or go unstable, the module won't load at all. It's the same
-forcing function you'd get from Rust's compiler:
+If some later edit makes it allocate or go unstable, the module won't load at all — the violation
+is caught immediately rather than at the next profiling session:
 
 ```julia
 @strict_function leaky(n::Int) = sum(collect(1:n))   # collect allocates
@@ -171,9 +190,10 @@ one-time warning and fall back to call-site [`@strict`](@ref) checks instead.
 
 ## Interfaces + performance with TypeContracts
 
-[`@strict_contract`](@ref) declares a [TypeContracts.jl](https://github.com/el-oso/TypeContracts)
-interface that also carries performance guarantees, and [`@verify_strict`](@ref) checks both sides
-of an implementation: that it has the right methods, and that those methods are fast.
+When you define an interface (an abstract type with a required set of methods), you can also
+require that every implementation of it is fast. [`@strict_contract`](@ref) declares the interface
+with performance guarantees attached, and [`@verify_strict`](@ref) checks both sides: that an
+implementation has the right methods, and that those methods are fast.
 
 ```@example guide
 using TypeContracts

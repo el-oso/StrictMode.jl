@@ -23,34 +23,37 @@ StrictMode with the checks off needs neither package. If you want the live feedb
 
 ## Enable the checks
 
-Every guarantee sits behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
-compile-time flag, and it's off by default. With it off, a production build pays nothing: the
-macros expand to the bare call and there's nothing left to run. Turn the checks on while you
-develop, or in CI:
+Every guarantee sits behind a compile-time setting, off by default. With it off, a production
+build pays nothing: the macros expand to the bare call and there's nothing left to run.
+
+The recommended way to enable checks for a package's dev and CI runs is to add a section to
+`Project.toml` (or a `LocalPreferences.toml` next to it). This gets committed alongside the code
+so every contributor and CI run picks it up automatically:
+
+```toml
+[preferences.StrictMode]
+checks_enabled = true
+fail_mode = "error"
+```
+
+Then run your tests in a **fresh Julia process** — the setting is read when Julia compiles the
+package, not while a session is already running.
+
+For interactive use during development, `enable_checks!()` writes the setting for you:
 
 ```julia
 using StrictMode
 
-StrictMode.enable_checks!()    # writes the preference; **restart Julia** to apply
+StrictMode.enable_checks!()    # writes the setting; restart Julia to apply
 # ... develop with guarantees active ...
 StrictMode.disable_checks!()   # back to the production default
 ```
 
-!!! note "The gate is compile-time"
-    `enable_checks!` writes a preference; it doesn't change the session you're already in.
-    `checks_enabled()` stays `false` until you restart, which means a script that enables checks
-    and then asserts in the same process is quietly checking nothing. To set it once for a
-    package's dev and CI runs, put it straight in the project's `Project.toml`, where it gets
-    committed alongside the code:
-
-    ```toml
-    [preferences.StrictMode]
-    checks_enabled = true
-    fail_mode = "error"
-    ```
-
-    A `LocalPreferences.toml` next to `Project.toml` works the same way. Either way, run your tests
-    in a fresh process, as in the pattern shown below.
+!!! note "Why does a restart matter?"
+    StrictMode's checks compile away to nothing when disabled, so the setting must be fixed before
+    Julia compiles the package. Calling `enable_checks!()` and then asserting in the same process
+    quietly checks nothing — the existing compiled image is already baked. Restart Julia (or start
+    a fresh process for your tests) after changing the setting.
 
 You can choose whether a violation throws or just warns:
 
@@ -126,10 +129,9 @@ JET and AllocCheck are heavyweight, so it's worth knowing where the time actuall
 
 - With checks off, in production: nothing at all. The macros are bare calls and the analyzers are
   never compiled in, so precompiling StrictMode stays quick (around 3 s here).
-- With checks on, in dev or CI: a `PrecompileTools` workload warms the analyzers into StrictMode's
-  precompiled image. That one-time compilation (10–20 s) happens at precompile, during install or
-  CI, rather than on your first interactive call. From then on the first `@explain` or `@strict` in
-  a session takes about 0.1 s, and a warm check on a small kernel runs in single-digit to tens of
+- With checks on, in dev or CI: a warmup step built into StrictMode runs once when the package is
+  first compiled (10–20 s during install). After that the first `@explain` or `@strict` in a
+  session takes about 0.1 s, and a warm check on a small kernel runs in single-digit to tens of
   milliseconds.
 
 The shape of it is: you pay once at precompile, not on every call, and an edit-and-rerun loop with

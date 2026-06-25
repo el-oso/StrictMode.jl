@@ -1,9 +1,9 @@
 # Agentic feedback
 
-A human can sit and watch a live REPL stream ([`watch`](@ref)). An AI coding agent needs something
-it can read in one shot: a structured, exit-coded result it can act on, the way it would use a
-linter or a test runner inside an edit-check-fix loop. That's [`audit`](@ref). Same checks, same
-findings as everywhere else, just rendered for a machine.
+[`audit`](@ref) is StrictMode's one-shot, structured reporting path — the same checks as
+everywhere else, returned as a `Vector{StrictFinding}` and optionally formatted as JSON, GitHub
+annotations, or plain text. It never throws on a violation; it writes the findings and returns
+them, so an AI agent or CI script can act on them programmatically.
 
 ## `audit`
 
@@ -62,11 +62,20 @@ audit(MyPkg; format = :github)
 
 GitHub Actions renders these as inline annotations on the offending lines.
 
-## Wiring it into Claude Code
+## Wiring it into a CI or agent loop
 
-StrictMode gives you the command; your harness decides when to run it. Here's a `Stop` (or
-`PostToolUse`) hook in `settings.json` that audits after each round of edits and feeds any failures
-back to the agent:
+StrictMode provides the command; your harness decides when to run it. The pattern is the same
+whether you're using GitHub Actions, a pre-commit hook, or an AI coding agent:
+
+```bash
+julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format=:json, exit_on_fail=true)'
+```
+
+A non-zero exit (failure count) signals the loop to act on the findings. For GitHub Actions,
+`:github` format emits inline annotations on the offending lines.
+
+**Example: Claude Code hook** — runs `audit` after every edit round and feeds failures back to
+the agent automatically:
 
 ```json
 {
@@ -85,5 +94,5 @@ back to the agent:
 }
 ```
 
-A non-zero exit puts the JSON findings in front of the agent, which fixes the kernel and runs
-again. It's the agent's version of a developer watching Revise.
+The JSON findings appear in the agent's context on a non-zero exit; the agent fixes the violation
+and runs again. It's the agent's version of a developer watching Revise.

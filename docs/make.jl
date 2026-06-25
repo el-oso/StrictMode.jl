@@ -18,7 +18,7 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
-        "Closing the Rust gaps" => "rust_gaps.md",
+        "Performance diagnostics" => "performance_diagnostics.md",
         "Guarantees" => "guarantees.md",
         "Automating checks" => "automating.md",
         "Agentic feedback" => "agents.md",
