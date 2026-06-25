@@ -4,7 +4,7 @@
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/el-oso/StrictMode.jl")
+Pkg.add("StrictMode")
 ```
 
 The real analysis is done by [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
