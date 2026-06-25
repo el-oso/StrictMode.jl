@@ -192,6 +192,35 @@ cache and register blocking and microkernel scheduling, still takes human roofli
 *complement* the guardrails, not replace them: keep asserting the invariants, and reach for the
 diagnostic when something is green but still slow.
 
+### Three more dimensions: branches, serial dependencies, and data distribution (F24/F28/F26)
+
+The same "guarantees are necessary-but-not-sufficient" gap recurs in three additional forms,
+all confirmed by the GP-crate porting campaign:
+
+**Branch misprediction (F24)**: a data-dependent `if x < 0` (50/50 signs) in a numeric kernel
+ran ~4× slower than the branchless equivalent, while `@assert_vectorized`, `@assert_noalloc`,
+and `@assert_typestable` all stayed green. The fix — `ifelse`/cmov, unconditional computation,
+`Base.ifelse` to force predication — flipped a 0.92× "loss" into a 1.5× beat of the Rust
+crate. `kernel_report` now counts conditional branches in vectorized functions as a mispredict
+signal (advisory: `branch_count`), but can't predict the data distribution.
+
+**Serial loop-carried dependency (F28)**: a `÷10` chain in itoa, a `÷100` trim loop in
+`Base.Ryu.writeshortest` — each iteration's inputs derived from the previous via a ~10–20
+cycle `div` op — is latency-bound regardless of branch prediction or vectorization. It
+allocates nothing, type-stable, isn't a vectorization candidate, passes `:no_scalar_loops`.
+The fix is to break the chain (process two digits/values per step via `÷100`, or restructure
+to independent chunks). `kernel_report` now counts `div`/`rem`/`sqrt` in functions with
+loop-carried integers as a serialization signal (`serial_dep_count`).
+
+**Value-distribution dependence (F26)**: `Base.Ryu.writeshortest` measured 0.76× on
+`rand()` (full mantissa) but 2.05× on integer-valued floats — *same code path*, 2.7× swing.
+No static analysis or single benchmark captures data-domain variation. Require measuring
+across representative value classes and reporting the spread (see cookbook).
+
+These three join register tiling (F13), cache-locality (F15), and algorithmic orchestration
+(F17) as the known "above-the-guarantee" performance levers that per-kernel IR analysis
+cannot close.
+
 ## Bonus: trim-safety (the static-binary story)
 
 Rust's other predictability win is ahead-of-time compilation to a small static binary. Julia's

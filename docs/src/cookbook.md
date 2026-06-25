@@ -183,3 +183,43 @@ alloc-free), and empirically smoke-test the **public entry** with a runtime `@al
 This mirrors the F11 principle: assert on the leaf where the guarantees actually hold; the thin
 dispatcher is smoke-tested empirically. The audit covers the performance-critical path; edge-case
 branches stay outside the guarantee boundary.
+
+### Defeat dead-code elimination before measuring (F25)
+
+A benchmark that only observes a derived value (a length, a checksum) lets the optimizer
+eliminate the actual work — the timing then measures the derived value alone. The itoa
+reference shim timed `buf.format(x).len()`, and because only the *length* was consumed,
+LLVM eliminated the digit-writes entirely: the "8.7× faster" number was measuring `ndigits`,
+not formatting.
+
+The rule: **every measured kernel needs an explicit sink that consumes its output.**
+
+```julia
+# Wrong: only length observed — stores may be DCE'd
+@btime length(format_int!(buf, x))
+
+# Right: sink the buffer so the stores are required
+@btime (format_int!(buf, x); Base.donotdelete(buf))
+```
+
+This applies on both sides of a Rust/Julia comparison: ensure the reference shim sinks its
+output (e.g. `std::hint::black_box(buf)` in Rust) and the Julia version sinks its buffer.
+`Base.donotdelete` is available in Julia 1.8+.
+
+### Measure across representative value classes (F26)
+
+A single benchmark input can flip a "gap" verdict into a "2× win". Re-probing `ryu` (float→
+string) showed **0.76×** on `rand()` (full mantissa) vs **2.05×** on integer-valued floats
+(`1000.0`) — the same code path, swinging 2.7× on input distribution alone. A one-distribution
+number is not a verdict.
+
+Required: measure across the value classes your kernel will actually see, and report the spread:
+
+```julia
+for (label, gen) in [("rand", ()->rand()), ("randn", ()->randn()), ("integer", ()->Float64(rand(1:10^6)))]
+    t = @belapsed kernel($gen()) setup=nothing
+    println("$label: $(round(t*1e9, digits=1)) ns")
+end
+```
+
+If the spread exceeds 2×, the "typical case" number may not represent production load.

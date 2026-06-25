@@ -83,3 +83,23 @@
         @test r3 == [10.0, 20.0, 30.0]
     end
 end
+
+@testitem "@golden validator= semantic invariant (F27)" begin
+    using StrictMode
+
+    # validator path: no golden file, just invariant check
+    mktempdir() do d
+        # Passing invariant
+        result = @golden "round_trip" 3.14 validator=x->(x isa Float64) dir=d
+        @test result === 3.14
+
+        # Failing invariant throws StrictViolation
+        err = try
+            @golden "bad" 3.14 validator=x->false dir=d
+        catch e
+            e
+        end
+        @test err isa StrictViolation
+        @test occursin("semantic invariant", err.details)
+    end
+end

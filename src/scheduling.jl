@@ -168,6 +168,10 @@ struct KernelReport
     # F22
     int_ops::Int        # vector integer arithmetic ops (add/sub/mul/and/or/xor/shl/icmp on <N x iN>)
     int_mem_ops::Int    # vector integer loads + stores
+    # F24
+    branch_count::Int   # conditional branches (br i1) coexisting with vector ops — mispredict risk (F24)
+    # F28
+    serial_dep_count::Int # high-latency ops (div/rem/sqrt) in functions with loop-carried phi — serialization risk (F28)
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -230,7 +234,7 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
                        working_set_bytes::Union{Nothing,Int} = nothing)
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0)
     width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half|i\d+)>", s)); init = 0)
     vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
@@ -253,7 +257,13 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     int_icmp_count = count(_ -> true, eachmatch(r"icmp \w+ <\d+ x i\d+>", s))
     int_ops_val = int_arith + int_icmp_count
     int_mem_val = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x i\d+>", s))
-    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val)
+    # F24 — conditional branches coexisting with vector ops: mispredict risk
+    branch_count_val = width > 0 ? count(_ -> true, eachmatch(r"\bbr i1\b", s)) : 0
+    # F28 — serial dep: high-latency op (div/rem/sqrt/fdiv) in a function with a loop-carried phi
+    has_loop_phi = occursin(r"\bphi i(?:8|16|32|64|128)\b", s)
+    high_lat = count(_ -> true, eachmatch(r"\b(?:s|u)div\b|\b(?:s|u)rem\b|\b@llvm\.sqrt\b", s))
+    serial_dep_val = has_loop_phi ? high_lat : 0
+    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val)
 end
 
 # --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
@@ -386,6 +396,18 @@ function Base.show(io::IO, r::KernelReport)
         print(io, "\n")
         printstyled(io, "  masked/variable-length ops: $(r.masked_mem_ops)"; color = :yellow)
         print(io, " — loop has irregular trip counts (remainder masking). Prefer fixed-width tiles.")
+    end
+    # F24 branch mispredict risk
+    if r.branch_count > 0 && r.vectorized
+        print(io, "\n")
+        printstyled(io, "  conditional branches: $(r.branch_count)"; color = :yellow)
+        print(io, " — data-dependent branches in a vectorized kernel are mispredict candidates. Consider branchless alternatives: `ifelse`, predication, or lookup tables.")
+    end
+    # F28 serial dep chain risk
+    if r.serial_dep_count > 0
+        print(io, "\n")
+        printstyled(io, "  serial high-latency ops: $(r.serial_dep_count)"; color = :yellow)
+        print(io, " — div/rem/sqrt in a loop with a loop-carried variable creates a serial dependency chain. Break the chain: process multiple elements per step, or use division-free extraction (e.g. jeaiii-style).")
     end
     # F14/F15 cache-residency annotation
     if !isnothing(r.working_set_bytes)
