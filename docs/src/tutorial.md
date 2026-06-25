@@ -7,16 +7,20 @@ Assumes checks are enabled — see [Getting Started](getting_started.md) if not.
 
 ## If you're coming from C, C++, or Java
 
-Think of `@strict_function` as a `static_assert` for performance properties. In C++ you might
-write `static_assert(std::is_trivially_copyable_v<T>)` to enforce a type constraint at compile
-time; `@strict_function` enforces "no heap allocation, concrete return type" at precompile time.
-A violation stops the module from loading — the same feedback loop you get from a compiler
-error, but for runtime performance properties the Julia compiler can't express as type
-constraints.
+In C++ or Java, types are part of the code — the compiler enforces them and won't let you
+confuse an `int` with a `std::string`. But the compiler won't tell you if a function
+unexpectedly allocates on the heap, fails to devirtualize a virtual call, or produces scalar
+code where you expected SIMD. You find those out from a profiler, after the fact.
 
-The boxing and dispatch failures you'll see in this tutorial are equivalent to Java autoboxing
-in a hot loop (`int` silently promoted to `Integer`) or a C++ vtable call where the compiler
-couldn't devirtualize. StrictMode makes those silent regressions loud.
+`@strict_function` fills that gap: it checks "no heap allocation, concrete return type" at
+precompile time, so a violation stops the module from loading rather than showing up in a
+profiler three days later. It's closer to a compile-time performance sanitizer than to a type
+declaration.
+
+The failures you'll see in this tutorial — boxing and type instability — are equivalent to Java
+autoboxing (`int` silently promoted to `Integer`) or a missed devirtualization in C++. The
+difference is that in Julia these happen silently without any source-level change, which is what
+makes them easy to miss. StrictMode makes them loud.
 
 ## If you're coming from Python or MATLAB
 
