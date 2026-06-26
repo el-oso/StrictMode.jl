@@ -1,6 +1,9 @@
 # StrictMode.jl release notes
 
-## v0.4.0
+## v0.3.1
+
+Additive, non-breaking: a new opt-in guarantee, a new diagnostic, and an optional weak dependency.
+
 
 - **`trim_compatible` guarantee** — an exposed, *escalating* `juliac --trim=safe` compatibility guarantee
   (`@assert_trim_compatible` / `:trim_compatible`). In `:fast` (or when `TrimCheck` is not loaded) it runs
