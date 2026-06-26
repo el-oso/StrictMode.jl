@@ -1,7 +1,7 @@
 name = "StrictMode"
 uuid = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 authors = ["el_oso"]
-version = "0.3.0"
+version = "0.4.0"
 
 [deps]
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
@@ -15,12 +15,14 @@ Cthulhu = "f68482b8-f384-11e8-15f7-abe071a5a75f"
 CpuId = "adafc99b-e345-5852-983c-f28acb93d879"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 
 [extensions]
 StrictModeAnalysisExt = ["AllocCheck", "JET"]
 StrictModeCthulhuExt = "Cthulhu"
 StrictModeCpuIdExt = "CpuId"
 StrictModeReviseExt = "Revise"
+StrictModeTrimExt = "TrimCheck"
 
 [compat]
 AllocCheck = "0.2"
@@ -31,5 +33,6 @@ JET = "0.11.4"
 Preferences = "1"
 PrecompileTools = "1"
 Revise = "3"
+TrimCheck = "0.1.4"
 TypeContracts = "0.13, 0.14"
 julia = "1.12"

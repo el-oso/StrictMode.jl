@@ -36,6 +36,22 @@ function _be_is_boxing end      # (alloc_instance) -> Bool  (boxing / dynamic-di
 function _be_opt_result end     # (f, types) -> JET optimization-analysis result
 function _be_opt_reports end    # (result)   -> the result's reports
 
+# Trim backend — an *independent* weak dependency (separate from AllocCheck/JET): `TrimCheck` drives
+# juliac's real `verify_typeinf_trim` verifier. The `:full` `trim_compatible` guarantee uses it; `:fast`
+# (and the fallback when TrimCheck is absent) uses the TypeContracts static scan in `trimsafe.jl`.
+const _TRIMCHECK_AVAILABLE = Ref(false)
+
+"""
+    StrictMode.trimcheck_available() -> Bool
+
+Whether the `TrimCheck` extension is loaded. When `true`, the `:full` `trim_compatible` guarantee runs
+juliac's authoritative `verify_typeinf_trim` verifier; when `false` it falls back to the TypeContracts
+static scan (the same check `:fast` uses).
+"""
+trimcheck_available() = _TRIMCHECK_AVAILABLE[]
+
+function _be_trim_validate end  # (f, types) -> (passed::Bool, findings::Vector{String})
+
 # Whether the `:full` AllocCheck pass ignores allocations on never-taken throw branches (a
 # `BoundsError` construction, etc.). `true` (default) = hot-path semantics: a runtime-zero-alloc
 # kernel with bounds checks is *not* a false positive. Strict users can count them with

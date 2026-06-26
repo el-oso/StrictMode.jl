@@ -21,7 +21,6 @@ to the bare call.
 @assert_vectorized
 @assert_no_scalar_loops
 @assert_effects
-@assert_trim_safe
 @strict
 @kernel
 ```
@@ -43,9 +42,14 @@ descend
 
 ## Static-binary compatibility
 
-Tools for checking compatibility with `juliac --trim=safe`. See [Performance diagnostics](performance_diagnostics.md).
+Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` / the
+`:trim_compatible` guarantee **escalate** by [`analysis_mode`](@ref): a cheap TypeContracts static scan in
+`:fast`, and juliac's authoritative `verify_typeinf_trim` verifier in `:full` when `TrimCheck` is loaded.
+`@assert_trim_safe` is the static-only subset. The reactive `explain_trim` translates a real build log.
 
 ```@docs
+@assert_trim_compatible
+@assert_trim_safe
 explain_trim
 ```
 
@@ -92,6 +96,19 @@ audit
 StrictFinding
 format_findings
 nfailures
+```
+
+## Fast↔full divergence
+
+The `:fast` heuristic and the `:full` proof occasionally disagree (e.g. internal dynamic dispatch with a
+concrete return, which `:fast` misses). `divergence_report` runs both and, on a disagreement, captures an
+**IP-free** record — anonymized signature shape, signal *categories*, and versions only — that you can send
+to the maintainers to fix the heuristic.
+
+```@docs
+divergence_report
+StrictDivergence
+StrictMode.save_divergence
 ```
 
 ## TypeContracts integration
@@ -142,6 +159,7 @@ checks_enabled
 fail_mode
 analysis_mode
 backend_available
+StrictMode.trimcheck_available
 ignore_throw
 set_ignore_throw!
 ```

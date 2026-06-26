@@ -63,12 +63,15 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
         return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
+    elseif g === :trim_compatible
+        return _trim_compatible_finding(f, types, md, fn, sg, :full)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, or :trimsafe"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
 end
 
-# `:trimsafe` finding — value-free `juliac --trim=safe` compatibility scan (TypeContracts, no
-# backend), so it's identical in `:fast` and `:full`.
+# `:trimsafe` finding — the static-only subset of `:trim_compatible`, kept for compatibility. Value-free
+# TypeContracts scan, identical in `:fast` and `:full` (never escalates to the TrimCheck verifier). Prefer
+# `:trim_compatible`.
 function _trimsafe_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
     r = _trim_report(f, types)
     m = try
@@ -79,6 +82,31 @@ function _trimsafe_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
     return _mkfinding(md, fn, sg, :trimsafe, !r.passed, "trim-unsafe: " * join(r.findings, "; "), file, line)
+end
+
+# `:trim_compatible` finding — escalating: `mode === :full` with TrimCheck loaded runs juliac's
+# authoritative `verify_typeinf_trim` verifier; otherwise the TypeContracts static scan (the
+# `:trimsafe` subset). `mode` is passed explicitly so `findings(...; mode=:fast|:full)` is honored
+# verbatim (the divergence report relies on this).
+function _trim_compatible_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg, mode::Symbol)
+    if mode === :full && trimcheck_available()
+        passed, fnds = _be_trim_validate(f, Tuple{types...})
+        msg = passed ? "trim-compatible (juliac verifier)" :
+            "trim-incompatible (juliac --trim=safe): " * join(fnds, "; ")
+    else
+        r = _trim_report(f, types)
+        passed = r.passed
+        msg = passed ? "trim-compatible (static scan)" :
+            "likely trim-incompatible (static scan): " * join(r.findings, "; ")
+    end
+    m = try
+        which(f, types)
+    catch
+        nothing
+    end
+    file = m === nothing ? "" : string(m.file)
+    line = m === nothing ? 0 : Int(m.line)
+    return _mkfinding(md, fn, sg, :trim_compatible, !passed, msg, file, line)
 end
 
 """
@@ -147,8 +175,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             push!(out, _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort)", "", 0))
         elseif g === :trimsafe
             push!(out, _trimsafe_finding(f, types, md, fn, sg))
+        elseif g === :trim_compatible
+            push!(out, _trim_compatible_finding(f, types, md, fn, sg, :fast))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, or :trimsafe"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
         end
     end
     return out

@@ -619,3 +619,25 @@ reaches **~85–87% of hand-written asm** and **beats LLVM-compiled Rust outrigh
 is **LLVM's register-scheduling vs hand-asm — not a Julia gap; it is identical for Rust** (whose own crate
 abandons LLVM and ships `.S` to get it). Honest takeaway for users: `@assert_vectorized` green +
 register-saturated ⇒ you are at the portable-compiler ceiling; the last 15% is unreachable from any IR.
+
+## F32 — `:fast`↔`:full` divergence is now a first-class IP-free report; `trim_compatible` escalates to the real verifier (v0.4)
+
+Two dogfooding gaps closed in 0.4. **(a) Divergence reporting.** The `:fast` inference heuristic and the
+`:full` AllocCheck/JET proof genuinely disagree on some functions (the canonical case: internal dynamic
+dispatch with a *concrete* return — `:fast`'s boxing heuristic is fooled by the concrete return type,
+`:full` catches the `DynamicDispatch`). Until now a user hitting this had no way to report it without sending
+us proprietary code. `divergence_report(f, types)` runs both modes, diffs per-guarantee verdicts, and emits a
+**provably IP-free** `StrictDivergence`: the signature *shape* with user/3rd-party types anonymized to
+`T1,T2,…` (only `Base`/`Core` names kept), the fired-signal **categories** (`full:alloc-sites=N`,
+`full:boxing`, `fast:boxing`, return-category — counts/booleans, never source/locations), and all
+package/Julia versions. Reproducible enough to fix the heuristic, safe enough to email. Implementation reuses
+the existing `findings(f,types; mode=:fast|:full)` seam (it already takes an explicit mode), so no new
+analysis code — just the diff + the anonymizer (`src/divergence.jl`). **(b) `trim_compatible`.** The
+`:trimsafe` guarantee was only TypeContracts' static scan and under-exposed. `:trim_compatible` (exposed,
+opt-in) now *escalates*: TypeContracts in `:fast`, and — via a new optional `TrimCheck` weak dep —
+**juliac's own `verify_typeinf_trim` verifier** in `:full`. TrimCheck's public API only accepts a call-expr
+evaled in `Main`; we drive its core (`hook_verify_typeinf_trim` + `Compiler.typeinf_ext_toplevel(…, TRIM_SAFE)`)
+directly for a concrete `(f, types)` in `StrictModeTrimExt`, with graceful fallback to the static scan when
+TrimCheck is absent. Lesson for the engine: the necessary-but-not-sufficient story (F10) also runs the other
+way — `:fast` can *under*-report relative to `:full`; the divergence report makes that observable and fixable
+instead of a silent "why did CI disagree with my editor" mystery.
