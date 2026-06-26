@@ -20,6 +20,7 @@ end
 # empirical path.
 @inline _allocated(thunk::F) where {F} = @allocated thunk()
 
+
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; static::Bool) where {F}
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if static
@@ -35,13 +36,36 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
             # Static analysis could not run on this call; fall through to the empirical path.
         end
     end
-    n = _allocated(thunk)         # measure the steady-state call
+    n = _allocated(thunk)         # measure the steady-state call (gc_num delta)
     if n > 0
+        # `@allocated` is the `gc_num().allocd` delta, which can be **nonzero with no real allocation** — a
+        # GC accounting artifact (SIMD / `GC.@preserve`-heavy kernels show a fixed per-call delta even when
+        # AllocCheck and `--track-allocation` prove the call allocates nothing). So a nonzero number alone
+        # is not proof. If the static backend (AllocCheck) is loaded, it is authoritative — escalate to it:
+        # only fail if it *also* finds a real allocation site; if it proves the call clean, the `@allocated`
+        # number was an artifact, so pass (with a note).
+        if backend_available()
+            results = try
+                _be_check_allocs(f, types)
+            catch err
+                err isa StrictViolation && rethrow()
+                nothing
+            end
+            if results !== nothing && isempty(results)
+                @warn "StrictMode @assert_noalloc: `$target` measured @allocated=$n B, but AllocCheck " *
+                    "proves the call allocates nothing — a gc_num accounting artifact (common in SIMD / " *
+                    "GC.@preserve kernels), not an allocation. Treating as alloc-free." maxlog = 1
+                return val
+            end
+            results !== nothing && !isempty(results) && _fail(:noalloc, target, _format_allocs(results))
+        end
         _fail(
             :noalloc, target,
-            "call allocated $n bytes at runtime (@allocated fallback). If the checked call " *
-                "references a non-`const` global, the allocation may be from the *binding* (global " *
-                "access boxes), not the function — make it `const` or a local, or use `:full` mode."
+            "call allocated $n bytes at runtime (@allocated). NOTE: `@allocated` measures the gc_num " *
+                "counter, which can report a per-call artifact with no real allocation on SIMD / " *
+                "GC.@preserve-heavy code — load AllocCheck and use `:full` mode for a definitive static " *
+                "proof. If the call references a non-`const` global, the allocation may be the binding " *
+                "(global access boxes), not the function — make it `const`/local."
         )
     end
     return val

@@ -641,3 +641,27 @@ directly for a concrete `(f, types)` in `StrictModeTrimExt`, with graceful fallb
 TrimCheck is absent. Lesson for the engine: the necessary-but-not-sufficient story (F10) also runs the other
 way — `:fast` can *under*-report relative to `:full`; the divergence report makes that observable and fixable
 instead of a silent "why did CI disagree with my editor" mystery.
+
+## F33 — the empirical `@assert_noalloc` (`:fast`/`static=false`) false-fails on a `gc_num` accounting artifact
+
+Dogfooding PureFFT's `Butterfly256/512` AVX kernels surfaced a real `@assert_noalloc` bug. The kernels are
+**provably allocation-free** — AllocCheck (static IR), `--track-allocation=user`/`=all` (line profiler, incl.
+Base), all report **zero** — yet `@allocated` (and `@btime`/`@ballocated`) report a *nonzero, per-call* number
+(a flaky 0–400 B/call; even the trivial radix-4 path shows a ~64 B floor). `@allocated` is the
+`Base.gc_num().allocd` delta, and on SIMD / `GC.@preserve`-heavy code that counter increments **without a real
+heap object** — an accounting artifact, not an allocation (the allocation profiler `Profile.Allocs` is *also*
+unreliable here — 0 one run, 7·10⁵ "samples" the next — so it is **not** a usable cross-check oracle).
+
+The bug: the empirical path (`:fast` mode, or `static=false`) failed whenever `@allocated > 0` — so it would
+**false-fail a provably-clean kernel** (confirmed: `_allocated` returned 400 B on a kernel AllocCheck proves
+allocation-free). That is exactly the hot-path code StrictMode exists to bless.
+
+Fix (`src/static_checks.jl`): a nonzero `@allocated` is no longer proof on its own. When the analysis backend
+is loaded, the empirical path now **escalates to AllocCheck** (the authoritative oracle): fail only if it *also*
+finds a real allocation site; if it proves the call clean, the `@allocated` number was an artifact → pass (with
+a one-shot `@warn`). With no backend, it still fails, but the message now names the `gc_num`-artifact
+possibility and points at `:full`. A real allocation still fails (the `static=false` regression test, which
+allocates a `collect`, now routes through the escalation and AllocCheck confirms it). Lesson for the engine:
+**`@allocated` is a measurement, not a proof** — a guarantee built on it must defer to the static oracle when
+they disagree, exactly the inverse of F32's `:fast`-under-reports case (here `:fast`/empirical *over*-reports).
+This also argues PureFFT-style packages should assert no-alloc in `:full` (AllocCheck), not the empirical path.
