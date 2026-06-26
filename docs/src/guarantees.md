@@ -152,6 +152,36 @@ That's why it isn't part of [`@strict`](@ref).
 # ERROR: StrictViolation (@inlined): call to `cold` was not inlined — it survives as an `:invoke` …
 ```
 
+## `@assert_trim_compatible` — static-binary (`juliac --trim`) compatibility
+
+[`@assert_trim_compatible`](@ref) fails unless `f(args...)` is compatible with `juliac --trim=safe`, the
+static-binary build mode that rejects dynamic dispatch and reflection. It **escalates** with
+[`analysis_mode`](@ref): in `:fast` (or when `TrimCheck` is not loaded) it runs a value-free `TypeContracts`
+scan of the typed IR; in `:full` with the optional `TrimCheck` weak dependency it runs juliac's
+*authoritative* `verify_typeinf_trim` verifier over the exact signature, returning deduplicated,
+source-mapped findings.
+
+Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's
+whole-program verifier over the real build is the final word. [`@assert_trim_safe`](@ref) is the
+static-only subset (never escalates; needs no `TrimCheck`). The reactive counterpart, for a real build log,
+is [`explain_trim`](@ref).
+
+```julia
+clean(x::Int) = x * 2 + 1
+@assert_trim_compatible clean(3)          # ok
+
+reflecty(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection → trim-unsafe
+@assert_trim_compatible reflecty(3)
+# ERROR: StrictViolation (@trim_compatible): trim-incompatible (juliac --trim=safe):
+#   Base.indexed_iterate(…)::Any  [myfile.jl:NN]; … (+N more call site(s))
+```
+
+As an engine guarantee it is `:trim_compatible` (with `:trimsafe` the static subset):
+
+```julia
+check(reflecty, (Int,); guarantees = (:trim_compatible,))
+```
+
 ## `@strict` — every per-call guarantee at once
 
 [`@strict`](@ref) checks type stability first, since that's usually what's behind a surprise
@@ -291,8 +321,9 @@ end
 
 ## Promise scope
 
-StrictMode's guarantees cover **allocation-freedom**, **type-stability**, and **vectorization**
-(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)). One property is
+StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**
+(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), and **static-binary
+(`juliac --trim`) compatibility** (via [`@assert_trim_compatible`](@ref)). One property is
 explicitly out of scope: **bit-reproducibility**.
 
 SIMD reduction order is LLVM-codegen-defined. The lane-combine order for a vector reduction —
