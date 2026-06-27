@@ -174,6 +174,11 @@ struct KernelReport
     serial_dep_count::Int # high-latency ops (div/rem/sqrt) in functions with loop-carried phi — serialization risk (F28)
     # F29
     noalias_missing_count::Int  # pointer params without noalias in LLVM IR define line — aliasing risk (F29)
+    # F33
+    shuffle_ops::Int            # shufflevector + x86 shuffle/permute/pshufb/palignr intrinsics — port-5 work
+    # F34
+    prefetch_ops::Int           # @llvm.prefetch count (its absence in a low-intensity loop ⇒ maybe latency-bound)
+    has_loop_phi::Bool          # loop-carried integer phi present (the loop check for the latency-bound hint)
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -205,6 +210,12 @@ function _kr_bound(r::KernelReport)
         r.int_ops / r.int_mem_ops
     else
         0.0
+    end
+    # F33 — shuffle-port-bound: several shuffles with low arithmetic intensity ⇒ the bottleneck is the
+    # shuffle port (vpshufb/vperm, ~1/cycle), not FLOP:byte. The `shuffle_ops >= fp_ops` + `eff < 2.0`
+    # guards keep a transpose-heavy *compute* kernel (high intensity) classified as :compute.
+    if r.shuffle_ops >= 2 && r.shuffle_ops >= r.fp_ops && eff < 2.0
+        return :shuffle
     end
     eff >= 2.0 && return :compute
     eff >= 0.75 && return :balanced
@@ -246,7 +257,7 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
                        working_set_bytes::Union{Nothing,Int} = nothing)
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0, 0)
+    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0, 0, 0, 0, false)
     width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half|i\d+)>", s)); init = 0)
     vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
@@ -290,7 +301,12 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     total_ptr = count(_ -> true, eachmatch(r"\bptr\b", param_section))
     noalias_ptr = count(_ -> true, eachmatch(r"\bnoalias\b", param_section))
     noalias_missing_val = max(0, total_ptr - noalias_ptr)
-    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val)
+    # F33 — shuffle/permute ops: the work of byte-transcoding/validation kernels, invisible to fp/int counts
+    shuffle_val = count(_ -> true, eachmatch(r"shufflevector <\d+ x", s)) +
+                  count(_ -> true, eachmatch(r"@llvm\.x86\.\w+\.(?:pshuf\.?b?|perm[di]?|palignr|valign)", s))
+    # F34 — prefetch presence; its absence in a low-intensity streaming loop ⇒ possibly latency-bound
+    prefetch_val = count(_ -> true, eachmatch(r"@llvm\.prefetch", s))
+    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val, shuffle_val, prefetch_val, has_loop_phi)
 end
 
 # --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
@@ -449,9 +465,26 @@ function Base.show(io::IO, r::KernelReport)
     elseif b === :balanced
         printstyled(io, "  → balanced"; color = :cyan)
         print(io, ": some data reuse; more register/cache blocking may still help.")
+    elseif b === :shuffle
+        printstyled(io, "  → shuffle/port-bound"; color = :yellow)
+        print(io, ": dominated by vpshufb/vperm/shufflevector (the shuffle port, ~1/cycle), not arithmetic. ",
+                  "Speed it with WIDER vectors (SSE→AVX2→AVX-512) or FEWER shuffles — register/cache blocking does not apply.")
     else
         printstyled(io, "  → compute-bound"; color = :green)
         print(io, ": good FLOP:byte balance.")
+    end
+    # F33 — shuffle ops are invisible to the arithmetic-intensity counts above; surface them explicitly
+    if r.shuffle_ops > 0
+        print(io, "\n")
+        printstyled(io, "  shuffle/permute vector ops: $(r.shuffle_ops)"; color = :cyan)
+        print(io, " — pshufb/perm/shufflevector; not counted in the intensity above (the work of lookup/transcode kernels).")
+    end
+    # F34 — streaming-load loop, low intensity, no prefetch ⇒ likely latency-bound, not bandwidth-bound
+    if r.vectorized && r.prefetch_ops == 0 && r.has_loop_phi && (r.mem_ops + r.int_mem_ops) > 0 && b in (:memory, :balanced)
+        print(io, "\n")
+        printstyled(io, "  no prefetch in a streaming loop"; color = :yellow)
+        print(io, " — if this is a forward scan it is likely memory-LATENCY-bound (not bandwidth-bound): ",
+                  "prefetch ~1 chunk ahead with `@llvm.prefetch`. A bandwidth-bound loop won't benefit (then it's a real ceiling).")
     end
     # F13 alignment hint
     if r.unaligned_mem_ops > 0
