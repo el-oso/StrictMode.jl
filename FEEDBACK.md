@@ -56,8 +56,8 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F29 | a data-dependent load address (from a SIMD reduction) serializes cache-miss latency — invisible to every guarantee | 🔴 open | SwissDict: `@assert_vectorized`/`@assert_noalloc`/`@assert_typestable` all green, yet lookup-HIT 1.8× slower than Base `Dict` — the slot index is derived FROM the control-group SIMD reduction, so `keys[jr]` loads serially (no memory-level parallelism); Base Dict knows `keys[ideal]` from the hash and overlaps it. Validated against DataStructures.SwissDict. A new "necessary-not-sufficient" axis after F10/F17/F24/F28 |
 | F30 | a vectorized kernel can be data-marshalling-bound (scalar-gather transpose)  -  `@assert_vectorized` passes but throughput is limited by the gather, not the compute | 🔴 open | blake3 `hash_many`: `<16 x i32>` compute confirmed green, but each `Vec{16}` is built from 16 strided scalar loads (a transpose); the crate uses SIMD-shuffle transpose → we land 0.71×. Distinct SIMD-layout axis; may partly overlap `kernel_report` mem-intensity |
 | F31 | register saturation / spills invisible to IR-level guarantees | ✅ diagnostic | `register_report(f, types)` reads `code_native` (post-register-allocation); counts unique zmm registers + spill lines; `show` gives saturated / unexpected-spills / clean verdict with ceiling note |
-| F34 | `kernel_report`'s compute-vs-memory intensity doesn't distinguish **memory-LATENCY-bound** (prefetch helps) from **bandwidth-bound** (it doesn't) | 🔴 open (candidate) | Surfaced by *pushing the BlazingPorts UTF-8 validator's ASCII fast-path to parity with simdutf8* (2026-06-27): both sit near memory bandwidth (~72 GB/s) yet simdutf8 was ~8% ahead until an explicit `@llvm.prefetch` (one chunk ahead) + a 128-byte chunk closed it (0.92× → ≥0.96×). A streaming validate/scan loop is **latency**-bound, not bandwidth-bound, and benefits from prefetch — but the intensity model (FP/int ops : memory ops) gives no hint of this; it would call such a loop "memory-bound" without distinguishing the two, which point to opposite fixes (prefetch / restructure-loads vs accept-the-ceiling). *Suggested:* a latency-vs-bandwidth signal (e.g. sequential-load loop with no prefetch + low arithmetic intensity ⇒ "latency-bound, consider prefetch"). Methodological note: the finding only appeared because the port was pushed to the crate's level — stopping at "beats Base" would have hidden it. |
-| F33 | `kernel_report` intensity model is **blind to shuffle/permute ops** — a `pshufb`-dominated (shuffle/lookup) SIMD kernel is mischaracterized by its incidental arithmetic | 🔴 open | `kernel_report` counts FP and integer **arithmetic** ops + memory ops, but **not** `vpshufb`/`vpermd`/shuffle intrinsics — the actual work of the encoding/validation/transcoding kernel class. Repro (BlazingPorts `Utf8._check_special`, a UTF-8 validator = 3 `pshufb` nibble lookups + 5 bitwise ops, 2026-06-27): report says `FP intensity 0.0`, `integer ops:mem = 5:3 → "balanced: some data reuse; more register/cache blocking may help"` — but the 3 `pshufb` (the bottleneck) are uncounted, the "3 memory ops" are phantom (const-table materialization, no real traffic), and "cache blocking" is irrelevant for a **shuffle-port-bound** kernel. The conjectured "data-movement SIMD" blind spot. *Suggested fix:* add a **shuffle/permute op count** axis (scan IR for `shufflevector`/`@llvm.x86.*.pshuf*`/`*.perm*`) and a `:shuffle-bound` verdict; this is a large + growing kernel class (UTF-8 validate, base64, hex — see the BlazingPorts byte-ops cluster). (Minor: also reported "2 pointer params" on a `Vec`-only function — spurious.) |
+| F34 | `kernel_report`'s compute-vs-memory intensity doesn't distinguish **memory-LATENCY-bound** (prefetch helps) from **bandwidth-bound** (it doesn't) | 🔴 open (candidate) — spec ready (see Findings §F34) | Surfaced by *pushing the BlazingPorts UTF-8 validator's ASCII fast-path to parity with simdutf8* (2026-06-27): both sit near memory bandwidth (~72 GB/s) yet simdutf8 was ~8% ahead until an explicit `@llvm.prefetch` (one chunk ahead) + a 128-byte chunk closed it (0.92× → ≥0.96×). A streaming validate/scan loop is **latency**-bound, not bandwidth-bound, and benefits from prefetch — but the intensity model (FP/int ops : memory ops) gives no hint of this; it would call such a loop "memory-bound" without distinguishing the two, which point to opposite fixes (prefetch / restructure-loads vs accept-the-ceiling). *Suggested:* a latency-vs-bandwidth signal (e.g. sequential-load loop with no prefetch + low arithmetic intensity ⇒ "latency-bound, consider prefetch"). Methodological note: the finding only appeared because the port was pushed to the crate's level — stopping at "beats Base" would have hidden it. |
+| F33 | `kernel_report` intensity model is **blind to shuffle/permute ops** — a `pshufb`-dominated (shuffle/lookup) SIMD kernel is mischaracterized by its incidental arithmetic | 🔴 open — spec ready (see Findings §F33) | `kernel_report` counts FP and integer **arithmetic** ops + memory ops, but **not** `vpshufb`/`vpermd`/shuffle intrinsics — the actual work of the encoding/validation/transcoding kernel class. Repro (BlazingPorts `Utf8._check_special`, a UTF-8 validator = 3 `pshufb` nibble lookups + 5 bitwise ops, 2026-06-27): report says `FP intensity 0.0`, `integer ops:mem = 5:3 → "balanced: some data reuse; more register/cache blocking may help"` — but the 3 `pshufb` (the bottleneck) are uncounted, the "3 memory ops" are phantom (const-table materialization, no real traffic), and "cache blocking" is irrelevant for a **shuffle-port-bound** kernel. The conjectured "data-movement SIMD" blind spot. *Suggested fix:* add a **shuffle/permute op count** axis (scan IR for `shufflevector`/`@llvm.x86.*.pshuf*`/`*.perm*`) and a `:shuffle-bound` verdict; this is a large + growing kernel class (UTF-8 validate, base64, hex — see the BlazingPorts byte-ops cluster). (Minor: also reported "2 pointer params" on a `Vec`-only function — spurious.) |
 | F32 | `@assert_no_scalar_loops` (the F20 fix) was blind to a scalar loop that **coexists** with vectorized code in the same function | ✅ fixed | `scalar_fp_loops` short-circuited on `_vectorized(f, types) && return false` (`src/scheduling.jl`), so **any** function containing a `<N x …>` op was declared scalar-loop-free even with a real scalar hot loop present. Repro (JSON.jl stage-1 SIMD POC, `BlazingPorts` campaign 2026-06-27): kernel `_string_scan_simd` lowers to a SIMD main loop (4× `<64 x i8>`) **and** a scalar tail loop (`load i8` + `phi i64`, back-edge `L32→L40` in `code_llvm`) — yet `@assert_no_scalar_loops` **passed**. **Fix:** new `_loop_regions(ir)` splits the text IR into loop regions (back-edge = `br … label %X` with `X` defined at/before the branch); `scalar_fp_loops` now scans **per-loop** — a loop region with scalar FP/int hot ops but no `<N x …>` of its own is flagged, even if a *different* loop in the same function vectorized. Existing F20/F22 cases preserved (`scalar_sum`/`first_gt` → true, `vec_scale!` → false — no false positive on explicit-SIMD-no-remainder loops); the JSON kernel's tail now correctly flags. Refines F20. |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
@@ -692,3 +692,105 @@ type itself**, which is more robust to flag than waiting for a non-concrete *res
 even when every call in the loop returns a concrete value. (PureFFT's planner was then refactored to a static
 `Tuple` of candidates + `map`-timing → `NTuple{N,Float64}` scores; `_besttime` is no longer dynamically
 dispatched.)
+
+### F33 — `kernel_report` is blind to shuffle/permute ops (shuffle-dominated SIMD)  *(spec ready — cold-agent implementable)*
+
+**Symptom.** A `pshufb`-dominated kernel (UTF-8 validate, base64, hex — the byte-transcoding class) is
+characterized by its *incidental* arithmetic. On `BlazingPorts.Utf8._check_special` (3 `pshufb` + ~5 bitwise,
+0 real memory): the report prints `FP intensity 0.0`, `integer ops:mem = 5:3 → "balanced … cache blocking may
+help"`. The 3 `pshufb` — the actual work and the port-5 bottleneck — are **uncounted**; the "3 memory ops" are
+phantom (const-table materialization, not traffic); "cache blocking" is irrelevant for a shuffle-port-bound
+kernel. The whole intensity model (`fp/int : mem`) has no shuffle axis.
+
+**Fix (all in `src/scheduling.jl`).**
+
+1. **Struct** — add a field to `KernelReport` (after `noalias_missing_count`, ~line 176):
+   ```julia
+       # F33
+       shuffle_ops::Int   # shufflevector + x86 shuffle/permute intrinsics (pshufb/perm/palignr) — port-5 work
+   ```
+   Then update **both** `KernelReport(...)` constructor calls (the empty-IR early return ~line 249 and the
+   main return ~line 293) to pass the new value (`0` for the empty case).
+
+2. **Count** — in `kernel_report`, after the noalias block (~line 292), before the `return`:
+   ```julia
+   # F33 — shuffle/permute ops: the work of byte-transcoding/validation kernels (invisible to fp/int counts)
+   shuffle_val = count(_ -> true, eachmatch(r"shufflevector <\d+ x", s)) +
+                 count(_ -> true, eachmatch(r"@llvm\.x86\.\w+\.(?:pshuf\.?b?|perm[di]?|palignr|valign)", s))
+   ```
+   Add `shuffle_val` as the last constructor arg.
+
+3. **Verdict** — in `_kr_bound` (~line 199), before the `eff`-threshold returns:
+   ```julia
+   # F33 — shuffle-port-bound: several shuffles with low arithmetic intensity ⇒ the bottleneck is port 5,
+   # not FLOP:byte. Guard against a compute kernel that has an incidental transpose (shuffles ≥ arith).
+   if r.shuffle_ops ≥ 2 && r.shuffle_ops ≥ r.fp_ops && eff < 2.0
+       return :shuffle
+   end
+   ```
+   (Compute `eff` first; reorder the function so `eff` is available. Tunable: the `≥ 2` and `≥ r.fp_ops`
+   thresholds are judgment — a transpose-heavy gemm has many shuffles *and* high `eff`, so the `eff < 2.0`
+   keeps it `:compute`.)
+
+4. **show** — in the `_kr_bound` dispatch (~line 442), add a `:shuffle` branch, and unconditionally surface the
+   count when `shuffle_ops > 0`:
+   ```julia
+   elseif b === :shuffle
+       printstyled(io, "  → shuffle/port-bound"; color = :yellow)
+       print(io, ": dominated by vpshufb/vperm (port 5, ~1 shuffle/cycle). Speed it by WIDER vectors ",
+                 "(SSE→AVX2→AVX-512) or FEWER shuffles — register/cache blocking does NOT apply.")
+   end
+   ...
+   if r.shuffle_ops > 0
+       print(io, "\n"); printstyled(io, "  shuffle/permute vector ops: $(r.shuffle_ops)"; color = :cyan)
+       print(io, " — pshufb/perm/shufflevector; not counted in the arithmetic intensity above.")
+   end
+   ```
+
+**Verify.** `kernel_report(BlazingPorts.Utf8._check_special, (Vec{32,UInt8}, Vec{32,UInt8}))` must now print
+`shuffle/permute vector ops: 3` and the `→ shuffle/port-bound` verdict (was `→ balanced … cache blocking`).
+Guard test: a real FMA microkernel (high `eff`) with a transpose still reports `:compute`, not `:shuffle`.
+
+**Sub-bug (spurious noalias).** The same repro printed `noalias missing: 2 pointer param(s)` for a
+`Vec`-only (by-value) function with **no** pointer params. The `param_section` `\bptr\b` count over-counts when
+const-global tables (`@llvm.x86…` operands / global addressing) leak `ptr` tokens into the `define` line.
+Tighten: count `ptr` only on tokens that are actual parameter declarations (split `param_section` on `,` and
+require each counted token to be a top-level `ptr %argN`, not an embedded operand). Low priority.
+
+### F34 — `kernel_report` can't distinguish memory-LATENCY-bound from BANDWIDTH-bound  *(candidate — spec ready)*
+
+**Symptom.** A sequential validate/scan loop near memory bandwidth is **latency**-bound (hidden by prefetch),
+not bandwidth-bound — opposite fixes, same "memory-bound" label. Found by pushing the UTF-8 validator's ASCII
+fast-path to parity: ~8% behind `simdutf8` until an explicit `@llvm.prefetch` (one chunk ahead) + 128-byte
+chunk closed it. `kernel_report`'s `fp/int : mem` ratio gives no hint; it would say "memory-bound: tile the
+reduction / cache-block" — useless here (there is no reduction; it's a forward stream).
+
+**Fix (heuristic, `src/scheduling.jl`).** Can't *prove* latency-bound from static IR, so flag the *opportunity*:
+a looping kernel that streams vector loads with low arithmetic intensity and **no prefetch**.
+
+1. **Count prefetch** in `kernel_report` (near the F33 block):
+   ```julia
+   # F34 — prefetch presence (its absence in a low-intensity streaming loop ⇒ possible latency-bound)
+   prefetch_val = count(_ -> true, eachmatch(r"@llvm\.prefetch", s))
+   ```
+   Add a `prefetch_ops::Int` field to `KernelReport` (and the two constructor sites) carrying `prefetch_val`.
+
+2. **show** — after the memory-bound note, add:
+   ```julia
+   # F34 — streaming-load loop, low intensity, no prefetch ⇒ likely latency-bound, not bandwidth-bound
+   if r.vectorized && r.prefetch_ops == 0 && _kr_bound(r) in (:memory, :balanced) &&
+      (r.mem_ops + r.int_mem_ops) > 0 && occursin(r"\bphi i(?:8|16|32|64)\b", "")  # loop check: pass `s` in
+       print(io, "\n"); printstyled(io, "  no prefetch in a streaming loop"; color = :yellow)
+       print(io, " — if this is a forward scan (latency-bound, not bandwidth-bound), prefetch ~1 chunk ",
+                 "ahead with `@llvm.prefetch`; bandwidth-bound loops won't benefit (then it's a real ceiling).")
+   end
+   ```
+   (Note: `show` only has the `KernelReport`, not `s` — to do the loop-phi check, add a `has_loop_phi::Bool`
+   field to the struct set from the existing `has_loop_phi` local, and test that instead of the placeholder.)
+
+**Verify.** `kernel_report` on the un-prefetched 64-byte-chunk version of `Utf8._isvalid_utf8` prints the
+"no prefetch in a streaming loop" note; the shipped (prefetched) version does not.
+
+**Methodological note (for both F33/F34).** Neither finding appears unless the port is pushed to ≥0.96× the
+reference crate. Stopping at "beats Base" hides the limiting factor — *parity is the instrument that exposes
+where the diagnostics are blind.* This is the campaign's core loop, not an aside.
