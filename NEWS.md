@@ -1,5 +1,20 @@
 # StrictMode.jl release notes
 
+## v0.3.2
+
+Bugfix, non-breaking.
+
+- **`@assert_noalloc` empirical path no longer false-fails on a `gc_num` accounting artifact (F33).**
+  `@allocated` measures the `Base.gc_num().allocd` delta, which can be **nonzero with no real heap
+  allocation** — an artifact seen on SIMD / `GC.@preserve`-heavy kernels that AllocCheck and
+  `--track-allocation` both prove allocation-free (found dogfooding PureFFT's Butterfly256/512 AVX
+  kernels). The `:fast` / `static = false` path previously failed whenever `@allocated > 0`, so it could
+  reject provably-clean hot paths. It now **escalates to AllocCheck** when the analysis backend is loaded:
+  it fails only if AllocCheck *also* finds a real allocation site; if AllocCheck proves the call clean, the
+  number is treated as an artifact and the check passes (with a one-shot `@warn`). With no backend it still
+  fails, but the message names the artifact possibility and points at `:full`. Real allocations continue to
+  fail through the escalation. See `FEEDBACK.md` F33.
+
 ## v0.3.1
 
 Additive, non-breaking: a new opt-in guarantee, a new diagnostic, and an optional weak dependency.
