@@ -328,12 +328,52 @@ signal: a `true` result means "look here for a vectorization opportunity"; a `fa
 not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for per-kernel vectorization
 enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
 """
+# Vector op in the text IR (any `<N x …>` value). Used to decide, per-loop, whether a given loop
+# vectorized — see `_loop_regions` / `scalar_fp_loops`.
+const _VEC_RE = r"<\d+ x "
+
+# Split the optimized text IR into loop regions. A loop is a back-edge: a `br … label %X` whose target
+# label `X` is defined *at or before* the branch line. The region is the IR text from the loop header
+# (label `X`) through the back-edge line — enough to scan that one loop for vector vs scalar ops.
+# Coarse (text, not a CFG), but enough to reason per-loop instead of whole-function.
+function _loop_regions(ir::AbstractString)
+    lines = split(ir, '\n')
+    labelpos = Dict{SubString{String},Int}()
+    for (i, l) in enumerate(lines)
+        m = match(r"^([A-Za-z0-9._]+):", l)
+        m !== nothing && (labelpos[m.captures[1]] = i)
+    end
+    regions = String[]
+    for (i, l) in enumerate(lines)
+        for m in eachmatch(r"\bbr\b[^\n]*\blabel %([A-Za-z0-9._]+)", l)
+            j = get(labelpos, m.captures[1], 0)
+            0 < j <= i && push!(regions, join(view(lines, j:i), '\n'))   # back-edge ⇒ loop region
+        end
+    end
+    return regions
+end
+
 function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     s = _llvm_ir(f, types)
     isempty(s) && return false
-    _vectorized(f, types) && return false
-    (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
-    (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
+    # F32: per-loop, not whole-function. The old `_vectorized(f) && return false` short-circuit hid a
+    # scalar hot loop whenever the function *also* contained any `<N x …>` op (e.g. a SIMD kernel with a
+    # scalar tail/glue loop). Now we scan each loop region: a loop that has scalar FP/int hot ops but no
+    # vector op of its own is a scalar loop — even if a *different* loop in the same function vectorized.
+    regions = _loop_regions(s)
+    if isempty(regions)   # no detectable back-edge: fall back to the whole-function scan (unchanged)
+        _vectorized(f, types) && return false
+        return (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
+               (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
+    end
+    for r in regions
+        occursin(_VEC_RE, r) && continue   # this loop vectorized → fine
+        if (occursin(_LOOP_RE, r) && occursin(_SCALAR_FP_RE, r)) ||
+           (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
+            return true
+        end
+    end
+    return false
 end
 
 function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::Tuple))
