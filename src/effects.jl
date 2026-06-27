@@ -11,6 +11,18 @@ const _ALLOC_FFI = ("alloc", "gc_pool", "gc_big", "jl_box", "ijl_box", "new_arra
 
 _nonconcrete(@nospecialize T) = T isa Type && !Base.isconcretetype(T) && T !== Union{} && !(T <: Type)
 
+# An abstract-`eltype` container — e.g. `Vector{AbstractFoo}` (often grown with `push!` of concrete
+# subtypes). The container *type* is concrete, but its *elements* are abstractly typed, so indexing /
+# iterating yields abstract values and any method called on them dynamically dispatches. A classic speed
+# + `--trim` anti-pattern, and one the result-type boxing heuristic *misses* when the dispatched method
+# returns a concrete type (e.g. `f(::AbstractFoo)::Float64`) — so it is worth flagging from the IR directly.
+# Only an *abstract type* / `Any` element is flagged; a small splittable `Union` element is not.
+function _abstract_container(@nospecialize T)
+    (T isa Type && (T <: AbstractArray || T <: Memory) && Base.isconcretetype(T)) || return false
+    et = eltype(T)
+    return et isa Type && (isabstracttype(et) || et === Any)
+end
+
 """
     _alloc_signals(f, types) -> (; alloc, boxing, file, line)
 
@@ -21,12 +33,16 @@ result type — e.g. a runtime tuple index). Location is the method's definition
 """
 function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple))
     cts = Base.code_typed(f, types; optimize = true)
-    isempty(cts) && return (; alloc = false, boxing = false, file = "", line = 0)
+    isempty(cts) && return (; alloc = false, boxing = false, abscontainer = nothing, file = "", line = 0)
     ci, _ = first(cts)
     alloc = false
     boxing = false
+    abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
+        if abscontainer === nothing && _abstract_container(T)
+            abscontainer = eltype(T)
+        end
         if Meta.isexpr(st, :foreigncall)
             tgt = lowercase(string(st.args[1]))
             any(p -> occursin(p, tgt), _ALLOC_FFI) && (alloc = true)
@@ -40,7 +56,6 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple))
             # (that over-reported on type-stable SIMD/pointer kernels).
             boxing = true
         end
-        alloc && boxing && break
     end
     m = try
         which(f, types)
@@ -49,7 +64,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple))
     end
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
-    return (; alloc, boxing, file, line)
+    return (; alloc, boxing, abscontainer, file, line)
 end
 
 # --- Base.infer_effects layer (cheap; basis for @assert_effects in Phase 3) -------------------

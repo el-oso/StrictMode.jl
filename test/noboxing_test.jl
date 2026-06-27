@@ -37,3 +37,44 @@ end
     @test_throws StrictViolation @assert_noalloc fill_sum(3)   # it does allocate
     @test (@assert_noboxing fill_sum(3)) == 6.0               # …but it does not box
 end
+
+@testitem "abstract-eltype container is detected as a boxing anti-pattern (F34)" begin
+    using StrictMode
+    abstract type _Foo end
+    struct _A <: _Foo
+        x::Int
+    end
+    struct _B <: _Foo
+        y::Float64
+    end
+    _val(a::_A) = a.x
+    _val(b::_B) = round(Int, b.y)
+    function bad(n)                       # the autoplan anti-pattern in miniature
+        v = _Foo[]                        # Vector{_Foo} — abstract eltype, grown with push!
+        push!(v, _A(n)); push!(v, _B(2.0))
+        s = 0
+        for f in v                        # dispatch over abstract elements — note _val returns concrete Int
+            s += _val(f)
+        end
+        return s
+    end
+    function good(n)                      # the fix: a Tuple keeps each element's concrete type
+        v = (_A(n), _B(2.0))
+        s = 0
+        for f in v
+            s += _val(f)
+        end
+        return s
+    end
+    sb = StrictMode._alloc_signals(bad, (Int,))
+    sg = StrictMode._alloc_signals(good, (Int,))
+    # Detected from the IR's container type directly — even though `_val` returns a concrete `Int`, which
+    # the result-type boxing heuristic would miss:
+    @test sb.abscontainer === _Foo
+    @test sg.abscontainer === nothing
+    # …and the finding message names the root cause + the fix:
+    msg = StrictMode._box_msg("boxing (fast heuristic)", sb)
+    @test occursin("abstract-eltype container", msg)
+    @test occursin("Tuple", msg)
+    @test StrictMode._box_msg("boxing (fast heuristic)", sg) == "boxing (fast heuristic)"   # no enrichment when clean
+end

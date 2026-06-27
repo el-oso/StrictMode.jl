@@ -150,6 +150,16 @@ function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guara
     return _findings_fast(f, types, guarantees, md, fn, sg)
 end
 
+# Enrich a boxing/alloc finding with the abstract-`eltype`-container root cause + fix, when the IR scan
+# found one (e.g. `Vector{AbstractFoo}`). This is the dispatch the result-type heuristic misses when the
+# dispatched method returns a concrete type — and the most actionable thing to tell the user.
+function _box_msg(base::AbstractString, sig)
+    sig.abscontainer === nothing && return base
+    return string(base, "; abstract-eltype container detected (`Vector{", sig.abscontainer,
+        "}`, …) — indexing/iterating it dispatches dynamically (a speed + `--trim` anti-pattern). ",
+        "Use a `Tuple`, a concrete or small-`Union` eltype, or restructure so elements are concretely typed.")
+end
+
 # `:fast` per-guarantee findings from cheap Base-only analysis (`_alloc_signals`, `return_types`,
 # `_inlined_survives`). Triage speed for the edit loop; `:full` is the proof for CI.
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
@@ -161,11 +171,11 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             fail = length(rts) != 1 || !_is_typestable_return(only(rts))
             push!(out, _mkfinding(md, fn, sg, g, fail, "return type is not concrete (inference)", "", 0))
         elseif g === :noalloc
-            fail = sig.alloc || sig.boxing
-            push!(out, _mkfinding(md, fn, sg, g, fail, "allocates / boxes (fast heuristic)", sig.file, sig.line))
+            fail = sig.alloc || sig.boxing || sig.abscontainer !== nothing
+            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (fast heuristic)", sig), sig.file, sig.line))
         elseif g === :noboxing
-            fail = sig.boxing
-            push!(out, _mkfinding(md, fn, sg, g, fail, "boxing / dynamic dispatch (fast heuristic)", sig.file, sig.line))
+            fail = sig.boxing || sig.abscontainer !== nothing
+            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig), sig.file, sig.line))
         elseif g === :inlined
             fail = _inlined_survives(f, types) === true
             push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))

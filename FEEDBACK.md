@@ -665,3 +665,27 @@ allocates a `collect`, now routes through the escalation and AllocCheck confirms
 **`@allocated` is a measurement, not a proof** — a guarantee built on it must defer to the static oracle when
 they disagree, exactly the inverse of F32's `:fast`-under-reports case (here `:fast`/empirical *over*-reports).
 This also argues PureFFT-style packages should assert no-alloc in `:full` (AllocCheck), not the empirical path.
+
+## F34 — flag the abstract-`eltype` container directly (the `:fast` boxing heuristic misses it)
+
+Dogfooding PureFFT's `:fast` planner found a classic Julia speed + `--trim` anti-pattern the user wanted
+StrictMode to catch: `cands = AbstractFFTPlan{T}[…]` — a `Vector` whose `eltype` is abstract because the
+kernels are siblings under one supertype, grown with `push!` of concrete subtypes, then iterated and timed
+(`_besttime(c, y)`). Indexing/iterating yields abstractly-typed elements, so the method call **dynamically
+dispatches** — and the whole construct is `--trim`-hostile (an open subtype set can't be statically resolved).
+
+The gap: the `:fast` boxing heuristic (`_alloc_signals`) flags a `:call` whose **result** is non-concrete. But
+here the dispatched method *returns a concrete type* (`_besttime(::AbstractFFTPlan, y)::Float64`), so the result
+is `Float64` and the heuristic **does not flag it** — only `:full`/JET (which sees the dispatch regardless of
+result type) caught it. So `:fast` silently passed a real dynamic-dispatch site.
+
+Fix (`src/effects.jl`, `src/check.jl`): `_abstract_container(T)` recognizes a concrete container type
+(`<:AbstractArray`/`Memory`) with an **abstract-type (or `Any`) element type** (a small splittable `Union`
+element is *not* flagged). `_alloc_signals` now reports the first such `eltype`; the `:fast` `:noboxing`/`:noalloc`
+findings fail on it and the message names the root cause + the fix: *"abstract-eltype container detected
+(`Vector{AbstractFFTPlan}`, …) — indexing/iterating it dispatches dynamically; use a `Tuple`, a concrete or
+small-`Union` eltype, or restructure."* Lesson for the engine: the IR carries the anti-pattern in the **container
+type itself**, which is more robust to flag than waiting for a non-concrete *result* — the dispatch can be real
+even when every call in the loop returns a concrete value. (PureFFT's planner was then refactored to a static
+`Tuple` of candidates + `map`-timing → `NTuple{N,Float64}` scores; `_besttime` is no longer dynamically
+dispatched.)
