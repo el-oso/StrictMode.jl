@@ -50,7 +50,7 @@ nfailures(fs::AbstractVector{StrictFinding}) = count(_failed, fs)
 function Base.show(io::IO, f::StrictFinding)
     mark = f.status === :fail ? "✗" : (f.status === :pass ? "✓" : "•")
     print(io, "[", mark, " ", f.guarantee, "] ", f.func, f.signature)
-    f.status === :fail && print(io, " — ", f.reason)
+    f.status !== :pass && f.reason != "" && print(io, " — ", f.reason)
     return nothing
 end
 
@@ -90,9 +90,9 @@ function _fmt_text(io::IO, fs)
     println(io, "StrictMode: ", length(fs), " finding(s), ", nf, " failing.")
     for f in fs
         println(io, "  ", f)
-        if _failed(f)
+        if _failed(f) || f.status === :info
             f.file != "" && println(io, "      at ", f.file, ":", f.line)
-            println(io, "      → ", f.suggestion)
+            f.suggestion != "" && println(io, "      → ", f.suggestion)
         end
     end
     return nothing
@@ -159,9 +159,13 @@ end
 
 function _fmt_github(io::IO, fs)
     for f in fs
-        _failed(f) || continue
         loc = f.file != "" ? "file=$(f.file),line=$(f.line)" : ""
-        println(io, "::error ", loc, "::StrictMode @", f.guarantee, " ", f.func, f.signature, " — ", f.reason)
+        if _failed(f)
+            println(io, "::error ", loc, "::StrictMode @", f.guarantee, " ", f.func, f.signature, " — ", f.reason)
+        elseif f.status === :info
+            # Informational (e.g. inline suggestions): a GitHub `::notice`, never a CI-failing `::error`.
+            println(io, "::notice ", loc, "::StrictMode @", f.guarantee, " ", f.func, f.signature, " — ", f.reason)
+        end
     end
     return nothing
 end

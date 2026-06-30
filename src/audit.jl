@@ -25,6 +25,11 @@ julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_o
 `format` is `:json`, `:jsonlines`, `:github`, or `:text`. Each JSON finding carries `guarantee`,
 `status`, `file`, `line`, `reason`, and an actionable `suggestion`.
 
+`inline_suggest = true` additionally runs [`inline_suggestions`](@ref): informational
+"consider `@inline` on X" findings (`guarantee = :inline_suggestion`, `status = :info`) for
+`@generated` / in-loop callees the compiler left non-inlined. They are **never failures**
+(`nfailures`/`exit_on_fail` ignore them) — a prompt to benchmark, not a gate.
+
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
 function audit(
@@ -37,16 +42,29 @@ function audit(
         only = nothing,
         exempt = (),
         mode::Symbol = analysis_mode(),
+        inline_suggest::Bool = false,
     )
     fs = StrictFinding[]
     if target === :registered
         append!(fs, check_all(; guarantees, fail = :none, mode))
+        if inline_suggest
+            for ((f, types), _) in STRICT_REGISTRY
+                _is_exempt(f) && continue
+                try
+                    append!(fs, inline_suggestions(f, types))
+                catch err
+                    err isa StrictViolation && rethrow()
+                end
+            end
+        end
     elseif target isa Module
         append!(fs, _registered_findings_in(target; guarantees, mode))   # declared scope (quiet)
         if sweep
             gs = guarantees === nothing ? (:typestable, :noalloc) : guarantees
             append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt, mode))
         end
+        # Inline suggestions are informational (status :info, never failures) and noisy, so opt-in.
+        inline_suggest && append!(fs, inline_suggestions(target; only, exempt))
     else
         throw(ArgumentError("audit target must be :registered or a Module, got $(target)"))
     end
