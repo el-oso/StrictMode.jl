@@ -93,6 +93,7 @@ One-shot, structured, exit-coded reporting for AI agents and CI. See
 
 ```@docs
 audit
+inline_suggestions
 StrictFinding
 format_findings
 nfailures

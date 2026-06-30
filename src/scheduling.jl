@@ -328,22 +328,6 @@ const _LOOP_RE = r"\bphi (?:double|float)\b"
 const _SCALAR_INT_RE = r"\b(?:add|sub|mul|and|or|xor|shl|lshr|ashr) i(?:8|16|32|64)\b"
 const _LOOP_INT_RE   = r"\bphi i(?:8|16|32|64)\b"
 
-"""
-    scalar_fp_loops(f, types::Tuple) -> Bool
-
-**Best-effort** detection: returns `true` if `f`'s optimized LLVM IR shows a loop (back-edge
-branch tagged with `!llvm.loop`) alongside scalar (non-`<N x>` vector) floating-point
-arithmetic on `double`/`float`, AND the function did not vectorize as a whole.
-
-This is intentionally coarse — it operates on text IR, not a structured IR graph. The loop
-indicator is the presence of a `phi double`/`phi float` node (a loop-carried FP accumulator);
-this is more portable than `!llvm.loop` metadata, which LLVM emits inconsistently across
-optimization levels. A false-negative is possible when the optimizer eliminates all loop-carried
-FP variables (e.g. pure store loops, full unrolls with no accumulator). Use it as a triage
-signal: a `true` result means "look here for a vectorization opportunity"; a `false` result does
-not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for per-kernel vectorization
-enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
-"""
 # Vector op in the text IR (any `<N x …>` value). Used to decide, per-loop, whether a given loop
 # vectorized — see `_loop_regions` / `scalar_fp_loops`.
 const _VEC_RE = r"<\d+ x "
@@ -369,6 +353,22 @@ function _loop_regions(ir::AbstractString)
     return regions
 end
 
+"""
+    scalar_fp_loops(f, types::Tuple) -> Bool
+
+**Best-effort** detection: returns `true` if `f`'s optimized LLVM IR shows a loop (back-edge
+branch tagged with `!llvm.loop`) alongside scalar (non-`<N x>` vector) floating-point
+arithmetic on `double`/`float`, AND the function did not vectorize as a whole.
+
+This is intentionally coarse — it operates on text IR, not a structured IR graph. The loop
+indicator is the presence of a `phi double`/`phi float` node (a loop-carried FP accumulator);
+this is more portable than `!llvm.loop` metadata, which LLVM emits inconsistently across
+optimization levels. A false-negative is possible when the optimizer eliminates all loop-carried
+FP variables (e.g. pure store loops, full unrolls with no accumulator). Use it as a triage
+signal: a `true` result means "look here for a vectorization opportunity"; a `false` result does
+not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for per-kernel vectorization
+enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
+"""
 function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     s = _llvm_ir(f, types)
     isempty(s) && return false
