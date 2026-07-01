@@ -84,25 +84,46 @@ public function gets a failing `:coverage` finding (with the `register_strict!` 
 paste) until the function either declares its guarantees or is exempted visibly. See
 [Automating checks](automating.md).
 
-**Example: Claude Code hook** — runs `audit` after every edit round and feeds failures back to
-the agent automatically:
+**Example: Claude Code Stop hook** — audits at the end of every agent turn that touched `src/`,
+and blocks the stop until the findings are fixed. Naively re-running `julia -e 'audit(...)'` on
+every stop costs a cold start each time; the template below skips unchanged source via a content
+hash and only pays the audit when an edit actually happened.
+
+`.claude/settings.json` (committed, so every agent session gets it):
 
 ```json
 {
   "hooks": {
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; format=:json, exit_on_fail=true)'"
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "bash .claude/hooks/strictmode-stop.sh" }] }
     ]
   }
 }
 ```
 
-The JSON findings appear in the agent's context on a non-zero exit; the agent fixes the violation
-and runs again. It's the agent's version of a developer watching Revise.
+`.claude/hooks/strictmode-stop.sh` — point the `julia` line at your audit script (a file that
+warms your kernels, runs `audit(MyPkg; ...)`, and errors on `nfailures > 0`):
+
+```bash
+#!/usr/bin/env bash
+# StrictMode Stop hook: audit only when src/ changed this turn; block the stop on failures.
+input=$(cat)
+grep -q '"stop_hook_active":true' <<<"$input" && exit 0   # loop guard: don't re-block our own stop
+
+cd "$(dirname "$0")/../.." || exit 0
+hash=$(find src -name '*.jl' | sort | xargs cat | md5sum | cut -d' ' -f1)
+stamp=.claude/hooks/.src-hash                              # gitignore this stamp file
+[[ -f $stamp && $(cat "$stamp") == "$hash" ]] && exit 0    # src untouched → free
+
+if ! out=$(julia --project=bench bench/strictmode_audit.jl 2>&1); then
+    echo "StrictMode audit failed — fix these findings before stopping:" >&2
+    tail -40 <<<"$out" >&2
+    exit 2                                                 # blocks the stop, stderr reaches the agent
+fi
+echo "$hash" > "$stamp"                                    # only stamp a clean audit
+```
+
+The findings appear in the agent's context on exit 2; the agent fixes the violation and stops
+again. It's the agent's version of a developer watching Revise, at Stop-hook granularity — a
+cold `julia` run costs ~30–60 s once per source-touching turn. Keep the audit script on
+`analysis = "fast"` (no AllocCheck/JET needed) so that run stays as cheap as possible.
