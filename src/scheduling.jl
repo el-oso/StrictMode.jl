@@ -164,7 +164,7 @@ struct KernelReport
     unaligned_mem_ops::Int          # vector loads/stores where recorded align < vector width
     masked_mem_ops::Int             # @llvm.masked.* ops → irregular/variable-length trips
     # F14/F15
-    working_set_bytes::Union{Nothing,Int}   # user-supplied; enables cache-residency annotation
+    working_set_bytes::Union{Nothing, Int}   # user-supplied; enables cache-residency annotation
     # F22
     int_ops::Int        # vector integer arithmetic ops (add/sub/mul/and/or/xor/shl/icmp on <N x iN>)
     int_mem_ops::Int    # vector integer loads + stores
@@ -253,8 +253,10 @@ kernel_report(syrk_tiled!, (Matrix{Float64},); working_set_bytes = 8*512*512)
 # → compute-bound with note about packing at this problem size
 ```
 """
-function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
-                       working_set_bytes::Union{Nothing,Int} = nothing)
+function kernel_report(
+        @nospecialize(f), @nospecialize(types::Tuple);
+        working_set_bytes::Union{Nothing, Int} = nothing
+    )
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
     isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0, 0, 0, 0, false)
@@ -276,7 +278,7 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     # F22 — integer vector ops: arithmetic on <N x iN>
     ivop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x i\d+>"), s))
     int_arith = ivop("add") + ivop("sub") + ivop("mul") + ivop("and") + ivop("or") +
-                ivop("xor") + ivop("shl") + ivop("lshr") + ivop("ashr")
+        ivop("xor") + ivop("shl") + ivop("lshr") + ivop("ashr")
     int_icmp_count = count(_ -> true, eachmatch(r"icmp \w+ <\d+ x i\d+>", s))
     int_ops_val = int_arith + int_icmp_count
     int_mem_val = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x i\d+>", s))
@@ -303,7 +305,7 @@ function kernel_report(@nospecialize(f), @nospecialize(types::Tuple);
     noalias_missing_val = max(0, total_ptr - noalias_ptr)
     # F33 — shuffle/permute ops: the work of byte-transcoding/validation kernels, invisible to fp/int counts
     shuffle_val = count(_ -> true, eachmatch(r"shufflevector <\d+ x", s)) +
-                  count(_ -> true, eachmatch(r"@llvm\.x86\.\w+\.(?:pshuf\.?b?|perm[di]?|palignr|valign)", s))
+        count(_ -> true, eachmatch(r"@llvm\.x86\.\w+\.(?:pshuf\.?b?|perm[di]?|palignr|valign)", s))
     # F34 — prefetch presence; its absence in a low-intensity streaming loop ⇒ possibly latency-bound
     prefetch_val = count(_ -> true, eachmatch(r"@llvm\.prefetch", s))
     return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val, shuffle_val, prefetch_val, has_loop_phi)
@@ -326,7 +328,7 @@ const _LOOP_RE = r"\bphi (?:double|float)\b"
 
 # F22 — scalar integer loop indicators
 const _SCALAR_INT_RE = r"\b(?:add|sub|mul|and|or|xor|shl|lshr|ashr) i(?:8|16|32|64)\b"
-const _LOOP_INT_RE   = r"\bphi i(?:8|16|32|64)\b"
+const _LOOP_INT_RE = r"\bphi i(?:8|16|32|64)\b"
 
 # Vector op in the text IR (any `<N x …>` value). Used to decide, per-loop, whether a given loop
 # vectorized — see `_loop_regions` / `scalar_fp_loops`.
@@ -338,7 +340,7 @@ const _VEC_RE = r"<\d+ x "
 # Coarse (text, not a CFG), but enough to reason per-loop instead of whole-function.
 function _loop_regions(ir::AbstractString)
     lines = split(ir, '\n')
-    labelpos = Dict{SubString{String},Int}()
+    labelpos = Dict{SubString{String}, Int}()
     for (i, l) in enumerate(lines)
         m = match(r"^([A-Za-z0-9._]+):", l)
         m !== nothing && (labelpos[m.captures[1]] = i)
@@ -380,12 +382,12 @@ function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     if isempty(regions)   # no detectable back-edge: fall back to the whole-function scan (unchanged)
         _vectorized(f, types) && return false
         return (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
-               (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
+            (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
     end
     for r in regions
         occursin(_VEC_RE, r) && continue   # this loop vectorized → fine
         if (occursin(_LOOP_RE, r) && occursin(_SCALAR_FP_RE, r)) ||
-           (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
+                (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
             return true
         end
     end
@@ -397,8 +399,8 @@ function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::
     _fail(
         :no_scalar_loops, target,
         "scalar hot loop (FP or integer) detected in a numeric path that did not vectorize. " *
-        "Wrap the hot loop in a separate kernel and annotate it with `@assert_vectorized` / " *
-        "`@kernel`, or add `@inbounds @simd` / SIMD.jl to the loop body."
+            "Wrap the hot loop in a separate kernel and annotate it with `@assert_vectorized` / " *
+            "`@kernel`, or add `@inbounds @simd` / SIMD.jl to the loop body."
     )
     return nothing
 end
@@ -452,8 +454,10 @@ function Base.show(io::IO, r::KernelReport)
     )
     if r.fp_ops == 0 && r.int_ops > 0
         int_intensity = r.int_mem_ops > 0 ? r.int_ops / r.int_mem_ops : Inf
-        print(io, "  integer vector ops : integer memory ops = ", r.int_ops, " : ", r.int_mem_ops,
-              "  → integer intensity ", round(int_intensity; digits = 2), "\n")
+        print(
+            io, "  integer vector ops : integer memory ops = ", r.int_ops, " : ", r.int_mem_ops,
+            "  → integer intensity ", round(int_intensity; digits = 2), "\n"
+        )
     end
     b = _kr_bound(r)
     if b === :memory
@@ -467,8 +471,10 @@ function Base.show(io::IO, r::KernelReport)
         print(io, ": some data reuse; more register/cache blocking may still help.")
     elseif b === :shuffle
         printstyled(io, "  → shuffle/port-bound"; color = :yellow)
-        print(io, ": dominated by vpshufb/vperm/shufflevector (the shuffle port, ~1/cycle), not arithmetic. ",
-                  "Speed it with WIDER vectors (SSE→AVX2→AVX-512) or FEWER shuffles — register/cache blocking does not apply.")
+        print(
+            io, ": dominated by vpshufb/vperm/shufflevector (the shuffle port, ~1/cycle), not arithmetic. ",
+            "Speed it with WIDER vectors (SSE→AVX2→AVX-512) or FEWER shuffles — register/cache blocking does not apply."
+        )
     else
         printstyled(io, "  → compute-bound"; color = :green)
         print(io, ": good FLOP:byte balance.")
@@ -483,8 +489,10 @@ function Base.show(io::IO, r::KernelReport)
     if r.vectorized && r.prefetch_ops == 0 && r.has_loop_phi && (r.mem_ops + r.int_mem_ops) > 0 && b in (:memory, :balanced)
         print(io, "\n")
         printstyled(io, "  no prefetch in a streaming loop"; color = :yellow)
-        print(io, " — if this is a forward scan it is likely memory-LATENCY-bound (not bandwidth-bound): ",
-                  "prefetch ~1 chunk ahead with `@llvm.prefetch`. A bandwidth-bound loop won't benefit (then it's a real ceiling).")
+        print(
+            io, " — if this is a forward scan it is likely memory-LATENCY-bound (not bandwidth-bound): ",
+            "prefetch ~1 chunk ahead with `@llvm.prefetch`. A bandwidth-bound loop won't benefit (then it's a real ceiling)."
+        )
     end
     # F13 alignment hint
     if r.unaligned_mem_ops > 0
@@ -561,8 +569,8 @@ function register_report(@nospecialize(f), @nospecialize(types::Tuple))
     s = _native_asm(f, types)
     isempty(s) && return RegisterReport(target, 0, 0, 0)
     zmm_regs = Set(m[1] for m in eachmatch(r"%zmm(\d+)\b", s))
-    spills   = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
-    total    = isempty(zmm_regs) ? 0 : 32
+    spills = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
+    total = isempty(zmm_regs) ? 0 : 32
     return RegisterReport(target, length(zmm_regs), total, spills)
 end
 

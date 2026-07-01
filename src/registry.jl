@@ -320,7 +320,7 @@ function _coverage_findings(mod::Module; only = nothing, exempt = ())
             out, StrictFinding(
                 nameof(mod), s, "", :coverage, :fail, string(m.file), Int(m.line),
                 "public function `$s` has no registered StrictMode guarantee",
-                "declare it: `register_strict!($s, (T1, …); guarantees = (:typestable, :noalloc))` " *
+                "declare it: `StrictMode.register_strict!($s, (T1, …); guarantees = (:typestable, :noalloc))` " *
                     "in the test setup (then `check_all()` enforces it), or opt it out explicitly " *
                     "with `@strict_exempt $s` / the `exempt` kwarg if it is cold by design."
             )

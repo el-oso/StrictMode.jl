@@ -5,11 +5,11 @@
     using StrictMode
 
     module CovPkg
-        export covered, uncovered, coldpub
-        covered(x::Float64) = x + 1.0
-        uncovered(x::Float64) = x * 2.0
-        coldpub(x::Float64) = [x]          # cold by design — exempted below
-        _private(x::Float64) = x - 1.0     # not public: never flagged
+    export covered, uncovered, coldpub
+    covered(x::Float64) = x + 1.0
+    uncovered(x::Float64) = x * 2.0
+    coldpub(x::Float64) = [x]          # cold by design — exempted below
+    _private(x::Float64) = x - 1.0     # not public: never flagged
     end
 
     empty!(StrictMode.registered_strict())
@@ -47,8 +47,8 @@ end
     using StrictMode
 
     module CovClean
-        export k
-        k(x::Int) = x + 1
+    export k
+    k(x::Int) = x + 1
     end
 
     empty!(StrictMode.registered_strict())

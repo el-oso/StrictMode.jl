@@ -99,7 +99,7 @@ exported/`public` function of the module that is neither registered nor exempted
 
 ```julia
 # in your test suite: registration is the manifest, the gate enforces completeness
-register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:typestable, :noalloc))
+StrictMode.register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:typestable, :noalloc))
 check_all()                                       # the declared guarantees hold…
 @test nfailures(audit(MyPkg; require = :public)) == 0   # …and nothing public is undeclared
 ```
