@@ -201,6 +201,8 @@ or sweep everything and exempt the rest.
 | `@assert_vectorized f(args...)` | fail unless the loop SIMD-vectorized (best-effort, LLVM IR scan) |
 | `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
 | `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee) |
+| `@assert_concurrency_safe f(plan, args...)` | fail unless `f` treats its plan arg as read-only (no write of, or through, the plan) — proof that one plan is safe to share across concurrent tasks |
+| `@assert_no_threadid_state f(args...)` | fail on mutable state indexed by `Threads.threadid()` (the task-migration hazard) |
 | `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |
 | `explain_trim(output)` | translate raw `juliac --trim` verifier output into a source-mapped explanation |
 | `@strict f(args...)` | all per-call guarantees at once; returns the call's value |
