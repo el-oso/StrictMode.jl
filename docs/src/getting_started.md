@@ -39,6 +39,10 @@ fail_mode = "error"
 Then run your tests in a **fresh Julia process** — the setting is read when Julia compiles the
 package, not while a session is already running.
 
+To catch the preference silently going missing (with checks off, every `@assert_*` is a no-op
+and your strictmode tests pass vacuously), start those tests with [`assert_enabled`](@ref): it
+returns `checks_enabled()` locally but **errors under CI** when checks are disabled.
+
 For interactive use during development, `enable_checks!()` writes the setting for you:
 
 ```julia

@@ -15,6 +15,41 @@ checks_enabled() = CHECKS_ENABLED
 const CHECKS_ENABLED = @load_preference("checks_enabled", false)::Bool
 
 """
+    assert_enabled() -> Bool
+
+Guard against the silent-skip failure mode: returns [`checks_enabled`](@ref) locally, but
+**errors under CI** (any non-empty `ENV["CI"]`, set by GitHub Actions and most CI systems)
+when checks are disabled. With checks off every `@assert_*` expands to the bare call, so a
+"passing" strictmode test proves nothing — in CI that must be a red build, not a green skip.
+
+Use it as the predicate where you would otherwise skip:
+
+```julia
+if !StrictMode.assert_enabled()          # errors in CI instead of skipping
+    @test_skip false                      # local session with checks off: skip is fine
+    return
+end
+```
+
+Reports the **build** state (the precompile-baked preference), which is what CI must check:
+a preference flipped without a restart does not count.
+"""
+assert_enabled() = _assert_enabled(checks_enabled(), !isempty(get(ENV, "CI", "")))
+
+# Pure core, unit-testable without touching ENV or the baked const.
+function _assert_enabled(enabled::Bool, ci::Bool)
+    enabled && return true
+    ci && error(
+        "StrictMode checks are DISABLED in this build, but CI is set — refusing to skip " *
+            "silently (a green run with checks off proves nothing). Enable them by adding\n" *
+            "    [preferences.StrictMode]\n    checks_enabled = true\n    fail_mode = \"error\"\n" *
+            "to the test environment's Project.toml (or run `StrictMode.enable_checks!()` and " *
+            "restart), and make sure AllocCheck + JET are test deps for :full analysis."
+    )
+    return false
+end
+
+"""
     fail_mode() -> Symbol
 
 How a failed guarantee is reported: `:error` (default — throw [`StrictViolation`](@ref),

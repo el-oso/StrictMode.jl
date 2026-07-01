@@ -157,6 +157,7 @@ takes effect on the next Julia start. See [Getting Started](getting_started.md) 
 enable_checks!
 disable_checks!
 checks_enabled
+assert_enabled
 fail_mode
 analysis_mode
 backend_available

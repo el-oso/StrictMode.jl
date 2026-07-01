@@ -4,6 +4,17 @@
     @test StrictMode.fail_mode() === :error
 end
 
+@testitem "assert_enabled: errors under CI when disabled, skippable locally" begin
+    using StrictMode
+    # Pure-core truth table.
+    @test StrictMode._assert_enabled(true, false) === true
+    @test StrictMode._assert_enabled(true, true) === true
+    @test StrictMode._assert_enabled(false, false) === false
+    @test_throws ErrorException StrictMode._assert_enabled(false, true)
+    # Public entry point in this env (checks baked on): true regardless of CI.
+    @test assert_enabled() === true
+end
+
 @testitem "_gate selects the branch by compile-time flag" begin
     using StrictMode
     expected = StrictMode.checks_enabled() ? :checked : :bare

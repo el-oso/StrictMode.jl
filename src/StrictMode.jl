@@ -42,7 +42,7 @@ export check, findings, check_all, check_compiled, check_signatures, audit, form
 export inline_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
-export enable_checks!, disable_checks!, checks_enabled, fail_mode, analysis_mode, backend_available
+export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, analysis_mode, backend_available
 
 include("preferences.jl")
 include("report.jl")
