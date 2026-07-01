@@ -5,7 +5,8 @@
 
 """
     audit(target = :registered; format = :json, io = stdout, exit_on_fail = false,
-          guarantees = nothing, sweep = false, only = nothing, exempt = ()) -> Vector{StrictFinding}
+          guarantees = nothing, sweep = false, require = nothing,
+          only = nothing, exempt = ()) -> Vector{StrictFinding}
 
 Run the strict checks once, write the findings to `io` in a machine-readable `format`, and return
 them, the same `Vector{StrictFinding}` you get from [`check`](@ref), [`check_all`](@ref), and
@@ -25,6 +26,13 @@ julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_o
 `format` is `:json`, `:jsonlines`, `:github`, or `:text`. Each JSON finding carries `guarantee`,
 `status`, `file`, `line`, `reason`, and an actionable `suggestion`.
 
+`require = :public` (Module target only) adds the **coverage gate**: one failing finding
+(`guarantee = :coverage`) per exported/`public` function of the module that is neither
+registered ([`register_strict!`](@ref) / [`@strict_function`](@ref)) nor exempted
+(`@strict_exempt` / the `exempt` kwarg). It makes "every public kernel declares its
+guarantees" a red test instead of a convention — a new function cannot ship silently
+unchecked; opting out requires a visible exempt.
+
 `inline_suggest = true` additionally runs [`inline_suggestions`](@ref): informational
 "consider `@inline` on X" findings (`guarantee = :inline_suggestion`, `status = :info`) for
 `@generated` / in-loop callees the compiler left non-inlined. They are **never failures**
@@ -39,11 +47,16 @@ function audit(
         exit_on_fail::Bool = false,
         guarantees = nothing,
         sweep::Bool = false,
+        require::Union{Nothing, Symbol} = nothing,
         only = nothing,
         exempt = (),
         mode::Symbol = analysis_mode(),
         inline_suggest::Bool = false,
     )
+    require === nothing || require === :public ||
+        throw(ArgumentError("audit: require must be :public (or nothing), got $(require)"))
+    require === :public && !(target isa Module) &&
+        throw(ArgumentError("audit: require = :public needs a Module target"))
     fs = StrictFinding[]
     if target === :registered
         append!(fs, check_all(; guarantees, fail = :none, mode))
@@ -63,6 +76,7 @@ function audit(
             gs = guarantees === nothing ? (:typestable, :noalloc) : guarantees
             append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt, mode))
         end
+        require === :public && append!(fs, _coverage_findings(target; only, exempt))
         # Inline suggestions are informational (status :info, never failures) and noisy, so opt-in.
         inline_suggest && append!(fs, inline_suggestions(target; only, exempt))
     else

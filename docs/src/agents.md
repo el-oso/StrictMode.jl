@@ -74,6 +74,16 @@ julia --project -e 'using MyPkg, StrictMode, AllocCheck, JET; audit(MyPkg; forma
 A non-zero exit (failure count) signals the loop to act on the findings. For GitHub Actions,
 `:github` format emits inline annotations on the offending lines.
 
+Guard the whole thing with [`assert_enabled`](@ref) as the first line of your strictmode test
+or audit script. With checks disabled every `@assert_*` expands to the bare call and the run
+passes **vacuously** — `assert_enabled()` turns that into a hard error under CI (any non-empty
+`ENV["CI"]`) while still letting a local session skip.
+
+Pair it with the coverage gate — `audit(MyPkg; require = :public)` — so an agent adding a new
+public function gets a failing `:coverage` finding (with the `register_strict!` snippet to
+paste) until the function either declares its guarantees or is exempted visibly. See
+[Automating checks](automating.md).
+
 **Example: Claude Code hook** — runs `audit` after every edit round and feeds failures back to
 the agent automatically:
 

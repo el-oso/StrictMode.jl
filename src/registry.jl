@@ -297,6 +297,38 @@ function check_compiled(
     return _run_and_report(_map_findings(items, parallel, mode), :check_compiled, string(nameof(mod)), fail)
 end
 
+# Coverage gate (`audit(mod; require = :public)`): one :fail finding per exported/public
+# function of `mod` that is neither registered (`register_strict!` / `@strict_function`) nor
+# exempted. Turns "every kernel declares its guarantees" from a convention into a red test.
+# Not a checkable guarantee — findings are built directly, never routed through _build_finding.
+function _coverage_findings(mod::Module; only = nothing, exempt = ())
+    exemptpred = _name_matcher(exempt)
+    onlypred = _name_matcher(only)
+    registered = Set{Any}(k[1] for k in keys(STRICT_REGISTRY))
+    out = StrictFinding[]
+    for nm in names(mod)   # exported + `public` on 1.12; macros/gensyms filtered below
+        s = String(nm)
+        (startswith(s, '#') || startswith(s, '@')) && continue
+        isdefined(mod, nm) || continue
+        f = getfield(mod, nm)
+        (f isa Function && parentmodule(f) === mod) || continue
+        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
+        onlypred === nothing || onlypred(f) || continue
+        f in registered && continue
+        m = first(methods(f))
+        push!(
+            out, StrictFinding(
+                nameof(mod), s, "", :coverage, :fail, string(m.file), Int(m.line),
+                "public function `$s` has no registered StrictMode guarantee",
+                "declare it: `register_strict!($s, (T1, …); guarantees = (:typestable, :noalloc))` " *
+                    "in the test setup (then `check_all()` enforces it), or opt it out explicitly " *
+                    "with `@strict_exempt $s` / the `exempt` kwarg if it is cold by design."
+            )
+        )
+    end
+    return out
+end
+
 # --- Revise live loop plumbing (the extension fills these in) ----------------------------------
 
 const _REVISE_WATCH = Ref{Any}(nothing)

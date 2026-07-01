@@ -90,6 +90,24 @@ check_compiled(MyPkg; guarantees = (:noalloc, :noboxing))
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
 best-effort and defensive. In return, it needs no marks at all.
 
+## The coverage gate — `audit(mod; require = :public)`
+
+The drivers above check what was *declared* (registry) or what *ran* (sweep) — neither notices
+a new public function that was never brought under StrictMode at all. The coverage gate closes
+that hole: it fails (one `guarantee = :coverage` finding, `status = :fail`) for every
+exported/`public` function of the module that is neither registered nor exempted.
+
+```julia
+# in your test suite: registration is the manifest, the gate enforces completeness
+register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:typestable, :noalloc))
+check_all()                                       # the declared guarantees hold…
+@test nfailures(audit(MyPkg; require = :public)) == 0   # …and nothing public is undeclared
+```
+
+A new public function now cannot ship silently unchecked: either it gets registered with its
+guarantees, or it is opted out **visibly** (`@strict_exempt` / the `exempt` kwarg) where a
+reviewer can see it. Scope with `only`/`exempt` exactly as in [`check_compiled`](@ref).
+
 ## Live feedback with Revise — `watch`
 
 Load [Revise](https://github.com/timholy/Revise.jl) next to StrictMode and you get a live loop:
