@@ -1,6 +1,6 @@
 # StrictMode.jl release notes
 
-## Unreleased
+## v0.3.4
 
 Additive, non-breaking. Two dogfooding gaps closed so the guarantee macros can be pointed at real
 public API surfaces instead of internal positional drivers ([#4], [#5]).
