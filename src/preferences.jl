@@ -68,8 +68,8 @@ How thoroughly the per-call asserts ([`@assert_typestable`](@ref), [`@assert_noa
   static no-allocation proof. Best for CI.
 - `:fast` — cheap Base-only checks: `Base.return_types` concreteness plus a typed-IR scan
   (dynamic dispatch — including internal dispatch behind a concrete return, explicit heap
-  allocation following non-inlined callees two levels deep, throw-path allocations excluded).
-  ~12× faster than `:full` (2026-07-02 corpus study, 552 real specializations: 24 ms vs 296 ms
+  allocation following direct non-inlined callees, throw-path allocations excluded). ~60×
+  faster than `:full` (2026-07-02 corpus study, 552 real specializations: 4.9 ms vs 296 ms
   median) at **matching verdicts on every `:typestable`/`:noalloc` case** (3 residual
   `:noboxing` under-reports on cold helpers, all still failing via `:noalloc`). Still a
   heuristic — `:full` remains the proof; `divergence_report` captures any disagreement.

@@ -61,7 +61,7 @@ function _static_callee(ci, @nospecialize(a))
 end
 
 """
-    _alloc_signals(f, types; depth = 2) -> (; alloc, boxing, abscontainer, file, line)
+    _alloc_signals(f, types; depth = 1) -> (; alloc, boxing, abscontainer, file, line)
 
 Value-free allocation heuristic from optimized typed IR (no execution, no backend). `alloc` flags
 explicit heap allocation (`:new` of a mutable/Array/`Core.Box` type, or a GC/box `:foreigncall`),
@@ -77,9 +77,20 @@ dynamic-dispatch subclass:
 A small all-concrete `Union` result stays unflagged (union-split, not boxing — flagging those
 over-reported on type-stable SIMD/pointer kernels). Location is the method's definition site.
 """
-function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = 2)
+function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = 1)
+    # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
+    # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
+    # so that form is reserved for the callee recursion, where the memo amortizes it.
     sig = Base.signature_type(f, Tuple{types...})
-    alloc, boxing, abscontainer = _signals_by_type(sig, depth, Set{Any}())
+    cts = try
+        Base.code_typed(f, types; optimize = true)
+    catch
+        Any[]
+    end
+    seen = Base.IdSet{Any}()
+    push!(seen, sig)
+    alloc, boxing, abscontainer = isempty(cts) ? (false, false, nothing) :
+        _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
     catch
@@ -113,28 +124,38 @@ end
 # internals especially) from every caller, and each visit pays a `code_typed_by_type`. Without
 # this, `:fast`'s median went 2.9 ms → 73 ms on the corpus study. Invalidated with the findings
 # cache (`clear_cache!` / the Revise extension) — same staleness contract.
-const _SIGNAL_MEMO = Dict{Any, Tuple{Bool, Bool, Any}}()
+#
+# Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
+# (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
+# kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Any}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
-function _signals_by_type(@nospecialize(sig), depth::Int, seen::Set{Any})
+function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     sig in seen && return (false, false, nothing)
     push!(seen, sig)
-    key = (sig, depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
-    memo = @lock _SIGNAL_MEMO_LOCK get(_SIGNAL_MEMO, key, nothing)
+    key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
+    memo = @lock _SIGNAL_MEMO_LOCK begin
+        bysig = get(_SIGNAL_MEMO, sig, nothing)
+        bysig === nothing ? nothing : get(bysig, key, nothing)
+    end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK _SIGNAL_MEMO[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Any}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Set{Any})
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     cts = try
         Base.code_typed_by_type(sig; optimize = true)
     catch
         return (false, false, nothing)
     end
     isempty(cts) && return (false, false, nothing)
-    ci, _ = first(cts)
+    return _scan_ci(first(cts)[1], sig, depth, seen)
+end
+
+function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     alloc = false
     boxing = false
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
