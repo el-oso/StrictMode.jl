@@ -830,8 +830,11 @@ false positives, 3 residual noboxing under-reports on cold helpers (`Utf8._bin`,
 Catching their boxing label would need `:invoke` recursion for the boxing signal — the exact F9 FP
 minefield; deliberately not done. **Cost:** callee-following made fast 2.9 → 73 ms median; a
 world-keyed session memo on the per-signature scan (`_SIGNAL_MEMO`, cleared by `clear_cache!`)
-brings it to **24 ms median** — ~12× faster than `:full` (296 ms) instead of ~100×, the price of
-seeing through callees. Regression tests: `test/fast_gap_test.jl` (one item per class, plus F8/F9
+brings it to **24 ms median** — ~12× faster than `:full` (296 ms) instead of ~100×. (This entry
+originally attributed the 24 ms to "the price of seeing through callees" — an UNMEASURED causal
+claim the addendum's profile disproved: it was `DataType` hashing. Left corrected-in-place as a
+worked example of asserting a mechanism before decomposing.) Regression tests:
+`test/fast_gap_test.jl` (one item per class, plus F8/F9
 guards). Bonus corpus finding: `_bcast32`'s un-`Val`ed `ntuple` is a real BlazingPorts bug of the
 same family as the Utf8 tail buffer.
 
