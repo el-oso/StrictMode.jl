@@ -95,26 +95,16 @@ to the bare call, with no overhead left behind.
 macro assert_noalloc(args...)
     # Default to AllocCheck's static proof in :full analysis, the empirical @allocated path in
     # :fast; an explicit `static = …` always wins.
-    static = ANALYSIS_MODE === :full
-    call = nothing
-    for a in args
-        if Meta.isexpr(a, :(=)) && a.args[1] === :static
-            static = a.args[2]::Bool
-        else
-            call = a
-        end
-    end
-    call === nothing && throw(ArgumentError("@assert_noalloc needs a call expression"))
-
+    pos, opts = _macro_call(args, (:static, :types))
+    static = haskey(opts, :static) ? opts[:static]::Bool : ANALYSIS_MODE === :full
+    isempty(pos) && throw(ArgumentError("@assert_noalloc needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
-    thunk = Expr(:->, Expr(:tuple), Expr(:block, Expr(:call, esc(fexpr), syms...)))
+    p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
-        $(binds...)
-        $(_assert_noalloc)($target, $(esc(fexpr)), $types, $thunk; static = $static)
+        $(p.binds...)
+        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); static = $static)
     end
     return _gate(checked, esc(call))
 end
@@ -156,18 +146,17 @@ once; the macro evaluates to the call's value; disabled builds expand to the bar
 @assert_noboxing sum_runtime_index(htuple)    # throws: jl_get_nth_field_checked (tuple boxing)
 ```
 """
-macro assert_noboxing(call)
+macro assert_noboxing(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_noboxing needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_noboxing)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_noboxing)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))

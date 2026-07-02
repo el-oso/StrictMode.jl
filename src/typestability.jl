@@ -26,7 +26,7 @@ end
 
 # The type-stability *check* expression (no value), branched on the active analysis mode. Shared
 # by `@assert_typestable` and `@strict`.
-function _typestable_check_expr(target, fe, litcall, types)
+function _typestable_check_expr(target, fe, types)
     base = :($(_typestable_fast)($target, $fe, $types))
     ANALYSIS_MODE === :full || return base
     return quote
@@ -51,18 +51,17 @@ the bare call.
 @assert_typestable pick(heterogeneous_tuple, i)   # throws: Union from runtime tuple index
 ```
 """
-macro assert_typestable(call)
+macro assert_typestable(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_typestable needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_typestable_check_expr(target, fe, litcall, types))
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_typestable_check_expr(target, p.checkfn, p.types))
         _val
     end
     return _gate(checked, esc(call))

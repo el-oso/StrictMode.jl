@@ -145,36 +145,111 @@ _gate(check_expr, passthrough_expr) = CHECKS_ENABLED ? check_expr : passthrough_
 
 # --- shared macro plumbing (runs at user macro-expansion time, never at module load) ---
 
-# Split a call expression into (function-expr, [arg-exprs]). Handles plain calls `f(a, b)` and
-# broadcasts `f.(a, b)` (rewritten to `broadcast(f, a, b)`). Anything else (keyword args, bare
-# macrocalls, blocks) gets a clear error pointing at the interference-proof `StrictMode.check`.
+# Split a call expression into `(function-expr, [positional-arg-exprs], [(kwname, valexpr)...])`.
+# Handles plain calls `f(a, b)`, keyword calls `f(a; k=v)` / `f(a, k=v)`, and broadcasts
+# `f.(a, b)` (rewritten to `broadcast(f, a, b)`). Genuinely unsupported forms (bare macrocalls,
+# blocks, non-calls) get a clear error pointing at the interference-proof `StrictMode.check`.
 function _callinfo(call)
     # Broadcasting: `f.(xs...)` parses as `Expr(:., f, Expr(:tuple, xs...))`.
     if Meta.isexpr(call, :., 2) && Meta.isexpr(call.args[2], :tuple)
-        return :broadcast, Any[call.args[1], call.args[2].args...]
+        return :broadcast, Any[call.args[1], call.args[2].args...], Any[]
     end
     Meta.isexpr(call, :call) || throw(
         ArgumentError(
             "StrictMode guarantee macros expect a call `f(args...)` or broadcast `f.(args...)`, " *
-                "got: $call. For keyword args, blocks, or other forms, use the function API: " *
+                "got: $call. For blocks or other forms, use the function API: " *
                 "`StrictMode.check(f, (T1, T2, …))`."
         )
     )
     fexpr = call.args[1]
-    argexprs = call.args[2:end]
-    any(a -> Meta.isexpr(a, (:parameters, :kw)), argexprs) && throw(
-        ArgumentError(
-            "StrictMode guarantee macros don't support keyword arguments in `$call`. " *
-                "Use the function API instead: `StrictMode.check(f, (T1, T2, …))`."
-        )
-    )
-    return fexpr, argexprs
+    argexprs = Any[]
+    kwexprs = Any[]   # normalized (name::Symbol, valexpr) pairs
+    for a in call.args[2:end]
+        if Meta.isexpr(a, :parameters)      # trailing `; k=v`
+            for p in a.args
+                _collect_kw!(kwexprs, p)
+            end
+        elseif Meta.isexpr(a, :kw)          # inline `k=v`
+            _collect_kw!(kwexprs, a)
+        else
+            push!(argexprs, a)
+        end
+    end
+    return fexpr, argexprs, kwexprs
 end
 
-# Evaluate each argument exactly once into a fresh local, so side effects don't repeat across
-# the warmup/measure passes. Returns (arg-symbols, binding-exprs) with arguments escaped.
-function _bind_args(argexprs)
-    syms = [gensym(:arg) for _ in eachindex(argexprs)]
-    binds = [:($s = $(esc(e))) for (s, e) in zip(syms, argexprs)]
-    return syms, binds
+function _collect_kw!(kwexprs, p)
+    if Meta.isexpr(p, :kw)
+        push!(kwexprs, (p.args[1]::Symbol, p.args[2]))
+    elseif p isa Symbol                     # `; k` shorthand for `k = k`
+        push!(kwexprs, (p, p))
+    else
+        throw(
+            ArgumentError(
+                "StrictMode guarantee macros can't handle the keyword form `$p` (e.g. `; kw...` " *
+                    "splats). Use the function API instead: `StrictMode.check(f, (T1, T2, …))`."
+            )
+        )
+    end
+    return kwexprs
+end
+
+# The single choke point behind every guarantee macro. Returns a NamedTuple:
+#   binds   — bind each positional arg AND each kw *value* to a fresh gensym (evaluate-once; the
+#             alloc thunk runs twice, so kw values must be hoisted, not re-evaluated inside it).
+#   litcall — the reconstructed `f(argsyms...; k=kwsym...)` used for the value.
+#   thunk   — `() -> litcall`, for the alloc path.
+#   checkfn — the function whose signature the backends inspect: `f`, or `Core.kwcall` when there
+#             are keyword args (so `check_allocs`/`return_types` see the real kwarg sites unchanged).
+#   types   — the inference-signature tuple expr matching `checkfn`.
+# `types = (...)` override pins the signature verbatim (fixes DataType-widening false positives).
+function _call_parts(call; types = nothing)
+    fexpr, argexprs, kwexprs = _callinfo(call)
+    fe = esc(fexpr)
+
+    argsyms = [gensym(:arg) for _ in eachindex(argexprs)]
+    binds = Any[:($s = $(esc(e))) for (s, e) in zip(argsyms, argexprs)]
+
+    kwnames = Symbol[name for (name, _) in kwexprs]
+    kwsyms = [gensym(:kw) for _ in eachindex(kwexprs)]
+    for (s, (_, v)) in zip(kwsyms, kwexprs)
+        push!(binds, :($s = $(esc(v))))
+    end
+    haskw = !isempty(kwexprs)
+
+    if haskw
+        params = Expr(:parameters, (Expr(:kw, n, s) for (n, s) in zip(kwnames, kwsyms))...)
+        litcall = Expr(:call, fe, params, argsyms...)
+    else
+        litcall = Expr(:call, fe, argsyms...)
+    end
+    thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
+
+    if types !== nothing
+        checkfn = fe
+        typesexpr = esc(types)
+    elseif haskw
+        nt = Expr(:tuple, (Expr(:(=), n, s) for (n, s) in zip(kwnames, kwsyms))...)
+        checkfn = Core.kwcall
+        typesexpr = Expr(:tuple, :(typeof($nt)), :(typeof($fe)), (:(typeof($s)) for s in argsyms)...)
+    else
+        checkfn = fe
+        typesexpr = Expr(:tuple, (:(typeof($s)) for s in argsyms)...)
+    end
+    return (; binds, litcall, thunk, checkfn, types = typesexpr)
+end
+
+# Varargs scan generalizing the `static=`/`self=` option loops: pulls any `Expr(:(=), key, val)`
+# whose `key ∈ allowed` into `opts` (raw RHS expr), everything else into `positionals` in order.
+function _macro_call(args, allowed::Tuple)
+    positionals = Any[]
+    opts = Dict{Symbol, Any}()
+    for a in args
+        if Meta.isexpr(a, :(=)) && a.args[1] isa Symbol && a.args[1] in allowed
+            opts[a.args[1]] = a.args[2]
+        else
+            push!(positionals, a)
+        end
+    end
+    return positionals, opts
 end

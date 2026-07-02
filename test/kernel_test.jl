@@ -29,3 +29,20 @@ end
     @test err isa StrictViolation
     @test err.kind === :vectorized
 end
+
+@testitem "@kernel accepts keyword arguments (issue #4)" begin
+    using StrictMode, AllocCheck, JET
+    using SIMD: Vec, vload, vstore
+
+    # `@inline` so the kwsorter body inlines into `Core.kwcall` (the kwarg inference/IR seam) —
+    # otherwise @assert_vectorized sees only the thin kwcall dispatcher (its documented
+    # non-inlined-callee limitation), same as any forwarding wrapper.
+    @inline goodkw!(y::Vector{Float64}, x::Vector{Float64}; scale = 2.0) = (
+        @inbounds for i in 1:8:length(x)
+            vstore(vload(Vec{8, Float64}, x, i) * scale, y, i)
+        end; y
+    )
+    x = rand(8); y = zeros(8)
+    result = @kernel goodkw!(y, x; scale = 2.0)
+    @test result === y
+end

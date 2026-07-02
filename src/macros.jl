@@ -5,22 +5,17 @@
 # Build the gated expression for a single `f(args...)` call: type-stable + non-allocating, or
 # the bare call when checks are disabled. Factored out so `@verify_strict` can reuse it without
 # fragile nested-macro composition.
-function _strict_expr(call)
+function _strict_expr(call; types = nothing)
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
-    thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
+    p = _call_parts(call; types)
 
     static = ANALYSIS_MODE === :full
     checked = quote
-        $(binds...)
+        $(p.binds...)
         # (1) type stability (root cause of most surprise allocations, so checked first)
-        $(_typestable_check_expr(target, fe, litcall, types))
+        $(_typestable_check_expr(target, p.checkfn, p.types))
         # (2) allocation-freedom (also returns the call's value)
-        $(_assert_noalloc)($target, $fe, $types, $thunk; static = $static)
+        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); static = $static)
     end
     return _gate(checked, esc(call))
 end
@@ -40,32 +35,29 @@ bare call.
 x = @strict kernel(a, b) # use the result while still guaranteeing the fast path
 ```
 """
-macro strict(ex)
+macro strict(args...)
     # `@strict module M … end` marks the whole module (see registry.jl); otherwise it's the
     # per-call guarantee on `f(args...)`.
-    Meta.isexpr(ex, :module) && return _strict_module(ex)
-    return _strict_expr(ex)
+    length(args) == 1 && Meta.isexpr(args[1], :module) && return _strict_module(args[1])
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@strict needs a call expression"))
+    return _strict_expr(pos[1]; types = get(opts, :types, nothing))
 end
 
 # Build the gated expression for `@kernel f(args...)`: type-stable + non-allocating + vectorized.
-function _kernel_expr(call)
+function _kernel_expr(call; types = nothing)
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
-    thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
+    p = _call_parts(call; types)
 
     static = ANALYSIS_MODE === :full
     checked = quote
-        $(binds...)
+        $(p.binds...)
         # (1) type stability
-        $(_typestable_check_expr(target, fe, litcall, types))
+        $(_typestable_check_expr(target, p.checkfn, p.types))
         # (2) allocation-freedom (returns the call's value)
-        local _kval = $(_assert_noalloc)($target, $fe, $types, $thunk; static = $static)
+        local _kval = $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); static = $static)
         # (3) vectorization
-        $(_assert_vectorized)($target, $fe, $types)
+        $(_assert_vectorized)($target, $(p.checkfn), $(p.types))
         _kval
     end
     return _gate(checked, esc(call))
@@ -99,6 +91,8 @@ x = @kernel dot_kernel(a, b)   # use the result while still guaranteeing the fas
 
 See also [`@strict`](@ref) for the subset without the vectorization check.
 """
-macro kernel(ex)
-    return _kernel_expr(ex)
+macro kernel(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@kernel needs a call expression"))
+    return _kernel_expr(pos[1]; types = get(opts, :types, nothing))
 end

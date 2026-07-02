@@ -32,13 +32,22 @@ end
     @test (@assert_typestable sqrt.(t)) == map(sqrt, t)   # broadcast over a tuple → stable, no alloc
     @test (@assert_noalloc sqrt.(t)) == map(sqrt, t)
     # _callinfo rewrites f.(x) to broadcast(f, x)
-    @test StrictMode._callinfo(:(f.(x))) == (:broadcast, Any[:f, :x])
+    @test StrictMode._callinfo(:(f.(x))) == (:broadcast, Any[:f, :x], Any[])
 end
 
-@testitem "macro hardening: keyword args give a clear error pointing at check" begin
+@testitem "macro hardening: keyword args are extracted; unsupported forms still error" begin
     using StrictMode
+    # (a) kwargs are now accepted — _callinfo pulls them out of both `:parameters` and `:kw`.
+    fexpr, argexprs, kwexprs = StrictMode._callinfo(:(solve(a, b; tol = 1)))
+    @test fexpr === :solve
+    @test argexprs == Any[:a, :b]
+    @test kwexprs == Any[(:tol, 1)]
+
+    # (b) a still-unsupported form (a bare block) still errors, pointing at StrictMode.check.
     err = try
-        StrictMode._callinfo(:(solve(a, b; tol = 1)))
+        StrictMode._callinfo(:(begin
+            x + 1
+        end))
         nothing
     catch e
         e

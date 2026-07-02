@@ -153,17 +153,16 @@ component(s, i) = s[i]
 #     ✗ @assert_noalloc would fail
 ```
 """
-macro explain(call)
+macro explain(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@explain needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
-        $(binds...)
-        $(_strict_report)($target, $fe, $types)   # builds the report via the analysis backend
+        $(p.binds...)
+        $(_strict_report)($target, $(p.checkfn), $(p.types))   # builds the report via the analysis backend
     end
     return _gate(checked, esc(call))
 end

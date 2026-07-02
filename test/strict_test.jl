@@ -16,3 +16,9 @@ end
     makevec(n) = collect(1:n)
     @test_throws StrictViolation @strict makevec(8)
 end
+
+@testitem "@strict accepts keyword arguments (issue #4)" begin
+    using StrictMode, AllocCheck, JET
+    weightedkw(a, b; w = 0.5) = w * a + (1 - w) * b
+    @test (@strict weightedkw(2.0, 4.0; w = 0.5)) === 3.0
+end
