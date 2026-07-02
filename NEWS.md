@@ -1,9 +1,52 @@
 # StrictMode.jl release notes
 
-## v0.3.4
+## v0.3.3
 
-Additive, non-breaking: multi-threading correctness guarantees (value-free IR scans — no
-AllocCheck/JET backend needed).
+Additive, non-breaking. Four themes: an automatic inlining audit, structural enforcement (make
+ignoring StrictMode loud), multi-threading correctness guarantees, and a corpus-measured
+accuracy/speed upgrade of `:fast` mode.
+
+### Inlining audit
+
+- **`inline_suggestions(f, types)` / `inline_suggestions(mod)`** (exported) — scan optimized typed
+  IR for callees the compiler did **not** inline and emit informational "consider `@inline`"
+  findings (never failures; `nfailures` ignores them). `@generated` and in-loop callees are the
+  flagged, high-value cases. Opt in from `audit(...; inline_suggest = true)`.
+
+### Structural enforcement
+
+- **`assert_enabled()`** (exported) — returns `checks_enabled()` locally but **errors under CI**
+  (any non-empty `ENV["CI"]`) when checks are disabled. With checks off every `@assert_*` expands
+  to the bare call and a strictmode test passes *vacuously*; in CI that is now a red build, not a
+  green skip. Use it as the first line of your strictmode tests.
+- **Coverage gate: `audit(mod; require = :public)`** — one failing `:coverage` finding per
+  exported/`public` function of the module that is neither registered (`register_strict!` /
+  `@strict_function`) nor exempted (`@strict_exempt` / the `exempt` kwarg). Registration becomes
+  the manifest; a new public function cannot ship silently unchecked — opting out requires a
+  visible exempt. See "Automating checks" in the docs.
+- **Usable agent Stop-hook template** — the `agents.md` Claude Code example no longer cold-starts
+  `julia -e` on every stop: the shipped template hashes `src/`, audits only on turns that changed
+  source, guards against stop loops, and blocks the stop (exit 2) with the findings.
+
+### `:fast` mode — corpus-measured accuracy and speed (F35)
+
+Measured against `:full` on 552 compiled specializations of two real packages
+(`bench/mode_gap.jl`; datasets committed under `bench/results/`). Fast mode previously
+under-reported 15 cases; it now matches `:full` on **every** `:typestable` / `:noalloc` /
+`:inlined` verdict (3 residual `:noboxing` under-reports on cold helpers, each still failing via
+`:noalloc`) with **zero false positives**, at **4.9 ms vs 296 ms median (~60×)**. What changed:
+
+- dynamic `:call`s with an abstract **argument** now flag boxing even when the result type is
+  concrete (the internal-dispatch-behind-a-concrete-return blind spot; canonical shape: an
+  un-`Val`ed `ntuple` feeding a constructor);
+- `Core.memorynew` (how Julia 1.12 allocates `Memory`) counts as an allocation — it is a builtin
+  `:call`, previously invisible to the `:new`/`:foreigncall` rules;
+- the alloc scan follows direct non-inlined callees (a grow path or string build in a helper is a
+  real allocation of the caller), skipping throw-path regions (`ignore_throw` semantics) and
+  memoized per signature (identity-keyed — hashing large signature types was itself the main cost);
+- fast `:typestable` consults the boxing signal, matching JET's "no runtime dispatch" semantics.
+
+### Multi-threading correctness (value-free IR scans, no backend needed)
 
 - **`concurrency_safe` guarantee** — `@assert_concurrency_safe f(plan, args...)` asserts that `f`
   treats its **plan** argument (the first, by default) as read-only for the whole call: it writes

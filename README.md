@@ -155,10 +155,14 @@ check(f, (T1, T2))                 # function API — never collides with other 
 check_compiled(MyPkg)              # usage-driven: check whatever actually compiled
 StrictMode.watch()                 # live re-checking on each edit (with `using Revise`)
 audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-coded — for AI agents / CI
+audit(MyPkg; require = :public)    # coverage gate: FAIL any public function with no declared guarantee
+assert_enabled()                   # first line of your strictmode tests: errors under CI if checks are off
 ```
 
 `audit` emits machine-readable findings (with a `file`, `line`, `reason`, and an actionable
-`suggestion` per violation) and returns the failure count. See
+`suggestion` per violation) and returns the failure count. `require = :public` and
+`assert_enabled()` make non-use loud: an unregistered public function, or a CI run with checks
+silently disabled, is a red build instead of a vacuous green. See
 [Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) and
 [Agentic feedback](https://el-oso.github.io/StrictMode.jl/dev/agents).
 
