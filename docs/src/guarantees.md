@@ -133,6 +133,36 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 #   reason:  return type is not concretely inferrable: …
 ```
 
+## Keyword calls and explicit signatures
+
+Every guarantee macro accepts two extra forms, so you can point them straight at a real API instead
+of an internal positional driver.
+
+**Keyword arguments.** A keyword call is guaranteed as written — StrictMode routes it through
+`Core.kwcall`, so inference, AllocCheck and JET all see the keyword sorter's real specialization:
+
+```julia
+@assert_noalloc    trsm!(B, A; side='L', uplo='L', alpha=1.0)   # public kwarg entry point, proved
+@assert_typestable scale(x; by=2)
+```
+
+**`types = (…)` — pin the analyzed signature.** By default the signature comes from
+`typeof.(args)`, so `typeof(Float64) == DataType`. For a *type-argument* function that widens a
+genuine false positive: over `Tuple{DataType, …}` the parameter `T` is unresolvable, so the return
+type widens to non-concrete. Supply the real specialization explicitly:
+
+```julia
+tmp(::Type{T}, n) where {T} = Vector{T}(undef, n)
+
+@assert_typestable tmp(Float64, 4)
+# ERROR: StrictViolation (@typestable): return type is not concrete: Vector  (DataType widened `T`)
+
+@assert_typestable tmp(Float64, 4) types=(Type{Float64}, Int)   # ok: real call-site specialization
+```
+
+`types = (…)` works on `@assert_noalloc`, `@strict`, `@kernel` and the rest the same way. It is the
+general escape hatch whenever `typeof.(args)` doesn't name the specialization you actually run.
+
 ## `@assert_inlined` — keep the call on the fast path (best-effort)
 
 [`@assert_inlined`](@ref) fails unless the compiler actually inlined the call. To find out,

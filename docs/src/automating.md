@@ -17,9 +17,10 @@ covers the higher-level options. Quick reference for which to reach for:
 ## The function API — `check`
 
 [`check`](@ref) runs the guarantees on a `(function, signature)` pair. It's an ordinary function
-call, so it can't collide with broadcasting, nested macros, or keyword arguments the way a macro
-might. Reach for it whenever a macro would get in the way, and use it as the programmatic entry
-point when you're building tooling on top.
+call over *types*, so it never has to parse a call expression — reach for it when you already have a
+signature in hand, or when you're building tooling on top. (The macros now accept keyword-argument
+calls and an explicit `types = (…)` signature override directly, so you rarely need `check` just to
+work around syntax — see [Guarantees](guarantees.md).)
 
 ```@example auto
 using StrictMode

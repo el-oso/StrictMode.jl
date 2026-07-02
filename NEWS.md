@@ -1,5 +1,28 @@
 # StrictMode.jl release notes
 
+## Unreleased
+
+Additive, non-breaking. Two dogfooding gaps closed so the guarantee macros can be pointed at real
+public API surfaces instead of internal positional drivers ([#4], [#5]).
+
+- **Keyword-argument calls** in every guarantee macro — `@assert_noalloc`, `@assert_typestable`,
+  `@assert_noboxing`, `@strict`, `@kernel`, `@assert_effects`, `@assert_vectorized`, … now accept
+  `f(args...; kw...)`. The call is routed through `Core.kwcall`, so `Base.return_types`, JET and
+  AllocCheck analyze the keyword sorter's real specialization; the backends are unchanged. This lets
+  keyword-based public entry points (`trsm!(B, A; side, uplo, …)`) be guaranteed directly rather
+  than via their positional internals. (A keyword *kernel*'s SIMD lives in the non-inlined
+  `Core.kwcall` sorter, so mark it `@inline` for `@assert_vectorized`/`@kernel` to see through it.)
+- **`types = (…)` signature override** on every guarantee macro — pins the inference signature
+  verbatim instead of deriving it from `typeof.(args)`. Fixes the false positive on type-argument
+  functions (`typeof(Float64) == DataType` widens `Matrix{T}` to `Matrix`): assert them at their
+  real specialization with `@assert_typestable f(Float64, …) types=(Type{Float64}, …)`.
+
+Internally, both fall out of one shared choke point (`_call_parts` / `_macro_call` in
+`preferences.jl`); the per-macro argument-binding boilerplate was deduplicated.
+
+[#4]: https://github.com/el-oso/StrictMode.jl/issues/4
+[#5]: https://github.com/el-oso/StrictMode.jl/issues/5
+
 ## v0.3.3
 
 Additive, non-breaking. Four themes: an automatic inlining audit, structural enforcement (make

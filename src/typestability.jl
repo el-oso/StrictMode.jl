@@ -37,6 +37,8 @@ end
 
 """
     @assert_typestable f(args...)
+    @assert_typestable f(args...; kw...)
+    @assert_typestable f(args...) types=(T1, T2, …)
 
 Fail unless `f(args...)` is type stable.
 
@@ -46,9 +48,21 @@ or runtime dispatch hiding inside the call, which is the part that needs the All
 Each argument is evaluated once, the macro returns the call's value, and disabled builds expand to
 the bare call.
 
+**Keyword arguments** are supported: `f(x; k=v)` is checked at its real specialization (the call is
+routed through `Core.kwcall`, so the keyword sorter's signature is what inference sees).
+
+**`types = (…)`** pins the inference signature explicitly instead of deriving it from
+`typeof.(args)`. Use it for type-argument functions, where `typeof(Float64) == DataType` would
+otherwise widen the result to a non-concrete type and false-positive.
+
 ```julia
 @assert_typestable muladd(2.0, 3.0, 1.0)          # ok
 @assert_typestable pick(heterogeneous_tuple, i)   # throws: Union from runtime tuple index
+@assert_typestable scale(x; by=2)                 # ok: keyword call checked as-is
+
+g(::Type{T}) where {T} = Vector{T}(undef, 1)
+@assert_typestable g(Float64)                     # false positive: `Vector` (DataType widened `T`)
+@assert_typestable g(Float64) types=(Type{Float64},)   # ok: pinned to the real specialization
 ```
 """
 macro assert_typestable(args...)

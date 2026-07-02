@@ -28,11 +28,13 @@ Ask for all of StrictMode's per-call guarantees on `f(args...)` at once: type st
 comes first, since instability is usually what's behind a surprise allocation.
 
 Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
-bare call.
+bare call. Keyword-argument calls and a `types = (…)` signature override are both supported, exactly
+as for [`@assert_typestable`](@ref) / [`@assert_noalloc`](@ref).
 
 ```julia
-@strict dot(u, v)        # ok: stable + non-allocating
-x = @strict kernel(a, b) # use the result while still guaranteeing the fast path
+@strict dot(u, v)              # ok: stable + non-allocating
+@strict trsm!(B, A; side='L')  # ok: keyword call guaranteed as-is
+x = @strict kernel(a, b)       # use the result while still guaranteeing the fast path
 ```
 """
 macro strict(args...)
@@ -87,7 +89,12 @@ x = @kernel dot_kernel(a, b)   # use the result while still guaranteeing the fas
 !!! note
     [`@assert_vectorized`](@ref) inspects the *leaf compiled body*. A thin dispatcher whose SIMD
     lives in non-inlined callees will fail it — point `@kernel` at the kernels where the vector
-    ops are, not at an entry-point wrapper.
+    ops are, not at an entry-point wrapper. A **keyword-argument** kernel routes through the
+    (non-inlined) `Core.kwcall` sorter, so mark it `@inline` for the vectorization check to see
+    through to the vector ops.
+
+Keyword-argument calls and a `types = (…)` signature override are supported (see
+[`@assert_typestable`](@ref)).
 
 See also [`@strict`](@ref) for the subset without the vectorization check.
 """

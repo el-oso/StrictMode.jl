@@ -223,6 +223,11 @@ or sweep everything and exempt the rest.
 | `audit` / `watch` | structured one-shot report for agents / live Revise loop for humans |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
+Every guarantee macro also accepts **keyword-argument calls** — `@assert_noalloc trsm!(B, A; side='L')`
+(routed through `Core.kwcall`, so a keyword public API is guaranteed directly) — and a **`types = (…)`
+signature override** — `@assert_typestable f(Float64) types=(Type{Float64},)` — to pin the analyzed
+specialization when `typeof.(args)` would widen a type-argument function to a false positive.
+
 See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 

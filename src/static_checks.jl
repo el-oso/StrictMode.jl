@@ -73,7 +73,9 @@ end
 
 """
     @assert_noalloc f(args...)
+    @assert_noalloc f(args...; kw...)
     @assert_noalloc static=false f(args...)
+    @assert_noalloc f(args...) types=(T1, T2, …)
 
 Fail unless the call `f(args...)` is allocation-free.
 
@@ -87,9 +89,15 @@ guarantee fails and lists them. When static analysis can't run, it falls back to
 Each argument is evaluated exactly once. With checks disabled (the production default) this expands
 to the bare call, with no overhead left behind.
 
+**Keyword arguments** are supported: `f(x; k=v)` is proved at its real specialization (routed
+through `Core.kwcall`, so AllocCheck sees the keyword sorter's method). **`types = (…)`** pins the
+analyzed signature explicitly, mirroring [`@assert_typestable`](@ref) — handy for type-argument
+functions where `typeof.(args)` would not name the real call-site specialization.
+
 ```julia
 @assert_noalloc sum(rand(100))         # ok
 @assert_noalloc grows_a_vector(1000)   # throws StrictViolation listing the allocation
+@assert_noalloc fill!(buf, x; offset=0)  # ok: keyword call proved as-is
 ```
 """
 macro assert_noalloc(args...)
