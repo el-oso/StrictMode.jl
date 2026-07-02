@@ -57,6 +57,7 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F30 | a vectorized kernel can be data-marshalling-bound (scalar-gather transpose)  -  `@assert_vectorized` passes but throughput is limited by the gather, not the compute | 🔴 open | blake3 `hash_many`: `<16 x i32>` compute confirmed green, but each `Vec{16}` is built from 16 strided scalar loads (a transpose); the crate uses SIMD-shuffle transpose → we land 0.71×. Distinct SIMD-layout axis; may partly overlap `kernel_report` mem-intensity |
 | F31 | register saturation / spills invisible to IR-level guarantees | ✅ diagnostic | `register_report(f, types)` reads `code_native` (post-register-allocation); counts unique zmm registers + spill lines; `show` gives saturated / unexpected-spills / clean verdict with ceiling note |
 | F34 | `kernel_report`'s compute-vs-memory intensity doesn't distinguish **memory-LATENCY-bound** (prefetch helps) from **bandwidth-bound** (it doesn't) | ✅ fixed | `KernelReport` gains `prefetch_ops` + `has_loop_phi` fields; `show` warns "no prefetch in a streaming loop → likely latency-bound, prefetch ahead" when a vectorized loop has loads + a loop-carried phi + low intensity + no `@llvm.prefetch`. Verified: a `@simd` reduction loop now prints the hint. Surfaced by *pushing the BlazingPorts UTF-8 validator's ASCII fast-path to parity with simdutf8* (2026-06-27): both sit near memory bandwidth (~72 GB/s) yet simdutf8 was ~8% ahead until an explicit `@llvm.prefetch` (one chunk ahead) + a 128-byte chunk closed it (0.92× → ≥0.96×). A streaming validate/scan loop is **latency**-bound, not bandwidth-bound, and benefits from prefetch — but the intensity model (FP/int ops : memory ops) gives no hint of this; it would call such a loop "memory-bound" without distinguishing the two, which point to opposite fixes (prefetch / restructure-loads vs accept-the-ceiling). *Suggested:* a latency-vs-bandwidth signal (e.g. sequential-load loop with no prefetch + low arithmetic intensity ⇒ "latency-bound, consider prefetch"). Methodological note: the finding only appeared because the port was pushed to the crate's level — stopping at "beats Base" would have hidden it. |
+| F35 | `:fast`↔`:full` gap quantified on a 552-specialization real corpus (PureFFT+BlazingPorts): 15 false negatives in 3 classes — internal dispatch behind a concrete return, callee-opaque allocations (incl. `Core.memorynew`), JET-only instability | ✅ fixed | `bench/mode_gap.jl` harness + `bench/results/mode_gap*.jsonl`; `_alloc_signals` gains boxy-argument rule, `memorynew`, depth-2 `:invoke` alloc recursion with throw-path mask + world-keyed memo; fast `:typestable` consults the boxing signal. After: 0 FP, 3 residual noboxing under-reports (cold helpers, still caught via noalloc); fast 24 ms vs full 296 ms median. `test/fast_gap_test.jl` |
 | F33 | `kernel_report` intensity model is **blind to shuffle/permute ops** — a `pshufb`-dominated (shuffle/lookup) SIMD kernel is mischaracterized by its incidental arithmetic | ✅ fixed | `KernelReport` gains a `shuffle_ops` field (counts `shufflevector` + `@llvm.x86.*.pshuf/perm/palignr`); `_kr_bound` returns `:shuffle` when shuffles dominate at low intensity (`shuffle_ops≥2 && ≥fp_ops && eff<2.0`, guarding compute kernels); `show` prints `→ shuffle/port-bound: … WIDER vectors or FEWER shuffles — cache blocking does not apply` + a shuffle-op count line. Verified: the byte-ops/UTF-8 `pshufb` kernels now read `:shuffle` (was `:balanced`); an FMA kernel stays put. `kernel_report` counts FP and integer **arithmetic** ops + memory ops, but **not** `vpshufb`/`vpermd`/shuffle intrinsics — the actual work of the encoding/validation/transcoding kernel class. Repro (BlazingPorts `Utf8._check_special`, a UTF-8 validator = 3 `pshufb` nibble lookups + 5 bitwise ops, 2026-06-27): report says `FP intensity 0.0`, `integer ops:mem = 5:3 → "balanced: some data reuse; more register/cache blocking may help"` — but the 3 `pshufb` (the bottleneck) are uncounted, the "3 memory ops" are phantom (const-table materialization, no real traffic), and "cache blocking" is irrelevant for a **shuffle-port-bound** kernel. The conjectured "data-movement SIMD" blind spot. *Suggested fix:* add a **shuffle/permute op count** axis (scan IR for `shufflevector`/`@llvm.x86.*.pshuf*`/`*.perm*`) and a `:shuffle-bound` verdict; this is a large + growing kernel class (UTF-8 validate, base64, hex — see the BlazingPorts byte-ops cluster). (Minor: also reported "2 pointer params" on a `Vec`-only function — spurious.) |
 | F32 | `@assert_no_scalar_loops` (the F20 fix) was blind to a scalar loop that **coexists** with vectorized code in the same function | ✅ fixed | `scalar_fp_loops` short-circuited on `_vectorized(f, types) && return false` (`src/scheduling.jl`), so **any** function containing a `<N x …>` op was declared scalar-loop-free even with a real scalar hot loop present. Repro (JSON.jl stage-1 SIMD POC, `BlazingPorts` campaign 2026-06-27): kernel `_string_scan_simd` lowers to a SIMD main loop (4× `<64 x i8>`) **and** a scalar tail loop (`load i8` + `phi i64`, back-edge `L32→L40` in `code_llvm`) — yet `@assert_no_scalar_loops` **passed**. **Fix:** new `_loop_regions(ir)` splits the text IR into loop regions (back-edge = `br … label %X` with `X` defined at/before the branch); `scalar_fp_loops` now scans **per-loop** — a loop region with scalar FP/int hot ops but no `<N x …>` of its own is flagged, even if a *different* loop in the same function vectorized. Existing F20/F22 cases preserved (`scalar_sum`/`first_gt` → true, `vec_scale!` → false — no false positive on explicit-SIMD-no-remainder loops); the JSON kernel's tail now correctly flags. Refines F20. |
 
@@ -794,3 +795,42 @@ a looping kernel that streams vector loads with low arithmetic intensity and **n
 **Methodological note (for both F33/F34).** Neither finding appears unless the port is pushed to ≥0.96× the
 reference crate. Stopping at "beats Base" hides the limiting factor — *parity is the instrument that exposes
 where the diagnostics are blind.* This is the campaign's core loop, not an aside.
+
+## F35 — the `:fast`↔`:full` gap, quantified on a real corpus and closed to 3 residual under-reports
+
+The user asked for the gap to be measured, not assumed. `bench/mode_gap.jl` enumerates every compiled
+concrete specialization of PureFFT + the BlazingPorts crates (the `check_compiled` walk after warming
+real kernels — 552–558 specializations), runs `findings` in **both** modes for
+`(:typestable, :noalloc, :noboxing, :inlined)`, and streams per-case records to
+`bench/results/mode_gap.jsonl` (resumable JSONL; `mode_gap_before.jsonl` preserves the pre-fix run).
+
+**Before (baseline):** zero false positives, **15 false negatives** across 8 functions; fast median
+2.87 ms vs full 292 ms. Three FN classes: (a) *internal dynamic dispatch behind a concrete return* —
+the canonical case is an un-`Val`ed `ntuple` feeding a constructor (`ByteOps._bcast32`): the dynamic
+`:call`'s own result is concrete and `return_types` is concrete, so nothing fired; (b) *callee-opaque
+allocations* — the alloc lives in a non-inlined `:invoke` target (SwissDict's grow path), and the
+one-body scan can't see it; also direct `Memory` allocation is the 1.12 `Core.memorynew` **builtin
+`:call`** — neither `:new` nor `:foreigncall`, previously invisible; (c) JET-only internal
+instability with concrete returns (`prfft`).
+
+**Fixes (all in `_alloc_signals`/`_signals_by_type` + fast `:typestable`):** flag a dynamic `:call`
+with a boxy **argument** even when its result is concrete (non-builtin callees only); flag
+`Core.memorynew`; follow `:invoke` callees **two levels** for the alloc signal, skipping throw-path
+regions (`_deadend_mask` — the `ignore_throw` semantics; without this `pfft!` false-positived on
+callees' error-message builds); feed the boxing signal into fast `:typestable` (JET semantics). Three
+wrong turns, each caught by tests/corpus and reverted: exempting splittable unions on dynamic `:call`s
+(broke the founding runtime-tuple-index trap — union-split is an `:invoke` optimization, it does not
+save a dynamic call); flagging `:invoke`s with abstract recorded results (a resolved `:invoke` is
+never dispatch — mutating helpers with unused returns are typed `Any`, 18 FPs); and `Argument` types
+falling back to `Any` when optimized IR has `slottypes === nothing` (derive from the signature).
+
+**After:** `typestable` 552/552, `noalloc` 552/552, `inlined` 552/552, `noboxing` 549/552 — zero
+false positives, 3 residual noboxing under-reports on cold helpers (`Utf8._bin`, `ByteOps._bin`,
+`_bluestein_Ms`), each still failing via `:noalloc`, so no divergent function escapes entirely.
+Catching their boxing label would need `:invoke` recursion for the boxing signal — the exact F9 FP
+minefield; deliberately not done. **Cost:** callee-following made fast 2.9 → 73 ms median; a
+world-keyed session memo on the per-signature scan (`_SIGNAL_MEMO`, cleared by `clear_cache!`)
+brings it to **24 ms median** — ~12× faster than `:full` (296 ms) instead of ~100×, the price of
+seeing through callees. Regression tests: `test/fast_gap_test.jl` (one item per class, plus F8/F9
+guards). Bonus corpus finding: `_bcast32`'s un-`Val`ed `ntuple` is a real BlazingPorts bug of the
+same family as the Utf8 tail buffer.

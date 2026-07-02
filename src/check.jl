@@ -155,21 +155,29 @@ end
 # dispatched method returns a concrete type — and the most actionable thing to tell the user.
 function _box_msg(base::AbstractString, sig)
     sig.abscontainer === nothing && return base
-    return string(base, "; abstract-eltype container detected (`Vector{", sig.abscontainer,
+    return string(
+        base, "; abstract-eltype container detected (`Vector{", sig.abscontainer,
         "}`, …) — indexing/iterating it dispatches dynamically (a speed + `--trim` anti-pattern). ",
-        "Use a `Tuple`, a concrete or small-`Union` eltype, or restructure so elements are concretely typed.")
+        "Use a `Tuple`, a concrete or small-`Union` eltype, or restructure so elements are concretely typed."
+    )
 end
 
 # `:fast` per-guarantee findings from cheap Base-only analysis (`_alloc_signals`, `return_types`,
 # `_inlined_survives`). Triage speed for the edit loop; `:full` is the proof for CI.
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
-    sig = (:noalloc in guarantees || :noboxing in guarantees) ? _alloc_signals(f, types) : nothing
+    sig = (:typestable in guarantees || :noalloc in guarantees || :noboxing in guarantees) ?
+        _alloc_signals(f, types) : nothing
     out = StrictFinding[]
     for g in guarantees
         if g === :typestable
             rts = Base.return_types(f, Tuple{types...})
-            fail = length(rts) != 1 || !_is_typestable_return(only(rts))
-            push!(out, _mkfinding(md, fn, sg, g, fail, "return type is not concrete (inference)", "", 0))
+            badret = length(rts) != 1 || !_is_typestable_return(only(rts))
+            # A concrete return can hide internal runtime dispatch (JET's :full finding); the IR
+            # boxing signal catches that shape, so fast typestable checks both.
+            fail = badret || sig.boxing
+            reason = badret ? "return type is not concrete (inference)" :
+                "internal dynamic dispatch (concrete return; fast IR heuristic)"
+            push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0))
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || sig.abscontainer !== nothing
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (fast heuristic)", sig), sig.file, sig.line))

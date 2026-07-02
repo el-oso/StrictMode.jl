@@ -1,7 +1,9 @@
 # IP-free fast↔full divergence report.
 #
 # StrictMode's `:fast` inference heuristic and `:full` AllocCheck/JET proof can disagree on a guarantee
-# (e.g. internal-dispatch-with-concrete-return that `:fast` misses). When they do, a user wants to send
+# (rarely, post-F35: the 2026-07-02 corpus study measured 3 residual `:noboxing` under-reports on
+# 552 real specializations, zero elsewhere — but `:fast` remains a heuristic, not a proof). When
+# they do, a user wants to send
 # us a bug report — but their function is proprietary. `divergence_report` runs *both* modes, and on a
 # disagreement captures the verdict plus enough **anonymized** context to reproduce and fix the heuristic:
 # the type-signature *shape* (user / 3rd-party types → `T1, T2, …`; only `Base`/`Core` names kept), the
@@ -171,7 +173,7 @@ function Base.show(io::IO, d::StrictDivergence)
     end
     println(io, "  fast signals : ", isempty(d.fast_signals) ? "(none)" : join(d.fast_signals, ", "))
     println(io, "  full signals : ", isempty(d.full_signals) ? "(none)" : join(d.full_signals, ", "))
-    print(io, "  versions     : ", join(("$k=$v" for (k, v) in d.versions), ", "))
+    return print(io, "  versions     : ", join(("$k=$v" for (k, v) in d.versions), ", "))
 end
 
 """
