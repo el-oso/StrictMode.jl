@@ -36,3 +36,18 @@ end
     addone(x) = x + 1                          # alloc-free ⇒ passes
     @test (@assert_noalloc static = false addone(41)) === 42
 end
+
+@testitem "@assert_noalloc accepts keyword arguments (issue #4)" begin
+    using StrictMode, AllocCheck, JET
+    addkw(x; k = 1) = x + k
+    @test (@assert_noalloc addkw(41; k = 1)) === 42
+    bad(n; k = 1) = collect(1:(n + k))
+    @test_throws StrictViolation @assert_noalloc bad(10; k = 2)
+end
+
+@testitem "@assert_noalloc types= override pins the inference signature (issue #5)" begin
+    using StrictMode, AllocCheck, JET
+    g(::Type{T}) where {T} = Vector{T}(undef, 1)
+    # g allocates a Vector, so noalloc fails either way; the point is the override drives the signature.
+    @test_throws StrictViolation @assert_noalloc g(Float64) types = (Type{Float64},)
+end

@@ -63,18 +63,17 @@ to the bare call.
 @assert_inlined cold(3.0)       # throws: survives as an :invoke
 ```
 """
-macro assert_inlined(call)
+macro assert_inlined(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_inlined needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_inlined)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_inlined)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))

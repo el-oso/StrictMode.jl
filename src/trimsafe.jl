@@ -34,17 +34,16 @@ dependency and stays cheap in *any* mode — use it only when you specifically w
 [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call. The reactive
 counterpart, for a real build failure, is [`explain_trim`](@ref).
 """
-macro assert_trim_safe(call)
+macro assert_trim_safe(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_trim_safe needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_trim_safe)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_trim_safe)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))
@@ -92,17 +91,16 @@ build is the final word. Each argument is evaluated once; disabled builds expand
 cheaper static-only form is [`@assert_trim_safe`](@ref); the reactive counterpart, for a real build
 failure, is [`explain_trim`](@ref).
 """
-macro assert_trim_compatible(call)
+macro assert_trim_compatible(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_trim_compatible needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_trim_compatible)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_trim_compatible)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))

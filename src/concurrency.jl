@@ -354,29 +354,17 @@ Options: `@assert_concurrency_safe self=2 f(out, plan)` picks a different plan s
 `max_depth=N` bounds interprocedural recursion (default 4).
 """
 macro assert_concurrency_safe(args...)
-    self_arg = 1
-    max_depth = 4
-    call = nothing
-    for a in args
-        if Meta.isexpr(a, :(=)) && a.args[1] === :self
-            self_arg = a.args[2]::Int
-        elseif Meta.isexpr(a, :(=)) && a.args[1] === :max_depth
-            max_depth = a.args[2]::Int
-        else
-            call = a
-        end
-    end
-    call === nothing && throw(ArgumentError("@assert_concurrency_safe needs a call expression"))
+    pos, opts = _macro_call(args, (:self, :max_depth, :types))
+    self_arg = haskey(opts, :self) ? opts[:self]::Int : 1
+    max_depth = haskey(opts, :max_depth) ? opts[:max_depth]::Int : 4
+    isempty(pos) && throw(ArgumentError("@assert_concurrency_safe needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_concurrency_safe)($target, $fe, $types; self_arg = $self_arg, max_depth = $max_depth)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_concurrency_safe)($target, $(p.checkfn), $(p.types); self_arg = $self_arg, max_depth = $max_depth)
         _val
     end
     return _gate(checked, esc(call))
@@ -486,17 +474,16 @@ task-local id. Detects the direct `store buf[threadid()]` shape; it does not tra
 stashed into another array and reused later. Not part of [`@strict`](@ref). Disabled builds expand
 to the bare call.
 """
-macro assert_no_threadid_state(call)
+macro assert_no_threadid_state(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_no_threadid_state needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_no_threadid_state)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_no_threadid_state)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))

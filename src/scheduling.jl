@@ -69,17 +69,16 @@ diagnostics when a loop vectorizes but is still slow.
 @assert_vectorized branchy(a)      # throws: a data-dependent branch blocked vectorization
 ```
 """
-macro assert_vectorized(call)
+macro assert_vectorized(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_vectorized needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_vectorized)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_vectorized)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))
@@ -109,17 +108,16 @@ them (and influence codegen), use `Base.@assume_effects`. Each argument is evalu
 @assert_effects dot3(a, b) (:nothrow, :effect_free)   # ok if the compiler agrees
 ```
 """
-macro assert_effects(call, required)
+macro assert_effects(args...)
+    pos, opts = _macro_call(args, (:types,))
+    length(pos) >= 2 || throw(ArgumentError("@assert_effects needs a call expression and a required-effects tuple"))
+    call, required = pos[1], pos[2]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_effects)($target, $fe, $types, $(esc(required)))
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_effects)($target, $(p.checkfn), $(p.types), $(esc(required)))
         _val
     end
     return _gate(checked, esc(call))
@@ -422,17 +420,16 @@ to the bare call.
 @assert_no_scalar_loops apply_T!(Y, T, W)   # throws if TᵀW is a scalar triple-loop
 ```
 """
-macro assert_no_scalar_loops(call)
+macro assert_no_scalar_loops(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_no_scalar_loops needs a call expression"))
+    call = pos[1]
     target = string(call)
-    fexpr, argexprs = _callinfo(call)
-    syms, binds = _bind_args(argexprs)
-    fe = esc(fexpr)
-    litcall = Expr(:call, fe, syms...)
-    types = Expr(:tuple, (:(typeof($s)) for s in syms)...)
+    p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
-        $(binds...)
-        local _val = $litcall
-        $(_assert_no_scalar_loops)($target, $fe, $types)
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_no_scalar_loops)($target, $(p.checkfn), $(p.types))
         _val
     end
     return _gate(checked, esc(call))
