@@ -15,6 +15,36 @@
     @test occursin("const", f.suggestion)
 end
 
+@testitem "static_ownership_suggestions flags a lookup reached via a non-inlined callee (interprocedural)" begin
+    using StrictMode
+    # The PureBLAS `_symm_scr` shape (also @assert_owned's motivating case): the driver's own body
+    # is clean, the Type-keyed IdDict lookup lives one level down in a @noinline accessor, and the
+    # accessor's `get(...)` itself fully inlines to a `jl_eqtable_get` ccall — no `getindex`/`get`
+    # call survives at ANY level for a direct method-name match.
+    const _SO_ITP = IdDict{DataType, Vector{Float64}}()
+    @noinline _so_scr(::Type{T}) where {T} = get(_SO_ITP, T, Float64[])::Vector{Float64}
+    _so_driver(::Type{T}) where {T} = length(_so_scr(T))
+
+    fs = static_ownership_suggestions(_so_driver, (Type{Float64},))
+    @test !isempty(fs)
+    @test only(fs).status === :info
+    @test occursin("interprocedural", only(fs).reason)
+end
+
+@testitem "static_ownership_suggestions does not flag a value-keyed IdDict via interprocedural scan" begin
+    using StrictMode
+    # The interprocedural eqtable rule is deliberately IdDict-shaped (a known, documented
+    # precision/recall tradeoff — see the comment in static_ownership.jl), but a plain (non-IdDict)
+    # value-keyed Dict reached through a callee must still not be flagged: check_compiled and the
+    # direct rule (`_mi_typekey_dict_lookup`) require a Type/Symbol key, so a hash-Dict-based
+    # config-style lookup one level down stays clean.
+    const _SO_ITP_STR = Dict{String, Int}("a" => 1)
+    @noinline _so_cfg(s::String) = get(_SO_ITP_STR, s, 0)
+    _so_cfg_driver(s::String) = _so_cfg(s)
+
+    @test isempty(static_ownership_suggestions(_so_cfg_driver, (String,)))
+end
+
 @testitem "static_ownership_suggestions flags a Type-keyed Dict getindex" begin
     using StrictMode
 

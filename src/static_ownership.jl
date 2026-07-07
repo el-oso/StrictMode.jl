@@ -82,9 +82,70 @@ function _registry_lookup_sites(@nospecialize(f), @nospecialize(types::Tuple))
     return sites
 end
 
+# Interprocedural companion to the scan above: `_registry_lookup_sites` only sees `f`'s own body,
+# so it misses the common "driver calls a non-inlined workspace accessor" shape (the accessor does
+# the lookup, one level down). `@assert_owned`'s `_mi_dict_lookup`/`_alloc_signals(...).dictlookup`
+# already walk exactly this callee tree — but their rule flags *any* `AbstractDict` accessor,
+# key type unchecked (by design: `@assert_owned` is about any runtime-keyed "owned scratch", not
+# specifically type/symbol keys). Reusing it here would flag a value-keyed cache
+# (`Dict{String,_}`), which issue #7 explicitly requires *not* flagging. So this narrows
+# `_mi_dict_lookup`'s receiver check with an additional key-type check, and re-walks the same
+# `:invoke` tree independently (unmemoized: this is a dev-time audit, not on the `:fast` hot loop,
+# so the cost of `@assert_owned`'s `_SIGNAL_MEMO` isn't worth sharing across two different rules).
+function _mi_typekey_dict_lookup(mi::Core.MethodInstance)
+    d = mi.def
+    (d isa Method && d.name in _DICT_ACCESSORS) || return false
+    st = mi.specTypes
+    st isa DataType || return false
+    ps = st.parameters
+    length(ps) >= 2 || return false
+    any(p -> p isa Type && p <: AbstractDict, ps[2:end]) || return false
+    return any(_is_type_or_symbol_key, ps[2:end])
+end
+
+function _typekey_lookup_by_sig(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+    sig in seen && return false
+    push!(seen, sig)
+    cts = try
+        Base.code_typed_by_type(sig; optimize = true)
+    catch
+        return false
+    end
+    isempty(cts) && return false
+    for st in first(cts)[1].code
+        if Meta.isexpr(st, :foreigncall)
+            # `IdDict` (unlike hash-based `Dict`) inlines `get`/`get!`/`getindex` straight to a
+            # `jl_eqtable_*` ccall — no `:invoke` to a named accessor survives to match against,
+            # at ANY recursion depth (verified: a `Type{T}`-static-parameter key folds the whole
+            # call away even one level down in a non-inlined callee). The ccall args are already
+            # type-erased, so the key type can't be re-checked here the way `_mi_typekey_dict_lookup`
+            # does — `IdDict` is disproportionately used for identity-comparable keys (Type/Symbol/
+            # Module) in practice, so this trades a little precision for recall on exactly the
+            # interprocedural shape the top-level/`:invoke` checks can't see. Known ceiling: an
+            # `IdDict` keyed by arbitrary object identity (not Type/Symbol) reached through a
+            # non-inlined callee would also fire here; narrow it by resolving the callee's dict
+            # binding to its declared key type if this proves noisy in practice.
+            occursin("eqtable", lowercase(string(st.args[1]))) && return true
+        elseif Meta.isexpr(st, :invoke)
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            mi isa Core.MethodInstance || continue
+            _mi_typekey_dict_lookup(mi) && return true
+            depth > 0 && _typekey_lookup_by_sig(mi.specTypes, depth - 1, seen) && return true
+        end
+    end
+    return false
+end
+
+function _interprocedural_typekey_lookup(@nospecialize(f), @nospecialize(types::Tuple))
+    sig = Base.signature_type(f, Tuple{types...})
+    return _typekey_lookup_by_sig(sig, _FAST_ALLOC_DEPTH[], Base.IdSet{Any}())
+end
+
 function _static_ownership_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
     sites = _registry_lookup_sites(f, types)
-    isempty(sites) && return StrictFinding(md, fn, sg, :static_ownership, :pass, "", 0, "", "")
+    interprocedural = isempty(sites) && _interprocedural_typekey_lookup(f, types)
+    (isempty(sites) && !interprocedural) && return StrictFinding(md, fn, sg, :static_ownership, :pass, "", 0, "", "")
     m = try
         which(f, types)
     catch
@@ -92,8 +153,12 @@ function _static_ownership_finding(@nospecialize(f), @nospecialize(types::Tuple)
     end
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
-    callees = join(sort(unique(s.callee for s in sites)), ", ")
-    reason = "runtime type/symbol-keyed registry lookup ($(callees)) — $(length(sites)) site(s)"
+    reason = if !isempty(sites)
+        callees = join(sort(unique(s.callee for s in sites)), ", ")
+        "runtime type/symbol-keyed registry lookup ($(callees)) — $(length(sites)) site(s)"
+    else
+        "runtime type/symbol-keyed registry lookup reached via a non-inlined callee (interprocedural scan)"
+    end
     suggestion = "give each type a `const` owner reached by dispatch (`_ws(::Type{T})=_WS_T`), so " *
         "it const-folds (trim-safe, 0-alloc, no runtime lookup). Keep a Dict only as an explicit " *
         "rare-type fallback, off the hot path. See `staticval`/`@unroll` for the idiom."
