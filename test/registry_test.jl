@@ -54,6 +54,28 @@ end
     @test_throws StrictViolation StrictMode._auto_check_module(@__MODULE__)
 end
 
+@testitem "register_strict! accepts a ::Type{T} argument signature (F37)" begin
+    using StrictMode
+    # `isconcretetype(Type{Float64})` is `false` (a real Julia quirk) even though `Type{Float64}`
+    # is a fully-specified, singleton dispatch signature — `all(isconcretetype, tt)` used to treat
+    # every `::Type{T}`-argument function as "non-concrete" and silently skip it.
+    empty!(StrictMode.registered_strict())
+    typed_alloc(::Type{T}, n::Int) where {T} = Vector{T}(undef, n)
+    StrictMode.register_strict!(typed_alloc, (Type{Float64}, Int))
+    @test length(StrictMode.registered_strict()) == 1
+end
+
+@testitem "check_compiled sweeps a ::Type{T}-argument specialization (F37)" begin
+    using StrictMode
+    module SweptTyped
+    ws(::Type{T}) where {T} = Vector{T}(undef, 0)
+    end
+    SweptTyped.ws(Float64)                         # compile a Type{Float64}-argument specialization
+
+    fs = check_compiled(SweptTyped; guarantees = (:noalloc,))
+    @test any(f -> f.func == "ws", fs)             # previously invisible to the sweep
+end
+
 @testitem "check_compiled sweeps actually-compiled instances" begin
     using StrictMode
     module Swept

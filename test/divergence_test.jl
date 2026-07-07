@@ -1,9 +1,10 @@
 @testitem "divergence_report — flags fast↔full disagreement, IP-free" begin
     using StrictMode
 
-    # Internal dynamic dispatch through an abstract eltype, but with a concrete (`Float64`) return —
-    # the canonical case `:fast` misses (concrete return fools the boxing heuristic) and `:full`
-    # (AllocCheck) catches.
+    # Internal dynamic dispatch through an abstract eltype, but with a concrete (`Float64`) return,
+    # buried two non-inlined hops below the entry point — deeper than `_FAST_ALLOC_DEPTH[]` (2)
+    # follows by default. `:fast` misses it (concrete return + out-of-reach depth fools the boxing
+    # heuristic) and `:full` (AllocCheck/JET) catches it regardless of depth.
     abstract type Shape end
     struct Circ <: Shape
         r::Float64
@@ -13,7 +14,9 @@
     end
     area(c::Circ) = 3.14 * c.r^2
     area(s::Sq) = s.s^2
-    total(v::Vector{Shape}) = sum(a -> area(a), v)
+    @noinline _total_inner(v) = sum(a -> area(a), v)
+    @noinline _total_mid(v) = _total_inner(v)
+    total(v::Vector{Shape}) = _total_mid(v)
 
     d = divergence_report(total, (Vector{Shape},))
     @test !isempty(d)

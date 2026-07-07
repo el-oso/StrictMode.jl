@@ -40,6 +40,7 @@ export @golden
 export StrictViolation, StrictReport, StrictFinding
 export check, findings, check_all, check_compiled, check_signatures, audit, format_findings, nfailures, watch, unwatch
 export inline_suggestions
+export static_ownership_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, analysis_mode, backend_available
@@ -57,6 +58,7 @@ include("trimsafe.jl")
 include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
+include("static_ownership.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("findings.jl")
