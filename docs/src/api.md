@@ -18,6 +18,7 @@ to the bare call.
 @assert_noboxing
 @assert_typestable
 @assert_inlined
+@assert_owned
 @assert_vectorized
 @assert_no_scalar_loops
 @assert_effects
@@ -94,6 +95,7 @@ One-shot, structured, exit-coded reporting for AI agents and CI. See
 ```@docs
 audit
 inline_suggestions
+static_ownership_suggestions
 StrictFinding
 format_findings
 nfailures
