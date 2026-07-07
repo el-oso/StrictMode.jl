@@ -1,5 +1,43 @@
 # StrictMode.jl release notes
 
+## v0.3.5
+
+Additive, non-breaking. GKH ownership — a `const`-owner-per-type idiom for replacing runtime
+type/symbol-keyed registry lookups — gets both a precise tool and a broad one, plus a `:fast`
+accuracy fix and a dispatch-signature bugfix found while dogfooding the new guarantee ([#7], [#8]).
+
+- **`@assert_owned f(args...)`** — fails if the call reaches a runtime `AbstractDict` lookup
+  (`get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!`) on its hot path: the *owned-scratch* /
+  GKH-ownership violation. A structural IR lint (no backend, no timing), like `@assert_noboxing`:
+  it follows non-inlined callees (the lookup often lives in a workspace accessor a level down) and
+  matches the `jl_eqtable_*` foreigncall shape an `IdDict` lookup on a statically-known key
+  const-folds to. Opt-in per call site, like `@assert_inlined` — deliberately **not** part of
+  `@strict` or `register_strict!`'s defaults, since a broad sweep would flag (and break the build
+  on) the pattern's own sanctioned Dict fallback for a rare-type tail.
+- **`static_ownership_suggestions(f, types)` / `static_ownership_suggestions(mod)`** (exported) —
+  the advisory, whole-package counterpart: scans for the same type/symbol-keyed lookup pattern and
+  emits an `:info` finding (never a failure; `nfailures` ignores it), like `inline_suggestions`.
+  Opt in from `audit(...; static_ownership_suggest = true)`. Detection scans **unoptimized** typed
+  IR — a `Type{T}`-keyed lookup on a statically-known `T` can fully const-fold away during
+  optimization before an optimized-IR scan would ever see it — plus a key-type-aware interprocedural
+  check for the "lookup lives in a non-inlined accessor" shape, narrowed to Type/Symbol keys only so
+  a value-keyed cache (`Dict{String,_}`) is never flagged.
+- **`:fast` mode false negatives fixed (closes [#8]).** `noalloc`/`typestable` missed allocations
+  living 2+ non-inlined `:invoke` hops down (e.g. a BLAS/LAPACK-style `driver! -> prep-helper ->
+  similar/Array` chain) — the depth-1 callee recursion added in v0.3.3 (F35) didn't go deep enough,
+  and a non-inlined callee's own boxing signal was computed but discarded rather than propagated to
+  the caller. `StrictMode._FAST_ALLOC_DEPTH[]` is now a tunable `Ref` (default 2, was hardcoded 1;
+  same override pattern as `_CACHE_BYTES`), and boxing now propagates through the recursion.
+- **Dispatch-signature bugfix (F37).** `register_strict!`, `check_compiled`, `inline_suggestions
+  (mod)`, and `@strict_function` all silently skipped every `::Type{T}`-argument method —
+  `isconcretetype(Type{Float64})` is `false` in Julia despite `Type{T}` being a fully-specified
+  dispatch singleton. All four now use `Base.isdispatchtuple` instead, so `::Type{T}`-argument
+  methods (the exact shape `@assert_owned`/`static_ownership_suggestions` recommend writing) are no
+  longer invisible to module sweeps and the mark-once registry.
+
+[#7]: https://github.com/el-oso/StrictMode.jl/issues/7
+[#8]: https://github.com/el-oso/StrictMode.jl/issues/8
+
 ## v0.3.4
 
 Additive, non-breaking. Two dogfooding gaps closed so the guarantee macros can be pointed at real
