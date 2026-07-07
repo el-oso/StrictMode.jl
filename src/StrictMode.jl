@@ -30,7 +30,7 @@ using Preferences: Preferences, @load_preference, @set_preferences!, @has_prefer
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
-export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_inlined
+export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_owned, @assert_inlined
 export @assert_vectorized, @assert_no_scalar_loops, @assert_effects, @assert_trim_safe, @assert_trim_compatible, descend, explain_trim, kernel_report, scalar_fp_loops, register_report
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_exempt
@@ -40,6 +40,7 @@ export @golden
 export StrictViolation, StrictReport, StrictFinding
 export check, findings, check_all, check_compiled, check_signatures, audit, format_findings, nfailures, watch, unwatch
 export inline_suggestions
+export static_ownership_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, analysis_mode, backend_available
@@ -57,6 +58,7 @@ include("trimsafe.jl")
 include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
+include("static_ownership.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("findings.jl")

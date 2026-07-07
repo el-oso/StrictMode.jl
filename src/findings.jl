@@ -8,8 +8,10 @@
 A single guarantee result for one `(function, signature)`. Flat and serializable so the same
 record feeds the human (`:text`) and agent (`:json`) reporting paths.
 
-Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:inlined`),
-`status` (`:fail`/`:pass`/`:skip`), `file`, `line`, `reason`, `suggestion`.
+Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/
+`:inlined`/…), `status` (`:fail`/`:pass`/`:skip`/`:info` — `:info` is an advisory, never a
+failure, e.g. [`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)), `file`, `line`,
+`reason`, `suggestion`.
 """
 struct StrictFinding
     mod::Symbol
@@ -26,6 +28,7 @@ end
 # Actionable fix hint per guarantee — the structured equivalent of what `@explain` tells a human.
 function _suggestion(guarantee::Symbol)
     guarantee === :noboxing && return "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter."
+    guarantee === :owned && return "runtime AbstractDict lookup on owned scratch (GKH-ownership violation): replace the keyed dictionary probe with a const-dispatched, per-concrete-type accessor (a Ref/field owned by the type)."
     guarantee === :typestable && return "type instability: annotate the unstable variable, split the method, or push sizes/flags into the type domain (Val). Note: small isbits unions (Union{T,Nothing}, Union{T,Missing}) are accepted — only heap-allocating unions fail."
     guarantee === :noalloc && return "allocation in a hot path: preallocate the buffer, use @views for slices, or @unroll to avoid boxing."
     guarantee === :inlined && return "not inlined: add @inline to the callee, or accept it (inlining is a heuristic)."

@@ -60,8 +60,35 @@ function _static_callee(ci, @nospecialize(a))
     return nothing
 end
 
+# `AbstractDict` accessors whose appearance on the hot path means a runtime keyed lookup — the
+# "owned scratch / GKH-ownership" violation: an owned workspace must resolve to a const-dispatched
+# per-type accessor, never a runtime dictionary probe (measured ~130 ns/call, type-stable and
+# non-allocating on the warm hit, so it slips past every value-based check). Same category as
+# boxing: read from optimized IR, no timing.
+const _DICT_ACCESSORS = (:get, :getindex, :get!, :setindex!, :haskey, :pop!)
+
+# A resolved `:invoke` whose callee is a dict accessor on an `AbstractDict` receiver. `specTypes`
+# is `Tuple{typeof(get), <dict>, key, …}` — parameters[2] is the receiver.
+function _mi_dict_lookup(mi::Core.MethodInstance)
+    d = mi.def
+    (d isa Method && d.name in _DICT_ACCESSORS) || return false
+    st = mi.specTypes
+    st isa DataType || return false
+    ps = st.parameters
+    length(ps) >= 2 || return false
+    recv = ps[2]
+    return recv isa Type && recv <: AbstractDict
+end
+
+# How many non-inlined `:invoke` levels the alloc/boxing/dictlookup scan follows by default. F35
+# measured depth 1 as sufficient on the PureFFT/BlazingPorts corpus; BLAS/LAPACK-style drivers
+# (issue #8) route workspace allocation through a `driver! -> prep-helper -> similar/Array` chain
+# that's 2+ levels deep, which depth 1 can't see. Override for a codebase with deeper chains:
+# `StrictMode._FAST_ALLOC_DEPTH[] = 3`.
+const _FAST_ALLOC_DEPTH = Ref(2)
+
 """
-    _alloc_signals(f, types; depth = 1) -> (; alloc, boxing, abscontainer, file, line)
+    _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[]) -> (; alloc, boxing, dictlookup, abscontainer, file, line)
 
 Value-free allocation heuristic from optimized typed IR (no execution, no backend). `alloc` flags
 explicit heap allocation (`:new` of a mutable/Array/`Core.Box` type, or a GC/box `:foreigncall`),
@@ -75,9 +102,12 @@ dynamic-dispatch subclass:
   its own result is concrete — the "internal dispatch with a concrete return" blind spot.
 
 A small all-concrete `Union` result stays unflagged (union-split, not boxing — flagging those
-over-reported on type-stable SIMD/pointer kernels). Location is the method's definition site.
+over-reported on type-stable SIMD/pointer kernels). `dictlookup` flags a runtime `AbstractDict`
+accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the owned-scratch/GKH-ownership
+violation — following non-inlined callees like `alloc` (the lookup usually lives in a workspace
+accessor callee, not the top function). Location is the method's definition site.
 """
-function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = 1)
+function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
@@ -89,7 +119,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     seen = Base.IdSet{Any}()
     push!(seen, sig)
-    alloc, boxing, abscontainer = isempty(cts) ? (false, false, nothing) :
+    alloc, boxing, dictlookup, abscontainer = isempty(cts) ? (false, false, false, nothing) :
         _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
@@ -98,7 +128,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
-    return (; alloc, boxing, abscontainer, file, line)
+    return (; alloc, boxing, dictlookup, abscontainer, file, line)
 end
 
 # Per-statement "this straight-line region ends in an unreachable return" mask — the throw-path
@@ -128,11 +158,11 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Any}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, nothing)
+    sig in seen && return (false, false, false, nothing)
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -141,7 +171,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Any}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -149,15 +179,16 @@ function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.Id
     cts = try
         Base.code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, nothing)
+        return (false, false, false, nothing)
     end
-    isempty(cts) && return (false, false, nothing)
+    isempty(cts) && return (false, false, false, nothing)
     return _scan_ci(first(cts)[1], sig, depth, seen)
 end
 
 function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     alloc = false
     boxing = false
+    dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
     for (i, st) in enumerate(ci.code)
@@ -169,24 +200,43 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             dead[i] && continue
             tgt = lowercase(string(st.args[1]))
             any(p -> occursin(p, tgt), _ALLOC_FFI) && (alloc = true)
+            # An `IdDict` runtime lookup inlines to a `jl_eqtable_get`/`_put`/`_pop` ccall (no `:get`
+            # method survives in optimized IR), so the method-name rules below never see it. This is
+            # the exact PureBLAS `_symm_scr` shape — detect the primitive directly.
+            occursin("eqtable", tgt) && (dictlookup = true)
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
             nt = st.args[1]
             (nt isa Type && (ismutabletype(nt) || nt <: Array || nt <: Memory || nt === Core.Box)) && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
-            # A resolved `:invoke` is never dispatch (F9) — even with an abstract recorded result
-            # (mutating helpers with an unused return are typed `Any`). Boxing shows up where the
-            # value is *used*: a downstream dynamic `:call` (result or argument rule below).
-            if !alloc && !dead[i] && depth > 0
+            # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
+            # with an abstract recorded result (mutating helpers with an unused return are typed
+            # `Any`). That's about the :invoke statement's SSA type, not what happens inside the
+            # callee. If the callee's own body genuinely allocates, boxes, or hits a dict accessor
+            # (found by recursing with the same F8/F9-safe scan below, plus the direct
+            # `_mi_dict_lookup` check on the resolved callee itself), that's a real signal one
+            # level removed from the caller — not the F9 trap.
+            if !dead[i]
                 a1 = st.args[1]
                 mi = a1 isa Core.CodeInstance ? a1.def : a1
                 if mi isa Core.MethodInstance
-                    a2, _, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
-                    a2 && (alloc = true)
+                    _mi_dict_lookup(mi) && (dictlookup = true)
+                    if depth > 0 && (!alloc || !boxing || !dictlookup)
+                        a2, b2, d2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
+                        a2 && (alloc = true)
+                        b2 && (boxing = true)
+                        d2 && (dictlookup = true)
+                    end
                 end
             end
         elseif Meta.isexpr(st, :call)
             callee = _static_callee(ci, st.args[1])
+            # A *dynamic* dict accessor (abstract dict receiver) — the runtime-lookup form that never
+            # resolves to an `:invoke`. Receiver is the first argument.
+            if !dictlookup && !dead[i] && callee isa Function && nameof(callee) in _DICT_ACCESSORS && length(st.args) >= 2
+                rt = _stmt_arg_type(ci, sig, st.args[2])
+                (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
+            end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
                 dead[i] || (alloc = true)
             elseif _nonconcrete(T)
@@ -203,7 +253,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         end
     end
-    return (alloc, boxing, abscontainer)
+    return (alloc, boxing, dictlookup, abscontainer)
 end
 
 # --- Base.infer_effects layer (cheap; basis for @assert_effects in Phase 3) -------------------

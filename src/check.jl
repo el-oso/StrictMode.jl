@@ -54,6 +54,10 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
         fail = would_fail_noboxing(rep)
         file, line = _first_loc(rep.allocs, true)
         return _mkfinding(md, fn, sg, g, fail, "boxing / dynamic dispatch", file, line)
+    elseif g === :owned
+        # IR-only lint (no backend equivalent), identical in :fast and :full.
+        s = _alloc_signals(f, types; depth = 2)
+        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
@@ -66,7 +70,7 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
     elseif g === :trim_compatible
         return _trim_compatible_finding(f, types, md, fn, sg, :full)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
 end
 
 # `:trimsafe` finding — the static-only subset of `:trim_compatible`, kept for compatibility. Value-free
@@ -184,6 +188,9 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :noboxing
             fail = sig.boxing || sig.abscontainer !== nothing
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig), sig.file, sig.line))
+        elseif g === :owned
+            s = _alloc_signals(f, types; depth = 2)
+            push!(out, _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line))
         elseif g === :inlined
             fail = _inlined_survives(f, types) === true
             push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
@@ -196,7 +203,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :trim_compatible
             push!(out, _trim_compatible_finding(f, types, md, fn, sg, :fast))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
         end
     end
     return out

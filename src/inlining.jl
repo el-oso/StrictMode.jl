@@ -237,7 +237,7 @@ function inline_suggestions(
                 catch
                     continue
                 end
-                all(isconcretetype, tt) || continue
+                Base.isdispatchtuple(Tuple{tt...}) || continue
                 try
                     append!(out, inline_suggestions(f, tt; include_base, only_flagged))
                 catch err
