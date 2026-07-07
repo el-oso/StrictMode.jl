@@ -80,8 +80,15 @@ function _mi_dict_lookup(mi::Core.MethodInstance)
     return recv isa Type && recv <: AbstractDict
 end
 
+# How many non-inlined `:invoke` levels the alloc/boxing/dictlookup scan follows by default. F35
+# measured depth 1 as sufficient on the PureFFT/BlazingPorts corpus; BLAS/LAPACK-style drivers
+# (issue #8) route workspace allocation through a `driver! -> prep-helper -> similar/Array` chain
+# that's 2+ levels deep, which depth 1 can't see. Override for a codebase with deeper chains:
+# `StrictMode._FAST_ALLOC_DEPTH[] = 3`.
+const _FAST_ALLOC_DEPTH = Ref(2)
+
 """
-    _alloc_signals(f, types; depth = 1) -> (; alloc, boxing, dictlookup, abscontainer, file, line)
+    _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[]) -> (; alloc, boxing, dictlookup, abscontainer, file, line)
 
 Value-free allocation heuristic from optimized typed IR (no execution, no backend). `alloc` flags
 explicit heap allocation (`:new` of a mutable/Array/`Core.Box` type, or a GC/box `:foreigncall`),
@@ -100,7 +107,7 @@ accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the owned-scratch/GK
 violation — following non-inlined callees like `alloc` (the lookup usually lives in a workspace
 accessor callee, not the top function). Location is the method's definition site.
 """
-function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = 1)
+function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
@@ -202,19 +209,22 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             nt = st.args[1]
             (nt isa Type && (ismutabletype(nt) || nt <: Array || nt <: Memory || nt === Core.Box)) && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
-            # A resolved `:invoke` is never dispatch (F9) — even with an abstract recorded result
-            # (mutating helpers with an unused return are typed `Any`). Boxing shows up where the
-            # value is *used*: a downstream dynamic `:call` (result or argument rule below). But a
-            # resolved dict accessor here IS a runtime lookup, and the accessor usually lives in a
-            # non-inlined callee (the owned-scratch accessor), so recurse for `dictlookup` too.
+            # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
+            # with an abstract recorded result (mutating helpers with an unused return are typed
+            # `Any`). That's about the :invoke statement's SSA type, not what happens inside the
+            # callee. If the callee's own body genuinely allocates, boxes, or hits a dict accessor
+            # (found by recursing with the same F8/F9-safe scan below, plus the direct
+            # `_mi_dict_lookup` check on the resolved callee itself), that's a real signal one
+            # level removed from the caller — not the F9 trap.
             if !dead[i]
                 a1 = st.args[1]
                 mi = a1 isa Core.CodeInstance ? a1.def : a1
                 if mi isa Core.MethodInstance
                     _mi_dict_lookup(mi) && (dictlookup = true)
-                    if depth > 0 && (!alloc || !dictlookup)
-                        a2, _, d2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
+                    if depth > 0 && (!alloc || !boxing || !dictlookup)
+                        a2, b2, d2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
                         a2 && (alloc = true)
+                        b2 && (boxing = true)
                         d2 && (dictlookup = true)
                     end
                 end

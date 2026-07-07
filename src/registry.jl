@@ -13,7 +13,12 @@ signatures are dropped with a warning (nothing to analyze).
 """
 function register_strict!(@nospecialize(f), @nospecialize(types); guarantees = (:typestable, :noalloc))
     tt = Tuple(types)
-    if !all(isconcretetype, tt)
+    # `isdispatchtuple`, not `all(isconcretetype, tt)`: a `::Type{T}` argument is a valid,
+    # fully-specified dispatch signature (there's exactly one value of `Type{Float64}`), but
+    # `isconcretetype(Type{Float64})` is `false` — a real Julia quirk that would otherwise skip
+    # every `::Type{T}`-argument function, silently, including the GKH-dispatch idiom this
+    # package's own `:static_ownership` guarantee recommends.
+    if !Base.isdispatchtuple(Tuple{tt...})
         @warn "register_strict!: skipping $(_func_name(f))$(_sig_string(tt)) — non-concrete argument types."
         return nothing
     end
@@ -284,7 +289,7 @@ function check_compiled(
                 catch
                     continue
                 end
-                all(isconcretetype, tt) || continue
+                Base.isdispatchtuple(Tuple{tt...}) || continue
                 push!(items, (f, tt, guarantees))
             end
         end

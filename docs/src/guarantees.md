@@ -349,6 +349,121 @@ and splice the literal into `@unroll` from a `@generated` method:
 end
 ```
 
+## GKH ownership — static dispatch over runtime registries
+
+**What it is.** GKH ownership (named for the Greg Kroah-Hartman / Linux-kernel principle that
+*data has a clear static owner, reached through that owner — never a global registry*) is the
+idiom of giving each concrete type a `const` value, reached by dispatch, instead of storing it in
+a runtime-keyed lookup table:
+
+```julia
+# GKH ownership: each type owns a const value, reached by compile-time dispatch.
+const _WS_F64 = Workspace{Float64}()
+const _WS_F32 = Workspace{Float32}()
+_ws(::Type{Float64}) = _WS_F64      # bare dispatch, const-folds — no lookup at all
+_ws(::Type{Float32}) = _WS_F32
+```
+
+versus the anti-pattern it replaces:
+
+```julia
+const _WS = IdDict{Type, Any}()
+_ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)   # runtime lookup on every call
+```
+
+**What problem it solves.** A type/symbol-keyed `Dict`/`IdDict` lookup is often type-stable and
+non-allocating on the warm hit — so `@assert_typestable`, `@assert_noalloc`, and
+`@assert_noboxing` all pass on it. Nothing else in this package would tell you it's there. But it
+still costs a real hash/eq-table probe on every call (measured ~130 ns), and it's exactly the kind
+of runtime indirection that trips up `juliac --trim` (see `@assert_trim_compatible` above) —
+a static build wants to prove every call resolves at compile time, and a dict keyed by `Type` is
+resolved by *value*, at *runtime*. The dispatch form sidesteps both: it const-folds like any other
+method call, so it's free and trim-safe by construction.
+
+**Two tools, for two different jobs.** Detecting "is this call a GKH-ownership violation" is not a
+provable property the way "does this allocate" is — it's a judgment call (a `Dict` is sometimes
+exactly the right tool: a config table parsed once, a plugin registry, a value-keyed memo cache).
+StrictMode gives you a precise tool and a broad one, and they don't overlap in scope (different
+guarantee names, no shared registry entry):
+
+| | [`@assert_owned`](@ref) | [`static_ownership_suggestions`](@ref) |
+|---|---|---|
+| Use it to… | pin a **specific, known-hot** call and guard it forever | **discover** every occurrence across a whole package |
+| Failure mode | hard `StrictViolation` — breaks the build | `status = :info` — never a failure, `nfailures` ignores it |
+| Where it runs | one call site you write by hand, like [`@assert_inlined`](@ref) | `audit(MyPkg; static_ownership_suggest = true)`, a whole-module/whole-registry sweep |
+
+Reach for `@assert_owned` the same way you'd reach for `@assert_inlined`: on a call you've already
+identified as hot and want a permanent regression guard on. Reach for
+`static_ownership_suggestions` (or `audit(...; static_ownership_suggest = true)`) when you don't
+yet know where the pattern shows up and want a package-wide pass that can't break anything while
+you look — the same relationship [`inline_suggestions`](@ref) has to `@assert_inlined`.
+
+**Why `@assert_owned` isn't swept in by default.** Keep it scoped to calls you assert by hand;
+don't add it to `register_strict!`'s guarantee list or a `@strict module`'s default set. The
+pattern's own sanctioned escape hatch — a `Dict` fallback for a rare-type tail that doesn't earn
+its own `const` — is *also* a runtime dict lookup, and a broad sweep would flag (and, since
+`@assert_owned` hard-fails, break the build on) the very fallback the idiom recommends. A
+narrow, opt-in `@assert_owned` on your known-hot calls avoids that; the advisory sweep is built
+for exactly the "show me everywhere, break nothing" case instead.
+
+### Example 1 — the anti-pattern, caught both ways
+
+```@example guide
+struct Workspace{T} end
+const _WS = IdDict{Type, Any}()
+_ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)
+
+only(static_ownership_suggestions(_ws, (Type{Float64},)))    # advisory: an :info finding, not a throw
+```
+
+```julia
+@assert_owned _ws(Float64) types = (Type{Float64},)
+# ERROR: StrictViolation (@owned): guarantee not satisfied
+#   target:  _ws(Float64)
+#   reason:  hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): …
+```
+
+The GKH-dispatch fix satisfies both — `@assert_owned` passes, and the advisory sweep has nothing
+left to say:
+
+```@example guide
+const _WS_F64 = Workspace{Float64}()
+const _WS_F32 = Workspace{Float32}()
+_ws2(::Type{Float64}) = _WS_F64
+_ws2(::Type{Float32}) = _WS_F32
+
+@assert_owned _ws2(Float64) types = (Type{Float64},)   # passes: dispatch, no lookup
+```
+
+```@example guide
+static_ownership_suggestions(_ws2, (Type{Float64},))   # empty: nothing left to suggest
+```
+
+### Example 2 — whole-package discovery, and the sanctioned fallback
+
+The realistic shape combines dispatch for the hot types with a `Dict` fallback for a rare-type
+tail — exactly the case `@assert_owned` would break the build on if swept broadly, and exactly
+the case the advisory sweep is built to surface without breaking anything:
+
+```@example guide
+module Workspaces
+    using StrictMode
+    struct Ws{T} end
+    const WS_F64 = Ws{Float64}()
+    const WS_F32 = Ws{Float32}()
+    const WS_FALLBACK = IdDict{Type, Any}()
+    get_ws(::Type{Float64}) = WS_F64      # hot path: dispatch, no lookup
+    get_ws(::Type{Float32}) = WS_F32      # hot path: dispatch, no lookup
+    get_ws(::Type{T}) where {T} = get!(() -> Ws{T}(), WS_FALLBACK, T)   # rare types, off the hot path
+end
+
+Workspaces.get_ws(Float64)
+Workspaces.get_ws(BigFloat)   # exercises the sanctioned fallback
+
+fs = audit(Workspaces; static_ownership_suggest = true, format = :text)
+nfailures(fs)   # 0 — only the fallback is flagged, and an advisory finding never fails a sweep
+```
+
 ## Promise scope
 
 StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**

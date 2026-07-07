@@ -53,3 +53,31 @@ end
     fs = StrictMode.findings(usplitheap, (Int,); guarantees = (:noboxing,), mode = :fast)
     @test only(fs).status === :pass
 end
+
+@testitem "fast follows non-inlined callees 2 levels deep for allocations (F36, GH #8)" begin
+    # The BLAS/LAPACK driver shape (PureBLAS.jl): `driver! -> prep-helper -> similar/Array` puts
+    # the real allocation 2 non-inlined hops below the entry point. F35's depth-1 default only
+    # sees the direct callee; this regressed to `fast=pass` on 7 real driver functions.
+    using StrictMode
+    @noinline hidden_alloc(n::Int) = zeros(n)
+    @noinline workspace(n::Int) = hidden_alloc(n)
+    driver(n::Int) = length(workspace(n))
+    fs = StrictMode.findings(driver, (Int,); guarantees = (:noalloc,), mode = :fast)
+    @test only(fs).status === :fail
+end
+
+@testitem "fast propagates a non-inlined callee's own boxing signal (F36, GH #8)" begin
+    # Distinct from F9: F9 was about flagging an `:invoke` merely for having an abstract
+    # *recorded result type* (mutating helpers with unused returns). This is the callee's own
+    # body genuinely dispatching dynamically, one level down — the caller's own body is clean.
+    using StrictMode
+    abstract type Shape end
+    struct Circ <: Shape; r::Float64; end
+    struct Sq <: Shape; s::Float64; end
+    area(c::Circ) = 3.14 * c.r^2
+    area(s::Sq) = s.s^2
+    @noinline dispatch_sum(v::Vector{Shape}) = sum(a -> area(a), v)
+    caller(v::Vector{Shape}) = dispatch_sum(v)
+    fs = StrictMode.findings(caller, (Vector{Shape},); guarantees = (:noboxing,), mode = :fast)
+    @test only(fs).status === :fail
+end

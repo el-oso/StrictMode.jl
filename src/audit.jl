@@ -38,6 +38,10 @@ unchecked; opting out requires a visible exempt.
 `@generated` / in-loop callees the compiler left non-inlined. They are **never failures**
 (`nfailures`/`exit_on_fail` ignore them) — a prompt to benchmark, not a gate.
 
+`static_ownership_suggest = true` additionally runs [`static_ownership_suggestions`](@ref):
+informational "consider GKH ownership" findings (`guarantee = :static_ownership`,
+`status = :info`) for type/symbol-keyed registry lookups. Also never a failure.
+
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
 function audit(
@@ -52,6 +56,7 @@ function audit(
         exempt = (),
         mode::Symbol = analysis_mode(),
         inline_suggest::Bool = false,
+        static_ownership_suggest::Bool = false,
     )
     require === nothing || require === :public ||
         throw(ArgumentError("audit: require must be :public (or nothing), got $(require)"))
@@ -60,11 +65,12 @@ function audit(
     fs = StrictFinding[]
     if target === :registered
         append!(fs, check_all(; guarantees, fail = :none, mode))
-        if inline_suggest
+        if inline_suggest || static_ownership_suggest
             for ((f, types), _) in STRICT_REGISTRY
                 _is_exempt(f) && continue
                 try
-                    append!(fs, inline_suggestions(f, types))
+                    inline_suggest && append!(fs, inline_suggestions(f, types))
+                    static_ownership_suggest && append!(fs, static_ownership_suggestions(f, types))
                 catch err
                     err isa StrictViolation && rethrow()
                 end
@@ -77,8 +83,10 @@ function audit(
             append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt, mode))
         end
         require === :public && append!(fs, _coverage_findings(target; only, exempt))
-        # Inline suggestions are informational (status :info, never failures) and noisy, so opt-in.
+        # Inline / static-ownership suggestions are informational (status :info, never failures)
+        # and noisy, so opt-in.
         inline_suggest && append!(fs, inline_suggestions(target; only, exempt))
+        static_ownership_suggest && append!(fs, static_ownership_suggestions(target; only, exempt))
     else
         throw(ArgumentError("audit target must be :registered or a Module, got $(target)"))
     end

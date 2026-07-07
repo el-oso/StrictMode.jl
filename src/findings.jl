@@ -8,8 +8,10 @@
 A single guarantee result for one `(function, signature)`. Flat and serializable so the same
 record feeds the human (`:text`) and agent (`:json`) reporting paths.
 
-Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/`:inlined`),
-`status` (`:fail`/`:pass`/`:skip`), `file`, `line`, `reason`, `suggestion`.
+Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/
+`:inlined`/…), `status` (`:fail`/`:pass`/`:skip`/`:info` — `:info` is an advisory, never a
+failure, e.g. [`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)), `file`, `line`,
+`reason`, `suggestion`.
 """
 struct StrictFinding
     mod::Symbol

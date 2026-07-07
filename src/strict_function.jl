@@ -34,7 +34,7 @@ end
 
 # Runs at precompile/module-load. Only verifies *concrete* signatures; abstract ones warn once.
 function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), target)
-    all(isconcretetype, types) || return begin
+    Base.isdispatchtuple(Tuple{types...}) || return begin
         @warn "@strict_function $target: signature has non-concrete argument types " *
             "$(types); precompile guarantees skipped (call sites can still use @strict)."
         nothing
