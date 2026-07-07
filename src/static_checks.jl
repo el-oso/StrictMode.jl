@@ -169,3 +169,62 @@ macro assert_noboxing(args...)
     end
     return _gate(checked, esc(call))
 end
+
+# --- @assert_owned: no runtime AbstractDict lookup on owned scratch (GKH-ownership lint) ---
+# Value-free structural lint (same category as @assert_noboxing): scans optimized typed IR for a
+# runtime `AbstractDict` accessor reached on the hot path, following non-inlined callees (the
+# lookup usually lives in a workspace accessor, not the top function). No backend, no timing.
+
+function _assert_owned(target, @nospecialize(f), @nospecialize(types::Tuple); depth::Int = 2)
+    sig = _alloc_signals(f, types; depth = depth)
+    if sig.dictlookup
+        _fail(
+            :owned, target,
+            "hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): give " *
+                "the type a const-dispatched accessor (Ref-per-concrete-type) instead of a runtime " *
+                "keyed lookup."
+        )
+    end
+    return nothing
+end
+
+"""
+    @assert_owned f(args...)
+
+Fail if the call reaches a **runtime `AbstractDict` lookup** on its hot path — the *owned-scratch*
+(a.k.a. GKH-ownership) violation: an owned workspace/scratch accessor must resolve to a
+const-dispatched, per-concrete-type accessor (a `Ref`/field owned by the type), never a runtime
+keyed dictionary probe (`get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!` on a `<:AbstractDict`).
+
+This is a purely *structural* lint in the same family as [`@assert_noboxing`](@ref): it reads the
+optimized typed IR (no execution, no backend, no timing) and follows non-inlined `:invoke` callees,
+because the dictionary probe typically lives in a workspace accessor a level or two down, not in the
+top function. It catches the latency-shaped bug the value-based checks miss: a keyed lookup is
+type-stable, non-allocating on the warm hit, and trim-tolerated, so it passes `@assert_typestable`,
+`@assert_noalloc`, and `@assert_noboxing` — only a benchmark (or this lint) exposes it.
+
+Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
+the bare call. Pass `depth = n` (default 2) to control how many non-inlined callee levels are
+walked.
+
+```julia
+@assert_owned symm!(C, A, B)            # ok: every type has a const-dispatched scratch accessor
+@assert_owned hemm!(C, A, B)            # throws: ComplexF64 falls through to a runtime IdDict get
+```
+"""
+macro assert_owned(args...)
+    pos, opts = _macro_call(args, (:types, :depth))
+    isempty(pos) && throw(ArgumentError("@assert_owned needs a call expression"))
+    call = pos[1]
+    target = string(call)
+    depth = haskey(opts, :depth) ? opts[:depth]::Int : 2
+    p = _call_parts(call; types = get(opts, :types, nothing))
+
+    checked = quote
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_assert_owned)($target, $(p.checkfn), $(p.types); depth = $depth)
+        _val
+    end
+    return _gate(checked, esc(call))
+end
