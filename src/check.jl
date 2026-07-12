@@ -181,6 +181,13 @@ end
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
     sig = (:typestable in guarantees || :noalloc in guarantees || :noboxing in guarantees) ?
         _alloc_signals(f, types) : nothing
+    # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-
+    # free? A resolved `:invoke` to a callee that boxes internally (e.g. the complex `_l3ws` IdDict
+    # `get!`, whose abstract result is narrowed by a `::L3Workspace{T}` assert) is not the caller's
+    # instability — only a direct dynamic `:call` is. So typestable uses depth-0 (this-level) boxing;
+    # noalloc/noboxing keep the full-depth signal (a callee's runtime alloc/dispatch IS a real cost).
+    # Matches JET's :full (flags dynamic dispatch, not resolved invokes). See typestability.jl.
+    local_boxing = (:typestable in guarantees) ? _alloc_signals(f, types; depth = 0).boxing : false
     out = StrictFinding[]
     for g in guarantees
         shared = _mode_independent_finding(g, f, types, md, fn, sg)
@@ -191,7 +198,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch (JET's :full finding); the IR
             # boxing signal catches that shape, so fast typestable checks both.
-            fail = badret || sig.boxing
+            fail = badret || local_boxing
             reason = badret ? "return type is not concrete (inference)" :
                 "internal dynamic dispatch (concrete return; fast IR heuristic)"
             push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0))

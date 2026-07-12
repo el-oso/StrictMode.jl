@@ -10,6 +10,14 @@ _is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(
 # the IR boxing signal (F38): a concrete return can hide internal runtime dispatch — the same
 # blind spot `_findings_fast`'s :typestable branch (check.jl) already closed for the batch API,
 # which this macro-level fast check had been missing.
+#
+# DEPTH-0 (this-level only) for the boxing signal: type stability is a property of THIS function's
+# own IR. A direct dynamic `:call` (an abstract callee/result in THIS body — F38's `c.f(1)`) is a
+# real instability; a resolved `:invoke` to a callee that boxes internally is NOT — the call itself
+# is statically dispatched, and if its abstract result is narrowed (e.g. the complex `_l3ws` IdDict
+# `get!` behind a `::L3Workspace{T}` assert) the caller stays stable. JET's :full opt-analysis agrees
+# (it flags dynamic dispatch, not resolved invokes). Depth-2 (the noalloc/noboxing depth, which counts
+# a callee's runtime cost) over-flagged concrete-return callers of boxy helpers. See check.jl.
 function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = Base.return_types(f, Tuple{types...})
     if length(rts) != 1 || !_is_typestable_return(only(rts))
@@ -17,7 +25,7 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
         _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")
         return nothing
     end
-    if _alloc_signals(f, types).boxing
+    if _alloc_signals(f, types; depth = 0).boxing
         _fail(:typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)")
     end
     return nothing

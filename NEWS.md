@@ -1,5 +1,21 @@
 # StrictMode.jl release notes
 
+## v0.3.7
+
+Bugfix. Fixes a `:fast`-mode `@assert_typestable` false positive introduced in v0.3.6.
+
+- **`:fast` typestable is now THIS-LEVEL (depth-0).** v0.3.6 added the IR boxing signal to the fast
+  typestable check (F38), but reused the *full-depth* `_alloc_signals` — the same signal `noalloc`/
+  `noboxing` use, which follows non-inlined `:invoke` callees. That over-flagged a **type-stable**
+  caller whose only "boxing" is a resolved `:invoke` into a helper that boxes internally but whose
+  result is narrowed at the call site (the canonical shape: a `get!` on an abstract-valued IdDict
+  behind a `::Concrete` assert — PureBLAS's complex `_l3ws` workspace accessor, reached from
+  `herk!`/`_cpotrf_lower!`). Such a caller has no dispatch of its own; JET's `:full` opt-analysis
+  passes it, and now `:fast` agrees. Type stability is a property of the function's OWN IR, so the
+  typestable boxing scan uses depth-0 (a direct dynamic `:call` — F38's `c.f(1)` — is still caught);
+  `noalloc`/`noboxing` keep the full-depth signal (a callee's runtime alloc/dispatch IS a real cost).
+  Regression test in `test/typestable_test.jl`.
+
 ## v0.3.6
 
 Additive, non-breaking. Dogfooding + readability audit: a fast-math visibility gap, two

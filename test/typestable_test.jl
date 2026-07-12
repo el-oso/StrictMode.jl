@@ -40,6 +40,26 @@ end
     @test StrictMode._typestable_fast("stable", stable, (Float64,)) === nothing
 end
 
+@testitem "typestable is this-level (depth-0): a resolved :invoke to a boxy helper is not the caller's instability" begin
+    using StrictMode
+    # Regression for the 0.3.6 :fast false positive on PureBLAS complex herk!/_cpotrf_lower!. Those call
+    # the complex `_l3ws` workspace accessor, a `get!` on an abstract-valued IdDict that boxes internally
+    # but whose result is narrowed by a `::L3Workspace{T}` assert. The caller has NO dispatch of its own
+    # (only a resolved :invoke), so it is type-stable — JET's :full opt-analysis agrees. The typestable
+    # boxing signal must therefore be THIS-LEVEL (depth-0), not the full-depth noalloc/noboxing signal.
+    const _BOXD = IdDict{Symbol, Any}()
+    boxy_helper() = get!(() -> Int[], _BOXD, :k)::Vector{Int}   # boxes internally; result narrowed
+    stable_caller() = length(boxy_helper())::Int                # only a resolved :invoke to the helper
+    @test StrictMode._typestable_fast("stable_caller", stable_caller, ()) === nothing        # :fast passes
+    @test all(f -> f.status === :pass, check(stable_caller, (); guarantees = (:typestable,), fail = :none))
+    # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
+    @test any(f -> f.status === :fail, check(stable_caller, (); guarantees = (:noboxing,), fail = :none))
+    # And a DIRECT dynamic dispatch (F38's shape) is still caught at this level.
+    struct _CB; f::Function; end
+    callit(c::_CB) = (c.f(1))::Int
+    @test_throws StrictViolation StrictMode._typestable_fast("callit", callit, (_CB,))
+end
+
 @testitem "@assert_typestable accepts keyword arguments (issue #4)" begin
     using StrictMode
     scaled(x; scale = 2) = x .* scale
