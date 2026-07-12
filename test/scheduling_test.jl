@@ -49,8 +49,8 @@ end
     using StrictMode
     # Any concrete function works — register counts depend on the target CPU, so we only assert
     # on shape (isa, field invariants) rather than specific values.
-    dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) = a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
-    rr = register_report(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))
+    dot3(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+    rr = register_report(dot3, (NTuple{3, Float64}, NTuple{3, Float64}))
     @test rr isa StrictMode.RegisterReport
     @test rr.vec_regs_total == 0 || rr.vec_regs_total == 32   # either no zmm or AVX-512
     @test rr.vec_regs_used >= 0

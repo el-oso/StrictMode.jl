@@ -200,15 +200,21 @@ or sweep everything and exempt the rest.
 |---|---|
 | `@assert_noalloc f(args...)` | call is allocation-free (AllocCheck; `@allocated` fallback) |
 | `@assert_noboxing f(args...)` | forbid boxing / dynamic dispatch, but **allow** legitimate buffer allocation |
+| `@assert_owned f(args...)` | fail on a runtime `AbstractDict` lookup on the hot path (GKH-ownership: an owned scratch/workspace must resolve via a const-dispatched accessor, not a keyed probe) |
 | `@assert_typestable f(args...)` | concrete return type + no internal instability/dispatch (JET + `@inferred`) |
 | `@assert_inlined f(args...)` | fail unless the call is inlined (best-effort; not part of `@strict`) |
 | `@assert_vectorized f(args...)` | fail unless the loop SIMD-vectorized (best-effort, LLVM IR scan) |
+| `@assert_no_scalar_loops f(args...)` | fail if a scalar (non-vectorized) hot loop is detected between audited kernels (best-effort) |
 | `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
-| `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee) |
+| `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee; static scan only) |
+| `@assert_trim_compatible f(args...)` | like `@assert_trim_safe`, but escalates to juliac's authoritative verifier (`TrimCheck`) in `:full` mode |
 | `@assert_concurrency_safe f(plan, args...)` | fail unless `f` treats its plan arg as read-only (no write of, or through, the plan) — proof that one plan is safe to share across concurrent tasks |
 | `@assert_no_threadid_state f(args...)` | fail on mutable state indexed by `Threads.threadid()` (the task-migration hazard) |
 | `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |
+| `kernel_report(f, types)` | performance-quality diagnostic (not pass/fail): arithmetic intensity, alignment/masking, branch/serial-dep/noalias/shuffle/prefetch signals, and fast-math-flag usage, read from LLVM IR |
+| `register_report(f, types)` | post-register-allocation diagnostic: zmm register usage and spills from `code_native` (x86-64 AVX-512) |
 | `explain_trim(output)` | translate raw `juliac --trim` verifier output into a source-mapped explanation |
+| `@golden name expr` | gated bit-exact (or ULP-tolerant) regression harness for numeric kernels; always runs regardless of `checks_enabled` |
 | `@strict f(args...)` | all per-call guarantees at once; returns the call's value |
 | `@strict_function def` | verify the definition's contract at precompile time |
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |
@@ -221,6 +227,8 @@ or sweep everything and exempt the rest.
 | `check_all` / `check_compiled` | re-check the registry / sweep what actually compiled |
 | `check_signatures(pairs)` | check an explicit `(f, types)` list — no `src` annotations needed |
 | `audit` / `watch` | structured one-shot report for agents / live Revise loop for humans |
+| `divergence_report(f, types)` | compare `:fast` vs `:full` verdicts for a signature; `save_divergence` persists a corpus sweep |
+| `pool_balance_report(...)` | diagnostic for `@assert_no_threadid_state`-adjacent thread-pool balance questions |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
 Every guarantee macro also accepts **keyword-argument calls** — `@assert_noalloc trsm!(B, A; side='L')`

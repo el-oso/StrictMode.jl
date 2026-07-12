@@ -37,6 +37,35 @@ end
     @test (@assert_noalloc static = false addone(41)) === 42
 end
 
+@testitem "@assert_noalloc's :fast default is the value-free heuristic, not @allocated (F38)" begin
+    using StrictMode
+    # A branch-dependent allocator: the branch actually taken for n=5 doesn't allocate, so the
+    # value-dependent @allocated(thunk) measurement — the OLD :fast default — passes for this
+    # input. But the function's code structurally allocates in its n>100 branch, which
+    # _alloc_signals (the NEW :fast default, mode=:heuristic) sees regardless of which branch a
+    # given call happens to execute — matching what findings(...; mode=:fast) already reported.
+    maybe_alloc(n::Int) = n > 100 ? sum(zeros(n)) : Float64(n)
+
+    @test_throws StrictViolation StrictMode._assert_noalloc(
+        "maybe_alloc(5)", maybe_alloc, (Int,), () -> maybe_alloc(5); mode = :heuristic
+    )
+
+    # mode=:empirical (explicit static=false) is unchanged: value-dependent, doesn't see it for n=5.
+    @test StrictMode._assert_noalloc(
+        "maybe_alloc(5)", maybe_alloc, (Int,), () -> maybe_alloc(5); mode = :empirical
+    ) == 5.0
+
+    # The heuristic path still catches a plain, unconditional allocator.
+    grows(n::Int) = collect(1:n)
+    @test_throws StrictViolation StrictMode._assert_noalloc(
+        "grows(5)", grows, (Int,), () -> grows(5); mode = :heuristic
+    )
+
+    # And still passes a genuinely clean call.
+    addone(x) = x + 1
+    @test StrictMode._assert_noalloc("addone(41)", addone, (Int,), () -> addone(41); mode = :heuristic) === 42
+end
+
 @testitem "@assert_noalloc accepts keyword arguments (issue #4)" begin
     using StrictMode, AllocCheck, JET
     addkw(x; k = 1) = x + k

@@ -4,8 +4,12 @@
 # Shared plan-like fixtures (a composite plan holding child plans with embedded scratch buffers).
 @testitem "concurrency: PASS on a read-only immutable apply" begin
     using StrictMode
-    mutable struct CBuf1; data::Vector{Float64}; end
-    struct CPlan1; scr::CBuf1; n::Int; end
+    mutable struct CBuf1
+        data::Vector{Float64}
+    end
+    struct CPlan1
+        scr::CBuf1; n::Int
+    end
     # reads the plan, writes only x and the passed scratch → safe to share
     function apply_ro!(plan::CPlan1, x::Vector{Float64}, scr::Vector{Float64})
         @inbounds for i in eachindex(x)
@@ -22,7 +26,9 @@ end
 
 @testitem "concurrency: FAIL on writing a plan field (setfield! on self)" begin
     using StrictMode
-    mutable struct MPlan2; n::Int; end
+    mutable struct MPlan2
+        n::Int
+    end
     function apply_setfield!(plan::MPlan2, x::Vector{Float64}, scr::Vector{Float64})
         plan.n = length(x)   # mutates the shared plan
         return x
@@ -32,8 +38,12 @@ end
 
 @testitem "concurrency: FAIL on storing into a plan-reachable buffer" begin
     using StrictMode
-    mutable struct CBuf3; data::Vector{Float64}; end
-    struct CPlan3; scr::CBuf3; end
+    mutable struct CBuf3
+        data::Vector{Float64}
+    end
+    struct CPlan3
+        scr::CBuf3
+    end
     function apply_bufstore!(plan::CPlan3, x::Vector{Float64}, scr::Vector{Float64})
         @inbounds plan.scr.data[1] = x[1]   # heap store reachable through the plan
         return x
@@ -44,9 +54,15 @@ end
 
 @testitem "concurrency: FAIL on the composite convenience-path race (interprocedural)" begin
     using StrictMode
-    mutable struct CBuf4; data::Vector{Float64}; end
-    struct CChild4; scr::CBuf4; end
-    struct CPlan4; children::Vector{CChild4}; end
+    mutable struct CBuf4
+        data::Vector{Float64}
+    end
+    struct CChild4
+        scr::CBuf4
+    end
+    struct CPlan4
+        children::Vector{CChild4}
+    end
     # a child's convenience path that mutates its OWN embedded scratch (the real race)
     @noinline function child_convenience!(c::CChild4, x::Vector{Float64})
         @inbounds c.scr.data[1] = x[1]
@@ -63,9 +79,15 @@ end
 
 @testitem "concurrency: PASS when a child path writes only the passed-in output" begin
     using StrictMode
-    mutable struct CBuf5; data::Vector{Float64}; end
-    struct CChild5; scr::CBuf5; end
-    struct CPlan5; children::Vector{CChild5}; end
+    mutable struct CBuf5
+        data::Vector{Float64}
+    end
+    struct CChild5
+        scr::CBuf5
+    end
+    struct CPlan5
+        children::Vector{CChild5}
+    end
     # reads the child, writes only x (the scratch-passing form) → safe
     @noinline function child_readonly!(c::CChild5, x::Vector{Float64})
         @inbounds x[1] = c.scr.data[1]
@@ -82,7 +104,9 @@ end
 
 @testitem "concurrency: scalar plan field read (plan.n) does not taint arithmetic" begin
     using StrictMode
-    struct SPlan6; n::Int; scale::Float64; end
+    struct SPlan6
+        n::Int; scale::Float64
+    end
     function apply_scalar!(plan::SPlan6, x::Vector{Float64}, scr::Vector{Float64})
         @inbounds for i in eachindex(x)
             x[i] = x[i] * plan.scale + plan.n   # scalar reads → copies → not a shared write
@@ -94,7 +118,9 @@ end
 
 @testitem "concurrency: FAIL on handing a plan-reachable buffer to a Base mutator (push!)" begin
     using StrictMode
-    struct GPlan7; children::Vector{Int}; end
+    struct GPlan7
+        children::Vector{Int}
+    end
     function apply_push!(plan::GPlan7, x::Vector{Float64}, scr::Vector{Float64})
         push!(plan.children, length(x))   # mutates plan-reachable storage via Base
         return x
@@ -106,7 +132,9 @@ end
     # With checks enabled in the test project this still runs the check, but confirm the macro
     # returns the value and does not throw on safe code.
     using StrictMode
-    struct DPlan8; n::Int; end
+    struct DPlan8
+        n::Int
+    end
     f8(plan::DPlan8, x::Vector{Float64}) = (x[1] = plan.n; x)
     x = zeros(1)
     @test (@assert_concurrency_safe f8(DPlan8(5), x)) === x

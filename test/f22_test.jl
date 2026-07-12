@@ -7,7 +7,7 @@
     # Integer SIMD: byte-compare kernel (memchr-style, <16 x i8>)
     @noinline function count_byte(v::Vector{UInt8}, b::UInt8)
         n = 0
-        @inbounds for i in 1:16:length(v)-15
+        @inbounds for i in 1:16:(length(v) - 15)
             chunk = vload(Vec{16, UInt8}, v, i)
             n += Int(sum(chunk == Vec{16, UInt8}(b)))
         end

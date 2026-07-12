@@ -45,9 +45,13 @@ end
 
     # (b) a still-unsupported form (a bare block) still errors, pointing at StrictMode.check.
     err = try
-        StrictMode._callinfo(:(begin
-            x + 1
-        end))
+        StrictMode._callinfo(
+            :(
+                begin
+                    x + 1
+                end
+            )
+        )
         nothing
     catch e
         e

@@ -111,11 +111,13 @@ const _STORE_OPS = Dict(
     :unsafe_store! => 1, :pointerset => 1, :setindex! => 1, :arrayset => 2,
 )
 const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))   # value-carrying: taint result if any operand tainted
-const _BASE_MUTATORS = Set{Symbol}((
-    :push!, :pushfirst!, :append!, :prepend!, :resize!, :sizehint!, :empty!, :deleteat!, :insert!,
-    :splice!, :copyto!, :copy!, :unsafe_copyto!, :fill!, :map!, :_growend!, :_growbeg!,
-    :_deleteend!, :_deletebeg!,
-))
+const _BASE_MUTATORS = Set{Symbol}(
+    (
+        :push!, :pushfirst!, :append!, :prepend!, :resize!, :sizehint!, :empty!, :deleteat!, :insert!,
+        :splice!, :copyto!, :copy!, :unsafe_copyto!, :fill!, :map!, :_growend!, :_growbeg!,
+        :_deleteend!, :_deletebeg!,
+    )
+)
 
 struct _ConcViol
     message::String
@@ -142,7 +144,7 @@ end
 
 # Scan one CodeInfo. `targs` = tainted argument slots (Core.Argument `.n` values). Returns whether
 # the method may RETURN a plan-reachable reference (so the caller can keep tainting).
-function _scan_ci(
+function _taint_scan_ci(
         ci, targs::Set{Int}, chain::Vector{String}, fr::_Frame, depth::Int, max_depth::Int,
         memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String},
     )
@@ -228,9 +230,11 @@ function _scan_ci(
                     # a Base/Core intrinsic/read (getfield-family handled above) — non-mutating
                 else
                     tgt = nm === nothing ? "an unresolved callee" : "`$nm`"
-                    _record!(out, seen, chain,
+                    _record!(
+                        out, seen, chain,
                         "hands a plan-reachable value to $tgt via dynamic dispatch — StrictMode cannot " *
-                            "prove it treats the plan as read-only (flagged conservatively)", fr)
+                            "prove it treats the plan as read-only (flagged conservatively)", fr
+                    )
                 end
                 continue
             end
@@ -259,9 +263,11 @@ function _recurse(
     haskey(memo, key) && return memo[key]
     label = string(m.name)
     if depth >= max_depth
-        _record!(out, seen, chain,
+        _record!(
+            out, seen, chain,
             "hands a plan-reachable value to `$label` at recursion depth $depth (≥ max_depth=$max_depth) — " *
-                "not followed; flagged conservatively", _Frame(label, string(m.file), Int(m.line)))
+                "not followed; flagged conservatively", _Frame(label, string(m.file), Int(m.line))
+        )
         memo[key] = false
         return false
     end
@@ -271,7 +277,7 @@ function _recurse(
     # user param k (1-based) ↔ Core.Argument(k+1)
     callee_targs = Set{Int}(p + 1 for p in tainted_pos)
     fr = _Frame(label, string(m.file), Int(m.line))
-    rt = _scan_ci(ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen)
+    rt = _taint_scan_ci(ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen)
     memo[key] = rt
     return rt
 end
@@ -299,11 +305,13 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     catch
         nothing
     end
-    fr = _Frame(_func_name(f) * _sig_string(types),
-        m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0)
+    fr = _Frame(
+        _func_name(f) * _sig_string(types),
+        m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0
+    )
     targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
     out = _ConcViol[]
-    _scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Bool}(), out, Set{String}())
+    _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Bool}(), out, Set{String}())
     return out
 end
 
@@ -311,8 +319,10 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
     io = IOBuffer()
-    println(io, "plan argument is mutated during apply — NOT safe to share across concurrent tasks ",
-        "($(length(vs)) site(s)):")
+    println(
+        io, "plan argument is mutated during apply — NOT safe to share across concurrent tasks ",
+        "($(length(vs)) site(s)):"
+    )
     for (i, v) in enumerate(vs)
         print(io, "  [", i, "] ", v.message)
         v.file != "" && print(io, "\n        at ", v.file, ":", v.line)
@@ -383,14 +393,18 @@ end
 # `buf[threadid()] = …` shape (including via a local); it does NOT track a threadid stashed into
 # another array and reused later (documented limit).
 # scalar ops that carry a threadid-derived index forward (lowered forms)
-const _TID_CARRY = Set{Symbol}((
-    :+, :-, :*, :add_int, :sub_int, :mul_int, :and_int, :or_int, :sext_int, :zext_int, :trunc_int,
-))
+const _TID_CARRY = Set{Symbol}(
+    (
+        :+, :-, :*, :add_int, :sub_int, :mul_int, :and_int, :or_int, :sext_int, :zext_int, :trunc_int,
+    )
+)
 _is_threadid_foreigncall(st) =
     Meta.isexpr(st, :foreigncall) && !isempty(st.args) &&
-        (let fn = st.args[1] isa QuoteNode ? st.args[1].value : st.args[1]
-            fn isa Symbol && occursin("threadid", String(fn))
-        end)
+    (
+    let fn = st.args[1] isa QuoteNode ? st.args[1].value : st.args[1]
+        fn isa Symbol && occursin("threadid", String(fn))
+    end
+)
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
@@ -401,9 +415,13 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     isempty(cts) && return _ConcViol[]
     ci = cts[1].first
     code = ci.code
-    m = try which(f, types) catch nothing end
-    fr = _Frame(_func_name(f) * _sig_string(types),
-        m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0)
+    m = try
+        which(f, types)
+    catch nothing end
+    fr = _Frame(
+        _func_name(f) * _sig_string(types),
+        m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0
+    )
     tid = BitSet()          # threadid-derived scalar values
     tidref = BitSet()       # ref handles indexed by a threadid-derived value
     out = _ConcViol[]
@@ -439,9 +457,11 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                 idx_tid = any(a -> _op_tainted(a, tid, ()), dataargs)
                 cont_tid = 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tidref, ())
                 if idx_tid || cont_tid
-                    _record!(out, seen, String[],
+                    _record!(
+                        out, seen, String[],
                         "writes mutable state indexed by `Threads.threadid()` (`$nm`) — unsafe under task " *
-                            "migration; index by a captured task-local id or a per-task buffer instead", fr)
+                            "migration; index by a captured task-local id or a per-task buffer instead", fr
+                    )
                 end
                 continue
             end
@@ -478,14 +498,7 @@ macro assert_no_threadid_state(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_no_threadid_state needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_no_threadid_state)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_no_threadid_state; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 

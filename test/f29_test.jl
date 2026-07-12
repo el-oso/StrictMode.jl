@@ -4,7 +4,9 @@
     # Any function with array (pointer) args
     @noinline dot_fn(a::Vector{Float64}, b::Vector{Float64}) = begin
         s = 0.0
-        @inbounds for i in eachindex(a, b); s += a[i] * b[i]; end
+        @inbounds for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end
         s
     end
 

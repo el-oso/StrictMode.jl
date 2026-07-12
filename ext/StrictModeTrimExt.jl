@@ -20,8 +20,12 @@ function StrictMode._be_trim_validate(@nospecialize(f), @nospecialize(types))
     argtypes = (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
     rts = Base.return_types(f, Tuple{argtypes...})
     if length(rts) != 1
-        return (false, ["could not infer a single concrete return type ($(length(rts)) results); " *
-            "trim verification needs a fully-inferred signature"])
+        return (
+            false, [
+                "could not infer a single concrete return type ($(length(rts)) results); " *
+                    "trim verification needs a fully-inferred signature",
+            ],
+        )
     end
     ret_type = rts[1]
     Comp = TrimCheck.Compiler

@@ -52,6 +52,17 @@ end
     @test all(f -> f.status === :fail, bf)              # boxes → both noalloc and noboxing fail
 end
 
+@testitem "_alloc_signals catches an escaping non-isbits immutable :new (F38)" begin
+    using StrictMode
+    # `Some{Any}(x)` heap-allocates (it's not isbits) but is neither mutable nor an
+    # Array/Memory/Box — the old :new rule (mutable || Array || Memory || Box) missed it
+    # entirely. Verified against a real corpus (PureFFT.jl): the old rule false-negatived on
+    # `apply_rfft!`/`pfft!`, which both build escaping non-isbits immutables.
+    mkany(x::Int) = Some{Any}(x)
+    sig = StrictMode._alloc_signals(mkany, (Int,))
+    @test sig.alloc
+end
+
 @testitem "_alloc_signals doesn't flag union-split :invoke as boxing (F9)" begin
     using StrictMode
     @noinline g(x::Int) = x > 0 ? 1.0 : 1        # resolved call returning a small Union

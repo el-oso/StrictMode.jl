@@ -73,14 +73,7 @@ macro assert_vectorized(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_vectorized needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_vectorized)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_vectorized; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -112,14 +105,7 @@ macro assert_effects(args...)
     pos, opts = _macro_call(args, (:types,))
     length(pos) >= 2 || throw(ArgumentError("@assert_effects needs a call expression and a required-effects tuple"))
     call, required = pos[1], pos[2]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_effects)($target, $(p.checkfn), $(p.types), $(esc(required)))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_effects, esc(required); types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -151,7 +137,7 @@ end
 # that signal from the LLVM IR (FP vector ops : memory vector ops), so a green-but-slow kernel can be
 # *seen* to be memory-bound. Heuristic and advisory — it does not replace a profiler or a roofline.
 
-struct KernelReport
+Base.@kwdef struct KernelReport
     target::String
     vectorized::Bool
     width::Int         # widest vector seen (N in `<N x …>`)
@@ -177,6 +163,10 @@ struct KernelReport
     # F34
     prefetch_ops::Int           # @llvm.prefetch count (its absence in a low-intensity loop ⇒ maybe latency-bound)
     has_loop_phi::Bool          # loop-carried integer phi present (the loop check for the latency-bound hint)
+    # F38 — FP ops carrying fast-math flags (contract/reassoc/nnan/ninf/nsz/arcp/afn/fast): `@simd`/
+    # `@fastmath` permit floating-point reassociation and NaN/Inf assumptions that can change
+    # numerical results, not just speed — surfaced explicitly rather than silently folded into `fp_ops`.
+    fastmath_ops::Int
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -224,6 +214,20 @@ end
 # Override for non-standard hardware: StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
 const _CACHE_BYTES = Ref((l1 = 32_768, l2 = 524_288, l3 = 16_777_216))
 
+# LLVM inserts fast-math flags (`fast`, `nnan`, `ninf`, `nsz`, `arcp`, `contract`, `afn`,
+# `reassoc`) between a floating-point opcode/call and its result type whenever
+# `@fastmath`/`@simd`-style reassociation is proven safe — e.g. `fmul contract <8 x double>`,
+# `fadd reassoc contract double`, `call reassoc contract double @llvm.fmuladd.f64(...)`. A regex
+# anchored on opcode-immediately-followed-by-type misses every flagged op, which silently
+# undercounts FP work and can misclassify a compute-bound `@simd` kernel as memory-bound — the
+# exact misdiagnosis `kernel_report` exists to prevent. This fragment absorbs zero or more such
+# flag tokens wherever an FP opcode/call precedes its type.
+const _FMF = raw"(?: [a-z]+)*"
+# One-or-more form: requires a fast-math flag to actually be present, for F38's explicit
+# fast-math-usage count (as opposed to `_FMF`'s zero-or-more, used to count FP work regardless of
+# whether it carries these flags).
+const _FMF1 = raw"(?: [a-z]+)+"
+
 """
     kernel_report(f, types) -> KernelReport
 
@@ -236,7 +240,12 @@ memory-bound — pointing straight at register/cache blocking rather than discov
 
 Fields: `vectorized`, `width`, `fp_ops`, `mem_ops`, `intensity` (= `fp_ops/mem_ops`),
 `unaligned_mem_ops` (vector loads/stores with alignment < vector width — a proxy for unaligned
-access), `masked_mem_ops` (masked/variable-length memory ops — a proxy for irregular trip counts).
+access), `masked_mem_ops` (masked/variable-length memory ops — a proxy for irregular trip counts),
+`fastmath_ops` (FP ops carrying `contract`/`reassoc`/`nnan`/`ninf`/`nsz`/`arcp`/`afn`/`fast` flags —
+from `@simd`/`@fastmath` — counted into `fp_ops` like any other FP work, but also reported
+separately and printed as an explicit warning: these flags permit floating-point reassociation and
+NaN/Inf assumptions that can change numerical RESULTS, not just codegen, so a nonzero count is a
+numerics-risk signal worth a second look, not just a tuning note).
 **Heuristic and advisory** — it never fails, and does not replace a profiler/roofline.
 
 Pass `working_set_bytes` to get a cache-residency annotation: if the working set fits L1/L2,
@@ -257,9 +266,15 @@ function kernel_report(
     )
     target = _func_name(f) * _sig_string(types)
     s = _llvm_ir(f, types)
-    isempty(s) && return KernelReport(target, false, 0, 0, 0, 0.0, 0, 0, working_set_bytes, 0, 0, 0, 0, 0, 0, 0, false)
+    isempty(s) && return KernelReport(;
+        target, vectorized = false, width = 0, fp_ops = 0, mem_ops = 0, intensity = 0.0,
+        unaligned_mem_ops = 0, masked_mem_ops = 0, working_set_bytes,
+        int_ops = 0, int_mem_ops = 0, branch_count = 0, serial_dep_count = 0,
+        noalias_missing_count = 0, shuffle_ops = 0, prefetch_ops = 0, has_loop_phi = false,
+        fastmath_ops = 0
+    )
     width = maximum((parse(Int, m[1]) for m in eachmatch(r"<(\d+) x (?:float|double|half|i\d+)>", s)); init = 0)
-    vop(p) = count(_ -> true, eachmatch(Regex(p * raw" <\d+ x (?:float|double|half)>"), s))
+    vop(p) = count(_ -> true, eachmatch(Regex(p * _FMF * raw" <\d+ x (?:float|double|half)>"), s))
     fma = count(_ -> true, eachmatch(r"@llvm\.(?:fmuladd|fma)\.v\d+", s))
     fp = vop("fmul") + vop("fadd") + vop("fsub") + vop("fdiv") + fma
     mem = count(_ -> true, eachmatch(r"(?:load|store) <\d+ x (?:float|double|half)>", s))
@@ -306,7 +321,22 @@ function kernel_report(
         count(_ -> true, eachmatch(r"@llvm\.x86\.\w+\.(?:pshuf\.?b?|perm[di]?|palignr|valign)", s))
     # F34 — prefetch presence; its absence in a low-intensity streaming loop ⇒ possibly latency-bound
     prefetch_val = count(_ -> true, eachmatch(r"@llvm\.prefetch", s))
-    return KernelReport(target, width > 0, width, fp, mem, intensity, unaligned, masked, working_set_bytes, int_ops_val, int_mem_val, branch_count_val, serial_dep_val, noalias_missing_val, shuffle_val, prefetch_val, has_loop_phi)
+    # F38 — fast-math-flagged FP op count (see `_FMF1` above): `@simd`/`@fastmath` change floating-
+    # point semantics (reassociation, NaN/Inf assumptions), not just codegen — worth a standing
+    # warning independent of the (unaffected) intensity/bound classification.
+    vopf(p) = count(_ -> true, eachmatch(Regex(p * _FMF1 * raw" <\d+ x (?:float|double|half)>"), s))
+    scalarf(p) = count(_ -> true, eachmatch(Regex(p * _FMF1 * raw" (?:double|float)\b"), s))
+    fastmath_val = vopf("fmul") + vopf("fadd") + vopf("fsub") + vopf("fdiv") +
+        scalarf("fmul") + scalarf("fadd") + scalarf("fsub") + scalarf("fdiv") +
+        count(_ -> true, eachmatch(Regex(raw"call" * _FMF1 * raw" (?:double|float) @llvm\.(?:fma|fmuladd)"), s))
+    return KernelReport(;
+        target, vectorized = width > 0, width, fp_ops = fp, mem_ops = mem, intensity,
+        unaligned_mem_ops = unaligned, masked_mem_ops = masked, working_set_bytes,
+        int_ops = int_ops_val, int_mem_ops = int_mem_val, branch_count = branch_count_val,
+        serial_dep_count = serial_dep_val, noalias_missing_count = noalias_missing_val,
+        shuffle_ops = shuffle_val, prefetch_ops = prefetch_val, has_loop_phi,
+        fastmath_ops = fastmath_val
+    )
 end
 
 # --- F20: scalar FP loop scan — best-effort whole-function detection --------------------------
@@ -316,8 +346,15 @@ end
 # the optimized LLVM IR for the co-presence of a loop back-edge (`!llvm.loop` metadata or a
 # labeled branch) and scalar (non-vector) FP arithmetic on `double`/`float`.
 
-# Scalar FP op patterns in optimized IR (non-vector forms only).
-const _SCALAR_FP_RE = r"(?:fadd|fmul|fsub|fdiv) double|(?:fadd|fmul|fsub|fdiv) float|call double @llvm\.(?:fma|fmuladd)\.f64|call float @llvm\.(?:fma|fmuladd)\.f32"
+# Scalar FP op patterns in optimized IR (non-vector forms only). Allows fast-math flags between
+# the opcode/call and its type — see `_FMF` above; `@fastmath`/`@simd` scalar remainder/tail code
+# emits e.g. `fadd reassoc contract double`, which the unflagged form silently misses.
+const _SCALAR_FP_RE = Regex(
+    raw"(?:fadd|fmul|fsub|fdiv)" * _FMF * raw" double|" *
+        raw"(?:fadd|fmul|fsub|fdiv)" * _FMF * raw" float|" *
+        raw"call" * _FMF * raw" double @llvm\.(?:fma|fmuladd)\.f64|" *
+        raw"call" * _FMF * raw" float @llvm\.(?:fma|fmuladd)\.f32"
+)
 
 # Loop-carried FP accumulator: a `phi double`/`phi float` node indicates a loop with a
 # loop-carried FP variable. More portable than `!llvm.loop` (which LLVM emits inconsistently
@@ -424,14 +461,7 @@ macro assert_no_scalar_loops(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_no_scalar_loops needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_no_scalar_loops)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_no_scalar_loops; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -454,6 +484,19 @@ function Base.show(io::IO, r::KernelReport)
         print(
             io, "  integer vector ops : integer memory ops = ", r.int_ops, " : ", r.int_mem_ops,
             "  → integer intensity ", round(int_intensity; digits = 2), "\n"
+        )
+    end
+    # F38 — fast-math usage warning: `contract`/`reassoc`/`nnan`/`ninf`/`nsz`/`arcp`/`afn`/`fast`
+    # flags (from `@simd`/`@fastmath`) permit floating-point reassociation and NaN/Inf assumptions
+    # that can change numerical RESULTS, not just codegen. Counted into `fp_ops`/intensity above
+    # like any other FP work, but called out on its own line since it's a numerics-risk signal, not
+    # a tuning tip.
+    if r.fastmath_ops > 0
+        printstyled(io, "  ⚠ fast-math ops: $(r.fastmath_ops)"; color = :red, bold = true)
+        print(
+            io, " — this kernel uses `@simd`/`@fastmath`-relaxed floating-point (reassociation, ",
+            "NaN/Inf assumptions). Results may differ from strict IEEE 754 evaluation order; verify ",
+            "against a non-fast-math reference if bit-for-bit reproducibility matters.\n"
         )
     end
     b = _kr_bound(r)

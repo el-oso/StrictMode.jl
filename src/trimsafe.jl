@@ -38,14 +38,7 @@ macro assert_trim_safe(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_trim_safe needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_trim_safe)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_trim_safe; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -66,10 +59,12 @@ function _assert_trim_compatible(target, @nospecialize(f), @nospecialize(types::
     passed, findings, authoritative = _trim_compatible_check(f, types)
     passed || _fail(
         :trim_compatible, target,
-        (authoritative ?
-            "trim-incompatible — juliac --trim=safe verifier rejected $(length(findings)) site(s):\n  " :
-            "likely trim-incompatible ($(length(findings)) site(s); static heuristic — add TrimCheck and " *
-                "run in :full for the authoritative juliac verifier):\n  ") *
+        (
+            authoritative ?
+                "trim-incompatible — juliac --trim=safe verifier rejected $(length(findings)) site(s):\n  " :
+                "likely trim-incompatible ($(length(findings)) site(s); static heuristic — add TrimCheck and " *
+                "run in :full for the authoritative juliac verifier):\n  "
+        ) *
             join(findings, "\n  ")
     )
     return nothing
@@ -95,14 +90,7 @@ macro assert_trim_compatible(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_trim_compatible needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_trim_compatible)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_trim_compatible; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 

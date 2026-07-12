@@ -190,33 +190,16 @@ audit(MyPkg; static_ownership_suggest = true)
 function static_ownership_suggestions(@nospecialize(f), @nospecialize(types::Tuple))
     md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
     finding = _static_ownership_finding(f, types, md, fn, sg)
-    finding.status === :info ? StrictFinding[finding] : StrictFinding[]
+    return finding.status === :info ? StrictFinding[finding] : StrictFinding[]
 end
 
 function static_ownership_suggestions(mod::Module; only = nothing, exempt = ())
-    exemptpred = _name_matcher(exempt)
-    onlypred = _name_matcher(only)
     out = StrictFinding[]
-    for nm in names(mod; all = true)
-        isdefined(mod, nm) || continue
-        f = getfield(mod, nm)
-        (f isa Function && parentmodule(f) === mod) || continue
-        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
-        onlypred === nothing || onlypred(f) || continue
-        for mth in methods(f)
-            for mi in _specializations(mth)
-                tt = try
-                    Tuple((mi.specTypes::DataType).parameters[2:end])
-                catch
-                    continue
-                end
-                Base.isdispatchtuple(Tuple{tt...}) || continue
-                try
-                    append!(out, static_ownership_suggestions(f, tt))
-                catch err
-                    err isa StrictViolation && rethrow()
-                end
-            end
+    _module_specializations(mod; only, exempt) do f, tt
+        try
+            append!(out, static_ownership_suggestions(f, tt))
+        catch err
+            err isa StrictViolation && rethrow()
         end
     end
     return out

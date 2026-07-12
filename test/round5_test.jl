@@ -27,6 +27,42 @@
     @test occursin("intensity", sprint(show, rm))       # the report renders the diagnostic
 end
 
+@testitem "kernel_report counts fast-math-flagged FP ops (F38)" begin
+    using StrictMode
+    # `@inbounds @simd` grants the compiler reassociation permission, which LLVM records as
+    # fast-math flags between the opcode and its type (`fmul contract <8 x double>`,
+    # `fadd reassoc contract <8 x double>`). A regex anchored on opcode-immediately-followed-by-type
+    # silently counts 0 FP ops here, misclassifying this compute/balanced kernel as memory-bound.
+    function simd_dot(a::Vector{Float64}, b::Vector{Float64})
+        s = 0.0
+        @inbounds @simd for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end
+        return s
+    end
+    r = kernel_report(simd_dot, (Vector{Float64}, Vector{Float64}))
+    @test r.vectorized
+    @test r.fp_ops > 0
+    @test StrictMode._kr_bound(r) !== :memory
+
+    # Fast-math changes FP semantics (reassociation, NaN/Inf assumptions), not just codegen — this
+    # must surface as an explicit warning, not just be silently folded into fp_ops.
+    @test r.fastmath_ops > 0
+    @test occursin("fast-math", sprint(show, r))
+
+    # A plain (non-@simd) scalar loop carries no fast-math flags — no false positive on the warning.
+    function plain_dot(a::Vector{Float64}, b::Vector{Float64})
+        s = 0.0
+        for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end
+        return s
+    end
+    r_plain = kernel_report(plain_dot, (Vector{Float64}, Vector{Float64}))
+    @test r_plain.fastmath_ops == 0
+    @test !occursin("fast-math", sprint(show, r_plain))
+end
+
 @testitem "@assert_vectorized names non-inlined callees (F11)" begin
     using StrictMode
     @noinline leaf!(y, x) = (
@@ -80,24 +116,26 @@ end
 
     # F13 masking: a plain non-power-of-2 loop lets LLVM emit masked remainder ops
     scalar_loop!(y::Vector{Float64}, x::Vector{Float64}) = (
-        @inbounds for i in eachindex(y); y[i] = x[i] * 2.0; end; y
+        @inbounds for i in eachindex(y)
+            y[i] = x[i] * 2.0
+        end; y
     )
 
-    rm  = kernel_report(mem!,  (Vector{Float64}, Vector{Float64}))
-    rc  = kernel_report(comp!, (Vector{Float64}, Vector{Float64}))
+    rm = kernel_report(mem!, (Vector{Float64}, Vector{Float64}))
+    rc = kernel_report(comp!, (Vector{Float64}, Vector{Float64}))
     rsl = kernel_report(scalar_loop!, (Vector{Float64}, Vector{Float64}))
 
     # F13 struct fields exist and are integers
-    @test rm.unaligned_mem_ops  isa Int
-    @test rm.masked_mem_ops     isa Int
-    @test rc.unaligned_mem_ops  isa Int
-    @test rc.masked_mem_ops     isa Int
+    @test rm.unaligned_mem_ops isa Int
+    @test rm.masked_mem_ops isa Int
+    @test rc.unaligned_mem_ops isa Int
+    @test rc.masked_mem_ops isa Int
 
     # F14: working_set_bytes stored correctly
-    r_l1   = kernel_report(mem!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 1024)
-    r_dram = kernel_report(comp!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 32*1024*1024)
-    @test r_l1.working_set_bytes   == 1024
-    @test r_dram.working_set_bytes == 32*1024*1024
+    r_l1 = kernel_report(mem!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 1024)
+    r_dram = kernel_report(comp!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 32 * 1024 * 1024)
+    @test r_l1.working_set_bytes == 1024
+    @test r_dram.working_set_bytes == 32 * 1024 * 1024
 
     # F14: L1-resident shows "acceptable" note
     s_l1 = sprint(show, r_l1)
@@ -110,7 +148,7 @@ end
     @test occursin("packing", s_dram)
 
     # F15: large working set + memory-bound → cache-blocking note (not packing)
-    r_mem_large = kernel_report(mem!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 32*1024*1024)
+    r_mem_large = kernel_report(mem!, (Vector{Float64}, Vector{Float64}); working_set_bytes = 32 * 1024 * 1024)
     s_mem_large = sprint(show, r_mem_large)
     @test occursin("cache-blocking", s_mem_large) || occursin("tiling", s_mem_large)
 

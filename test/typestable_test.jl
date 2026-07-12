@@ -23,6 +23,23 @@ end
     @test_throws StrictViolation StrictMode._typestable_fast("t", pick, (typeof(heterogeneous), Int))
 end
 
+@testitem "_typestable_fast also catches internal dynamic dispatch behind a concrete return (F38)" begin
+    using StrictMode
+    # A concrete return can hide runtime dispatch: `c.f` is `::Function` (abstract), so `c.f(1)`
+    # dynamically dispatches even though the `::Int` annotation makes the overall return concrete.
+    # findings(...; mode=:fast) already caught this via the IR boxing signal (check.jl's
+    # _findings_fast); _typestable_fast (the macro's :fast path) had been missing it.
+    struct CB38
+        f::Function
+    end
+    callit(c::CB38) = (c.f(1))::Int
+    @test_throws StrictViolation StrictMode._typestable_fast("callit", callit, (CB38,))
+
+    # A genuinely stable call with no internal dispatch still passes.
+    stable(x) = 2x + 1
+    @test StrictMode._typestable_fast("stable", stable, (Float64,)) === nothing
+end
+
 @testitem "@assert_typestable accepts keyword arguments (issue #4)" begin
     using StrictMode
     scaled(x; scale = 2) = x .* scale

@@ -246,6 +246,34 @@ function _name_matcher(spec)
     return f -> _demangle(nameof(f)) in set
 end
 
+# Shared module-sweep core: every `(f, tt)` pair — a concrete dispatch-tuple specialization `mod`
+# has actually compiled — across its own functions matching `only`/`exempt`. `check_compiled`,
+# `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
+# this is the one place that does it, so scoping/filtering bugs get fixed once.
+function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
+    exemptpred = _name_matcher(exempt)
+    onlypred = _name_matcher(only)
+    for nm in names(mod; all = true)
+        isdefined(mod, nm) || continue
+        f = getfield(mod, nm)
+        (f isa Function && parentmodule(f) === mod) || continue
+        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
+        onlypred === nothing || onlypred(f) || continue
+        for mth in methods(f)
+            for mi in _specializations(mth)
+                tt = try
+                    Tuple((mi.specTypes::DataType).parameters[2:end])
+                catch
+                    continue
+                end
+                Base.isdispatchtuple(Tuple{tt...}) || continue
+                f!(f, tt)
+            end
+        end
+    end
+    return nothing
+end
+
 """
     check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none,
                    only = nothing, exempt = ()) -> Vector{StrictFinding}
@@ -273,26 +301,9 @@ function check_compiled(
         mode::Symbol = analysis_mode(),
         parallel::Bool = _default_parallel(mode),
     )
-    exemptpred = _name_matcher(exempt)
-    onlypred = _name_matcher(only)
     items = Any[]
-    for nm in names(mod; all = true)
-        isdefined(mod, nm) || continue
-        f = getfield(mod, nm)
-        (f isa Function && parentmodule(f) === mod) || continue
-        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue   # @strict_exempt + the kwarg
-        onlypred === nothing || onlypred(f) || continue
-        for mth in methods(f)
-            for mi in _specializations(mth)
-                tt = try
-                    Tuple((mi.specTypes::DataType).parameters[2:end])
-                catch
-                    continue
-                end
-                Base.isdispatchtuple(Tuple{tt...}) || continue
-                push!(items, (f, tt, guarantees))
-            end
-        end
+    _module_specializations(mod; only, exempt) do f, tt
+        push!(items, (f, tt, guarantees))
     end
     if isempty(items)
         @warn "check_compiled: no compiled method specializations matched in `$(nameof(mod))` " *

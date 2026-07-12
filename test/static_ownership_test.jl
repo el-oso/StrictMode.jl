@@ -110,13 +110,13 @@ end
     # `check_compiled`'s sweep recognizing a `::Type{T}` argument as a valid dispatch tuple (F37);
     # `isconcretetype(Type{Float64}) == false` used to make every such method invisible here.
     module StaticOwnershipDemo
-        struct Ws{T} end
-        const WS_F64 = Ws{Float64}()
-        const WS_F32 = Ws{Float32}()
-        const WS_FALLBACK = IdDict{Type, Any}()
-        get_ws(::Type{Float64}) = WS_F64
-        get_ws(::Type{Float32}) = WS_F32
-        get_ws(::Type{T}) where {T} = get!(() -> Ws{T}(), WS_FALLBACK, T)
+    struct Ws{T} end
+    const WS_F64 = Ws{Float64}()
+    const WS_F32 = Ws{Float32}()
+    const WS_FALLBACK = IdDict{Type, Any}()
+    get_ws(::Type{Float64}) = WS_F64
+    get_ws(::Type{Float32}) = WS_F32
+    get_ws(::Type{T}) where {T} = get!(() -> Ws{T}(), WS_FALLBACK, T)
     end
 
     StaticOwnershipDemo.get_ws(Float64)                # hot path: dispatch, no lookup

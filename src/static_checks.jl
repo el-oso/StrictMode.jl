@@ -20,10 +20,18 @@ end
 # empirical path.
 @inline _allocated(thunk::F) where {F} = @allocated thunk()
 
+# Resolve @assert_noalloc's (and @strict's/@kernel's) check strategy. `static_opt` is the parsed
+# `static=` keyword value, or `nothing` if not given. An explicit value always wins: `true` forces
+# AllocCheck's static proof, `false` forces the empirical `@allocated` path. With no override, the
+# default is AllocCheck in `:full` analysis and the value-free `_alloc_signals` heuristic in
+# `:fast` — not `@allocated`, which is value-dependent and reserved for the explicit opt-out.
+_noalloc_mode(static_opt::Union{Nothing, Bool}) =
+    static_opt === nothing ? (ANALYSIS_MODE === :full ? :static : :heuristic) :
+    static_opt ? :static : :empirical
 
-function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; static::Bool) where {F}
+function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; mode::Symbol) where {F}
     val = thunk()                 # warm up / force compilation, and capture the call's value
-    if static
+    if mode === :static
         _require_backend()
         try
             results = _be_check_allocs(f, types)
@@ -35,7 +43,21 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
             err isa StrictViolation && rethrow()
             # Static analysis could not run on this call; fall through to the empirical path.
         end
+    elseif mode === :heuristic
+        # F38 — the :fast default (no explicit `static=`). A value-free IR scan (`_alloc_signals`,
+        # the same engine `findings(...; mode=:fast)` uses), not the value-dependent `@allocated`
+        # measurement below: matches what `analysis_mode`'s docstring already promises for the
+        # batch API ("quick triage, no execution"), which this macro's `:fast` path had been
+        # silently missing — it always fell straight to `@allocated`, an empirical measurement of
+        # THIS call's inputs, not a signature-level verdict.
+        sig = _alloc_signals(f, types)
+        if sig.alloc || sig.boxing || sig.abscontainer !== nothing
+            _fail(:noalloc, target, _box_msg("allocates / boxes (fast heuristic)", sig))
+        end
+        return val
     end
+    # mode === :empirical (explicit `static=false`), or :static's fallback when AllocCheck
+    # could not analyze this call.
     n = _allocated(thunk)         # measure the steady-state call (gc_num delta)
     if n > 0
         # `@allocated` is the `gc_num().allocd` delta, which can be **nonzero with no real allocation** — a
@@ -82,9 +104,12 @@ Fail unless the call `f(args...)` is allocation-free.
 In the default `:full` [`analysis_mode`](@ref), StrictMode hands the call to
 [AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) and asks it to prove the call cannot
 allocate. If the proof turns up any allocation site, dynamic dispatch and boxing included, the
-guarantee fails and lists them. When static analysis can't run, it falls back to measuring with
-`@allocated` after a warmup call, and in `:fast` mode that empirical path is the default. Pass
-`static = true`/`false` to force one path regardless of mode.
+guarantee fails and lists them. In `:fast` mode, the default is the same value-free IR heuristic
+`findings(...; mode=:fast)` uses (`StrictMode._alloc_signals` — no execution beyond the one
+warmup call every path needs to produce the return value). Pass `static = false` to force the
+empirical `@allocated`-after-warmup path instead (useful when the heuristic can't reason about a
+construct, or per E3, when a non-`const` global's binding boxing is the actual culprit); `static =
+true` forces the AllocCheck proof regardless of mode.
 
 Each argument is evaluated exactly once. With checks disabled (the production default) this expands
 to the bare call, with no overhead left behind.
@@ -101,10 +126,11 @@ functions where `typeof.(args)` would not name the real call-site specialization
 ```
 """
 macro assert_noalloc(args...)
-    # Default to AllocCheck's static proof in :full analysis, the empirical @allocated path in
-    # :fast; an explicit `static = …` always wins.
+    # Default to AllocCheck's static proof in :full analysis, the value-free _alloc_signals
+    # heuristic in :fast; an explicit `static = …` always wins (`false` forces the empirical
+    # @allocated path — see `_noalloc_mode`).
     pos, opts = _macro_call(args, (:static, :types))
-    static = haskey(opts, :static) ? opts[:static]::Bool : ANALYSIS_MODE === :full
+    mode = _noalloc_mode(haskey(opts, :static) ? opts[:static]::Bool : nothing)
     isempty(pos) && throw(ArgumentError("@assert_noalloc needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -112,7 +138,7 @@ macro assert_noalloc(args...)
 
     checked = quote
         $(p.binds...)
-        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); static = $static)
+        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); mode = $(QuoteNode(mode)))
     end
     return _gate(checked, esc(call))
 end
@@ -158,15 +184,7 @@ macro assert_noboxing(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_noboxing needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_noboxing)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_noboxing; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -175,7 +193,7 @@ end
 # runtime `AbstractDict` accessor reached on the hot path, following non-inlined callees (the
 # lookup usually lives in a workspace accessor, not the top function). No backend, no timing.
 
-function _assert_owned(target, @nospecialize(f), @nospecialize(types::Tuple); depth::Int = 2)
+function _assert_owned(target, @nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     sig = _alloc_signals(f, types; depth = depth)
     if sig.dictlookup
         _fail(
@@ -204,8 +222,9 @@ type-stable, non-allocating on the warm hit, and trim-tolerated, so it passes `@
 `@assert_noalloc`, and `@assert_noboxing` — only a benchmark (or this lint) exposes it.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
-the bare call. Pass `depth = n` (default 2) to control how many non-inlined callee levels are
-walked.
+the bare call. Pass `depth = n` to control how many non-inlined callee levels are walked; defaults
+to `StrictMode._FAST_ALLOC_DEPTH[]` (2), the same session-wide override `@assert_noalloc` and the
+batch API honor.
 
 ```julia
 @assert_owned symm!(C, A, B)            # ok: every type has a const-dispatched scratch accessor
@@ -217,13 +236,16 @@ macro assert_owned(args...)
     isempty(pos) && throw(ArgumentError("@assert_owned needs a call expression"))
     call = pos[1]
     target = string(call)
-    depth = haskey(opts, :depth) ? opts[:depth]::Int : 2
+    # Unescaped (hygienic) reference when no depth= is given, so it resolves to this module's
+    # `_FAST_ALLOC_DEPTH` and reads its *current* value at each call — not a value frozen at
+    # macro-expansion time, matching `_alloc_signals`'s own `depth::Int = _FAST_ALLOC_DEPTH[]` default.
+    depth_expr = haskey(opts, :depth) ? esc(opts[:depth]) : :(_FAST_ALLOC_DEPTH[])
     p = _call_parts(call; types = get(opts, :types, nothing))
 
     checked = quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(_assert_owned)($target, $(p.checkfn), $(p.types); depth = $depth)
+        $(_assert_owned)($target, $(p.checkfn), $(p.types); depth = $depth_expr)
         _val
     end
     return _gate(checked, esc(call))

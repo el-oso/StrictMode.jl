@@ -65,7 +65,7 @@ end
 # per-type accessor, never a runtime dictionary probe (measured ~130 ns/call, type-stable and
 # non-allocating on the warm hit, so it slips past every value-based check). Same category as
 # boxing: read from optimized IR, no timing.
-const _DICT_ACCESSORS = (:get, :getindex, :get!, :setindex!, :haskey, :pop!)
+const _DICT_ACCESSORS = (:get, :getindex, :get!, :setindex!, :haskey, :pop!, :delete!, :getkey)
 
 # A resolved `:invoke` whose callee is a dict accessor on an `AbstractDict` receiver. `specTypes`
 # is `Tuple{typeof(get), <dict>, key, …}` — parameters[2] is the receiver.
@@ -207,7 +207,15 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
             nt = st.args[1]
-            (nt isa Type && (ismutabletype(nt) || nt <: Array || nt <: Memory || nt === Core.Box)) && (alloc = true)
+            # F38 — any non-isbits `:new` is a real heap allocation, not just mutable/Array/Memory/
+            # Box: an escaping *immutable* wrapper (e.g. `Some{Any}(x)`, a Tuple of heap refs) heap-
+            # allocates too. `!isbitstype` subsumes the old mutable/Array/Memory/Box checks (none of
+            # those are ever isbits) and additionally catches the immutable case AllocCheck sees but
+            # the old rule missed. Corpus-measured (PureFFT+BlazingPorts, 569 specializations): fixed
+            # 2 false negatives, net 1 new false positive on `Base.CodeUnits{UInt8,String}`-style
+            # non-escaping stdlib wrappers (no escape analysis here to tell those apart) — an
+            # acceptable tradeoff since over-flagging is the safe direction for an alloc guarantee.
+            (nt isa Type && !Base.isbitstype(nt)) && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
             # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
             # with an abstract recorded result (mutating helpers with an unused return are typed

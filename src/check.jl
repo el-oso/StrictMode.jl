@@ -41,7 +41,30 @@ _mkfinding(md, fn, sg, g, fail::Bool, reason, file, line) = StrictFinding(
     md, fn, sg, g, fail ? :fail : :pass, file, line, fail ? reason : "", fail ? _suggestion(g) : ""
 )
 
+# Guarantees with a single, backend-independent computation — identical in :fast and :full, so
+# both `_build_finding` (:full) and `_findings_fast` (:fast) delegate here instead of each keeping
+# its own copy. Returns `nothing` for any other guarantee (the caller then applies its own,
+# mode-specific logic for :typestable/:noalloc/:noboxing/:trim_compatible).
+function _mode_independent_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
+    if g === :owned
+        s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
+        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line)
+    elseif g === :inlined
+        fail = _inlined_survives(f, types) === true
+        return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
+    elseif g === :vectorized
+        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
+    elseif g === :no_scalar_loops
+        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
+    elseif g === :trimsafe
+        return _trimsafe_finding(f, types, md, fn, sg)
+    end
+    return nothing
+end
+
 function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), rep, md, fn, sg)
+    shared = _mode_independent_finding(g, f, types, md, fn, sg)
+    shared === nothing || return shared
     if g === :typestable
         fail = would_fail_typestable(rep)
         return _mkfinding(md, fn, sg, g, fail, "return type $(rep.return_type) is not concrete / internal instability", "", 0)
@@ -54,19 +77,6 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
         fail = would_fail_noboxing(rep)
         file, line = _first_loc(rep.allocs, true)
         return _mkfinding(md, fn, sg, g, fail, "boxing / dynamic dispatch", file, line)
-    elseif g === :owned
-        # IR-only lint (no backend equivalent), identical in :fast and :full.
-        s = _alloc_signals(f, types; depth = 2)
-        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line)
-    elseif g === :inlined
-        fail = _inlined_survives(f, types) === true
-        return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
-    elseif g === :vectorized
-        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
-    elseif g === :no_scalar_loops
-        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
-    elseif g === :trimsafe
-        return _trimsafe_finding(f, types, md, fn, sg)
     elseif g === :trim_compatible
         return _trim_compatible_finding(f, types, md, fn, sg, :full)
     end
@@ -173,7 +183,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         _alloc_signals(f, types) : nothing
     out = StrictFinding[]
     for g in guarantees
-        if g === :typestable
+        shared = _mode_independent_finding(g, f, types, md, fn, sg)
+        if shared !== nothing
+            push!(out, shared)
+        elseif g === :typestable
             rts = Base.return_types(f, Tuple{types...})
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch (JET's :full finding); the IR
@@ -188,18 +201,6 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :noboxing
             fail = sig.boxing || sig.abscontainer !== nothing
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig), sig.file, sig.line))
-        elseif g === :owned
-            s = _alloc_signals(f, types; depth = 2)
-            push!(out, _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line))
-        elseif g === :inlined
-            fail = _inlined_survives(f, types) === true
-            push!(out, _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0))
-        elseif g === :vectorized
-            push!(out, _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0))
-        elseif g === :no_scalar_loops
-            push!(out, _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort)", "", 0))
-        elseif g === :trimsafe
-            push!(out, _trimsafe_finding(f, types, md, fn, sg))
         elseif g === :trim_compatible
             push!(out, _trim_compatible_finding(f, types, md, fn, sg, :fast))
         else

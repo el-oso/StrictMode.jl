@@ -8,15 +8,9 @@
 # builds, since it checks correctness, not performance.
 
 # --- type support -------------------------------------------------------------------------------
-
-# Supported concrete real element types for golden storage.
-const _GOLDEN_REAL = Union{Float32, Float64}
-# Supported result types: Real scalar, real array, complex array.
-const _GOLDEN_SUPPORTED = Union{
-    Real,
-    AbstractArray{<:Real},
-    AbstractArray{<:Complex{<:Real}},
-}
+#
+# Supported result types (enforced ad-hoc by `_golden_tag`'s `isa` chain, not a declared Union):
+# Real scalar, AbstractArray{<:Real}, AbstractArray{<:Complex{<:Real}}.
 
 # Tag byte written at the start of every golden file (guards against type/shape mismatch).
 const _GOLDEN_MAGIC = UInt8(0xAB)   # arbitrary sentinel
@@ -24,7 +18,9 @@ const _TAG_F32 = UInt8(1)
 const _TAG_F64 = UInt8(2)
 const _TAG_CF32 = UInt8(3)
 const _TAG_CF64 = UInt8(4)
-const _TAG_SCALAR_F32 = UInt8(5)
+# 5 was _TAG_SCALAR_F32, dropped as dead code (every Real scalar is stored as Float64 — see
+# `_golden_tag`). Left unassigned rather than renumbered: these tags are a persisted file format,
+# and existing golden files on disk already have `6` for _TAG_SCALAR_F64 written into them.
 const _TAG_SCALAR_F64 = UInt8(6)
 
 function _golden_tag(@nospecialize(x))
@@ -107,51 +103,63 @@ function _compare_golden(name::String, @nospecialize(result), path::String, ulps
     rtag == 0 && error("@golden: unsupported result type $(typeof(result))")
 
     gtag, gdata = _read_golden(path)
-    rtag == gtag || throw(StrictViolation(
-        :golden, name,
-        "type mismatch: golden has tag $gtag, result has tag $rtag. " *
-        "Delete the golden file to re-record: $path"
-    ))
+    rtag == gtag || throw(
+        StrictViolation(
+            :golden, name,
+            "type mismatch: golden has tag $gtag, result has tag $rtag. " *
+                "Delete the golden file to re-record: $path"
+        )
+    )
 
     if rval isa Float64 && gdata isa Float64
         # Scalar case
         if ulps == 0
-            rval === gdata || throw(StrictViolation(
-                :golden, name,
-                "exact mismatch: expected $gdata, got $rval (ULP distance: $(_ulp_dist(rval, gdata))). " *
-                "Use `ulps=N` for tolerance or delete the golden to re-record."
-            ))
+            rval === gdata || throw(
+                StrictViolation(
+                    :golden, name,
+                    "exact mismatch: expected $gdata, got $rval (ULP distance: $(_ulp_dist(rval, gdata))). " *
+                        "Use `ulps=N` for tolerance or delete the golden to re-record."
+                )
+            )
         else
             d = _ulp_dist(rval, gdata)
-            d <= ulps || throw(StrictViolation(
-                :golden, name,
-                "ULP mismatch: expected $gdata, got $rval ($d ULPs, tolerance $ulps)."
-            ))
+            d <= ulps || throw(
+                StrictViolation(
+                    :golden, name,
+                    "ULP mismatch: expected $gdata, got $rval ($d ULPs, tolerance $ulps)."
+                )
+            )
         end
         return
     end
 
     # Array case
-    length(rval) == length(gdata) || throw(StrictViolation(
-        :golden, name,
-        "length mismatch: golden has $(length(gdata)) elements, result has $(length(rval)). " *
-        "Delete the golden file to re-record: $path"
-    ))
+    length(rval) == length(gdata) || throw(
+        StrictViolation(
+            :golden, name,
+            "length mismatch: golden has $(length(gdata)) elements, result has $(length(rval)). " *
+                "Delete the golden file to re-record: $path"
+        )
+    )
     for i in eachindex(rval, gdata)
         a, b = rval[i], gdata[i]
         if ulps == 0
-            a === b || throw(StrictViolation(
-                :golden, name,
-                "exact mismatch at index $i: expected $b, got $a " *
-                "(ULP distance: $(_ulp_dist(a, b))). " *
-                "Use `ulps=N` for tolerance or delete the golden to re-record."
-            ))
+            a === b || throw(
+                StrictViolation(
+                    :golden, name,
+                    "exact mismatch at index $i: expected $b, got $a " *
+                        "(ULP distance: $(_ulp_dist(a, b))). " *
+                        "Use `ulps=N` for tolerance or delete the golden to re-record."
+                )
+            )
         else
             d = _ulp_dist(a, b)
-            d <= ulps || throw(StrictViolation(
-                :golden, name,
-                "ULP mismatch at index $i: expected $b, got $a ($d ULPs, tolerance $ulps)."
-            ))
+            d <= ulps || throw(
+                StrictViolation(
+                    :golden, name,
+                    "ULP mismatch at index $i: expected $b, got $a ($d ULPs, tolerance $ulps)."
+                )
+            )
         end
     end
     return
@@ -241,18 +249,20 @@ macro golden(name, expr, kwargs...)
 
     return quote
         let _golden_name = $(name_esc),
-            _golden_dir  = $(dir_code),
-            _golden_ulps = $(ulps_esc),
-            _golden_path = joinpath(_golden_dir, string(_golden_name) * ".golden"),
-            _golden_result = $(expr_esc)
+                _golden_dir = $(dir_code),
+                _golden_ulps = $(ulps_esc),
+                _golden_path = joinpath(_golden_dir, string(_golden_name) * ".golden"),
+                _golden_result = $(expr_esc)
 
             if $(validator_esc) !== nothing
                 # Semantic invariant path: call validator(result) instead of byte comparison.
                 # No golden file is written or read — the invariant IS the oracle.
-                $(validator_esc)(_golden_result) || throw(StrictViolation(
-                    :golden, string(_golden_name),
-                    "semantic invariant failed for \"$_golden_name\": validator returned false."
-                ))
+                $(validator_esc)(_golden_result) || throw(
+                    StrictViolation(
+                        :golden, string(_golden_name),
+                        "semantic invariant failed for \"$_golden_name\": validator returned false."
+                    )
+                )
             else
                 if !isfile(_golden_path) || get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1"
                     mkpath(_golden_dir)

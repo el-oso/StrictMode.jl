@@ -100,6 +100,13 @@ instead of one).
 attribute. LLVM conservatively assumes two pointers may alias, which can limit vectorization across
 iterations. Add `@simd ivdep` to assert no loop-carried dependencies.
 
+**Fast-math ops** (`fastmath_ops`): FP arithmetic carrying LLVM fast-math flags (`contract`,
+`reassoc`, `nnan`, `ninf`, `nsz`, `arcp`, `afn`, `fast`) — the result of `@simd`/`@fastmath`.
+These permit floating-point reassociation and NaN/Inf assumptions that can change numerical
+results, not just codegen, so `kernel_report`'s `show` prints a standing `⚠` warning whenever
+`fastmath_ops > 0` rather than silently folding them into `fp_ops`. Verify against a non-fast-math
+reference if bit-for-bit reproducibility matters.
+
 ## Register saturation: `register_report`
 
 Even with good arithmetic intensity, a kernel can stall if it uses more vector registers than the

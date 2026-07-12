@@ -67,15 +67,7 @@ macro assert_inlined(args...)
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_inlined needs a call expression"))
     call = pos[1]
-    target = string(call)
-    p = _call_parts(call; types = get(opts, :types, nothing))
-
-    checked = quote
-        $(p.binds...)
-        local _val = $(p.litcall)
-        $(_assert_inlined)($target, $(p.checkfn), $(p.types))
-        _val
-    end
+    checked = _guarantee_expr(call, _assert_inlined; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 
@@ -221,29 +213,12 @@ function inline_suggestions(
         mod::Module;
         only = nothing, exempt = (), include_base::Bool = false, only_flagged::Bool = true,
     )
-    exemptpred = _name_matcher(exempt)
-    onlypred = _name_matcher(only)
     out = StrictFinding[]
-    for nm in names(mod; all = true)
-        isdefined(mod, nm) || continue
-        f = getfield(mod, nm)
-        (f isa Function && parentmodule(f) === mod) || continue
-        (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
-        onlypred === nothing || onlypred(f) || continue
-        for mth in methods(f)
-            for mi in _specializations(mth)
-                tt = try
-                    Tuple((mi.specTypes::DataType).parameters[2:end])
-                catch
-                    continue
-                end
-                Base.isdispatchtuple(Tuple{tt...}) || continue
-                try
-                    append!(out, inline_suggestions(f, tt; include_base, only_flagged))
-                catch err
-                    err isa StrictViolation && rethrow()
-                end
-            end
+    _module_specializations(mod; only, exempt) do f, tt
+        try
+            append!(out, inline_suggestions(f, tt; include_base, only_flagged))
+        catch err
+            err isa StrictViolation && rethrow()
         end
     end
     return out

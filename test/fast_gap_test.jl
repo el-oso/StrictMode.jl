@@ -72,8 +72,12 @@ end
     # body genuinely dispatching dynamically, one level down — the caller's own body is clean.
     using StrictMode
     abstract type Shape end
-    struct Circ <: Shape; r::Float64; end
-    struct Sq <: Shape; s::Float64; end
+    struct Circ <: Shape
+        r::Float64
+    end
+    struct Sq <: Shape
+        s::Float64
+    end
     area(c::Circ) = 3.14 * c.r^2
     area(s::Sq) = s.s^2
     @noinline dispatch_sum(v::Vector{Shape}) = sum(a -> area(a), v)

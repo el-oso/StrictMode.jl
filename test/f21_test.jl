@@ -10,7 +10,11 @@
 
     # non-isbits union still fails
     unstable(x::Int) = x > 0 ? x : "nope"
-    err = try; @assert_typestable(unstable(1)); nothing; catch e; e; end
+    err = try
+        @assert_typestable(unstable(1)); nothing
+    catch e
+        e
+    end
     @test err isa StrictViolation
 
     # batch path: isbits union → :pass

@@ -54,6 +54,20 @@ Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compat
 explain_trim
 ```
 
+## Concurrency safety
+
+`@assert_concurrency_safe` proves a function treats its plan/workspace argument as read-only (no
+write of, or through, it) — the precondition for sharing one plan object safely across concurrent
+tasks. `@assert_no_threadid_state` fails on mutable state indexed by `Threads.threadid()`, the
+task-migration hazard (a task can move threads mid-run, stranding state keyed on the thread it
+started on). `pool_balance_report` is the companion diagnostic for thread-pool balance questions.
+
+```@docs
+@assert_concurrency_safe
+@assert_no_threadid_state
+pool_balance_report
+```
+
 ## Testing
 
 Golden-file regression for numeric kernels: record exact or ULP-tolerant reference outputs and

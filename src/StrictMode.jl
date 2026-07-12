@@ -26,7 +26,7 @@ See the README and `docs/cookbook.md` for the trap → macro mapping.
 module StrictMode
 
 # AllocCheck and JET are loaded only by the StrictModeAnalysisExt extension (weak deps).
-using Preferences: Preferences, @load_preference, @set_preferences!, @has_preference
+using Preferences: Preferences, @load_preference, @set_preferences!
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 

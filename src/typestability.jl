@@ -6,12 +6,19 @@
 # Union{T,Nothing} and other small isbits unions don't box; treat as type-stable (F21).
 _is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(T)
 
-# Cheap return-type check: the inferred return type must be a single concrete type.
+# Cheap return-type check: the inferred return type must be a single concrete type. Also checks
+# the IR boxing signal (F38): a concrete return can hide internal runtime dispatch — the same
+# blind spot `_findings_fast`'s :typestable branch (check.jl) already closed for the batch API,
+# which this macro-level fast check had been missing.
 function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = Base.return_types(f, Tuple{types...})
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
         _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")
+        return nothing
+    end
+    if _alloc_signals(f, types).boxing
+        _fail(:typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)")
     end
     return nothing
 end
@@ -43,10 +50,11 @@ end
 Fail unless `f(args...)` is type stable.
 
 Both [`analysis_mode`](@ref)s check that the inferred return type is a single concrete type, using
-`Base.return_types`. On top of that, `:full` runs JET's optimization analysis to catch instability
-or runtime dispatch hiding inside the call, which is the part that needs the AllocCheck+JET backend.
-Each argument is evaluated once, the macro returns the call's value, and disabled builds expand to
-the bare call.
+`Base.return_types`, and additionally check the IR boxing signal (`StrictMode._alloc_signals`) for
+internal dynamic dispatch hiding behind a concrete return — the classic "the return type is fine
+but something inside dispatches at runtime" shape. On top of that, `:full` also runs JET's
+optimization analysis, which needs the AllocCheck+JET backend; `:fast` does not. Each argument is
+evaluated once, the macro returns the call's value, and disabled builds expand to the bare call.
 
 **Keyword arguments** are supported: `f(x; k=v)` is checked at its real specialization (the call is
 routed through `Core.kwcall`, so the keyword sorter's signature is what inference sees).

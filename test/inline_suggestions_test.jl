@@ -84,20 +84,22 @@ end
     using StrictMode
 
     module InlineDemo
-        @noinline leaf(x) = x * x + 1.0
-        function hot(v::Vector{Float64})
-            s = 0.0
-            for x in v
-                s += leaf(x)
-            end
-            return s
+    @noinline leaf(x) = x * x + 1.0
+    function hot(v::Vector{Float64})
+        s = 0.0
+        for x in v
+            s += leaf(x)
         end
+        return s
+    end
     end
 
     InlineDemo.hot([1.0, 2.0, 3.0])                  # warm a concrete specialization
 
-    fs = audit(InlineDemo; inline_suggest = true, format = :text, io = devnull,
-               only = r"hot|leaf")
+    fs = audit(
+        InlineDemo; inline_suggest = true, format = :text, io = devnull,
+        only = r"hot|leaf"
+    )
     @test any(x -> x.guarantee === :inline_suggestion && occursin("leaf", x.reason), fs)
     @test nfailures(fs) == 0                          # info findings never fail the audit
 end
