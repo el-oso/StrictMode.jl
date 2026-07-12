@@ -1,5 +1,29 @@
 # StrictMode.jl release notes
 
+## v0.3.6
+
+Additive, non-breaking. Dogfooding + readability audit: a fast-math visibility gap, two
+under-reported heuristic gaps, and a round of dead-code/duplication cleanup.
+
+- **`kernel_report` fast-math visibility.** Its vector-op regexes didn't account for LLVM
+  fast-math flags (`fmul contract <8 x double>` etc.), silently undercounting `fp_ops`/`mem_ops`
+  for any `@simd`/`@fastmath` kernel — and gave no indication the kernel relies on relaxed IEEE
+  semantics at all. `KernelReport` gains a `fastmath_ops` field, and `show` prints a standing `⚠`
+  warning whenever it's nonzero, rather than folding fast-math ops silently into the normal counts.
+- **`:owned` (GKH ownership) scan** now also flags `delete!`/`getkey`, not just
+  `get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!`.
+- **`:new`-allocation rule broadened.** The old rule (`mutable || Array || Memory || Box`) missed
+  escaping non-isbits *immutables* (e.g. `Some{Any}(x)`) — a real false negative found via a
+  569-specialization PureFFT+BlazingPorts corpus measurement (2 false negatives fixed; one
+  documented residual false positive on non-escaping stdlib wrappers like `Base.CodeUnits`,
+  accepted since over-flagging is the safe direction for an alloc guarantee).
+- **`@assert_owned`'s default depth** now reads `StrictMode._FAST_ALLOC_DEPTH[]` live, instead of
+  baking in a stale compile-time value.
+- **Cleanup**: removed dead code (`golden.jl`'s unused constants, an unused import), renamed a
+  duplicate `_scan_ci`, and merged three near-duplicated code paths (shared macro-call plumbing,
+  the mode-independent `findings` branches, and the module-specialization sweep loop used by
+  `check_compiled`/`static_ownership_suggestions`/`inline_suggestions`) that had started to drift.
+
 ## v0.3.5
 
 Additive, non-breaking. GKH ownership — a `const`-owner-per-type idiom for replacing runtime
