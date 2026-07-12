@@ -29,10 +29,32 @@ end
 
 @testitem "kernel_report counts fast-math-flagged FP ops (F38)" begin
     using StrictMode
+    # `@fastmath` rewrites `+`/`*`/… to their fast-math intrinsic variants unconditionally, so it
+    # flags scalar ops with LLVM fast-math flags regardless of whether the loop auto-vectorizes.
+    # `@simd` alone doesn't: its fast-math flags land only on ops the auto-vectorizer actually
+    # widens into `<N x …>`, which depends on the target CPU's SIMD width — this genuinely differs
+    # between a local AVX-capable machine and a CI runner (found via a real CI failure: `@simd`
+    # didn't vectorize on the runner, so `r.vectorized` was false). `@fastmath` is the portable way
+    # to exercise this signal; the `@simd` case below is checked best-effort, not asserted.
+    function fastmath_dot(a::Vector{Float64}, b::Vector{Float64})
+        s = 0.0
+        @fastmath @inbounds for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end
+        return s
+    end
+    r = kernel_report(fastmath_dot, (Vector{Float64}, Vector{Float64}))
+    # Fast-math changes FP semantics (reassociation, NaN/Inf assumptions), not just codegen — this
+    # must surface as an explicit warning, not just be silently folded into fp_ops. Must hold
+    # whether or not the kernel vectorized (a real bug fixed here: the warning used to be
+    # unreachable code in `show` whenever `!r.vectorized`).
+    @test r.fastmath_ops > 0
+    @test occursin("fast-math", sprint(show, r))
+
     # `@inbounds @simd` grants the compiler reassociation permission, which LLVM records as
-    # fast-math flags between the opcode and its type (`fmul contract <8 x double>`,
-    # `fadd reassoc contract <8 x double>`). A regex anchored on opcode-immediately-followed-by-type
-    # silently counts 0 FP ops here, misclassifying this compute/balanced kernel as memory-bound.
+    # fast-math flags between the opcode and its type on the ops it actually vectorizes (`fmul
+    # contract <8 x double>`). Best-effort: whether this loop widens into `<N x …>` ops (and so
+    # whether these flags appear at all) is target-CPU dependent, not a portability guarantee.
     function simd_dot(a::Vector{Float64}, b::Vector{Float64})
         s = 0.0
         @inbounds @simd for i in eachindex(a, b)
@@ -40,17 +62,13 @@ end
         end
         return s
     end
-    r = kernel_report(simd_dot, (Vector{Float64}, Vector{Float64}))
-    @test r.vectorized
-    @test r.fp_ops > 0
-    @test StrictMode._kr_bound(r) !== :memory
+    r_simd = kernel_report(simd_dot, (Vector{Float64}, Vector{Float64}))
+    if r_simd.vectorized
+        @test r_simd.fp_ops > 0
+        @test StrictMode._kr_bound(r_simd) !== :memory
+    end
 
-    # Fast-math changes FP semantics (reassociation, NaN/Inf assumptions), not just codegen — this
-    # must surface as an explicit warning, not just be silently folded into fp_ops.
-    @test r.fastmath_ops > 0
-    @test occursin("fast-math", sprint(show, r))
-
-    # A plain (non-@simd) scalar loop carries no fast-math flags — no false positive on the warning.
+    # A plain (no fastmath at all) scalar loop carries no fast-math flags — no false positive.
     function plain_dot(a::Vector{Float64}, b::Vector{Float64})
         s = 0.0
         for i in eachindex(a, b)

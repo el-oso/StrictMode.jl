@@ -465,12 +465,28 @@ macro assert_no_scalar_loops(args...)
     return _gate(checked, esc(call))
 end
 
+# F38 — fast-math usage warning: `contract`/`reassoc`/`nnan`/`ninf`/`nsz`/`arcp`/`afn`/`fast` flags
+# (from `@simd`/`@fastmath`) permit floating-point reassociation and NaN/Inf assumptions that can
+# change numerical RESULTS, not just codegen — a numerics-risk signal independent of vectorization
+# (`@fastmath` alone flags plain scalar ops), so it must print whether or not `r.vectorized`.
+function _print_fastmath_warning(io::IO, r::KernelReport)
+    r.fastmath_ops > 0 || return nothing
+    printstyled(io, "  ⚠ fast-math ops: $(r.fastmath_ops)"; color = :red, bold = true)
+    print(
+        io, " — this kernel uses `@simd`/`@fastmath`-relaxed floating-point (reassociation, ",
+        "NaN/Inf assumptions). Results may differ from strict IEEE 754 evaluation order; verify ",
+        "against a non-fast-math reference if bit-for-bit reproducibility matters.\n"
+    )
+    return nothing
+end
+
 function Base.show(io::IO, r::KernelReport)
     printstyled(io, "KernelReport"; bold = true)
     print(io, ": ", r.target, "\n")
     if !r.vectorized
         printstyled(io, "  not vectorized"; color = :red)
-        print(io, " — no `<N x …>` ops (see `@assert_vectorized`).")
+        print(io, " — no `<N x …>` ops (see `@assert_vectorized`).\n")
+        _print_fastmath_warning(io, r)
         return
     end
     printstyled(io, "  vectorized"; color = :green)
@@ -486,19 +502,7 @@ function Base.show(io::IO, r::KernelReport)
             "  → integer intensity ", round(int_intensity; digits = 2), "\n"
         )
     end
-    # F38 — fast-math usage warning: `contract`/`reassoc`/`nnan`/`ninf`/`nsz`/`arcp`/`afn`/`fast`
-    # flags (from `@simd`/`@fastmath`) permit floating-point reassociation and NaN/Inf assumptions
-    # that can change numerical RESULTS, not just codegen. Counted into `fp_ops`/intensity above
-    # like any other FP work, but called out on its own line since it's a numerics-risk signal, not
-    # a tuning tip.
-    if r.fastmath_ops > 0
-        printstyled(io, "  ⚠ fast-math ops: $(r.fastmath_ops)"; color = :red, bold = true)
-        print(
-            io, " — this kernel uses `@simd`/`@fastmath`-relaxed floating-point (reassociation, ",
-            "NaN/Inf assumptions). Results may differ from strict IEEE 754 evaluation order; verify ",
-            "against a non-fast-math reference if bit-for-bit reproducibility matters.\n"
-        )
-    end
+    _print_fastmath_warning(io, r)
     b = _kr_bound(r)
     if b === :memory
         printstyled(io, "  → memory-bound"; color = :yellow)

@@ -2,7 +2,9 @@
 
 ## v0.3.7
 
-Bugfix. Fixes a `:fast`-mode `@assert_typestable` false positive introduced in v0.3.6.
+Bugfix. Fixes a `:fast`-mode `@assert_typestable` false positive introduced in v0.3.6, and a
+CI-only failure caught just after: `kernel_report`'s fast-math warning was unreachable whenever
+the kernel didn't auto-vectorize.
 
 - **`:fast` typestable is now THIS-LEVEL (depth-0).** v0.3.6 added the IR boxing signal to the fast
   typestable check (F38), but reused the *full-depth* `_alloc_signals` — the same signal `noalloc`/
@@ -15,6 +17,18 @@ Bugfix. Fixes a `:fast`-mode `@assert_typestable` false positive introduced in v
   typestable boxing scan uses depth-0 (a direct dynamic `:call` — F38's `c.f(1)` — is still caught);
   `noalloc`/`noboxing` keep the full-depth signal (a callee's runtime alloc/dispatch IS a real cost).
   Regression test in `test/typestable_test.jl`.
+- **`kernel_report`'s fast-math warning is no longer gated on `vectorized`.** `Base.show`'s
+  `!r.vectorized` branch returned early, before ever reaching the `fastmath_ops` warning — so a
+  kernel with fast-math-flagged *scalar* ops (or one whose loop simply didn't widen into `<N x …>`
+  on a given CPU target) never printed the warning, even though `fastmath_ops` was computed
+  correctly. The warning print is now a shared helper (`_print_fastmath_warning`) called from both
+  branches of `show`.
+- **Regression test root cause**: the original F38 test exercised the fast-math signal only via
+  `@simd`, whose fast-math flags land solely on ops the auto-vectorizer actually widens —
+  target-CPU dependent, and the reason this passed locally but failed on CI's runner (a different
+  SIMD-width decision). The test now uses `@fastmath` for its hard assertions (flags scalar ops
+  unconditionally, portable across targets) and checks the `@simd`/vectorized case only when
+  vectorization actually occurred.
 
 ## v0.3.6
 
