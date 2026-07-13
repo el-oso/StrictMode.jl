@@ -214,6 +214,17 @@ end
 # Override for non-standard hardware: StrictMode._CACHE_BYTES[] = (l1=…, l2=…, l3=…)
 const _CACHE_BYTES = Ref((l1 = 32_768, l2 = 524_288, l3 = 16_777_216))
 
+# Robust ingest of a `CpuId.cachesize()` result. On CPUs CpuId doesn't recognize (brand-new models like
+# EPYC 9455/Zen5, or VMs/hypervisors that mask the deterministic-cache CPUID leaf) `cachesize()` returns
+# an EMPTY tuple `()`. The extension's __init__ must NOT blindly destructure it (`l1,l2,l3 = cachesize()`
+# → BoundsError, which crashes the whole ext load and takes `using CpuId`/downstream packages down with
+# it). Guard: keep the safe default unless we got ≥3 positive sizes. Returns whether it applied (for tests).
+function _set_cache_bytes!(cs)
+    (length(cs) >= 3 && cs[1] > 0 && cs[2] > 0) || return false
+    _CACHE_BYTES[] = (l1 = Int(cs[1]), l2 = Int(cs[2]), l3 = Int(cs[3]))
+    return true
+end
+
 # LLVM inserts fast-math flags (`fast`, `nnan`, `ninf`, `nsz`, `arcp`, `contract`, `afn`,
 # `reassoc`) between a floating-point opcode/call and its result type whenever
 # `@fastmath`/`@simd`-style reassociation is proven safe — e.g. `fmul contract <8 x double>`,
