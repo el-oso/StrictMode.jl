@@ -42,6 +42,9 @@ src/
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
   trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate)
+  memsafe.jl          — @assert_memsafe, memsafe_report/MemsafeReport, _guarded_array/GuardedBuffer
+                        (mmap/mprotect guard-page harness for deterministic OOB read/write detection;
+                        isolate=true runs the probe in a subprocess via Serialization + Base.run)
 ext/
   StrictModeAnalysisExt.jl  — AllocCheck + JET backend (weak dep, loaded on `using AllocCheck, JET`)
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
