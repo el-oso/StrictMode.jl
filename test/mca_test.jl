@@ -110,6 +110,34 @@ end
     @test isnan(r.block_rthroughput)
 end
 
+@testitem "_mca_bound_problems fails loudly (not silently) on an unparseable NaN metric" begin
+    using StrictMode
+    nan_report = StrictMode.McaReport(;
+        target = "f(Int)", mcpu = "generic", mcpu_fellback = false, whole_function = false
+    )
+    @test isnan(nan_report.ipc) && isnan(nan_report.block_rthroughput)   # McaReport's own NaN default
+
+    # An explicit bound against an unparseable metric must be reported as a problem, not silently
+    # pass just because `NaN > x`/`NaN < x` are both `false`.
+    probs1 = StrictMode._mca_bound_problems(nan_report, 10.0, nothing)
+    @test length(probs1) == 1 && occursin("could not be parsed", probs1[1])
+
+    probs2 = StrictMode._mca_bound_problems(nan_report, nothing, 2.0)
+    @test length(probs2) == 1 && occursin("could not be parsed", probs2[1])
+
+    # No bounds supplied at all: NaN metrics are fine (informational-only path).
+    @test isempty(StrictMode._mca_bound_problems(nan_report, nothing, nothing))
+
+    # A real, parseable report: bounds are enforced normally.
+    ok_report = StrictMode.McaReport(;
+        target = "f(Int)", mcpu = "generic", mcpu_fellback = false, whole_function = false,
+        ipc = 3.0, block_rthroughput = 1.5
+    )
+    @test isempty(StrictMode._mca_bound_problems(ok_report, 2.0, 1.0))     # within both bounds
+    @test !isempty(StrictMode._mca_bound_problems(ok_report, 1.0, nothing))  # exceeds max_rthroughput
+    @test !isempty(StrictMode._mca_bound_problems(ok_report, nothing, 5.0)) # below min_ipc
+end
+
 @testitem "mca_report/@assert_mca errors clearly without LLVM_full_jll loaded" begin
     using StrictMode
     if StrictMode.mca_available()

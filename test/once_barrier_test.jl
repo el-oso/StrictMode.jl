@@ -68,6 +68,25 @@ end
     @test sig.alloc
 end
 
+@testitem "a user function merely TAKING a once-guard as an argument is not itself a barrier" begin
+    using StrictMode, AllocCheck, JET
+    # `_mi_is_barrier` matches OncePerProcess/OncePerThread at parameter 2 because that's where
+    # Base's OWN cold-path init closure carries it (init_perprocesss(closure, once, state)) — but
+    # a USER function with that exact parameter shape (a once-guard as its own 2nd argument) is
+    # NOT that closure, and must not be silently treated as one: this function genuinely allocates
+    # on every call, real bug this test pins down (a prior version wrongly reported it clean via
+    # `mi.def.module` not being checked).
+    const _NPBP_ONCE = Base.OncePerProcess{Int}(() -> 1)
+    @noinline helper(o::Base.OncePerProcess{Int}, n::Int) = o() + length(Vector{Float64}(undef, n))
+    caller(n::Int) = helper(_NPBP_ONCE, n)
+
+    sig = StrictMode._alloc_signals(caller, (Int,))
+    @test sig.barrier         # the OncePerProcess call inside `caller` is still correctly recognized
+    @test sig.alloc           # but `helper`'s OWN allocation must NOT be hidden by that recognition
+
+    @test_throws StrictViolation (@assert_noalloc caller(4))
+end
+
 @testitem "a barrier call that ALSO reads an abstract-eltype container is not exempted (:full must not be laxer than :fast)" begin
     using StrictMode, AllocCheck, JET
     # Without also checking `abscontainer`, the exemption gate would pass :full while :fast's own
@@ -153,4 +172,25 @@ end
     )
     sig = StrictMode._alloc_signals(boxy, (Tuple{Int, Float64, Float32},))
     @test sig.boxing
+end
+
+@testitem "the barrier exemption is consistent across every :full noalloc entry point" begin
+    using StrictMode, AllocCheck, JET
+    # _checked_allocs was originally wired into @assert_noalloc/@assert_noboxing/findings/check
+    # only — @strict_function (a SEPARATE :full noalloc entry point, at module-load time) and
+    # divergence_report's diagnostic signal labels (a separate, auxiliary raw-AllocCheck call,
+    # NOT the .diverged comparison itself — that already went through `findings`/`_checked_allocs`)
+    # both still called `_be_check_allocs` directly, so a barrier-exempted function could pass
+    # @assert_noalloc/check while still reding at @strict_function load time, or showing a phantom
+    # "full:alloc-sites=N" label in a divergence_report that no longer actually diverges.
+    _measure_cc() = length(rand(4))
+    const _CC_ONCE = Base.OncePerProcess{Int}(_measure_cc)
+    steady_cc(x::Int) = x + _CC_ONCE()
+
+    @strict_function steady_cc2(x::Int) = x + _CC_ONCE()   # would previously red at load time
+    @test steady_cc2(1) == 1 + _CC_ONCE()
+
+    d = divergence_report(steady_cc, (Int,); guarantees = (:noalloc,))
+    @test isempty(d)
+    @test !any(l -> startswith(l, "full:alloc-sites="), d.full_signals)
 end

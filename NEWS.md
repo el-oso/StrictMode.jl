@@ -1,5 +1,54 @@
 # StrictMode.jl release notes
 
+## v0.4.0
+
+Five features closing four issues (#13, #14, #15, #16), each independently reviewed and
+cross-checked before landing (per-phase review, then a final whole-branch pass — two real
+regressions were only visible at that level and are called out below).
+
+- **`@assert_no_spill` / `spill_report`** (issue #16 Tier 1) — a hard-gate guarantee for
+  vector-register spilling, the codegen analogue of `@assert_noalloc`: fails if the compiled
+  kernel's `code_native` shows LLVM spilling a vector (xmm/ymm/zmm) register to the stack.
+  Syntax-independent (works whether `code_native` emitted AT&T or Intel).
+- **`@assert_memsafe` / `memsafe_report`** (issue #15) — a guard-page (electric-fence style)
+  harness catching out-of-bounds array reads/writes in unsafe SIMD kernels *deterministically*
+  instead of flakily. `isolate=true` (default) runs the probe in a subprocess to catch a fatal
+  out-of-bounds read (an otherwise-uncatchable `SIGSEGV`); `isolate=false` is a cheaper in-process
+  check that only catches out-of-bounds writes. Linux/macOS only, `Array` arguments only.
+- **One-time-init allocation barrier exemption** (issue #14) — `Base.OncePerProcess`/
+  `OncePerThread`-memoized lazy calibration no longer reds `:full` `@assert_noalloc`/
+  `@assert_noboxing` on its one-time cold-path allocation; recognized automatically via a static
+  IR scan (`Base.OncePerTask` is NOT auto-recognized — a different underlying implementation with
+  no detectable non-inlined callee boundary), or register a hand-rolled pattern with
+  `register_alloc_barrier!`. Always logged once via `@info`, never a silent exemption; disable
+  globally with `set_ignore_barrier!(false)`.
+- **Trim-heuristic coverage-gap caveat** (issue #13) — a heuristic-path `@assert_trim_safe`/
+  `@assert_trim_compatible` PASS now logs a one-time session note about a known
+  reachability-limit union-split class the static scan can't reliably flag without
+  false-positiving on safe code. `StrictFinding.status`/`.reason` are untouched (back-compat).
+- **`mca_report` / `@assert_mca`** (issue #16 Tier 2) — an `llvm-mca`-backed steady-state
+  throughput/IPC estimate (new `LLVM_full_jll` weak dependency, ~680MiB, never a test/CI default).
+  Informational only — `@assert_mca` never fails without an explicit `max_rthroughput=`/`min_ipc=`
+  bound, since a naive whole-function `llvm-mca` run can disagree with ground truth (a false
+  loop-carried dependency from the function-boundary store/reload); region markers around the
+  detected innermost hot loop sidestep that.
+
+Two regressions only surfaced in a final whole-branch review, after each phase had already passed
+its own individual review — both fixed before release:
+
+- The barrier exemption's IR-scan (`_mi_is_barrier`) matched any function whose second parameter
+  happened to be a `OncePerProcess`/`OncePerThread` value, not just Base's own cold-path init
+  closure — a user function with that exact parameter shape was wrongly treated as the barrier
+  itself, silently hiding its own real per-call allocation. Fixed by additionally requiring the
+  match come from `Base` (`mi.def.module === Base`).
+- The barrier exemption was wired into `@assert_noalloc`/`@assert_noboxing`/`findings`/`check`
+  but not into `@strict_function` (a barrier-containing definition could still fail to load) or
+  `divergence_report`'s diagnostic signal labels (a phantom `full:alloc-sites=N` label on a call
+  that no longer actually diverges). Both now route through the same `_checked_allocs` seam.
+
+Also: `Serialization` (a stdlib, used for `@assert_memsafe`'s subprocess argument marshaling) is a
+new main dependency.
+
 ## v0.3.7
 
 Bugfix. Fixes a `:fast`-mode `@assert_typestable` false positive introduced in v0.3.6, and a

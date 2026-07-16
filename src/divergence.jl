@@ -86,7 +86,7 @@ function _full_signals(@nospecialize(f), @nospecialize(types::Tuple))
     tt = Tuple{types...}
     labels = String[]
     try
-        insts = _be_check_allocs(f, tt)
+        insts, _ = _checked_allocs(f, types)
         n = length(insts)
         n > 0 && push!(labels, "full:alloc-sites=$n")
         any(_be_is_boxing, insts) && push!(labels, "full:boxing")

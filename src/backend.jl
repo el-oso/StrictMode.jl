@@ -58,7 +58,7 @@ function _be_trim_validate end  # (f, types) -> (passed::Bool, findings::Vector{
 const _MCA_AVAILABLE = Ref(false)
 
 """
-    StrictMode.mca_available() -> Bool
+    mca_available() -> Bool
 
 Whether the `LLVM_full_jll` extension (`StrictModeMcaExt`) is loaded — i.e. whether
 [`mca_report`](@ref)/`@assert_mca` can actually run `llvm-mca`. `LLVM_full_jll` is a heavy
@@ -111,18 +111,18 @@ end
 const _IGNORE_BARRIER = Ref(true)
 
 """
-    StrictMode.ignore_barrier() -> Bool
+    ignore_barrier() -> Bool
 
 Whether `:full` `@assert_noalloc`/`@assert_noboxing` (and `findings`/`check`) exempt a call
 recognized as routing through a one-time-init allocation barrier
 (`Base.OncePerProcess`/`OncePerThread`, or a function registered via
 [`register_alloc_barrier!`](@ref)) from AllocCheck's all-paths proof. Default `true`. See
-[`StrictMode.set_ignore_barrier!`](@ref).
+[`set_ignore_barrier!`](@ref).
 """
 ignore_barrier() = _IGNORE_BARRIER[]
 
 """
-    StrictMode.set_ignore_barrier!(b::Bool)
+    set_ignore_barrier!(b::Bool)
 
 Set whether `:full` exempts a detected allocation barrier from AllocCheck's all-paths proof.
 `false` disables the exemption — a barrier-containing call reds `:full` `@assert_noalloc` exactly
@@ -156,7 +156,7 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     if _IGNORE_BARRIER[]
         sig = _alloc_signals(f, types)
         if sig.barrier && !sig.alloc && !sig.boxing && sig.abscontainer === nothing
-            @info "StrictMode: `$(f)` reaches a one-time-init allocation barrier — :full noalloc/noboxing exempted (steady-state :fast heuristic used instead of AllocCheck's all-paths proof for this call). Disable with StrictMode.set_ignore_barrier!(false)." maxlog = 1
+            @info "StrictMode: `$(f)` reaches a one-time-init allocation barrier — :full noalloc/noboxing exempted (steady-state :fast heuristic used instead of AllocCheck's all-paths proof for this call). Disable with set_ignore_barrier!(false)." maxlog = 1
             return (Any[], true)
         end
     end

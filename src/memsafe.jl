@@ -300,6 +300,10 @@ function memsafe_report(
         @nospecialize(f), args...;
         isolate::Bool = true, align::Union{Nothing, Int} = nothing, using_module::Union{Nothing, Symbol} = nothing
     )
+    Sys.islinux() || Sys.isapple() || error(
+        "StrictMode @assert_memsafe: only Linux/macOS are supported (needs mmap/mprotect + POSIX " *
+            "signal delivery); got Sys.KERNEL = $(Sys.KERNEL)."
+    )
     target = _func_name(f) * _sig_string(map(typeof, args))
     violation = isolate ? _memsafe_probe_subprocess(f, args; using_module, align) :
         _memsafe_probe_inprocess(f, args; align)
@@ -355,6 +359,15 @@ macro assert_memsafe(args...)
     binds = Any[:($s = $(esc(e))) for (s, e) in zip(argsyms, argexprs)]
     isolate_expr = haskey(opts, :isolate) ? esc(opts[:isolate]) : true
     align_expr = haskey(opts, :align) ? esc(opts[:align]) : nothing
+    if haskey(opts, :using_module) && !(opts[:using_module] isa Symbol)
+        throw(
+            ArgumentError(
+                "@assert_memsafe: using_module must be a plain top-level module name (e.g. " *
+                    "`using_module = MyPackage`), not `$(opts[:using_module])` — a dotted " *
+                    "submodule path isn't supported."
+            )
+        )
+    end
     using_module_expr = haskey(opts, :using_module) ? Expr(:quote, opts[:using_module]) : nothing
 
     checked = quote

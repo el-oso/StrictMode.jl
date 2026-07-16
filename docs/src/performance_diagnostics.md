@@ -166,7 +166,7 @@ gap by running [`llvm-mca`](https://llvm.org/docs/CommandGuide/llvm-mca.html) �
 throughput analyzer — on the kernel's own native assembly:
 
 ```julia
-using LLVM_full_jll   # optional, ~680MiB weak dependency — see StrictMode.mca_available
+using LLVM_full_jll   # optional, ~680MiB weak dependency — see mca_available
 
 r = mca_report(fma_kernel!, (Vector{Float64}, Vector{Float64}))
 r.ipc                # steady-state instructions/cycle estimate
@@ -183,7 +183,7 @@ the numbers as a relative signal, not an authoritative one. [`@assert_mca`](@ref
 it only fails when you supply an explicit `max_rthroughput=`/`min_ipc=` bound yourself.
 
 ```julia
-@assert_mca fma_kernel!(C, A, B)                # always passes; useful for eyeballing r in a REPL
+@assert_mca fma_kernel!(C, A, B)                # always passes; @info-logs the McaReport once
 @assert_mca min_ipc=2.0 fma_kernel!(C, A, B)     # throws if steady-state IPC drops below 2.0
 ```
 

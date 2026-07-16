@@ -122,13 +122,14 @@ end
 const _BASE_BARRIER_TYPES = (Base.OncePerProcess, Base.OncePerThread)
 
 # User-registered hand-rolled barriers (functions that allocate once, memoize, and are alloc-free
-# on every subsequent call) — the escape hatch for memoization that doesn't use one of the three
-# `Base` once-guard types above. Keyed on the function value itself (`IdSet`, identity — function
-# singletons compare `===` to themselves).
+# on every subsequent call) — the escape hatch for memoization that doesn't use one of the two
+# `Base` once-guard types above (this includes `Base.OncePerTask`, deliberately excluded from
+# `_BASE_BARRIER_TYPES` — see the note there). Keyed on the function value itself (`IdSet`,
+# identity — function singletons compare `===` to themselves).
 const _ALLOC_BARRIERS = Base.IdSet{Any}()
 
 """
-    StrictMode.register_alloc_barrier!(f)
+    register_alloc_barrier!(f)
 
 Mark `f` as a one-time-init allocation barrier: a function that allocates on its first call (per
 process/thread/task) and is alloc-free on every subsequent call. `@assert_noalloc`/
@@ -141,13 +142,13 @@ and register that instead).
 
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:full` `:noalloc`/`:noboxing` verdicts for every caller of `f`).
-See [`StrictMode.set_ignore_barrier!`](@ref) to disable the exemption globally.
+See [`set_ignore_barrier!`](@ref) to disable the exemption globally.
 
 ```julia
 @noinline function _my_calibrator()
     ...   # measures something once, memoizes it in a Ref/const
 end
-StrictMode.register_alloc_barrier!(_my_calibrator)
+register_alloc_barrier!(_my_calibrator)
 ```
 """
 function register_alloc_barrier!(@nospecialize(f))
@@ -176,7 +177,14 @@ function _mi_is_barrier(mi::Core.MethodInstance)
     ps = st.parameters
     isempty(ps) && return false
     _is_registered_callee(ps[1]) && return true
-    return length(ps) >= 2 && _is_base_barrier_type(ps[2])
+    # The parameter-2 (Base once-guard) shape must ALSO be Base's own init closure, not merely
+    # any function whose second argument happens to be a OncePerProcess/OncePerThread — a user
+    # method with that exact parameter shape (e.g. `helper(o::OncePerProcess, n::Int) = o() +
+    # length(Vector(undef, n))`) would otherwise be wrongly recognized as the barrier itself,
+    # silently hiding its own real per-call allocation (a genuine false negative, verified: without
+    # this check, `_alloc_signals` reports `alloc=false` for a caller of such a function). A user
+    # cannot define a method inside `Base`, so `mi.def.module === Base` is the reliable boundary.
+    return length(ps) >= 2 && _is_base_barrier_type(ps[2]) && mi.def.module === Base
 end
 
 # How many non-inlined `:invoke` levels the alloc/boxing/dictlookup scan follows by default. F35

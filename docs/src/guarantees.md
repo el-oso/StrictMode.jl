@@ -89,7 +89,7 @@ steady(x::Int) = x + _NP_ONCE()
 ```
 
 For a hand-rolled memoization pattern that doesn't use one of those two `Base` types, register it
-explicitly with [`StrictMode.register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
+explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
 auto-recognized (its implementation has no detectable non-inlined callee boundary to key off of —
 wrap it in your own function and register that instead).
 

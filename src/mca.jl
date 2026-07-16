@@ -204,7 +204,7 @@ end
 Run `llvm-mca` on `f`'s native assembly and return a steady-state throughput/IPC estimate.
 **Informational, advisory** — never fails; use [`@assert_mca`](@ref) for a gate, which only fails
 on bounds you explicitly supply. Needs `LLVM_full_jll` (`using LLVM_full_jll`, a ~680MiB weak
-dependency — see [`StrictMode.mca_available`](@ref)).
+dependency — see [`mca_available`](@ref)).
 
 - `mcpu`: the target CPU model name; defaults to the host's own (`Sys.CPU_NAME`), validated
   against what this `llvm-mca` build actually recognizes and substituted with `"generic"` (warned
@@ -268,18 +268,39 @@ function Base.show(io::IO, r::McaReport)
     return nothing
 end
 
+# Pure (no execution, no backend) so it's testable without a live llvm-mca run. `NaN > x`/`NaN <
+# x` are both `false` in Julia — a plain comparison would silently PASS an explicit bound when
+# llvm-mca's output couldn't be parsed (e.g. its report format shifted across an LLVM release),
+# which is exactly backwards for a guarantee the caller explicitly asked to be enforced: "couldn't
+# measure" must fail loudly, not read as "no violation."
+function _mca_bound_problems(r::McaReport, max_rthroughput, min_ipc)
+    problems = String[]
+    if max_rthroughput !== nothing
+        if isnan(r.block_rthroughput)
+            push!(problems, "Block RThroughput could not be parsed from llvm-mca's output — cannot verify max_rthroughput=$max_rthroughput")
+        elseif r.block_rthroughput > max_rthroughput
+            push!(problems, "Block RThroughput $(round(r.block_rthroughput; digits = 2)) exceeds max_rthroughput=$max_rthroughput")
+        end
+    end
+    if min_ipc !== nothing
+        if isnan(r.ipc)
+            push!(problems, "IPC could not be parsed from llvm-mca's output — cannot verify min_ipc=$min_ipc")
+        elseif r.ipc < min_ipc
+            push!(problems, "IPC $(round(r.ipc; digits = 2)) is below min_ipc=$min_ipc")
+        end
+    end
+    return problems
+end
+
 function _assert_mca(target, @nospecialize(f), @nospecialize(types::Tuple); mcpu, region, max_rthroughput, min_ipc)
     r = mca_report(f, types; mcpu, region)
-    problems = String[]
-    max_rthroughput !== nothing && r.block_rthroughput > max_rthroughput && push!(
-        problems,
-        "Block RThroughput $(round(r.block_rthroughput; digits = 2)) exceeds max_rthroughput=$max_rthroughput"
-    )
-    min_ipc !== nothing && r.ipc < min_ipc && push!(
-        problems,
-        "IPC $(round(r.ipc; digits = 2)) is below min_ipc=$min_ipc"
-    )
-    isempty(problems) || _fail(
+    problems = _mca_bound_problems(r, max_rthroughput, min_ipc)
+    if isempty(problems)
+        (max_rthroughput === nothing && min_ipc === nothing) &&
+            @info "StrictMode @assert_mca: $target\n" * sprint(show, r) maxlog = 1
+        return nothing
+    end
+    _fail(
         :mca, target,
         "llvm-mca bound(s) violated: " * join(problems, "; ") *
             (r.whole_function ? " (whole-function fallback — no loop region detected, numbers are less reliable)" : "")

@@ -121,6 +121,19 @@ end
     @test err.error isa ArgumentError
 end
 
+@testitem "@assert_memsafe rejects a dotted using_module path with a clear error, not a MethodError" begin
+    using StrictMode
+    err = try
+        eval(:(@assert_memsafe using_module = Foo.Bar f(x)))
+        nothing
+    catch e
+        e
+    end
+    @test err isa LoadError
+    @test err.error isa ArgumentError
+    @test occursin("dotted submodule path", err.error.msg)
+end
+
 @testitem "memsafe_report errors clearly on a closure/anonymous function (isolate=true, no file)" begin
     using StrictMode
     if Sys.iswindows()

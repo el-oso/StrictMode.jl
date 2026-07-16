@@ -68,7 +68,7 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
         # number was an artifact, so pass (with a note).
         if backend_available()
             results = try
-                _be_check_allocs(f, types)
+                first(_checked_allocs(f, types))
             catch err
                 err isa StrictViolation && rethrow()
                 nothing

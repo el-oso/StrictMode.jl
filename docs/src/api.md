@@ -36,7 +36,7 @@ report intensity, register pressure, and signals like alignment, masking, and se
 version of `@assert_no_scalar_loops`; `spill_report` is the programmatic version of
 [`@assert_no_spill`](@ref). `mca_report`/`@assert_mca` go one step further and estimate
 steady-state throughput/IPC via `llvm-mca` (an optional, ~680MiB `LLVM_full_jll` weak dependency —
-see [`StrictMode.mca_available`](@ref)); unlike every other guarantee here `@assert_mca` never
+see [`mca_available`](@ref)); unlike every other guarantee here `@assert_mca` never
 fails on its own, only on an explicit `max_rthroughput=`/`min_ipc=` bound you supply, since a
 naive whole-function `llvm-mca` run can disagree with ground truth (see its docstring).
 
