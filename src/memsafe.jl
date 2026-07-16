@@ -95,7 +95,12 @@ function _guarded_array(src::Array{T, N}; align::Int = sizeof(T)) where {T, N}
     total_bytes = data_region_bytes + ps
     base = _mmap_anon(total_bytes)
     guard_ptr = base + data_region_bytes
-    _mprotect_none!(guard_ptr, ps)
+    try
+        _mprotect_none!(guard_ptr, ps)
+    catch
+        _munmap!(base, total_bytes)
+        rethrow()
+    end
     data_start = guard_ptr - padded_bytes   # flush against the guard once `slack` is accounted for
     arr = unsafe_wrap(Array, Ptr{T}(data_start), size(src); own = false)
     copyto!(arr, src)
@@ -145,24 +150,36 @@ function _indent(s::AbstractString)
     return join(("  " * l for l in split(s, '\n')), '\n')
 end
 
-function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_path::AbstractString, using_module::Union{Nothing, Symbol})
+function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_path::AbstractString, using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int})
     mod_stmt = using_module === nothing ? "include($(repr(kernel_file)))" : "using $(using_module)"
     lookup_mod = using_module === nothing ? "Main" : string(using_module)
+    align_kw = align === nothing ? "" : "; align=$align"   # an Int repr is safe to splice verbatim
     # Plain (global) top-level bindings, not `local` — a top-level `local` in a multi-statement
     # script only scopes to its own statement, so it doesn't survive to the next line. Harmless
     # here: this is a throwaway one-shot process that exits right after.
+    #
+    # An out-of-bounds WRITE against the guard page is catchable even in this (child) process, as a
+    # `ReadOnlyMemoryError` — it must be caught HERE and reported via a distinct stdout sentinel,
+    # not left to propagate: an uncaught exception exits nonzero with no signal, which the parent
+    # would otherwise (wrongly) treat as an unrelated script error rather than a memsafe violation.
+    # Any OTHER exception is a genuine bug in `f` unrelated to memory safety and must still propagate.
     return """
     using StrictMode, Serialization
     $mod_stmt
     __args = deserialize($(repr(args_path)))
     __f = getfield($lookup_mod, $(repr(fname)))
-    __guarded = map(__a -> __a isa Array ? StrictMode._guarded_array(__a).array : __a, __args)
-    __f(__guarded...)
-    print(stdout, "STRICTMODE_MEMSAFE_OK")
+    __guarded = map(__a -> __a isa Array ? StrictMode._guarded_array(__a$(align_kw)).array : __a, __args)
+    try
+        __f(__guarded...)
+        print(stdout, "STRICTMODE_MEMSAFE_OK")
+    catch __e
+        __e isa ReadOnlyMemoryError || rethrow()
+        print(stdout, "STRICTMODE_MEMSAFE_WRITE_VIOLATION")
+    end
     """
 end
 
-function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::Union{Nothing, Symbol})
+function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int} = nothing)
     fname = nameof(f)
     if using_module === nothing
         # A function is reachable in a fresh child regardless of which module it ended up in
@@ -189,7 +206,7 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
 
     args_path, args_io = mktemp()
     close(args_io)
-    script = _memsafe_child_script(kernel_file, fname, args_path, using_module)
+    script = _memsafe_child_script(kernel_file, fname, args_path, using_module, align)
     try
         serialize(args_path, args)
         cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`
@@ -201,6 +218,11 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
             signame = proc.termsignal == 11 ? "SIGSEGV" : proc.termsignal == 7 ? "SIGBUS" : "signal $(proc.termsignal)"
             return "deterministic out-of-bounds access — the guarded probe subprocess was killed by " *
                 "$signame. Child's own signal report (names the faulting op):\n" * _indent(err_s)
+        elseif occursin("STRICTMODE_MEMSAFE_WRITE_VIOLATION", out_s)
+            # A WRITE fault is catchable even in the child (ReadOnlyMemoryError) — it exits 0 with
+            # this sentinel rather than a signal, so it must be checked before the exitcode branch.
+            return "out-of-bounds WRITE detected (guard page triggered ReadOnlyMemoryError in the " *
+                "guarded subprocess)."
         elseif proc.exitcode != 0
             error(
                 "StrictMode @assert_memsafe: the guarded probe errored for a reason other than a " *
@@ -272,13 +294,13 @@ function memsafe_report(
         isolate::Bool = true, align::Union{Nothing, Int} = nothing, using_module::Union{Nothing, Symbol} = nothing
     )
     target = _func_name(f) * _sig_string(map(typeof, args))
-    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module) :
+    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module, align) :
         _memsafe_probe_inprocess(f, args; align)
     return MemsafeReport(target, isolate, violation)
 end
 
 function _assert_memsafe(target, @nospecialize(f), args::Tuple; isolate::Bool, align, using_module)
-    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module) :
+    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module, align) :
         _memsafe_probe_inprocess(f, args; align)
     violation === nothing || _fail(:memsafe, target, violation)
     return nothing

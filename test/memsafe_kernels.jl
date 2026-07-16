@@ -27,3 +27,11 @@ function memsafe_oob_write_kernel!(a::Vector{Float64})
     @inbounds a[n + 1] = 99.0
     return nothing
 end
+
+# Errors (a genuine, non-memsafe failure) unless `a`'s start pointer is 64-byte aligned — used to
+# prove `align=` actually reaches the guard buffer built inside the `isolate=true` subprocess, not
+# just the in-process path.
+function memsafe_align64_check_kernel!(a::Vector{Float64})
+    UInt(pointer(a)) % 64 == 0 || error("not 64-byte aligned: pointer = $(pointer(a))")
+    return nothing
+end

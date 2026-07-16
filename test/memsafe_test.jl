@@ -1,5 +1,6 @@
 @testsetup module MemsafeFixtures
-export memsafe_inbounds_kernel!, memsafe_oob_read_kernel!, memsafe_oob_write_kernel!, MEMSAFE_KERNELS_FILE
+export memsafe_inbounds_kernel!, memsafe_oob_read_kernel!, memsafe_oob_write_kernel!,
+    memsafe_align64_check_kernel!, MEMSAFE_KERNELS_FILE
 
 const MEMSAFE_KERNELS_FILE = joinpath(@__DIR__, "memsafe_kernels.jl")
 include(MEMSAFE_KERNELS_FILE)
@@ -53,6 +54,33 @@ end
         @test r.violation !== nothing
         @test occursin("WRITE", r.violation)
         @test occursin("ReadOnlyMemoryError", r.violation)
+    end
+end
+
+@testitem "memsafe_report(; isolate=true, the default) also catches an out-of-bounds WRITE" setup = [MemsafeFixtures] begin
+    using StrictMode
+    if Sys.iswindows()
+        @test_skip false
+    else
+        r = memsafe_report(memsafe_oob_write_kernel!, rand(8))   # isolate=true (default)
+        @test r.violation !== nothing
+        @test occursin("WRITE", r.violation)
+        @test occursin("ReadOnlyMemoryError", r.violation)
+
+        @test_throws StrictViolation (@assert_memsafe memsafe_oob_write_kernel!(rand(8)))
+    end
+end
+
+@testitem "align= reaches the guard buffer built inside the isolate=true subprocess" setup = [MemsafeFixtures] begin
+    using StrictMode
+    if Sys.iswindows()
+        @test_skip false
+    else
+        # 9 Float64s = 72 bytes, not a multiple of 64 — the default (align=sizeof(Float64)=8)
+        # placement would NOT be 64-aligned here, so this only passes if `align=64` actually reached
+        # the guard buffer the CHILD process built, not just the (untested-by-this-case) in-process path.
+        r = memsafe_report(memsafe_align64_check_kernel!, rand(9); align = 64)
+        @test r.violation === nothing
     end
 end
 
