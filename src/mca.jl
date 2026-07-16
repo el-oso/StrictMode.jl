@@ -60,24 +60,40 @@ function _asm_loop_spans(lines::AbstractVector{<:AbstractString})
     return spans
 end
 
+const _ASM_ZMM_RE = r"%zmm\d+\b"
+
 """
     _innermost_loop_span(sanitized_asm) -> Union{Nothing, Tuple{Int,Int}}
 
 Find the hot loop to bound an `llvm-mca` region around: among every detected loop span (a label
-targeted by a backward jump), prefer the SMALLEST span that contains a vector register mention
-(the actual SIMD kernel core, as opposed to an incidental scalar remainder/tail loop, which is
-typically smaller in line count but not what a codegen-quality report should focus on); if no span
-contains a vector op, fall back to the smallest span overall; `nothing` if no loop was found at
-all (the caller then falls back to a whole-function run, flagged with a caveat).
+targeted by a backward jump), prefer spans that contain a vector register mention (the actual SIMD
+kernel core, as opposed to an incidental scalar remainder/tail loop, which is typically smaller in
+line count but not what a codegen-quality report should focus on); among those, prefer spans using
+`%zmm` over `%ymm`-only (LLVM's unroll-epilogue vectorization emits a narrower-width "cleanup" loop
+alongside the main wide loop, and the main loop is the one worth reporting on); ties (including the
+nested-loop case, where an inner loop's span is a sub-range of any loop containing it) go to the
+smallest span. `nothing` if no loop was found at all (the caller then falls back to a whole-function
+run, flagged with a caveat).
+
+**Known limitation, inherent to a text-based heuristic with no real CFG**: two DISJOINT
+(non-nested) vectorized loops of comparable width in the same function are not distinguished by
+runtime weight — the smaller one wins regardless of which one actually dominates. This is why
+[`mca_report`](@ref)'s result is informational-only and [`@assert_mca`](@ref) never hard-gates
+without an explicit bound; pass `region = :whole_function`, or point `f` at a smaller helper
+containing only the loop you actually want measured, if this matters for your case.
 """
 function _innermost_loop_span(sanitized_asm::AbstractString)
     lines = split(sanitized_asm, '\n')
     spans = _asm_loop_spans(lines)
     isempty(spans) && return nothing
-    vec_spans = filter(spans) do (a, b)
-        any(l -> occursin(_ASM_VEC_REG_RE, l), view(lines, a:b))
+    has_match(re, a, b) = any(l -> occursin(re, l), view(lines, a:b))
+    vec_spans = filter(((a, b),) -> has_match(_ASM_VEC_REG_RE, a, b), spans)
+    pool = if isempty(vec_spans)
+        spans
+    else
+        zmm_spans = filter(((a, b),) -> has_match(_ASM_ZMM_RE, a, b), vec_spans)
+        isempty(zmm_spans) ? vec_spans : zmm_spans
     end
-    pool = isempty(vec_spans) ? spans : vec_spans
     return pool[argmin(b - a for (a, b) in pool)]
 end
 

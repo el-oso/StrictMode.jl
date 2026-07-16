@@ -45,19 +45,12 @@ end
     @test (@assert_trim_safe safe_fn(3)) == 7
     @test (@assert_trim_compatible safe_fn(3)) == 7
 
-    # The one-time session note actually fires — checked in a disposable subprocess (a fresh
-    # `julia --project=test` process already has checks_enabled=true, from
-    # test/Project.toml's [preferences.StrictMode]) so `maxlog=1` (this repo's standing convention
-    # for a hot-path advisory, same as _assert_noalloc's gc_num note) doesn't make the assertion
-    # order-dependent against whatever else ran earlier in this shared test worker. @info logs to
-    # stderr, not stdout.
-    script = """
-    using StrictMode
-    safe_fn(x::Int) = x * 2 + 1
-    @assert_trim_safe safe_fn(3)
-    """
-    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`
-    err = IOBuffer()
-    run(pipeline(cmd; stdout = devnull, stderr = err))
-    @test occursin("reachability-limit union-splits", String(take!(err)))
+    # The one-time session note actually fires. `@test_logs` installs its own fresh logger for the
+    # duration of the block, so it captures this `maxlog=1` (this repo's standing convention for a
+    # hot-path advisory, same as _assert_noalloc's gc_num note) note independently of whatever else
+    # ran earlier against the DEFAULT logger in this shared test worker — verified directly: a
+    # maxlog=1 message already fired once against Base's default logger is still captured by a
+    # subsequent `@test_logs` on the same call, since maxlog counting lives on the active logger
+    # instance, not globally per call site.
+    @test_logs (:info, r"reachability-limit union-splits") match_mode = :any (@assert_trim_safe safe_fn(3))
 end
