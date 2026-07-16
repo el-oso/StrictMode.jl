@@ -41,7 +41,7 @@ function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_res
     rt = isempty(rts) ? Any : reduce((a, b) -> Union{a, b}, rts)
     opt_reports = opt_result === nothing ? [] : _be_opt_reports(opt_result)
     allocs, alloc_error = try
-        (_be_check_allocs(f, types), nothing)
+        (first(_checked_allocs(f, types)), nothing)
     catch err
         err isa StrictViolation && rethrow()
         (nothing, sprint(showerror, err))

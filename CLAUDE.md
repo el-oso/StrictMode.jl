@@ -19,7 +19,10 @@ src/
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
   effects.jl          — _alloc_signals (the `:fast`-mode value-free IR heuristic engine used by
-                        noalloc/noboxing/owned), @assert_effects internals, _DICT_ACCESSORS
+                        noalloc/noboxing/owned), @assert_effects internals, _DICT_ACCESSORS,
+                        register_alloc_barrier!/_is_base_barrier_type/_mi_is_barrier (issue #14
+                        one-time-init allocation barriers: OncePerProcess/OncePerThread/OncePerTask
+                        auto-recognized + user-registered, both feed the `barrier` alloc signal)
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES
@@ -38,7 +41,11 @@ src/
   divergence.jl       — divergence_report/StrictDivergence (fast-vs-full comparison), save_divergence
   cache.jl            — (method, world, signature, mode) → findings cache
   report.jl           — StrictViolation exception
-  backend.jl          — AllocCheck/JET backend glue (_be_*), _require_backend, set_ignore_throw!
+  backend.jl          — AllocCheck/JET backend glue (_be_*), _require_backend, set_ignore_throw!,
+                        _checked_allocs/set_ignore_barrier! (issue #14: substitutes the barrier-
+                        aware :fast heuristic for AllocCheck's proof on a barrier-containing call
+                        — filtering AllocCheck's own per-instance backtraces does not work, ~half
+                        merge into generic Base scheduler internals with no traceable origin)
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
   trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate)

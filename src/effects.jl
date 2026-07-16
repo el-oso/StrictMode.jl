@@ -60,6 +60,19 @@ function _static_callee(ci, @nospecialize(a))
     return nothing
 end
 
+# Is `st` a `Core.getfield(receiver, field, ...)` call whose FIELD/INDEX argument is a
+# compile-time constant (a literal `Symbol`/`Int` or `QuoteNode`), as opposed to a runtime value
+# (an `SSAValue`/`Argument` — a Phi-fed loop variable, say)? A constant field/index always reads
+# the SAME fixed memory location no matter how loosely-typed that location is, so it never itself
+# allocates. A runtime-computed index into a heterogeneous `Tuple` genuinely can vary in type by
+# value (the founding runtime-tuple-index boxing trap) and must NOT be treated as static here.
+function _static_getfield(@nospecialize(callee), st)
+    callee === Core.getfield || return false
+    length(st.args) >= 3 || return false
+    a = st.args[3]
+    return !(a isa Core.SSAValue || a isa Core.Argument)
+end
+
 # `AbstractDict` accessors whose appearance on the hot path means a runtime keyed lookup — the
 # "owned scratch / GKH-ownership" violation: an owned workspace must resolve to a const-dispatched
 # per-type accessor, never a runtime dictionary probe (measured ~130 ns/call, type-stable and
@@ -80,6 +93,81 @@ function _mi_dict_lookup(mi::Core.MethodInstance)
     return recv isa Type && recv <: AbstractDict
 end
 
+# --- issue #14: one-time-init allocation barriers -----------------------------------------------
+#
+# `Base.OncePerProcess`/`OncePerThread`/`OncePerTask`-memoized lazy init (and hand-rolled
+# equivalents) allocate exactly once per process/thread/task, then read a memoized value forever
+# after — but AllocCheck's all-paths static proof sees the initializer's allocation as statically
+# reachable and reds `:full` @assert_noalloc/@assert_noboxing on a call that is provably alloc-free
+# in steady state. Filtering AllocCheck's own per-instance backtraces to attribute allocations to
+# the barrier does NOT work in practice: measured on a real `OncePerProcess`-memoized calibrator,
+# 24 of 52 reported instances are merged into generic Base scheduler/lock/task internals
+# ("multiple call sites") with no traceable single origin, even under an exact type-based filter.
+# So the exemption is granted at the STATIC-IR level instead (the same reliable technique
+# `_mi_dict_lookup` already uses for `@assert_owned`): recognize a call that routes through a
+# barrier via its resolved `:invoke` callee type, and skip recursing into it for alloc/boxing/
+# dictlookup signals — the barrier's cold-path cost is not a steady-state cost. `:full` mode then
+# substitutes this (already-correct) heuristic for AllocCheck's proof on a barrier-containing call
+# — see `_checked_allocs` in backend.jl.
+
+const _BASE_BARRIER_TYPES = (Base.OncePerProcess, Base.OncePerThread, Base.OncePerTask)
+
+# User-registered hand-rolled barriers (functions that allocate once, memoize, and are alloc-free
+# on every subsequent call) — the escape hatch for memoization that doesn't use one of the three
+# `Base` once-guard types above. Keyed on the function value itself (`IdSet`, identity — function
+# singletons compare `===` to themselves).
+const _ALLOC_BARRIERS = Base.IdSet{Any}()
+
+"""
+    StrictMode.register_alloc_barrier!(f)
+
+Mark `f` as a one-time-init allocation barrier: a function that allocates on its first call (per
+process/thread/task) and is alloc-free on every subsequent call. `@assert_noalloc`/
+`@assert_noboxing` (and `findings`/`check`) then treat a call reaching `f` as exempt from
+`:full`'s all-paths AllocCheck proof for that call, the same way `Base.OncePerProcess`/
+`OncePerThread`/`OncePerTask` are recognized automatically — use this for a hand-rolled
+memoization pattern that doesn't use one of those three `Base` types.
+
+Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
+the findings cache (it changes `:full` `:noalloc`/`:noboxing` verdicts for every caller of `f`).
+See [`StrictMode.set_ignore_barrier!`](@ref) to disable the exemption globally.
+
+```julia
+@noinline function _my_calibrator()
+    ...   # measures something once, memoizes it in a Ref/const
+end
+StrictMode.register_alloc_barrier!(_my_calibrator)
+```
+"""
+function register_alloc_barrier!(@nospecialize(f))
+    push!(_ALLOC_BARRIERS, f)
+    clear_cache!()
+    return nothing
+end
+
+# A registered function is only a barrier when it is ITSELF the callee (parameter 1 — Julia's
+# MethodInstance always includes the callee's own type there for a direct call), never when it
+# merely appears as an ordinary argument elsewhere (e.g. passed as a callback) — that distinction
+# matters here in a way it doesn't for the `Base` types below, since a registered function is an
+# arbitrary user function that could legitimately be passed around as a value.
+_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _ALLOC_BARRIERS)
+
+# `(::OncePerProcess)()` (and OncePerThread/OncePerTask) are themselves `@inline`d away in Base —
+# the fast (already-initialized) path is inlined directly into the caller, so the only surviving
+# non-inlined `:invoke` boundary is the COLD-path initializer closure (`init_perprocesss` and
+# friends), whose signature is `(closure, ::OncePerProcess, ::UInt8)` — the barrier type sits at
+# parameter 2, not 1 (verified against the actual optimized IR, not assumed).
+_is_base_barrier_type(@nospecialize(p)) = p isa Type && any(bt -> p <: bt, _BASE_BARRIER_TYPES)
+
+function _mi_is_barrier(mi::Core.MethodInstance)
+    st = mi.specTypes
+    st isa DataType || return false
+    ps = st.parameters
+    isempty(ps) && return false
+    _is_registered_callee(ps[1]) && return true
+    return length(ps) >= 2 && _is_base_barrier_type(ps[2])
+end
+
 # How many non-inlined `:invoke` levels the alloc/boxing/dictlookup scan follows by default. F35
 # measured depth 1 as sufficient on the PureFFT/BlazingPorts corpus; BLAS/LAPACK-style drivers
 # (issue #8) route workspace allocation through a `driver! -> prep-helper -> similar/Array` chain
@@ -88,7 +176,7 @@ end
 const _FAST_ALLOC_DEPTH = Ref(2)
 
 """
-    _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[]) -> (; alloc, boxing, dictlookup, abscontainer, file, line)
+    _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[]) -> (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
 
 Value-free allocation heuristic from optimized typed IR (no execution, no backend). `alloc` flags
 explicit heap allocation (`:new` of a mutable/Array/`Core.Box` type, or a GC/box `:foreigncall`),
@@ -105,7 +193,11 @@ A small all-concrete `Union` result stays unflagged (union-split, not boxing —
 over-reported on type-stable SIMD/pointer kernels). `dictlookup` flags a runtime `AbstractDict`
 accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the owned-scratch/GKH-ownership
 violation — following non-inlined callees like `alloc` (the lookup usually lives in a workspace
-accessor callee, not the top function). Location is the method's definition site.
+accessor callee, not the top function). `barrier` flags a call reaching a recognized one-time-init
+allocation barrier (`Base.OncePerProcess`/`OncePerThread`/`OncePerTask`, or a
+`register_alloc_barrier!`-registered function) — recursion stops there, so the barrier's own
+one-time allocation never contributes to `alloc`/`boxing`/`dictlookup`. Location is the method's
+definition site.
 """
 function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
@@ -119,7 +211,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     seen = Base.IdSet{Any}()
     push!(seen, sig)
-    alloc, boxing, dictlookup, abscontainer = isempty(cts) ? (false, false, false, nothing) :
+    alloc, boxing, dictlookup, abscontainer, barrier = isempty(cts) ? (false, false, false, nothing, false) :
         _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
@@ -128,7 +220,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
-    return (; alloc, boxing, dictlookup, abscontainer, file, line)
+    return (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
 end
 
 # Per-statement "this straight-line region ends in an unreachable return" mask — the throw-path
@@ -158,11 +250,11 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, false, nothing)
+    sig in seen && return (false, false, false, nothing, false)
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -171,7 +263,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -179,9 +271,9 @@ function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.Id
     cts = try
         Base.code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, false, nothing)
+        return (false, false, false, nothing, false)
     end
-    isempty(cts) && return (false, false, false, nothing)
+    isempty(cts) && return (false, false, false, nothing, false)
     return _scan_ci(first(cts)[1], sig, depth, seen)
 end
 
@@ -190,6 +282,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     boxing = false
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
+    barrier = false                   # a call reached a recognized one-time-init allocation barrier
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
@@ -228,12 +321,20 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                 a1 = st.args[1]
                 mi = a1 isa Core.CodeInstance ? a1.def : a1
                 if mi isa Core.MethodInstance
-                    _mi_dict_lookup(mi) && (dictlookup = true)
-                    if depth > 0 && (!alloc || !boxing || !dictlookup)
-                        a2, b2, d2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
-                        a2 && (alloc = true)
-                        b2 && (boxing = true)
-                        d2 && (dictlookup = true)
+                    if _mi_is_barrier(mi)
+                        # The callee itself IS a recognized barrier (e.g. `(::OncePerProcess)()`,
+                        # or a directly-registered function) — its one-time cold-path allocation
+                        # is not a steady-state cost, so recursion stops here rather than seeing it.
+                        barrier = true
+                    else
+                        _mi_dict_lookup(mi) && (dictlookup = true)
+                        if depth > 0 && (!alloc || !boxing || !dictlookup)
+                            a2, b2, d2, _, br2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            a2 && (alloc = true)
+                            b2 && (boxing = true)
+                            d2 && (dictlookup = true)
+                            br2 && (barrier = true)
+                        end
                     end
                 end
             end
@@ -247,10 +348,19 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
                 dead[i] || (alloc = true)
-            elseif _nonconcrete(T)
+            elseif _nonconcrete(T) && !_static_getfield(callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee
-                # (`:invoke`) optimization, it does not save a dynamic `:call`.
+                # (`:invoke`) optimization, it does not save a dynamic `:call`. EXCEPT a
+                # `Core.getfield` call whose field/index argument is a COMPILE-TIME CONSTANT
+                # (`_static_getfield`, below) — e.g. reading a named struct field like
+                # `OncePerProcess`'s internally loosely-typed memoized-value slot: always one
+                # fixed memory location regardless of static type precision, never itself
+                # allocates. Crucially this must NOT be widened to "any `getfield` call" —
+                # `t[i]` on a heterogeneous tuple with a RUNTIME `i` *also* lowers to
+                # `Core.getfield(t, i, ...)`, and that genuinely needs boxing (the field's type
+                # varies by which runtime index is read) — that IS the founding runtime-tuple-
+                # index trap `@unroll` exists for, and must keep flagging as boxing.
                 boxing = true
             elseif !boxing
                 # Concrete result but a boxy argument on a non-builtin call = runtime dispatch
@@ -261,7 +371,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         end
     end
-    return (alloc, boxing, dictlookup, abscontainer)
+    return (alloc, boxing, dictlookup, abscontainer, barrier)
 end
 
 # --- Base.infer_effects layer (cheap; basis for @assert_effects in Phase 3) -------------------

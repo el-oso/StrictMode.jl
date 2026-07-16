@@ -34,7 +34,7 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
     if mode === :static
         _require_backend()
         try
-            results = _be_check_allocs(f, types)
+            results, _ = _checked_allocs(f, types)
             if !isempty(results)
                 _fail(:noalloc, target, _format_allocs(results))
             end
@@ -150,7 +150,7 @@ end
 function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
     _require_backend()
     results = try
-        _be_check_allocs(f, types)
+        first(_checked_allocs(f, types))
     catch err
         err isa StrictViolation && rethrow()
         _fail(:noboxing, target, "AllocCheck could not analyze this call: $(sprint(showerror, err))")

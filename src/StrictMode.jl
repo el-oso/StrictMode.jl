@@ -46,6 +46,7 @@ export static_ownership_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, analysis_mode, backend_available
+export register_alloc_barrier!, ignore_barrier, set_ignore_barrier!
 
 include("preferences.jl")
 include("report.jl")

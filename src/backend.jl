@@ -78,3 +78,57 @@ function set_ignore_throw!(b::Bool)
     clear_cache!()
     return b
 end
+
+# Whether `:full` @assert_noalloc/@assert_noboxing exempt a detected one-time-init allocation
+# barrier (see effects.jl) from AllocCheck's all-paths proof, substituting the already-correct
+# `:fast` steady-state heuristic instead. `true` (default) = the exemption is active.
+const _IGNORE_BARRIER = Ref(true)
+
+"""
+    StrictMode.ignore_barrier() -> Bool
+
+Whether `:full` `@assert_noalloc`/`@assert_noboxing` (and `findings`/`check`) exempt a call
+recognized as routing through a one-time-init allocation barrier
+(`Base.OncePerProcess`/`OncePerThread`/`OncePerTask`, or a function registered via
+[`register_alloc_barrier!`](@ref)) from AllocCheck's all-paths proof. Default `true`. See
+[`StrictMode.set_ignore_barrier!`](@ref).
+"""
+ignore_barrier() = _IGNORE_BARRIER[]
+
+"""
+    StrictMode.set_ignore_barrier!(b::Bool)
+
+Set whether `:full` exempts a detected allocation barrier from AllocCheck's all-paths proof.
+`false` disables the exemption — a barrier-containing call reds `:full` `@assert_noalloc` exactly
+as it would without this feature (AllocCheck's static proof sees the barrier's one-time
+allocation and has no way to know it is amortized). Clears the findings cache, since it changes
+`:full` `:noalloc`/`:noboxing` results.
+"""
+function set_ignore_barrier!(b::Bool)
+    _IGNORE_BARRIER[] = b
+    clear_cache!()
+    return b
+end
+
+# Barrier-aware wrapper around `_be_check_allocs`. Filtering AllocCheck's own per-instance
+# backtraces to attribute allocations to a barrier does not work in practice — measured on a real
+# `OncePerProcess`-memoized calibrator, 24 of 52 reported instances merge into generic Base
+# scheduler/lock/task internals ("multiple call sites") with no single traceable origin, even
+# under an exact type-based filter. So the exemption is granted at the STATIC-IR level instead
+# (`_alloc_signals`'s `barrier` signal, effects.jl): when a call is recognized as routing through
+# a barrier AND the barrier-aware `:fast` heuristic finds nothing else allocating/boxing, skip
+# AllocCheck's per-instance proof entirely and report a clean, empty allocation list — this is
+# deliberately scoped to the "clean except for a recognized barrier" case; a barrier call that
+# ALSO has some other real allocation falls through to the normal (noisier, but honest) AllocCheck
+# proof, since the heuristic alone can't produce AllocCheck-typed per-site instances for that case.
+# Returns `(allocs, exempted::Bool)`.
+function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
+    if _IGNORE_BARRIER[]
+        sig = _alloc_signals(f, types)
+        if sig.barrier && !sig.alloc && !sig.boxing
+            @info "StrictMode: `$(f)` reaches a one-time-init allocation barrier — :full noalloc/noboxing exempted (steady-state :fast heuristic used instead of AllocCheck's all-paths proof for this call). Disable with StrictMode.set_ignore_barrier!(false)." maxlog = 1
+            return (Any[], true)
+        end
+    end
+    return (_be_check_allocs(f, types), false)
+end
