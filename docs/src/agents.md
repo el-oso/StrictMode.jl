@@ -48,10 +48,22 @@ Each finding is one object (here pretty-printed):
 }
 ```
 
-`guarantee` is one of `typestable | noalloc | noboxing | inlined`, and `status` is one of
-`fail | pass | skip`. The `suggestion` field is the structured version of what [`@explain`](@ref)
-would tell a person, so an agent can act on it as-is. All of it comes from the
-[`StrictFinding`](@ref) record, which you can also gather directly with [`findings`](@ref).
+`guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |
+no_scalar_loops | no_spill | trimsafe | trim_compatible`, and `status` is one of
+`fail | pass | skip | info` (`info` is advisory — never a failure, e.g.
+[`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)). The `suggestion` field is
+the structured version of what [`@explain`](@ref) would tell a person, so an agent can act on it
+as-is. All of it comes from the [`StrictFinding`](@ref) record, which you can also gather
+directly with [`findings`](@ref).
+
+**Not in this list**: [`@assert_memsafe`](@ref)/`memsafe_report` and [`@assert_mca`](@ref)/
+`mca_report` are deliberately outside the `findings`/`check`/`audit` pipeline — they need real
+argument *values* (guard-page buffers, actual assembly) to run, and that pipeline is explicitly
+value-free by design (it works from compiled *types*, so it can sweep an entire module without
+calling anything). An agent that wants those checks calls them directly and reads the returned
+[`MemsafeReport`](@ref)/[`McaReport`](@ref) struct's fields — there is no JSON formatter for them,
+but every field is public and named, so `getproperty`/`propertynames` is enough for a script to
+consume programmatically.
 
 ## `:github` format for CI
 

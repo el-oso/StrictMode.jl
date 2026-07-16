@@ -137,6 +137,61 @@ RegisterReport: my_kernel!(Matrix{Float64})
 
 `register_report` is meaningful only for x86-64 AVX-512 kernels; other targets return zeros.
 
+## `@assert_no_spill` — the hard-gate sibling of `register_report`
+
+`register_report` is advisory: it tells you a kernel is saturated, but it never fails. When you've
+already identified a kernel as hot and want a permanent regression guard against a future edit
+growing its live accumulator count past the register file, [`@assert_no_spill`](@ref) is the
+codegen analogue of [`@assert_noalloc`](@ref) — unambiguous evidence of register pressure, not a
+heuristic judgment call, so it's hard-gate-able where `register_report` deliberately isn't.
+
+```julia
+@assert_no_spill dtrsm_tile!(B, A)   # throws if the tile grew past the register budget
+```
+
+It reads the same post-register-allocation `code_native` output as `register_report`, but checks
+for LLVM's `# ... Spill`/`# ... Reload` annotations on a line naming a vector (xmm/ymm/zmm)
+register — syntax-independent (works whether `code_native` emitted AT&T or Intel syntax), unlike
+a register-name regex tied to one syntax's operand punctuation. The programmatic form is
+[`spill_report`](@ref), returning a [`SpillReport`](@ref).
+
+## Steady-state throughput: `mca_report`
+
+`kernel_report` and `register_report` both work from *static* IR — they can tell you a kernel is
+vectorized and register-clean, but not whether its dependency chain lets the hardware actually
+run at that rate. A kernel can be correct, vectorized, and register-clean and still be
+*latency-bound* — e.g. a fused kernel whose accumulators form a long serial FMA chain, running at
+a fraction of the throughput its instruction mix should allow. [`mca_report`](@ref) closes that
+gap by running [`llvm-mca`](https://llvm.org/docs/CommandGuide/llvm-mca.html) — LLVM's static
+throughput analyzer — on the kernel's own native assembly:
+
+```julia
+using LLVM_full_jll   # optional, ~680MiB weak dependency — see StrictMode.mca_available
+
+r = mca_report(fma_kernel!, (Vector{Float64}, Vector{Float64}))
+r.ipc                # steady-state instructions/cycle estimate
+r.block_rthroughput   # cycles per iteration of the hot loop, at the hardware's real throughput
+```
+
+**Informational only — `@assert_mca` never fails on its own.** A naive whole-function `llvm-mca`
+run models the entire function body as a single loop; a store→reload of the output pointer at the
+function boundary then creates a *false* loop-carried dependency that serializes the estimate —
+ground-truth runtime has disagreed with a naive run in exactly this shape. `mca_report` sidesteps
+this by wrapping the detected innermost hot loop in region markers before handing it to
+`llvm-mca`, but the region detection is a text heuristic (no real control-flow graph), so treat
+the numbers as a relative signal, not an authoritative one. [`@assert_mca`](@ref) reflects that:
+it only fails when you supply an explicit `max_rthroughput=`/`min_ipc=` bound yourself.
+
+```julia
+@assert_mca fma_kernel!(C, A, B)                # always passes; useful for eyeballing r in a REPL
+@assert_mca min_ipc=2.0 fma_kernel!(C, A, B)     # throws if steady-state IPC drops below 2.0
+```
+
+`-mcpu` defaults to the host's own (`Sys.CPU_NAME`), validated against what the bundled
+`LLVM_full_jll` build actually recognizes — `llvm-mca`'s CLI hard-fails on an unrecognized `-mcpu`
+(unlike Julia's own codegen path, which just warns and falls back), so `mca_report` checks first
+and substitutes `"generic"` if needed, warning once.
+
 ## What the diagnostics can't see
 
 Some performance problems are invisible to static IR analysis:

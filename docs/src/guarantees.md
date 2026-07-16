@@ -71,6 +71,28 @@ end
 #   reason:  call provably allocates (… site(s)): …
 ```
 
+### One-time-init calibration doesn't have to break this
+
+A `Base.OncePerProcess`/`OncePerThread`-memoized lazy calibration allocates once, then reads a
+memoized value forever after — but AllocCheck's all-paths proof sees the initializer's one-time
+allocation as statically reachable and would otherwise red a call that's provably alloc-free in
+steady state. `@assert_noalloc`/`@assert_noboxing` recognize the two `Base` once-guard types
+automatically and substitute the (already-correct) `:fast` steady-state heuristic for that one
+call, rather than reporting the cold-path allocation as a violation — logged once per session via
+`@info`, never silently:
+
+```julia
+const _NP_ONCE = Base.OncePerProcess{Int}(_measure_calibration)
+steady(x::Int) = x + _NP_ONCE()
+
+@assert_noalloc steady(1)   # passes: the once-guard's cold path is exempted, not the caller's own code
+```
+
+For a hand-rolled memoization pattern that doesn't use one of those two `Base` types, register it
+explicitly with [`StrictMode.register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
+auto-recognized (its implementation has no detectable non-inlined callee boundary to key off of —
+wrap it in your own function and register that instead).
+
 ## `@assert_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It only objects to the
@@ -464,12 +486,51 @@ fs = audit(Workspaces; static_ownership_suggest = true, format = :text)
 nfailures(fs)   # 0 — only the fallback is flagged, and an advisory finding never fails a sweep
 ```
 
+## `@assert_memsafe` — deterministic out-of-bounds detection
+
+Every guarantee above is about **speed** — allocation, boxing, dispatch. [`@assert_memsafe`](@ref)
+is about **safety**: it catches an out-of-bounds array read or write in an unsafe hand-vectorized
+kernel *deterministically*, instead of the way these bugs usually surface — flakily, once in a
+long benchmark run, only when the next page happens to be unmapped.
+
+The motivating shape: a masked SIMD load reads a full lane width at a tile pointer, up to `W-1`
+elements past a partial-row tile's valid region. That kernel is type-stable, allocation-free, and
+`--trim`-tolerated — every other guarantee in this package passes it — because none of them model
+runtime memory addresses. A benchmark using ordinary heap arrays (whose trailing page happens to
+be mapped) may never trip it at all.
+
+```julia
+function masked_load_kernel!(out::Vector{Float64}, a::Vector{Float64})
+    n = length(a)
+    @inbounds for i in 1:n
+        out[i] = a[i] + a[i + 1]   # reads one element past `a`'s end
+    end
+    return nothing
+end
+
+@assert_memsafe masked_load_kernel!(zeros(8), rand(8))
+# ERROR: StrictViolation (@memsafe): guarantee not satisfied
+#   reason:  deterministic out-of-bounds access — the guarded probe subprocess was killed by
+#            SIGSEGV. Child's own signal report (names the faulting op): …
+```
+
+Mechanically: `Array` arguments are copied into `mmap`-backed buffers whose data ends flush
+against a trailing `PROT_NONE` guard page, so a one-element overrun faults on *every* run, not
+just when a real allocation happens to leave the trailing page unmapped. The default
+`isolate=true` runs the probe in a subprocess — the only way to catch an out-of-bounds *read*,
+since that's a fatal, otherwise-uncatchable `SIGSEGV`; `isolate=false` is a cheaper in-process
+check that only catches out-of-bounds *writes*. See [`memsafe_report`](@ref)'s docstring for the
+full scope (Linux/macOS only, `Array` arguments only, end-of-buffer overruns only — no interior or
+underrun detection).
+
 ## Promise scope
 
 StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**
-(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), and **static-binary
-(`juliac --trim`) compatibility** (via [`@assert_trim_compatible`](@ref)). One property is
-explicitly out of scope: **bit-reproducibility**.
+(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), **register pressure**
+(via [`@assert_no_spill`](@ref)), **static-binary (`juliac --trim`) compatibility** (via
+[`@assert_trim_compatible`](@ref)), and, deterministically rather than flakily, **out-of-bounds
+array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is explicitly out
+of scope: **bit-reproducibility**.
 
 SIMD reduction order is LLVM-codegen-defined. The lane-combine order for a vector reduction —
 for example, how four `<4 x double>` lanes are collapsed to a scalar — is chosen by the compiler

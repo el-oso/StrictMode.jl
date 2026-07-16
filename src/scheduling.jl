@@ -642,6 +642,12 @@ end
 const _SPILL_RELOAD_RE = r"#.*\b(?:Spill|Reload)\b"
 const _VEC_REG_RE = r"\b(?:xmm|ymm|zmm)\d+\b"
 
+"""
+    SpillReport
+
+The result of [`spill_report`](@ref): `target` (the checked signature, as a string) and
+`vec_spills` (the count of vector-register spill/reload lines found).
+"""
 struct SpillReport
     target::String
     vec_spills::Int   # lines carrying both a vector register and a Spill/Reload annotation

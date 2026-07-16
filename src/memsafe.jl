@@ -240,6 +240,13 @@ end
 
 # --- public API -----------------------------------------------------------------------------------
 
+"""
+    MemsafeReport
+
+The result of [`memsafe_report`](@ref): `target` (the checked signature, as a string), `isolate`
+(whether the probe ran in a subprocess), and `violation` (`nothing` if clean, else a description
+of the out-of-bounds access detected — naming the faulting op when `isolate=true` caught it).
+"""
 struct MemsafeReport
     target::String
     isolate::Bool
@@ -273,7 +280,7 @@ guarded buffers, so it stays a `@golden`-style value-based function/macro pair i
 - `isolate = false`: the probe runs **in-process** — cheaper, but only catches out-of-bounds
   WRITES (caught as a `ReadOnlyMemoryError`); an out-of-bounds read is a fatal, uncatchable crash
   in this mode.
-- `align`: alignment (bytes) for each guarded array's start pointer; see [`_guarded_array`](@ref)
+- `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
   — the default (the element's own size) is always exact-flush, no tradeoff.
 - `using_module`: for `isolate=true` when `f`'s defining file isn't self-contained (relies on its
   package's `using`/context) — the subprocess does `using \$using_module` and looks `f` up there,
