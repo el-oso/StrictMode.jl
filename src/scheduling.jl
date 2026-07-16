@@ -629,6 +629,99 @@ function register_report(@nospecialize(f), @nospecialize(types::Tuple))
     return RegisterReport(target, length(zmm_regs), total, spills)
 end
 
+# --- @assert_no_spill: vector-register spill diagnostic as a hard gate --------------------------
+#
+# `register_report`/`RegisterReport` above are advisory (never fail). `@assert_no_spill` is the
+# codegen analogue of `@assert_noalloc`: a hard, gate-able guarantee that the compiled kernel
+# doesn't spill vector registers to the stack. Detection reads the `# ... Spill`/`# ... Reload`
+# comments LLVM's register allocator emits next to the spilling instruction — these are present
+# regardless of assembly syntax (AT&T vs Intel; `code_native`'s default varies by platform/Julia
+# version), unlike a register-name regex tied to one syntax's operand punctuation. A line only
+# counts if it also names a vector register (xmm/ymm/zmm) — a scalar (GPR) spill from ordinary
+# stack traffic is not what this guarantee is about.
+const _SPILL_RELOAD_RE = r"#.*\b(?:Spill|Reload)\b"
+const _VEC_REG_RE = r"\b(?:xmm|ymm|zmm)\d+\b"
+
+struct SpillReport
+    target::String
+    vec_spills::Int   # lines carrying both a vector register and a Spill/Reload annotation
+end
+
+"""
+    spill_report(f, types) -> SpillReport
+
+Read the native assembly for `f` specialised on `types` and count vector-register spill/reload
+events (LLVM's `# ... Spill`/`# ... Reload` annotations on a line naming an xmm/ymm/zmm register).
+A nonzero count means the kernel needs more live vector registers than the target ISA provides —
+the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/
+reload instead of running from registers. Complements [`register_report`](@ref) (which reads
+zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-allocation LLVM IR
+and can't see spills at all). Empty/unavailable `code_native` output reports zero spills, matching
+[`scalar_fp_loops`](@ref)'s "can't analyze ⇒ don't fail" convention.
+"""
+function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
+    target = _func_name(f) * _sig_string(types)
+    s = _native_asm(f, types)
+    isempty(s) && return SpillReport(target, 0)
+    n = count(
+        l -> occursin(_SPILL_RELOAD_RE, l) && occursin(_VEC_REG_RE, l),
+        split(s, '\n')
+    )
+    return SpillReport(target, n)
+end
+
+function Base.show(io::IO, r::SpillReport)
+    printstyled(io, "SpillReport"; bold = true)
+    print(io, ": ", r.target, "\n")
+    if r.vec_spills == 0
+        printstyled(io, "  clean"; color = :green)
+        print(io, ": no vector-register spills.")
+    else
+        printstyled(io, "  $(r.vec_spills) vector-register spill/reload line(s)"; color = :red)
+        print(io, " — reduce the live accumulator/tile count, or split into multiple passes. See `register_report` for zmm-saturation diagnostics.")
+    end
+    return nothing
+end
+
+function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple))
+    r = spill_report(f, types)
+    r.vec_spills == 0 && return nothing
+    _fail(
+        :no_spill, target,
+        "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s)) — the " *
+            "kernel needs more live vector registers than the target ISA provides. Reduce the " *
+            "live accumulator/tile count, or split into multiple passes."
+    )
+    return nothing
+end
+
+"""
+    @assert_no_spill f(args...)
+
+Fail if `f(args...)` compiled to code that **spills a vector register to the stack**
+(**best-effort**): StrictMode scans the post-register-allocation `code_native` output for LLVM's
+`# ... Spill`/`# ... Reload` annotations on a line naming a vector (xmm/ymm/zmm) register. This is
+the codegen analogue of [`@assert_noalloc`](@ref) — a kernel can be type-stable, allocation-free,
+and vectorized, and still be "correct but slower" because it needs more live vector registers than
+the target ISA provides (LLVM's portable register allocator has no choice but to spill). A
+failure means the kernel needs fewer live accumulators/tiles, not more optimization flags.
+
+Each argument is evaluated once; disabled builds expand to the bare call. Hard-gate-able (unlike
+[`kernel_report`](@ref)/[`register_report`](@ref), which are advisory and never fail) since a
+spill is unambiguous evidence of register pressure, not a heuristic judgment call.
+
+```julia
+@assert_no_spill dtrsm_tile!(B, A)     # throws if the tile grew past the register budget
+```
+"""
+macro assert_no_spill(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_no_spill needs a call expression"))
+    call = pos[1]
+    checked = _guarantee_expr(call, _assert_no_spill; types = get(opts, :types, nothing))
+    return _gate(checked, esc(call))
+end
+
 function Base.show(io::IO, r::RegisterReport)
     printstyled(io, "RegisterReport"; bold = true)
     print(io, ": ", r.target, "\n")

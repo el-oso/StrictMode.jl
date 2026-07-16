@@ -32,6 +32,7 @@ using InteractiveUtils: InteractiveUtils
 
 export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_owned, @assert_inlined
 export @assert_vectorized, @assert_no_scalar_loops, @assert_effects, @assert_trim_safe, @assert_trim_compatible, descend, explain_trim, kernel_report, scalar_fp_loops, register_report
+export @assert_no_spill, spill_report, SpillReport
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_exempt
 export @strict_contract, @verify_strict, @explain

@@ -21,8 +21,8 @@ src/
   effects.jl          — _alloc_signals (the `:fast`-mode value-free IR heuristic engine used by
                         noalloc/noboxing/owned), @assert_effects internals, _DICT_ACCESSORS
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
-                        kernel_report/KernelReport, register_report/RegisterReport, descend,
-                        _CACHE_BYTES
+                        @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
+                        spill_report/SpillReport, descend, _CACHE_BYTES
   static_ownership.jl — static_ownership_suggestions (module-sweep GKH-ownership advisory)
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
   strict_function.jl  — @strict_function (load-time enforcement), @strict_exempt

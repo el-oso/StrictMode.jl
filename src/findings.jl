@@ -34,6 +34,7 @@ function _suggestion(guarantee::Symbol)
     guarantee === :inlined && return "not inlined: add @inline to the callee, or accept it (inlining is a heuristic)."
     guarantee === :vectorized && return "did not vectorize: try @inbounds @simd / @simd ivdep, or assert on the leaf kernel (SIMD may be in a non-inlined callee). Use kernel_report for arithmetic-intensity diagnostics."
     guarantee === :no_scalar_loops && return "scalar hot loop (FP or integer) in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels."
+    guarantee === :no_spill && return "vector register spill: reduce the live accumulator/tile count (register-block a smaller tile), or split the kernel into multiple passes. See register_report for zmm-saturation diagnostics."
     guarantee === :trimsafe && return "trim-unsafe call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/which/methods). juliac --trim=safe is authoritative."
     return ""
 end

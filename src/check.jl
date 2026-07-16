@@ -56,6 +56,9 @@ function _mode_independent_finding(g::Symbol, @nospecialize(f), @nospecialize(ty
         return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
     elseif g === :no_scalar_loops
         return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
+    elseif g === :no_spill
+        r = spill_report(f, types)
+        return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
     end
@@ -80,7 +83,7 @@ function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
     elseif g === :trim_compatible
         return _trim_compatible_finding(f, types, md, fn, sg, :full)
     end
-    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
+    throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :no_spill, :trimsafe, or :trim_compatible"))
 end
 
 # `:trimsafe` finding — the static-only subset of `:trim_compatible`, kept for compatibility. Value-free
@@ -211,7 +214,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :trim_compatible
             push!(out, _trim_compatible_finding(f, types, md, fn, sg, :fast))
         else
-            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :trimsafe, or :trim_compatible"))
+            throw(ArgumentError("unknown guarantee :$g; expected :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized, :no_scalar_loops, :no_spill, :trimsafe, or :trim_compatible"))
         end
     end
     return out
