@@ -95,11 +95,12 @@ end
 
 # --- issue #14: one-time-init allocation barriers -----------------------------------------------
 #
-# `Base.OncePerProcess`/`OncePerThread`/`OncePerTask`-memoized lazy init (and hand-rolled
-# equivalents) allocate exactly once per process/thread/task, then read a memoized value forever
-# after — but AllocCheck's all-paths static proof sees the initializer's allocation as statically
-# reachable and reds `:full` @assert_noalloc/@assert_noboxing on a call that is provably alloc-free
-# in steady state. Filtering AllocCheck's own per-instance backtraces to attribute allocations to
+# `Base.OncePerProcess`/`OncePerThread`-memoized lazy init (and hand-rolled equivalents,
+# `OncePerTask` included — see the note on `_BASE_BARRIER_TYPES` below) allocate exactly once per
+# process/thread/task, then read a memoized value forever after — but AllocCheck's all-paths static
+# proof sees the initializer's allocation as statically reachable and reds `:full`
+# @assert_noalloc/@assert_noboxing on a call that is provably alloc-free in steady state. Filtering
+# AllocCheck's own per-instance backtraces to attribute allocations to
 # the barrier does NOT work in practice: measured on a real `OncePerProcess`-memoized calibrator,
 # 24 of 52 reported instances are merged into generic Base scheduler/lock/task internals
 # ("multiple call sites") with no traceable single origin, even under an exact type-based filter.
@@ -110,7 +111,15 @@ end
 # substitutes this (already-correct) heuristic for AllocCheck's proof on a barrier-containing call
 # — see `_checked_allocs` in backend.jl.
 
-const _BASE_BARRIER_TYPES = (Base.OncePerProcess, Base.OncePerThread, Base.OncePerTask)
+# `OncePerTask` is deliberately NOT included: unlike `OncePerProcess`/`OncePerThread` (which
+# resolve to a non-inlined `init_perprocesss`/`init_perthreads`-style cold-path closure — the
+# `:invoke` boundary this scan detects), `OncePerTask` is implemented via the current task's
+# `.storage` `IdDict` (`jl_eqtable_get`/`jl_eqtable_put`), fully inlined into the caller with no
+# separate callee boundary at all — verified against its actual optimized IR, not assumed. There
+# is nothing for this `:invoke`-based mechanism to detect. A user relying on `OncePerTask` can
+# still get the exemption by wrapping it in their own `@noinline` function and passing that to
+# `register_alloc_barrier!` — the wrapper's own call site IS a detectable `:invoke` boundary.
+const _BASE_BARRIER_TYPES = (Base.OncePerProcess, Base.OncePerThread)
 
 # User-registered hand-rolled barriers (functions that allocate once, memoize, and are alloc-free
 # on every subsequent call) — the escape hatch for memoization that doesn't use one of the three
@@ -125,8 +134,10 @@ Mark `f` as a one-time-init allocation barrier: a function that allocates on its
 process/thread/task) and is alloc-free on every subsequent call. `@assert_noalloc`/
 `@assert_noboxing` (and `findings`/`check`) then treat a call reaching `f` as exempt from
 `:full`'s all-paths AllocCheck proof for that call, the same way `Base.OncePerProcess`/
-`OncePerThread`/`OncePerTask` are recognized automatically — use this for a hand-rolled
-memoization pattern that doesn't use one of those three `Base` types.
+`OncePerThread` are recognized automatically — use this for a hand-rolled memoization pattern
+that doesn't use one of those two `Base` types (this includes `Base.OncePerTask`, which is
+**not** auto-recognized — see the note on `_BASE_BARRIER_TYPES` — wrap it in your own function
+and register that instead).
 
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:full` `:noalloc`/`:noboxing` verdicts for every caller of `f`).
@@ -152,7 +163,7 @@ end
 # arbitrary user function that could legitimately be passed around as a value.
 _is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _ALLOC_BARRIERS)
 
-# `(::OncePerProcess)()` (and OncePerThread/OncePerTask) are themselves `@inline`d away in Base —
+# `(::OncePerProcess)()` (and OncePerThread) are themselves `@inline`d away in Base —
 # the fast (already-initialized) path is inlined directly into the caller, so the only surviving
 # non-inlined `:invoke` boundary is the COLD-path initializer closure (`init_perprocesss` and
 # friends), whose signature is `(closure, ::OncePerProcess, ::UInt8)` — the barrier type sits at
@@ -194,10 +205,10 @@ over-reported on type-stable SIMD/pointer kernels). `dictlookup` flags a runtime
 accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the owned-scratch/GKH-ownership
 violation — following non-inlined callees like `alloc` (the lookup usually lives in a workspace
 accessor callee, not the top function). `barrier` flags a call reaching a recognized one-time-init
-allocation barrier (`Base.OncePerProcess`/`OncePerThread`/`OncePerTask`, or a
-`register_alloc_barrier!`-registered function) — recursion stops there, so the barrier's own
-one-time allocation never contributes to `alloc`/`boxing`/`dictlookup`. Location is the method's
-definition site.
+allocation barrier (`Base.OncePerProcess`/`OncePerThread`, or a `register_alloc_barrier!`-registered
+function — see the note on `_BASE_BARRIER_TYPES` for why `Base.OncePerTask` is not auto-recognized)
+— recursion stops there, so the barrier's own one-time allocation never contributes to
+`alloc`/`boxing`/`dictlookup`. Location is the method's definition site.
 """
 function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference

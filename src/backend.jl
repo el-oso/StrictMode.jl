@@ -89,7 +89,7 @@ const _IGNORE_BARRIER = Ref(true)
 
 Whether `:full` `@assert_noalloc`/`@assert_noboxing` (and `findings`/`check`) exempt a call
 recognized as routing through a one-time-init allocation barrier
-(`Base.OncePerProcess`/`OncePerThread`/`OncePerTask`, or a function registered via
+(`Base.OncePerProcess`/`OncePerThread`, or a function registered via
 [`register_alloc_barrier!`](@ref)) from AllocCheck's all-paths proof. Default `true`. See
 [`StrictMode.set_ignore_barrier!`](@ref).
 """
@@ -116,16 +116,20 @@ end
 # scheduler/lock/task internals ("multiple call sites") with no single traceable origin, even
 # under an exact type-based filter. So the exemption is granted at the STATIC-IR level instead
 # (`_alloc_signals`'s `barrier` signal, effects.jl): when a call is recognized as routing through
-# a barrier AND the barrier-aware `:fast` heuristic finds nothing else allocating/boxing, skip
-# AllocCheck's per-instance proof entirely and report a clean, empty allocation list — this is
-# deliberately scoped to the "clean except for a recognized barrier" case; a barrier call that
-# ALSO has some other real allocation falls through to the normal (noisier, but honest) AllocCheck
-# proof, since the heuristic alone can't produce AllocCheck-typed per-site instances for that case.
-# Returns `(allocs, exempted::Bool)`.
+# a barrier AND the barrier-aware `:fast` heuristic finds nothing else allocating/boxing/an
+# abstract-eltype container, skip AllocCheck's per-instance proof entirely and report a clean,
+# empty allocation list — this is deliberately scoped to the "clean except for a recognized
+# barrier" case; a barrier call that ALSO has some other real allocation risk falls through to the
+# normal (noisier, but honest) AllocCheck proof, since the heuristic alone can't produce
+# AllocCheck-typed per-site instances for that case. The `abscontainer` check matters: without it
+# a barrier call that ALSO reads an abstract-eltype container (e.g. a `Vector{Real}` field) would
+# pass :full while :fast's own `_findings_fast` (`check.jl`) correctly fails it via
+# `sig.abscontainer !== nothing` — :full must not become MORE permissive than :fast. Returns
+# `(allocs, exempted::Bool)`.
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     if _IGNORE_BARRIER[]
         sig = _alloc_signals(f, types)
-        if sig.barrier && !sig.alloc && !sig.boxing
+        if sig.barrier && !sig.alloc && !sig.boxing && sig.abscontainer === nothing
             @info "StrictMode: `$(f)` reaches a one-time-init allocation barrier — :full noalloc/noboxing exempted (steady-state :fast heuristic used instead of AllocCheck's all-paths proof for this call). Disable with StrictMode.set_ignore_barrier!(false)." maxlog = 1
             return (Any[], true)
         end

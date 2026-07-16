@@ -21,8 +21,9 @@ src/
   effects.jl          — _alloc_signals (the `:fast`-mode value-free IR heuristic engine used by
                         noalloc/noboxing/owned), @assert_effects internals, _DICT_ACCESSORS,
                         register_alloc_barrier!/_is_base_barrier_type/_mi_is_barrier (issue #14
-                        one-time-init allocation barriers: OncePerProcess/OncePerThread/OncePerTask
-                        auto-recognized + user-registered, both feed the `barrier` alloc signal)
+                        one-time-init allocation barriers: OncePerProcess/OncePerThread auto-
+                        recognized (NOT OncePerTask — different Base implementation, no detectable
+                        :invoke boundary) + user-registered, both feed the `barrier` alloc signal)
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES

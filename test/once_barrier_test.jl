@@ -68,11 +68,76 @@ end
     @test sig.alloc
 end
 
-@testitem "OncePerThread and OncePerTask are also recognized as barrier types" begin
+@testitem "a barrier call that ALSO reads an abstract-eltype container is not exempted (:full must not be laxer than :fast)" begin
+    using StrictMode, AllocCheck, JET
+    # Without also checking `abscontainer`, the exemption gate would pass :full while :fast's own
+    # `_findings_fast` correctly fails via `sig.abscontainer !== nothing` (check.jl) — a barrier
+    # call with an UNRELATED abstract-container risk must still be caught by :full.
+    _measure_ac() = length(rand(4))
+    const _AC_ONCE = Base.OncePerProcess{Int}(_measure_ac)
+    struct AbsContainerHolder
+        v::Vector{Real}
+    end
+    lenplus(h::AbsContainerHolder) = length(h.v) + _AC_ONCE()
+
+    sig = StrictMode._alloc_signals(lenplus, (AbsContainerHolder,))
+    @test sig.barrier
+    @test !sig.alloc
+    @test !sig.boxing
+    @test sig.abscontainer !== nothing
+
+    @test_throws StrictViolation (@assert_noalloc lenplus(AbsContainerHolder(Real[1, 2])))
+end
+
+@testitem "OncePerThread is also recognized end-to-end (not just the bare type predicate)" begin
+    using StrictMode, AllocCheck, JET
+    # Exercise the REAL detection path (_alloc_signals -> _mi_is_barrier), not just
+    # _is_base_barrier_type in isolation — a bare type-predicate pass doesn't prove the :invoke
+    # scan actually recognizes it (this gap is exactly what let OncePerTask ship un-detected
+    # despite `_is_base_barrier_type` trivially returning true for it).
+    _measure_pt() = length(rand(4))
+    const _PT_ONCE = Base.OncePerThread{Int}(_measure_pt)
+    pt_steady(x::Int) = x + _PT_ONCE()
+
+    sig = StrictMode._alloc_signals(pt_steady, (Int,))
+    @test sig.barrier
+    @test !sig.alloc
+    @test !sig.boxing
+    @test (@assert_noalloc pt_steady(1)) == 1 + _PT_ONCE()
+end
+
+@testitem "OncePerTask is NOT auto-recognized (different Base implementation, no detectable :invoke)" begin
+    using StrictMode, AllocCheck, JET
+    # OncePerTask is implemented via the current task's `.storage` IdDict (jl_eqtable_get/put),
+    # fully inlined into the caller — there is no non-inlined callee boundary for the :invoke-based
+    # mechanism to detect, unlike OncePerProcess/OncePerThread's cold-path init closure. Pin this
+    # down explicitly so a future "let's add OncePerTask to _BASE_BARRIER_TYPES" doesn't silently
+    # ship a barrier that's never actually detected (that's exactly how it shipped wrong the first
+    # time — the only prior test checked the bare `_is_base_barrier_type` predicate, not real
+    # detection through `_alloc_signals`).
+    _measure_ptk() = length(rand(4))
+    const _PTK_ONCE = Base.OncePerTask{Int}(_measure_ptk)
+    ptk_steady(x::Int) = x + _PTK_ONCE()
+
+    @test !StrictMode._is_base_barrier_type(Base.OncePerTask{Int, typeof(_measure_ptk)})
+    sig = StrictMode._alloc_signals(ptk_steady, (Int,))
+    @test !sig.barrier
+    # Documents the workaround: wrap it in a registered function instead.
+    @noinline _ptk_wrapper() = _PTK_ONCE()
+    ptk_wrapped(x::Int) = x + _ptk_wrapper()
+    StrictMode.register_alloc_barrier!(_ptk_wrapper)
+    try
+        @test (@assert_noalloc ptk_wrapped(1)) == 1 + _PTK_ONCE()
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        StrictMode.clear_cache!()
+    end
+end
+
+@testitem "OncePerProcess/OncePerThread type predicate; Int is not a barrier type" begin
     using StrictMode
     @test StrictMode._is_base_barrier_type(Base.OncePerProcess{Int, typeof(identity)})
     @test StrictMode._is_base_barrier_type(Base.OncePerThread{Int, typeof(identity)})
-    @test StrictMode._is_base_barrier_type(Base.OncePerTask{Int, typeof(identity)})
     @test !StrictMode._is_base_barrier_type(Int)
 end
 
