@@ -49,16 +49,30 @@ src/
                         merge into generic Base scheduler internals with no traceable origin)
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
-  trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate)
+  trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate;
+                        issue #13: a heuristic-path PASS logs a one-time _TRIM_HEURISTIC_CAVEAT note
+                        that reachability-limit union-splits aren't covered — status/reason on the
+                        structured StrictFinding are untouched, macro-path-only visibility)
   memsafe.jl          — @assert_memsafe, memsafe_report/MemsafeReport, _guarded_array/GuardedBuffer
                         (mmap/mprotect guard-page harness for deterministic OOB read/write detection;
                         isolate=true runs the probe in a subprocess via Serialization + Base.run)
+  mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
+                        throughput/IPC estimate, informational only — never fails without an
+                        explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the
+                        `;`-comment Function-Signature line llvm-mca's assembler chokes on),
+                        _innermost_loop_span/_wrap_mca_region (region markers around the ymm/zmm-
+                        containing loop — NOT bare xmm, which scalar SSE ops also use — to avoid the
+                        whole-function false-loop-carried-dependency trap), _resolve_mcpu (llvm-mca's
+                        CLI hard-fails on an unrecognized -mcpu, unlike Julia's own codegen path, so
+                        this validates against `-mcpu=help` and falls back to "generic")
 ext/
   StrictModeAnalysisExt.jl  — AllocCheck + JET backend (weak dep, loaded on `using AllocCheck, JET`)
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
   StrictModeCpuIdExt.jl     — CPU-specific _CACHE_BYTES override (weak dep, `using CpuId`)
   StrictModeReviseExt.jl    — cache invalidation on code change
   StrictModeTrimExt.jl      — TrimCheck-backed juliac --trim=safe verifier (weak dep, `using TrimCheck`)
+  StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,
+                              ~680MiB — never a test/CI default, see test/mca_test.jl's live-path guard)
 test/
   runtests.jl         — uses ReTestItems.runtests(StrictMode); loads AllocCheck+JET backend
   Project.toml        — has [preferences.StrictMode] checks_enabled=true, fail_mode="error"

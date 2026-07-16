@@ -52,6 +52,32 @@ trimcheck_available() = _TRIMCHECK_AVAILABLE[]
 
 function _be_trim_validate end  # (f, types) -> (passed::Bool, findings::Vector{String})
 
+# MCA backend — another *independent* weak dependency: `LLVM_full_jll` ships `llvm-mca`, an
+# ~680MiB artifact, so it's opt-in only (never a test/CI default — see `mca.jl`'s own notes).
+# `mca_report`/`@assert_mca` (issue #16 Tier 2) use it for informational codegen-quality reports.
+const _MCA_AVAILABLE = Ref(false)
+
+"""
+    StrictMode.mca_available() -> Bool
+
+Whether the `LLVM_full_jll` extension (`StrictModeMcaExt`) is loaded — i.e. whether
+[`mca_report`](@ref)/`@assert_mca` can actually run `llvm-mca`. `LLVM_full_jll` is a heavy
+(~680MiB) weak dependency, so this defaults `false`; add it to your dev environment to use these.
+"""
+mca_available() = _MCA_AVAILABLE[]
+
+function _require_mca()
+    _MCA_AVAILABLE[] && return nothing
+    error(
+        "StrictMode: mca_report/@assert_mca need LLVM_full_jll (an optional, ~680MiB weak " *
+            "dependency that ships llvm-mca) — add it to this environment to use them. Not " *
+            "needed for any other StrictMode guarantee."
+    )
+end
+
+function _be_mca_run end   # (sanitized_asm::String, mcpu::String) -> raw llvm-mca stdout::String
+function _be_mca_cpus end  # () -> Vector{String} of -mcpu names llvm-mca recognizes on this host
+
 # Whether the `:full` AllocCheck pass ignores allocations on never-taken throw branches (a
 # `BoundsError` construction, etc.). `true` (default) = hot-path semantics: a runtime-zero-alloc
 # kernel with bounds checks is *not* a false positive. Strict users can count them with
