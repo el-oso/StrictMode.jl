@@ -10,9 +10,34 @@
 
 _trim_report(@nospecialize(f), @nospecialize(types::Tuple)) = TypeContracts.trim_report(f, Tuple{types...})
 
+# issue #13: the static heuristic (`TypeContracts.trim_report`) misses a real trim-incompatibility
+# class that `:full` + TrimCheck's authoritative `verify_typeinf_trim` catches — N simultaneous
+# runtime `Union{Val,...}`-shaped arguments whose 2^N specialization count can exceed juliac's
+# reachability/union-split limit. A trivial, small callee does NOT trip this (the trimmer resolves
+# every instance when the callee is simple); it only shows up with a large/opaque callee where the
+# union propagates past what inference can collapse — so a per-call-site static scan cannot
+# reliably discriminate the safe case from the dangerous one (flagging heuristically would
+# false-positive on exactly the callees the issue's own repro proves are fine). No warn-tier
+# heuristic is added for that reason; instead, a PASS reached only via the static scan (not the
+# authoritative verifier) gets a one-time session note that this class isn't covered — a fast
+# dev-loop check that never escalates to :full + TrimCheck would otherwise get no signal at all
+# for it. `status`/`reason` on the structured `StrictFinding` are deliberately left untouched (a
+# heuristic PASS stays `:pass` with an empty reason, matching every other guarantee and the
+# existing back-compat contract) — this is macro-path-only visibility, not a findings/check API
+# change.
+const _TRIM_HEURISTIC_CAVEAT = "StrictMode: this trim-safety PASS is from the static heuristic scan only " *
+    "(TypeContracts.trim_report), not juliac's authoritative verifier — it does not cover " *
+    "reachability-limit union-splits (N simultaneous small-Union arguments whose 2^N specialization " *
+    "count can exceed juliac's split limit on a large/opaque callee). Verify with `:full` analysis " *
+    "mode + TrimCheck loaded (or a real `juliac --trim=safe` build) before relying on this pass alone."
+
 function _assert_trim_safe(target, @nospecialize(f), @nospecialize(types::Tuple))
     r = _trim_report(f, types)
-    r.passed || _fail(
+    if r.passed
+        @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
+        return nothing
+    end
+    _fail(
         :trimsafe, target,
         "likely trim-unsafe ($(length(r.findings)) site(s); juliac --trim=safe is authoritative):\n  " *
             join(r.findings, "\n  ")
@@ -33,6 +58,17 @@ dependency and stays cheap in *any* mode — use it only when you specifically w
 **Best-effort, advisory** — juliac's whole-program verifier is authoritative — so **not** part of
 [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call. The reactive
 counterpart, for a real build failure, is [`explain_trim`](@ref).
+
+!!! note "known gap: reachability-limit union-splits"
+    This static scan does **not** catch every trim-incompatibility juliac's real verifier does — in
+    particular, N simultaneous runtime `Union{Val,…}`-shaped arguments whose 2ᴺ specialization count
+    can exceed juliac's reachability/union-split limit when the callee is large/opaque enough that
+    inference can't collapse it (a trivial callee resolves fine and does *not* trip this). A scan
+    that flagged every small-`Union`-heavy call site would false-positive on exactly the callees that
+    are fine, so no heuristic is added for it — a PASS from this macro logs a one-time session note
+    that this class isn't covered; use `:full` mode with `TrimCheck` loaded (or
+    [`@assert_trim_compatible`](@ref), which escalates automatically) before relying on a green
+    `@assert_trim_safe` alone for a `juliac --trim` build.
 """
 macro assert_trim_safe(args...)
     pos, opts = _macro_call(args, (:types,))
@@ -57,7 +93,11 @@ end
 
 function _assert_trim_compatible(target, @nospecialize(f), @nospecialize(types::Tuple))
     passed, findings, authoritative = _trim_compatible_check(f, types)
-    passed || _fail(
+    if passed
+        authoritative || @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
+        return nothing
+    end
+    _fail(
         :trim_compatible, target,
         (
             authoritative ?
@@ -85,6 +125,15 @@ Advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's whole-prog
 build is the final word. Each argument is evaluated once; disabled builds expand to the bare call. The
 cheaper static-only form is [`@assert_trim_safe`](@ref); the reactive counterpart, for a real build
 failure, is [`explain_trim`](@ref).
+
+!!! note "known gap in the :fast/no-TrimCheck path: reachability-limit union-splits"
+    A PASS reached via the static scan (not the authoritative verifier — i.e. `:fast` mode, or `:full`
+    without `TrimCheck` loaded) does not cover N-simultaneous-small-`Union`-argument call sites that can
+    exceed juliac's reachability limit on a large/opaque callee (see [`@assert_trim_safe`](@ref) for why
+    no heuristic is added for it). This macro already escalates automatically in `:full` mode with
+    `TrimCheck` loaded — that authoritative path *does* catch this class, so the gap is specifically a
+    fast dev-loop check run without `:full` + `TrimCheck`, which logs a one-time session note when it
+    passes via the heuristic instead of the verifier.
 """
 macro assert_trim_compatible(args...)
     pos, opts = _macro_call(args, (:types,))
