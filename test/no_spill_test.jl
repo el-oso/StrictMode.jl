@@ -28,7 +28,9 @@ function _accum_kernel_expr(name::Symbol, n::Int)
 end
 
 eval(_accum_kernel_expr(:clean_accum_kernel!, 4))     # well under any x86-64 vector register file
-eval(_accum_kernel_expr(:spilly_accum_kernel!, 32))   # past 16 ymm (AVX2); at/past 32 zmm (AVX-512)
+# 80: past 16 ymm (AVX2) AND past 32 zmm (AVX-512) with real margin — 32 was found to land exactly
+# on the AVX-512 register count on some CI runners (zero margin, no spill observed).
+eval(_accum_kernel_expr(:spilly_accum_kernel!, 80))
 
 const CleanAccumKernel = clean_accum_kernel!
 const SpillyAccumKernel = spilly_accum_kernel!
@@ -43,7 +45,7 @@ end
 @testitem "@assert_no_spill throws on a register-starved kernel" setup = [NoSpillFixtures] begin
     using StrictMode
     if Sys.ARCH === :x86_64
-        @test_throws StrictViolation (@assert_no_spill spilly_accum_kernel!(zeros(32), zeros(3), zeros(3)))
+        @test_throws StrictViolation (@assert_no_spill spilly_accum_kernel!(zeros(80), zeros(3), zeros(3)))
     else
         @test_skip false   # spill/register-count shape is x86-64-specific (ymm/zmm)
     end

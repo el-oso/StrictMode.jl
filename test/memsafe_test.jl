@@ -38,7 +38,8 @@ end
 
         r = memsafe_report(memsafe_oob_read_kernel!, zeros(8), rand(8))
         @test r.violation !== nothing
-        @test occursin("SIGSEGV", r.violation)
+        # SIGSEGV on Linux, SIGBUS on macOS — same fault class, platform-dependent signal.
+        @test occursin("SIGSEGV", r.violation) || occursin("SIGBUS", r.violation)
         @test occursin("memsafe_oob_read_kernel!", r.violation)   # the child's own report names the faulting op's frame
 
         @test_throws StrictViolation (@assert_memsafe memsafe_oob_read_kernel!(zeros(8), rand(8)))
@@ -103,7 +104,9 @@ end
         outbuf = IOBuffer()
         proc = run(pipeline(cmd; stdout = outbuf, stderr = devnull); wait = false)
         wait(proc)
-        @test proc.termsignal == 11   # SIGSEGV — the process died, isolate=false did not (could not) catch it
+        # SIGSEGV(11) on Linux, SIGBUS(10) on macOS — the process died either way; isolate=false
+        # did not (could not) catch it.
+        @test proc.termsignal in (10, 11)
         @test !occursin("SHOULD_NOT_REACH_HERE", String(take!(outbuf)))
     end
 end
@@ -147,19 +150,23 @@ end
 
 @testitem "_guarded_array is exact-flush and warns when a wider align forces slack" begin
     using StrictMode
-    for n in (1, 3, 7, 64, 4097)
-        src = rand(n)
-        gb = StrictMode._guarded_array(src)
-        @test gb.array == src
-        @test length(gb.array) == n
+    if Sys.iswindows()
+        @test_skip false   # _guarded_array needs mmap/mprotect/getpagesize, POSIX-only
+    else
+        for n in (1, 3, 7, 64, 4097)
+            src = rand(n)
+            gb = StrictMode._guarded_array(src)
+            @test gb.array == src
+            @test length(gb.array) == n
+            StrictMode._free_guarded!(gb)
+        end
+
+        # align wider than sizeof(Float64) forces slack on a length that isn't a clean multiple —
+        # exercised for the warning path, not asserted on stdout/stderr content.
+        gb = StrictMode._guarded_array(rand(3); align = 32)
+        @test length(gb.array) == 3
         StrictMode._free_guarded!(gb)
     end
-
-    # align wider than sizeof(Float64) forces slack on a length that isn't a clean multiple —
-    # exercised for the warning path, not asserted on stdout/stderr content.
-    gb = StrictMode._guarded_array(rand(3); align = 32)
-    @test length(gb.array) == 3
-    StrictMode._free_guarded!(gb)
 end
 
 @testitem "MemsafeReport show renders pass/fail" begin

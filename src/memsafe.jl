@@ -150,6 +150,16 @@ function _indent(s::AbstractString)
     return join(("  " * l for l in split(s, '\n')), '\n')
 end
 
+# Signal numbers are OS-specific: SIGBUS is 7 on Linux but 10 on Darwin/macOS (SIGSEGV is 11 on
+# both). A guard-page boundary fault raises SIGSEGV on Linux but SIGBUS on macOS for the same
+# out-of-bounds access — both indicate the same fault class this harness is designed to catch.
+function _signal_name(sig::Integer)
+    sig == 11 && return "SIGSEGV"
+    bus = Sys.isapple() ? 10 : 7
+    sig == bus && return "SIGBUS"
+    return "signal $sig"
+end
+
 function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_path::AbstractString, using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int})
     mod_stmt = using_module === nothing ? "include($(repr(kernel_file)))" : "using $(using_module)"
     lookup_mod = using_module === nothing ? "Main" : string(using_module)
@@ -215,7 +225,7 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
         wait(proc)
         out_s, err_s = String(take!(outbuf)), String(take!(errbuf))
         if proc.termsignal != 0
-            signame = proc.termsignal == 11 ? "SIGSEGV" : proc.termsignal == 7 ? "SIGBUS" : "signal $(proc.termsignal)"
+            signame = _signal_name(proc.termsignal)
             return "deterministic out-of-bounds access — the guarded probe subprocess was killed by " *
                 "$signame. Child's own signal report (names the faulting op):\n" * _indent(err_s)
         elseif occursin("STRICTMODE_MEMSAFE_WRITE_VIOLATION", out_s)
@@ -288,8 +298,9 @@ guarded buffers, so it stays a `@golden`-style value-based function/macro pair i
 
 **Scope**: only `Array` arguments are guarded; every other argument passes through unguarded. Only
 catches overruns past the *end* of an allocation (no leading guard, no interior-overread
-detection). Linux/macOS only (needs `mmap`/`mprotect` + POSIX signal delivery); untested on macOS
-in this package's own CI as of writing.
+detection). Linux/macOS only (needs `mmap`/`mprotect` + POSIX signal delivery). The fatal signal
+for a guard-page fault is platform-dependent — SIGSEGV on Linux, SIGBUS on macOS — both are reported
+identically as a memsafe violation.
 
 ```julia
 r = memsafe_report(masked_load_kernel!, C, A, B)
