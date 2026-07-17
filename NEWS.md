@@ -1,6 +1,6 @@
 # StrictMode.jl release notes
 
-## v0.4.0
+## v0.3.9
 
 Five features closing four issues (#13, #14, #15, #16), each independently reviewed and
 cross-checked before landing (per-phase review, then a final whole-branch pass — two real
@@ -48,6 +48,18 @@ its own individual review — both fixed before release:
 
 Also: `Serialization` (a stdlib, used for `@assert_memsafe`'s subprocess argument marshaling) is a
 new main dependency.
+
+## v0.3.8
+
+Bugfix. `StrictModeCpuIdExt.__init__` blindly destructured `CpuId.cachesize()`'s result
+(`l1, l2, l3 = cachesize()`), which throws `BoundsError` on CPUs `CpuId` can't parse (brand-new
+models like EPYC 9455/Zen5, or VMs/hypervisors that mask the deterministic-cache CPUID leaf) — an
+`InitError` that crashed the whole extension load and took `using CpuId` (and every package that
+transitively loads it, e.g. PureBLAS) down with it.
+
+- **`StrictMode._set_cache_bytes!(cs)`** guards the ingest: keeps the safe default `_CACHE_BYTES`
+  unless `cs` has ≥3 positive sizes, instead of throwing. Regression test in
+  `test/cpuid_ext_test.jl` covers `()`, short, and zero tuples.
 
 ## v0.3.7
 
