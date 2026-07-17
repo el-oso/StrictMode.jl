@@ -376,7 +376,17 @@ end
 **What it is.** GKH ownership (named for the Greg Kroah-Hartman / Linux-kernel principle that
 *data has a clear static owner, reached through that owner — never a global registry*) is the
 idiom of giving each concrete type a `const` value, reached by dispatch, instead of storing it in
-a runtime-keyed lookup table:
+a runtime-keyed lookup table. The two forms have the same call-site shape (`_ws(Float64)`) but
+resolve the association through completely different machinery:
+
+- **Dispatch form:** the mapping `Float64 → _WS_F64` lives in the **method table**. When the
+  compiler specializes a caller for `Float64`, method selection happens at *compile time* — there
+  is exactly one applicable method, its body is a `const` global read, so the whole call
+  const-folds. At runtime there is nothing left: no call, no probe, no branch.
+- **Dict form:** the mapping lives in a **runtime data structure**. The type `T` is a value at
+  runtime, so `get!` must probe the table — hash (or an identity-scan for `IdDict`) plus a key
+  comparison — on *every* call. The compiler cannot fold this away, because a mutable dict's
+  contents aren't knowable at compile time.
 
 ```julia
 # GKH ownership: each type owns a const value, reached by compile-time dispatch.
@@ -393,20 +403,55 @@ const _WS = IdDict{Type, Any}()
 _ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)   # runtime lookup on every call
 ```
 
+The smallest possible instance of the pattern, with no domain complexity at all — dispatching on a
+type instead of keying a dict by it:
+
+```julia
+# anti-pattern
+const UNITS = Dict{Type, Any}(Int => 1, Float64 => 1.0)
+unit(::Type{T}) where {T} = UNITS[T]        # hash+eq probe every call, returns Any
+
+# GKH ownership
+unit(::Type{Int})     = 1                   # method table entry, const-folds
+unit(::Type{Float64}) = 1.0
+```
+
+(Base's own `one(::Type{T})` works exactly this way — it was never going to be a dict.)
+
 **What problem it solves.** A type/symbol-keyed `Dict`/`IdDict` lookup is often type-stable and
 non-allocating on the warm hit — so `@assert_typestable`, `@assert_noalloc`, and
 `@assert_noboxing` all pass on it. Nothing else in this package would tell you it's there. But it
-still costs a real hash/eq-table probe on every call (measured ~130 ns), and it's exactly the kind
-of runtime indirection that trips up `juliac --trim` (see `@assert_trim_compatible` above) —
-a static build wants to prove every call resolves at compile time, and a dict keyed by `Type` is
-resolved by *value*, at *runtime*. The dispatch form sidesteps both: it const-folds like any other
-method call, so it's free and trim-safe by construction.
+still costs a real hash/eq-table probe on every call (measured ~130 ns) — for a hot inner-loop
+accessor, that's dozens of FLOPs worth of latency spent fetching a pointer that could have cost
+zero. Because it's latency, not allocation or instability, only a benchmark or a structural IR
+lint exposes it — and it hides even from IR inspection when `T` is a static parameter, since the
+optimizer folds `get!` down to raw `jl_eqtable_*` foreigncalls, erasing the recognizable pattern
+from *optimized* IR. (That's why `static_ownership_suggestions` scans *unoptimized* typed IR —
+the runtime cost is real, but the source-level pattern is gone by the time optimized IR would show
+it.)
 
-**Two tools, for two different jobs.** Detecting "is this call a GKH-ownership violation" is not a
-provable property the way "does this allocate" is — it's a judgment call (a `Dict` is sometimes
-exactly the right tool: a config table parsed once, a plugin registry, a value-keyed memo cache).
-StrictMode gives you a precise tool and a broad one, and they don't overlap in scope (different
-guarantee names, no shared registry entry):
+**Why it matters for `juliac --trim` and non-allocating code.** `juliac --trim` builds a static
+binary by proving every reachable call resolves to a concrete method at compile time, then
+discarding everything it can't prove that about. A dispatch-based accessor is trivially provable:
+for a concrete call there is exactly one callee, its body is a `const`, and the whole thing inlines
+away — nothing dynamic is left to trim. A `Dict` lookup keyed by a `Type` value is resolved by
+*value*, at *runtime*: the trimmer can prove which `get!` *method* runs, but never what comes out
+of the table, because that association lives in mutable heap memory, not the type system or the
+method table. That's exactly the runtime indirection a static build cannot swallow. The same
+asymmetry shows up for allocation: the dict's first-miss allocation makes an all-paths allocation
+proof see a statically-reachable allocation forever, even though steady state is alloc-free; the
+`const`-owner form allocates once at module load, so the hot path is provably allocation-free with
+no barriers or exemptions needed.
+
+This is also why StrictMode treats GKH-ownership violations as a *judgment call* rather than a
+provable property the way "does this allocate" is: a `Dict` is sometimes exactly the right tool (a
+config table parsed once, a genuinely open-ended value-keyed memo cache) — and the pattern's own
+sanctioned escape hatch, a `Dict` fallback for a rare-type tail (Example 2 below), is *also* a
+runtime dict lookup. A hard gate swept over a whole package would break the build on the very
+fallback the idiom recommends.
+
+**Two tools, for two different jobs.** StrictMode gives you a precise tool and a broad one, and
+they don't overlap in scope (different guarantee names, no shared registry entry):
 
 | | [`@assert_owned`](@ref) | [`static_ownership_suggestions`](@ref) |
 |---|---|---|
@@ -486,6 +531,52 @@ fs = audit(Workspaces; static_ownership_suggest = true, format = :text)
 nfailures(fs)   # 0 — only the fallback is flagged, and an advisory finding never fails a sweep
 ```
 
+### Example 3 — real packages doing this
+
+This isn't a StrictMode-specific idiom; it's how Julia packages that care about it already solve
+the "per-type registry" problem.
+
+**TypeContracts.jl** — a separate interface-contract package. The obvious design for
+`@contract AbstractShape begin ... end` is a global `Dict{Type,ContractSpec}` mutated by the macro
+and queried by the checker. TypeContracts deliberately has no mutable registry at all: `@contract
+I` instead *emits methods* —
+
+```julia
+@generated function TypeContracts.interface_trait(::Type{I}, ::Type{T}) where {T}
+    return TypeContracts._build_trait_expr(I, T, arg_lists, fns)   # contract data baked in at macro-expansion time
+end
+```
+
+— plus a `_contract_specs(::Type{I})` method holding the spec. The generic fallback,
+`interface_trait(::Type{I}, ::Type{T}) where {I,T} = NotImplemented{I}()`, makes "not registered"
+a dispatch outcome too, not a `haskey` branch. The payoff is the GKH list verbatim: method
+definitions serialize into the precompile cache and survive package reloads (a dict would be
+wiped, needing an `__init__` re-registration step); no world-age problems; and `interface_trait`
+is `juliac --trim`-safe precisely because there is no runtime registry lookup for the trimmer to
+fail to prove — just ordinary, statically-resolvable methods.
+
+**Julia Base — `IteratorSize`/`IteratorEltype`** (`base/generator.jl`). A textbook per-type trait
+registry, shipped as pure dispatch:
+
+```julia
+IteratorSize(x) = IteratorSize(typeof(x))
+IteratorSize(::Type) = HasLength()                                 # default
+IteratorSize(::Type{<:Tuple}) = HasLength()
+IteratorSize(::Type{<:AbstractArray{<:Any, N}}) where {N} = HasShape{N}()
+```
+
+Packages "register" by defining their own `Base.IteratorSize(::Type{MyIter}) = HasShape{2}()`
+method rather than inserting into a table. `IteratorSize(Vector{Int})` const-folds to
+`HasShape{1}()`, and `collect`'s dispatch on it specializes completely; a `Dict{Type,...}` version
+would put an eqtable probe inside every `collect` call and be opaque to inference.
+
+One caveat so the idiom isn't over-applied: dispatch-per-type means one compiled specialization per
+type. For a handful of known-hot types that's the whole point; for an unbounded, genuinely dynamic
+key population it's compile-time and method-table bloat instead — the honest answer there is a
+`Dict`, or the hybrid fallback shape in Example 2. GKH ownership isn't "never use a `Dict`" — it's
+"the hot, statically-known associations belong in the method table, where the compiler can see
+them."
+
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
 Every guarantee above is about **speed** — allocation, boxing, dispatch. [`@assert_memsafe`](@ref)
@@ -494,16 +585,18 @@ kernel *deterministically*, instead of the way these bugs usually surface — fl
 long benchmark run, only when the next page happens to be unmapped.
 
 The motivating shape: a masked SIMD load reads a full lane width at a tile pointer, up to `W-1`
-elements past a partial-row tile's valid region. That kernel is type-stable, allocation-free, and
-`--trim`-tolerated — every other guarantee in this package passes it — because none of them model
-runtime memory addresses. A benchmark using ordinary heap arrays (whose trailing page happens to
-be mapped) may never trip it at all.
+elements past a partial-row tile's valid region — via a raw pointer (`unsafe_load`, a
+`VecElement`/LLVM-intrinsic vector load, or equivalent), not `getindex`. That kernel is
+type-stable, allocation-free, and `--trim`-tolerated — every other guarantee in this package
+passes it — because none of them model runtime memory addresses. A benchmark using ordinary heap
+arrays (whose trailing page happens to be mapped) may never trip it at all.
 
 ```julia
 function masked_load_kernel!(out::Vector{Float64}, a::Vector{Float64})
     n = length(a)
+    p = pointer(a)
     @inbounds for i in 1:n
-        out[i] = a[i] + a[i + 1]   # reads one element past `a`'s end
+        out[i] = a[i] + unsafe_load(p, i + 1)   # raw-pointer read one element past `a`'s end
     end
     return nothing
 end
@@ -514,14 +607,29 @@ end
 #            SIGSEGV. Child's own signal report (names the faulting op): …
 ```
 
+**Why not just `julia --check-bounds=yes`?** That flag forces Julia's own bounds check even inside
+`@inbounds` blocks, turning a plain `@inbounds a[i]` overrun into a catchable `BoundsError` — for
+*that* bug shape it's simpler than this whole harness, and you don't need `@assert_memsafe` for it
+(a `@test_throws BoundsError` run under the flag is enough). But `--check-bounds` only re-enables
+the bounds branch inside `getindex`/`setindex!`/`checkbounds` lowering — it has **no effect at
+all** on `unsafe_load`/`unsafe_store!`, raw `Ptr` arithmetic, or SIMD-intrinsic vector loads,
+because those never go through `checkbounds` in the first place (confirmed at both the runtime and
+`@code_llvm` level: `getindex` compiles a bounds branch, `unsafe_load` compiles none). That's
+exactly the access pattern the motivating bug above uses, and exactly why `@assert_memsafe` exists
+as a distinct tool rather than a wrapper around a compiler flag: it catches the class of
+out-of-bounds access that is invisible to `--check-bounds` by construction, not the class that
+flag already handles.
+
 Mechanically: `Array` arguments are copied into `mmap`-backed buffers whose data ends flush
 against a trailing `PROT_NONE` guard page, so a one-element overrun faults on *every* run, not
 just when a real allocation happens to leave the trailing page unmapped. The default
 `isolate=true` runs the probe in a subprocess — the only way to catch an out-of-bounds *read*,
-since that's a fatal, otherwise-uncatchable `SIGSEGV`; `isolate=false` is a cheaper in-process
-check that only catches out-of-bounds *writes*. See [`memsafe_report`](@ref)'s docstring for the
-full scope (Linux/macOS only, `Array` arguments only, end-of-buffer overruns only — no interior or
-underrun detection).
+since that's a fatal, otherwise-uncatchable `SIGSEGV` (verified: an out-of-bounds write against the
+guard page converts to a catchable `ReadOnlyMemoryError` in-process, but an out-of-bounds read
+kills the process outright, exit via signal, nothing to catch); `isolate=false` is a cheaper
+in-process check that only catches out-of-bounds *writes*. See [`memsafe_report`](@ref)'s
+docstring for the full scope (Linux/macOS only, `Array` arguments only, end-of-buffer overruns
+only — no interior or underrun detection).
 
 ## Promise scope
 
