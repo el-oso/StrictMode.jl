@@ -20,8 +20,10 @@
 
     d = divergence_report(total, (Vector{Shape},))
     @test !isempty(d)
-    # fast says pass, full says fail on the dispatch-driven guarantees
-    @test any(t -> t[1] === :noboxing && t[2] == false && t[3] == true, d.diverged)
+    # Which guarantee surfaces it is an optimizer detail: 1.12 reports :noboxing, 1.13 :typestable
+    # (its optimizer devirtualizes enough that neither tier sees an allocation). What must hold is the
+    # DIRECTION — some dispatch-driven guarantee where :fast passes and :full catches it.
+    @test any(t -> t[1] in (:typestable, :noalloc, :noboxing) && t[2] == false && t[3] == true, d.diverged)
 
     s = sprint(show, d)
     # IP-free: the user's type names and source must NOT appear

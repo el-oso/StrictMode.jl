@@ -8,6 +8,12 @@
 # wrapper that calls `f`, scan its optimized IR for a surviving `:invoke` to `f`'s method.
 # Returns `true` if the call was *not* inlined, `false` if it was, `nothing` if undeterminable
 # (e.g. a builtin/intrinsic with no resolvable method — effectively always inlined).
+# Force specialization on the callee type (`where {F}`), exactly as `_allocated` in static_checks.jl
+# does. `_inlined_survives` takes `f` under `@nospecialize`, so a wrapper closure built there captures
+# an unspecialized field: on Julia 1.13 the wrapper's IR is then `Core.getfield(_1, :f); (%1)(%2)` — a
+# dynamic `:call`, with no `:invoke` for the scan below to find, which silently reports every callee as
+# inlined. Building the closure through this specialized helper restores the `:invoke`.
+_inline_wrapper(f::F) where {F} = (args...) -> f(args...)
 function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     local m
     try
@@ -15,7 +21,7 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     catch
         return nothing
     end
-    wrapper = (args...) -> f(args...)
+    wrapper = _inline_wrapper(f)
     cts = Base.code_typed(wrapper, types; optimize = true)
     isempty(cts) && return nothing
     for stmt in first(cts).first.code

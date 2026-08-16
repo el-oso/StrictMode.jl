@@ -398,13 +398,24 @@ const _TID_CARRY = Set{Symbol}(
         :+, :-, :*, :add_int, :sub_int, :mul_int, :and_int, :or_int, :sext_int, :zext_int, :trunc_int,
     )
 )
-_is_threadid_foreigncall(st) =
-    Meta.isexpr(st, :foreigncall) && !isempty(st.args) &&
-    (
-    let fn = st.args[1] isa QuoteNode ? st.args[1].value : st.args[1]
-        fn isa Symbol && occursin("threadid", String(fn))
-    end
-)
+# Normalize a `:foreigncall` target to its function-name Symbol (or `nothing`). Julia 1.13 emits the
+# `(fname,)` / `(fname, lib)` form as `Expr(:tuple, QuoteNode(:jl_threadid))`, where 1.12 and earlier
+# emitted a bare `QuoteNode(:jl_threadid)`. Note it is an `Expr(:tuple, …)`, NOT a `Tuple` value. The
+# `occursin`-on-`string(args[1])` matchers elsewhere (effects.jl, static_ownership.jl) survive both
+# forms by accident since the name stays a substring; this one needs the actual Symbol.
+function _fcall_name(st)
+    (Meta.isexpr(st, :foreigncall) && !isempty(st.args)) || return nothing
+    fn = st.args[1]
+    Meta.isexpr(fn, :tuple) && !isempty(fn.args) && (fn = fn.args[1])
+    fn isa QuoteNode && (fn = fn.value)
+    fn isa Tuple && !isempty(fn) && (fn = fn[1])
+    return fn isa Symbol ? fn : nothing
+end
+
+function _is_threadid_foreigncall(st)
+    fn = _fcall_name(st)
+    return fn !== nothing && occursin("threadid", String(fn))
+end
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
