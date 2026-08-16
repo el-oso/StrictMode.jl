@@ -55,7 +55,9 @@ end
     # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
     @test any(f -> f.status === :fail, check(stable_caller, (); guarantees = (:noboxing,), fail = :none))
     # And a DIRECT dynamic dispatch (F38's shape) is still caught at this level.
-    struct _CB; f::Function; end
+    struct _CB
+        f::Function
+    end
     callit(c::_CB) = (c.f(1))::Int
     @test_throws StrictViolation StrictMode._typestable_fast("callit", callit, (_CB,))
 end
