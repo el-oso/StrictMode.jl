@@ -24,7 +24,7 @@ end
 end
 
 @testitem "@assert_noalloc empirical path escalates to AllocCheck, not @allocated alone (F33)" begin
-    using StrictMode, AllocCheck, JET   # backend loaded ⇒ escalation active
+    using StrictMode, StrictModeTest   # backend loaded ⇒ escalation active
     # `@allocated` is a `gc_num` delta that can be nonzero with NO real allocation (a SIMD / GC.@preserve
     # accounting artifact — see FEEDBACK F33, found via PureFFT's Butterfly256/512 kernels). So the
     # empirical (static=false) path must not fail on a nonzero `@allocated` alone: when the analysis
@@ -67,7 +67,7 @@ end
 end
 
 @testitem "@assert_noalloc accepts keyword arguments (issue #4)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     addkw(x; k = 1) = x + k
     @test (@assert_noalloc addkw(41; k = 1)) === 42
     bad(n; k = 1) = collect(1:(n + k))
@@ -75,7 +75,7 @@ end
 end
 
 @testitem "@assert_noalloc types= override pins the inference signature (issue #5)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     g(::Type{T}) where {T} = Vector{T}(undef, 1)
     # g allocates a Vector, so noalloc fails either way; the point is the override drives the signature.
     @test_throws StrictViolation @assert_noalloc g(Float64) types = (Type{Float64},)

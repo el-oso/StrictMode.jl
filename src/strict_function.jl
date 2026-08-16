@@ -49,8 +49,19 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
             "return type is not concrete for ($(join(types, ", "))): inferred $(rts)"
         )
     end
-    # Allocation-freedom (subsumes runtime dispatch / boxing, which show as allocations).
-    _require_backend()
+    # Allocation-freedom (subsumes runtime dispatch / boxing, which show as allocations). This runs
+    # at the enclosing module's PRECOMPILE, so it must not require an analysis backend: a package
+    # annotating its own `src/` depends on `StrictMode` alone, and AllocCheck/JET live in
+    # `StrictModeTest`, which is a test-environment dependency and is not loadable here. With the
+    # backend absent we use the value-free IR heuristic; a test run that adds `StrictModeTest`
+    # re-checks the same declarations against the proof.
+    if !backend_available()
+        sig = _alloc_signals(f, types)
+        if sig.alloc || sig.boxing || sig.abscontainer !== nothing
+            _fail(:strict_function, target, _box_msg("allocates / boxes (fast heuristic)", sig))
+        end
+        return nothing
+    end
     try
         results, _ = _checked_allocs(f, types)
         isempty(results) || _fail(:strict_function, target, _format_allocs(results))

@@ -1,5 +1,5 @@
 @testitem "@assert_trim_compatible + :trim_compatible (escalating: TypeContracts :fast / TrimCheck :full)" begin
-    using StrictMode, TrimCheck
+    using StrictMode, StrictModeTest
     @test StrictMode.trimcheck_available()                          # extension active
 
     safe_fn(x::Int) = x * 2 + 1

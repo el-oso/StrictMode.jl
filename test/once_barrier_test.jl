@@ -1,5 +1,5 @@
 @testitem "OncePerProcess-memoized calibrator passes :full @assert_noalloc (issue #14 acceptance)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # The `ger!` DRAM-path repro shape: a per-process calibration measured once via
     # Base.OncePerProcess, alloc-free on every steady-state call thereafter.
     _measure_np() = length(rand(4))
@@ -17,7 +17,7 @@
 end
 
 @testitem "set_ignore_barrier!(false) reverts to strict AllocCheck (barrier no longer exempted)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     _measure_np2() = length(rand(4))
     const _NP_ONCE2 = Base.OncePerProcess{Int}(_measure_np2)
     steady2(x::Int) = x + _NP_ONCE2()
@@ -34,7 +34,7 @@ end
 end
 
 @testitem "register_alloc_barrier! exempts a hand-rolled memoization pattern" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     const _HANDROLLED = Ref{Union{Nothing, Int}}(nothing)
     @noinline function _handrolled_calibrator()
         v = _HANDROLLED[]
@@ -59,7 +59,7 @@ end
 end
 
 @testitem "a genuinely-allocating steady state (no barrier involved) still fails unconditionally" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     really_allocates(x::Int) = x + length(rand(4))
     @test_throws StrictViolation (@assert_noalloc really_allocates(1))
 
@@ -69,7 +69,7 @@ end
 end
 
 @testitem "a user function merely TAKING a once-guard as an argument is not itself a barrier" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # `_mi_is_barrier` matches OncePerProcess/OncePerThread at parameter 2 because that's where
     # Base's OWN cold-path init closure carries it (init_perprocesss(closure, once, state)) — but
     # a USER function with that exact parameter shape (a once-guard as its own 2nd argument) is
@@ -88,7 +88,7 @@ end
 end
 
 @testitem "a barrier call that ALSO reads an abstract-eltype container is not exempted (:full must not be laxer than :fast)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # Without also checking `abscontainer`, the exemption gate would pass :full while :fast's own
     # `_findings_fast` correctly fails via `sig.abscontainer !== nothing` (check.jl) — a barrier
     # call with an UNRELATED abstract-container risk must still be caught by :full.
@@ -109,7 +109,7 @@ end
 end
 
 @testitem "OncePerThread is also recognized end-to-end (not just the bare type predicate)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # Exercise the REAL detection path (_alloc_signals -> _mi_is_barrier), not just
     # _is_base_barrier_type in isolation — a bare type-predicate pass doesn't prove the :invoke
     # scan actually recognizes it (this gap is exactly what let OncePerTask ship un-detected
@@ -126,7 +126,7 @@ end
 end
 
 @testitem "OncePerTask is NOT auto-recognized (different Base implementation, no detectable :invoke)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # OncePerTask is implemented via the current task's `.storage` IdDict (jl_eqtable_get/put),
     # fully inlined into the caller — there is no non-inlined callee boundary for the :invoke-based
     # mechanism to detect, unlike OncePerProcess/OncePerThread's cold-path init closure. Pin this
@@ -175,7 +175,7 @@ end
 end
 
 @testitem "the barrier exemption is consistent across every :full noalloc entry point" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # _checked_allocs was originally wired into @assert_noalloc/@assert_noboxing/findings/check
     # only — @strict_function (a SEPARATE :full noalloc entry point, at module-load time) and
     # divergence_report's diagnostic signal labels (a separate, auxiliary raw-AllocCheck call,

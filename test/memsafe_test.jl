@@ -26,7 +26,7 @@ end
 end
 
 @testitem "@assert_memsafe catches a deterministic out-of-bounds READ (isolate=true) — issue #15 acceptance" setup = [MemsafeFixtures] begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     if Sys.iswindows()
         @test_skip false
     else

@@ -29,6 +29,11 @@ _noalloc_mode(static_opt::Union{Nothing, Bool}) =
     static_opt === nothing ? :heuristic : static_opt ? :static : :empirical
 
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; mode::Symbol) where {F}
+    # `:heuristic` means "no explicit `static=`, use the best engine available". When StrictModeTest
+    # is loaded it supplies AllocCheck, so the default escalates to the proof at CALL time — the same
+    # compiled call site runs the heuristic in a dev session and the proof under test. An explicit
+    # `static = true`/`false` is a user decision and is never overridden.
+    mode === :heuristic && backend_available() && (mode = :static)
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if mode === :static
         _require_backend()
@@ -140,11 +145,19 @@ macro assert_noalloc(args...)
 end
 
 # --- @assert_noboxing: the boxing/dispatch subclass of allocations specifically ---
-# (Classifying an AllocCheck instance as boxing lives in the StrictModeAnalysisExt extension,
-# behind `_be_is_boxing`, since it pattern-matches AllocCheck's instance types.)
-
+# Classifying an AllocCheck instance as boxing lives in `StrictModeTest`, behind `_be_is_boxing`,
+# since it pattern-matches AllocCheck's instance types. Without that backend this falls back to the
+# same value-free IR signal `findings(...; mode=:fast)` uses for `:noboxing` — `sig.boxing ||
+# sig.abscontainer !== nothing` — so the macro is usable in a plain `StrictMode` environment rather
+# than erroring on a missing backend.
 function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _require_backend()
+    if !backend_available()
+        sig = _alloc_signals(f, types)
+        if sig.boxing || sig.abscontainer !== nothing
+            _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig))
+        end
+        return nothing
+    end
     results = try
         first(_checked_allocs(f, types))
     catch err

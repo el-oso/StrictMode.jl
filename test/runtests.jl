@@ -1,7 +1,9 @@
 using StrictMode
-# AllocCheck + JET are weak deps; loading them activates StrictModeAnalysisExt (the backend), so
-# the checks actually run. (A real package does the same in its test/runtests.jl.)
-using AllocCheck, JET, TrimCheck
+# StrictModeTest supplies the AllocCheck/JET/TrimCheck proofs. StrictMode alone analyzes with the
+# value-free heuristic; loading StrictModeTest flips `backend_available()` on, and every guarantee
+# escalates to the proof at CALL time. A real package does the same in its test/runtests.jl: depend
+# on StrictMode in Project.toml, StrictModeTest in test/Project.toml.
+using StrictModeTest   # supplies the AllocCheck/JET/TrimCheck proofs; StrictMode alone is the heuristic
 using TestItemRunner
 
 # Tests run with checks_enabled=true (see test/Project.toml [preferences.StrictMode]) so the

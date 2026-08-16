@@ -40,9 +40,17 @@ function _assert_opt(target, @nospecialize(f), @nospecialize(types::Tuple))
 end
 
 # The type-stability *check* expression (no value). Shared by `@assert_typestable` and `@strict`.
-# The rigorous JET `@report_opt` escalation lives in StrictModeTest, whose macros shadow these.
 function _typestable_check_expr(target, fe, types)
-    return :($(_typestable_fast)($target, $fe, $types))
+    return :($(_typestable_checked)($target, $fe, $types))
+end
+
+# Concreteness of the inferred return + the this-level IR boxing signal always; JET's optimization
+# analysis on top when the backend is present (i.e. StrictModeTest is loaded). Decided at CALL time,
+# so one compiled call site serves both environments.
+function _typestable_checked(target, @nospecialize(f), @nospecialize(types::Tuple))
+    _typestable_fast(target, f, types)
+    backend_available() && _assert_opt(target, f, types)
+    return nothing
 end
 
 """

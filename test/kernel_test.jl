@@ -31,7 +31,7 @@ end
 end
 
 @testitem "@kernel accepts keyword arguments (issue #4)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     using SIMD: Vec, vload, vstore
 
     # `@inline` so the kwsorter body inlines into `Core.kwcall` (the kwarg inference/IR seam) —

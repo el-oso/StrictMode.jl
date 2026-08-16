@@ -80,7 +80,7 @@ end
 end
 
 @testitem "warm dict lookup: :fast is RIGHT and AllocCheck is conservative (measured)" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, StrictModeTest
     # The PureBLAS `_l3ws` / GKH-ownership shape. Ground truth first: warm, this allocates NOTHING.
     # `Any` only boxes an *isbits* value on STORE; reading is always free, and storing a heap object
     # (the workspace itself) is free too. AllocCheck's all-paths proof still reports boxing here —
@@ -110,4 +110,26 @@ end
     unit(Float64)
     @test_throws StrictViolation @assert_typestable unit(Float64)
     @test_throws StrictViolation @assert_noboxing unit(Float64)
+end
+
+@testitem "the tier is the dependency graph: guarantees escalate when StrictModeTest is loaded" begin
+    using StrictMode, StrictModeTest
+    # This is what makes the two-package split work without a preference: the engine is chosen at
+    # CALL time, not at macro expansion, so ONE compiled call site runs the heuristic in a package's
+    # own dev/precompile environment (StrictMode alone) and the AllocCheck/JET proof under test
+    # (StrictModeTest present). Nothing is recompiled and no import line selects it.
+    @test StrictMode.backend_available()
+    @test StrictMode.trimcheck_available()
+    # `:heuristic` is the "no explicit static=" default and is the thing that escalates...
+    @test StrictMode._noalloc_mode(nothing) === :heuristic
+    # ...while an explicit user decision is never overridden in either direction.
+    @test StrictMode._noalloc_mode(true) === :static
+    @test StrictMode._noalloc_mode(false) === :empirical
+    # With the backend up, the default path is the proof: this boxes, and AllocCheck says so.
+    boxy(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+    @test_throws StrictViolation @assert_noalloc boxy((1, 2.0, 3.0f0))
 end
