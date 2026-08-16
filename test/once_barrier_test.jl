@@ -25,12 +25,12 @@ end
     old = StrictMode.ignore_barrier()
     StrictMode.set_ignore_barrier!(false)
     try
-        @test_throws StrictViolation (@assert_noalloc steady2(1))
+        @test_throws StrictViolation (@assert_noalloc steady2(1) static = true)
     finally
         StrictMode.set_ignore_barrier!(old)
     end
     # restored: exemption active again
-    @test (@assert_noalloc steady2(2)) == 6
+    @test (@assert_noalloc steady2(2) static = true) == 6
 end
 
 @testitem "register_alloc_barrier! exempts a hand-rolled memoization pattern" begin

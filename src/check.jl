@@ -127,16 +127,16 @@ function _trim_compatible_finding(@nospecialize(f), @nospecialize(types::Tuple),
 end
 
 """
-    findings(f, types; guarantees = (:typestable, :noalloc), mode = analysis_mode()) -> Vector{StrictFinding}
+    findings(f, types; guarantees = (:typestable, :noalloc), mode = :fast) -> Vector{StrictFinding}
 
 Analyze `f` for the concrete signature `types` and return one [`StrictFinding`](@ref) per
-requested guarantee. Pure analysis — `f` is never called. `mode` overrides [`analysis_mode`](@ref)
-for this call (`:fast` heuristic vs `:full` proof), so you can force a quick scan at runtime
-without changing the preference (`ANALYSIS_MODE` is baked at precompile).
+requested guarantee. Pure analysis — `f` is never called. `mode` selects the engine: `:fast` (the
+default) is the value-free heuristic; `:full` is the AllocCheck+JET proof, which needs the backend
+that `StrictModeTest` provides.
 """
 function findings(
         @nospecialize(f), @nospecialize(types::Tuple);
-        guarantees = (:typestable, :noalloc), mode::Symbol = analysis_mode(),
+        guarantees = (:typestable, :noalloc), mode::Symbol = :fast,
     )
     key = _cache_key(f, types, guarantees, mode)
     if key !== nothing
@@ -238,7 +238,7 @@ check(boxy, (Tuple{Int,Float64,Float32},); guarantees=(:noboxing,))   # throws S
 """
 function check(
         @nospecialize(f), @nospecialize(types::Tuple);
-        guarantees = (:typestable, :noalloc), fail::Symbol = fail_mode(), mode::Symbol = analysis_mode(),
+        guarantees = (:typestable, :noalloc), fail::Symbol = fail_mode(), mode::Symbol = :fast,
     )
     fs = findings(f, types; guarantees, mode)
     failed = filter(_failed, fs)

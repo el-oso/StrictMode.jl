@@ -137,5 +137,5 @@ echo "$hash" > "$stamp"                                    # only stamp a clean 
 
 The findings appear in the agent's context on exit 2; the agent fixes the violation and stops
 again. It's the agent's version of a developer watching Revise, at Stop-hook granularity — a
-cold `julia` run costs ~30–60 s once per source-touching turn. Keep the audit script on
-`analysis = "fast"` (no AllocCheck/JET needed) so that run stays as cheap as possible.
+cold `julia` run costs ~30–60 s once per source-touching turn. Keep `StrictModeTest` out of the
+audit environment (plain `StrictMode`, no AllocCheck/JET) so that run stays as cheap as possible.

@@ -178,7 +178,6 @@ You can gate a library's performance from its test suite, without ever adding St
    ```toml
    [preferences.StrictMode]
    checks_enabled = true
-   analysis = "fast"        # quick whole-package triage; use "full" for the rigorous proof
    ```
 3. List the guaranteed entry points — no `src` annotations needed:
    ```julia

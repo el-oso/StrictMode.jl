@@ -22,12 +22,11 @@ end
 
 # Resolve @assert_noalloc's (and @strict's/@kernel's) check strategy. `static_opt` is the parsed
 # `static=` keyword value, or `nothing` if not given. An explicit value always wins: `true` forces
-# AllocCheck's static proof, `false` forces the empirical `@allocated` path. With no override, the
-# default is AllocCheck in `:full` analysis and the value-free `_alloc_signals` heuristic in
-# `:fast` — not `@allocated`, which is value-dependent and reserved for the explicit opt-out.
+# AllocCheck's static proof (which needs the StrictModeTest backend), `false` forces the empirical
+# `@allocated` path. With no override the default is the value-free `_alloc_signals` heuristic —
+# not `@allocated`, which is value-dependent and reserved for the explicit opt-out.
 _noalloc_mode(static_opt::Union{Nothing, Bool}) =
-    static_opt === nothing ? (ANALYSIS_MODE === :full ? :static : :heuristic) :
-    static_opt ? :static : :empirical
+    static_opt === nothing ? :heuristic : static_opt ? :static : :empirical
 
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; mode::Symbol) where {F}
     val = thunk()                 # warm up / force compilation, and capture the call's value
@@ -46,8 +45,8 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
     elseif mode === :heuristic
         # F38 — the :fast default (no explicit `static=`). A value-free IR scan (`_alloc_signals`,
         # the same engine `findings(...; mode=:fast)` uses), not the value-dependent `@allocated`
-        # measurement below: matches what `analysis_mode`'s docstring already promises for the
-        # batch API ("quick triage, no execution"), which this macro's `:fast` path had been
+        # measurement below: matches what the batch API promises ("quick triage, no
+        # execution"), which this macro's default path had been
         # silently missing — it always fell straight to `@allocated`, an empirical measurement of
         # THIS call's inputs, not a signature-level verdict.
         sig = _alloc_signals(f, types)
@@ -101,10 +100,7 @@ end
 
 Fail unless the call `f(args...)` is allocation-free.
 
-In the default `:full` [`analysis_mode`](@ref), StrictMode hands the call to
-[AllocCheck](https://github.com/JuliaLang/AllocCheck.jl) and asks it to prove the call cannot
-allocate. If the proof turns up any allocation site, dynamic dispatch and boxing included, the
-guarantee fails and lists them. In `:fast` mode, the default is the same value-free IR heuristic
+By default StrictMode uses the same value-free IR heuristic that
 `findings(...; mode=:fast)` uses (`StrictMode._alloc_signals` — no execution beyond the one
 warmup call every path needs to produce the return value). Pass `static = false` to force the
 empirical `@allocated`-after-warmup path instead (useful when the heuristic can't reason about a
@@ -172,7 +168,7 @@ allocations — while **allowing** legitimate typed heap allocations (a `Vector`
 This is the relaxed sibling of [`@assert_noalloc`](@ref): use it for a hot path that may
 allocate a buffer but must never box (the runtime-tuple-index trap, captured-variable `Core.Box`,
 or accidental dynamic dispatch). It is always a static [AllocCheck] analysis — it must classify
-each allocation — so it ignores the `:fast` [`analysis_mode`](@ref). Each argument is evaluated
+each allocation — so it needs the AllocCheck backend from `StrictModeTest`. Each argument is evaluated
 once; the macro evaluates to the call's value; disabled builds expand to the bare call.
 
 ```julia

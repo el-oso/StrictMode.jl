@@ -22,8 +22,10 @@ end
         end; s
     )
     T = (Tuple{Int, Float64, Float32},)
-    @test all(f -> f.status === :pass, check(boxy, T; guarantees = (:typestable,), fail = :none))
-    @test any(f -> f.status === :fail, check(boxy, T; guarantees = (:noalloc,), fail = :none))
+    # Full tier: the :fast typestable signal also flags boxy's runtime tuple index (this-level
+    # boxing), so only :full separates "stable return" from "allocates". Moves to StrictModeTest.
+    @test all(f -> f.status === :pass, check(boxy, T; guarantees = (:typestable,), fail = :none, mode = :full))
+    @test any(f -> f.status === :fail, check(boxy, T; guarantees = (:noalloc,), fail = :none, mode = :full))
 end
 
 @testitem "macro hardening: broadcasting parses and runs" begin
@@ -68,7 +70,7 @@ end
         end; s
     )
     T = (Tuple{Int, Float64, Float32},)
-    # Force :fast regardless of the precompile-baked ANALYSIS_MODE; the heuristic still catches boxing.
+    # :fast is the default engine; the heuristic still catches boxing.
     fs = findings(boxy, T; guarantees = (:noboxing,), mode = :fast)
     @test any(f -> f.status === :fail, fs)
     # check honors the override too.

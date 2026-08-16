@@ -79,11 +79,11 @@ macro assert_trim_safe(args...)
 end
 
 # ── `trim_compatible`: escalating trim guarantee ──────────────────────────────────────────────────
-# `:fast` (or when TrimCheck is not loaded) = TypeContracts static IR scan (the `@assert_trim_safe`
-# subset). `:full` + TrimCheck loaded = juliac's authoritative `verify_typeinf_trim` verifier (via the
+# TrimCheck not loaded = TypeContracts static IR scan (the `@assert_trim_safe`
+# subset). TrimCheck loaded = juliac's authoritative `verify_typeinf_trim` verifier (via the
 # `_be_trim_validate` backend). Returns `(passed, findings, authoritative)`.
 function _trim_compatible_check(@nospecialize(f), @nospecialize(types::Tuple))
-    if analysis_mode() === :full && trimcheck_available()
+    if trimcheck_available()
         passed, findings = _be_trim_validate(f, Tuple{types...})
         return (passed, findings, true)
     end
@@ -113,12 +113,12 @@ end
 """
     @assert_trim_compatible f(args...)
 
-Fail unless `f(args...)` is compatible with `juliac --trim=safe`. **Escalating** by [`analysis_mode`](@ref):
+Fail unless `f(args...)` is compatible with `juliac --trim=safe`. **Escalating** by whether `TrimCheck` is loaded:
 
-- `:fast` (or when `TrimCheck` is not loaded) — TypeContracts' static IR scan for dynamic dispatch (a
+- `TrimCheck` not loaded — TypeContracts' static IR scan for dynamic dispatch (a
   call whose result infers to `Any`) and reflection (`return_types`/`invokelatest`/`which`/`methods`).
   Cheap and value-free.
-- `:full` with `TrimCheck` loaded — juliac's authoritative `verify_typeinf_trim` verifier over this exact
+- `TrimCheck` loaded (it is a dependency of `StrictModeTest`) — juliac's authoritative `verify_typeinf_trim` verifier over this exact
   signature.
 
 Advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's whole-program verifier over the real
@@ -127,12 +127,12 @@ cheaper static-only form is [`@assert_trim_safe`](@ref); the reactive counterpar
 failure, is [`explain_trim`](@ref).
 
 !!! note "known gap in the :fast/no-TrimCheck path: reachability-limit union-splits"
-    A PASS reached via the static scan (not the authoritative verifier — i.e. `:fast` mode, or `:full`
-    without `TrimCheck` loaded) does not cover N-simultaneous-small-`Union`-argument call sites that can
+    A PASS reached via the static scan (not the authoritative verifier — i.e. without
+    `TrimCheck` loaded) does not cover N-simultaneous-small-`Union`-argument call sites that can
     exceed juliac's reachability limit on a large/opaque callee (see [`@assert_trim_safe`](@ref) for why
-    no heuristic is added for it). This macro already escalates automatically in `:full` mode with
-    `TrimCheck` loaded — that authoritative path *does* catch this class, so the gap is specifically a
-    fast dev-loop check run without `:full` + `TrimCheck`, which logs a one-time session note when it
+    no heuristic is added for it). This macro already escalates automatically when `TrimCheck` is
+    loaded — that authoritative path *does* catch this class, so the gap is specifically a fast
+    dev-loop check run without `TrimCheck`, which logs a one-time session note when it
     passes via the heuristic instead of the verifier.
 """
 macro assert_trim_compatible(args...)

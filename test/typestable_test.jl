@@ -53,7 +53,7 @@ end
     @test StrictMode._typestable_fast("stable_caller", stable_caller, ()) === nothing        # :fast passes
     @test all(f -> f.status === :pass, check(stable_caller, (); guarantees = (:typestable,), fail = :none))
     # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
-    @test any(f -> f.status === :fail, check(stable_caller, (); guarantees = (:noboxing,), fail = :none))
+    @test any(f -> f.status === :fail, check(stable_caller, (); guarantees = (:noboxing,), fail = :none, mode = :full))
     # And a DIRECT dynamic dispatch (F38's shape) is still caught at this level.
     struct _CB
         f::Function
@@ -82,9 +82,4 @@ end
     @test_throws StrictViolation @assert_typestable g(Float64)
     # Pinning Type{Float64} restores concreteness.
     @test (@assert_typestable g(Float64) types = (Type{Float64},)) isa Vector{Float64}
-end
-
-@testitem "analysis_mode defaults to :full in the test environment" begin
-    using StrictMode
-    @test analysis_mode() === :full
 end

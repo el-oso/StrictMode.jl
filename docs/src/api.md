@@ -55,8 +55,9 @@ McaReport
 ## Static-binary compatibility
 
 Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` / the
-`:trim_compatible` guarantee **escalate** by [`analysis_mode`](@ref): a cheap TypeContracts static scan in
-`:fast`, and juliac's authoritative `verify_typeinf_trim` verifier in `:full` when `TrimCheck` is loaded.
+`:trim_compatible` guarantee **escalate** by whether `TrimCheck` is loaded: a cheap TypeContracts static
+scan without it, and juliac's authoritative `verify_typeinf_trim` verifier with it (`StrictModeTest`
+depends on `TrimCheck`).
 `@assert_trim_safe` is the static-only subset. The reactive `explain_trim` translates a real build log.
 
 The static-scan path has one known coverage gap it can't heuristically close without
@@ -211,7 +212,6 @@ disable_checks!
 checks_enabled
 assert_enabled
 fail_mode
-analysis_mode
 backend_available
 StrictMode.trimcheck_available
 mca_available

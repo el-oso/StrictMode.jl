@@ -128,8 +128,8 @@ boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, ru
 #   Allocating runtime call to "jl_get_nth_field_checked" …
 ```
 
-Because it has to classify each allocation, it always runs the static AllocCheck analysis, and so
-it ignores the `:fast` [`analysis_mode`](@ref).
+Because it has to classify each allocation, it always runs the static AllocCheck analysis, so it
+needs the backend that `StrictModeTest` provides.
 
 ## `@assert_typestable` — concrete, stable types
 
@@ -207,9 +207,9 @@ That's why it isn't part of [`@strict`](@ref).
 ## `@assert_trim_compatible` — static-binary (`juliac --trim`) compatibility
 
 [`@assert_trim_compatible`](@ref) fails unless `f(args...)` is compatible with `juliac --trim=safe`, the
-static-binary build mode that rejects dynamic dispatch and reflection. It **escalates** with
-[`analysis_mode`](@ref): in `:fast` (or when `TrimCheck` is not loaded) it runs a value-free `TypeContracts`
-scan of the typed IR; in `:full` with the optional `TrimCheck` weak dependency it runs juliac's
+static-binary build mode that rejects dynamic dispatch and reflection. It **escalates** with whether
+`TrimCheck` is loaded: without it, a value-free `TypeContracts`
+scan of the typed IR; with it (`StrictModeTest` depends on `TrimCheck`) juliac's
 *authoritative* `verify_typeinf_trim` verifier over the exact signature, returning deduplicated,
 source-mapped findings.
 

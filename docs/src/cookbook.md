@@ -49,9 +49,9 @@ StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of thro
 
 ### Trade rigor for speed while iterating
 
-```julia
-StrictMode.enable_checks!(analysis = "fast")   # cheap inference-only checks (sub-ms); :full in CI
-```
+Nothing to configure: `StrictMode` analyzes with the cheap inference-only engine by
+default (sub-ms per method, no backend). Add `StrictModeTest` to the test environment
+when you want the rigorous AllocCheck/JET proof in CI.
 
 ### Diagnose instead of assert
 

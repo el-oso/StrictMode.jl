@@ -96,8 +96,7 @@ end
     _so_fast(::Type{T}) where {T} = get!(() -> SOFastWs{T}(), _SO_FAST_WS, T)
 
     # No `mode` kwarg exists on static_ownership_suggestions — it's Base-inference-only by
-    # construction, so it needs no AllocCheck/JET backend and behaves identically regardless of
-    # analysis_mode().
+    # construction, so it needs no AllocCheck/JET backend.
     fs = static_ownership_suggestions(_so_fast, (Type{Float64},))
     @test !isempty(fs)
 end

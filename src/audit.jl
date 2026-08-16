@@ -54,7 +54,7 @@ function audit(
         require::Union{Nothing, Symbol} = nothing,
         only = nothing,
         exempt = (),
-        mode::Symbol = analysis_mode(),
+        mode::Symbol = :fast,
         inline_suggest::Bool = false,
         static_ownership_suggest::Bool = false,
     )

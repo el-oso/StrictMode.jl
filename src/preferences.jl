@@ -59,64 +59,25 @@ fail_mode() = FAIL_MODE
 const FAIL_MODE = Symbol(@load_preference("fail_mode", "error"))::Symbol
 
 """
-    analysis_mode() -> Symbol
-
-How thoroughly the per-call asserts ([`@assert_typestable`](@ref), [`@assert_noalloc`](@ref),
-[`@strict`](@ref)) analyze a call:
-
-- `:full` (default) — rigorous proofs: JET `@report_opt` for type stability and AllocCheck's
-  static no-allocation proof. Best for CI.
-- `:fast` — cheap Base-only checks: `Base.return_types` concreteness plus a typed-IR scan
-  (dynamic dispatch — including internal dispatch behind a concrete return, explicit heap
-  allocation following direct non-inlined callees, throw-path allocations excluded). ~60×
-  faster than `:full` (2026-07-02 corpus study, 552 real specializations: 4.9 ms vs 296 ms
-  median) at **matching verdicts on every `:typestable`/`:noalloc` case** (3 residual
-  `:noboxing` under-reports on cold helpers, all still failing via `:noalloc`). Still a
-  heuristic — `:full` remains the proof; `divergence_report` captures any disagreement.
-
-[`@explain`](@ref) and [`@strict_function`](@ref) always use the full analysis regardless of
-this setting. Controlled by the `analysis` preference; set it via [`enable_checks!`](@ref).
-
-`analysis_mode()` reads the *current* preference at runtime (so it reflects a change without a
-restart, and is what `check`/`audit`/`findings` use by default). The per-call macros instead use
-the value **baked at precompile** (`ANALYSIS_MODE`); if a stale package image disagrees with the
-current preference, `analysis_mode()` warns once.
-"""
-function analysis_mode()
-    live = Symbol(@load_preference("analysis", "full"))
-    if live !== ANALYSIS_MODE && !_MODE_WARNED[]
-        _MODE_WARNED[] = true
-        @warn "StrictMode: this image was precompiled with analysis = :$ANALYSIS_MODE, but the " *
-            "preference is now :$live. `check`/`audit`/`findings` will use :$live; the per-call " *
-            "macros still use the baked :$ANALYSIS_MODE until you restart/recompile."
-    end
-    return live
-end
-const _MODE_WARNED = Ref(false)
-# Baked at precompile — used by the per-call macros (which branch at expansion time).
-const ANALYSIS_MODE = Symbol(@load_preference("analysis", "full"))::Symbol
-
-"""
-    enable_checks!(; fail_mode = "error", analysis = "full")
+    enable_checks!(; fail_mode = "error")
 
 Turn StrictMode's guarantee checks on for the active project, and set the failure mode (`:error`
-or `:warn`) and the [`analysis_mode`](@ref) (`:full` or `:fast`) while you're at it. This writes a
-`LocalPreferences.toml` entry and triggers recompilation, so restart the session (or re-`using`)
-before the change takes effect.
+or `:warn`) while you're at it. This writes a `LocalPreferences.toml` entry and triggers
+recompilation, so restart the session (or re-`using`) before the change takes effect.
+
+StrictMode analyzes with the value-free `:fast` engine (`Base.return_types` concreteness plus a
+typed-IR scan) and needs no analysis backend. The rigorous `:full` proofs — AllocCheck's static
+no-allocation proof and JET's `@report_opt` — live in the companion `StrictModeTest` package,
+which you add to the test environment; there is no preference to switch between them.
 """
-function enable_checks!(;
-        fail_mode::Union{Symbol, AbstractString} = "error",
-        analysis::Union{Symbol, AbstractString} = "full",
-    )
+function enable_checks!(; fail_mode::Union{Symbol, AbstractString} = "error")
     fm = String(fail_mode)
     fm in ("error", "warn") || throw(ArgumentError("fail_mode must be :error or :warn, got $fail_mode"))
-    an = String(analysis)
-    an in ("full", "fast") || throw(ArgumentError("analysis must be :full or :fast, got $analysis"))
-    @set_preferences!("checks_enabled" => true, "fail_mode" => fm, "analysis" => an)
+    @set_preferences!("checks_enabled" => true, "fail_mode" => fm)
     if CHECKS_ENABLED
-        @info "StrictMode checks ENABLED (fail_mode = :$fm, analysis = :$an)."
+        @info "StrictMode checks ENABLED (fail_mode = :$fm)."
     else
-        @warn "StrictMode checks will be ENABLED (fail_mode = :$fm, analysis = :$an) — but the " *
+        @warn "StrictMode checks will be ENABLED (fail_mode = :$fm) — but the " *
             "gate is compile-time, so THIS session is unaffected (`checks_enabled()` stays false " *
             "and every `@assert_*` is still a no-op). Restart Julia to apply. To commit the " *
             "setting, add `[preferences.StrictMode]` with `checks_enabled = true` to the project's " *

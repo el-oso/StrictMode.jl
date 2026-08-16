@@ -143,45 +143,40 @@ Revise keeps the image warm between edits. The warm cost does grow with the size
 so these checks are happiest pointed at small hot kernels, which is exactly where the silent traps
 live anyway.
 
-### `:full` vs `:fast` analysis
+### The two analysis engines
 
-If even the warm cost is too much for your loop, say a large function you're iterating on, you can
-drop the per-call asserts down to cheap inference-only checks:
+The per-call asserts run on cheap inference-only checks by default — there is no rigor/speed
+preference to set. The rigorous proofs live in the companion `StrictModeTest` package, whose
+macros shadow these ones; you add it to the test environment and leave it out everywhere else.
 
-```julia
-StrictMode.enable_checks!(analysis = "fast")   # default is "full"
-```
-
-| Mode | Type stability | No-allocation / no-boxing | Backend | Per-method cost |
+| Package | Type stability | No-allocation / no-boxing | Backend | Per-method cost |
 |---|---|---|---|---|
-| `:full` (default) | JET `@report_opt` | AllocCheck static proof | AllocCheck + JET | ~900 µs |
-| `:fast` | `Base.return_types` concreteness | `code_typed` IR + `infer_effects` heuristic | none needed | ~70 µs |
+| `StrictMode` | `Base.return_types` concreteness | `code_typed` IR + `infer_effects` heuristic | none needed | ~70 µs |
+| `StrictModeTest` | JET `@report_opt` | AllocCheck static proof | AllocCheck + JET | ~900 µs |
 
-`:fast` is a quick triage over all the properties at once, type stability as well as
+`StrictMode`'s engine is a quick triage over all the properties at once, type stability as well as
 allocation and boxing, built entirely on Base's own inference. Because of that it needs no
-AllocCheck or JET backend and runs roughly 10× cheaper per method than `:full` (see
+AllocCheck or JET backend and runs roughly 10× cheaper per method than the proof (see
 `bench/timetax.jl`). It catches the usual suspects, like explicit heap allocation, boxing, dynamic
 dispatch, and non-concrete returns. Being a heuristic, it can occasionally miss or over-flag
-something that AllocCheck's LLVM-level proof would get exactly right, so [`@explain`](@ref) and
-[`@strict_function`](@ref) always use the full analysis. The split that works well in practice:
-`:fast` while you iterate, `:full` in CI.
+something that AllocCheck's LLVM-level proof would get exactly right. The split that works well in
+practice: `StrictMode` alone while you iterate, `StrictModeTest` in CI.
 
 ### Incremental re-checks
 
 `findings`, `check`, `audit`, and `check_all` cache their results per `(method, world, signature,
 mode)`. A re-run only re-analyzes the methods that actually changed, so editing one method and
-running `audit` again comes back almost instantly while everything else is a cache hit. `:fast`
-analysis also spreads across threads when `Threads.nthreads() > 1`. [`cache_stats`](@ref) shows you
+running `audit` again comes back almost instantly while everything else is a cache hit. Heuristic
+analysis can spread across threads (pass `parallel = true`). [`cache_stats`](@ref) shows you
 the hits and misses, and [`clear_cache!`](@ref) is there for the one case the cache can't see: when
 you edit a *callee* of a checked method rather than the method itself.
 
-The analysis mode comes from the `analysis` preference, which is baked in at precompile. That means
-a stale package image can still run `:full` even after you've switched the preference to `fast`. To
-force the mode for a single run without recompiling, pass `mode`:
+The batch API (`findings`/`check`/`audit`/`check_all`) takes a `mode` keyword if you want to pick
+the engine explicitly for one run:
 
 ```julia
-audit(MyPkg; sweep = true, mode = :fast)   # quick whole-package scan, regardless of the baked default
-check(f, types; mode = :fast)
+audit(MyPkg; sweep = true, mode = :fast)   # the default
+check(f, types; mode = :full)              # needs the StrictModeTest backend
 ```
 
 From here, the [Guarantees](guarantees.md) guide walks through each macro in turn, with examples

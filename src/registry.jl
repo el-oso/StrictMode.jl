@@ -48,9 +48,12 @@ The set of function names marked cold/exempt by `@strict_exempt`.
 """
 exempt_strict() = STRICT_EXEMPT
 
-# Parallelize cheap (:fast) analysis across threads; keep :full serial by default since
-# AllocCheck/JET hold global compiler state. `findings` is itself cache-locked and thread-safe.
-_default_parallel(mode::Symbol) = mode === :fast && Threads.nthreads() > 1
+# ponytail: pinned to `false`. This was `mode === :fast && nthreads() > 1` — serial for `:full`,
+# since AllocCheck/JET hold global compiler state. Now that `:fast` is the default it would flip
+# threading ON by default, which is a behaviour change riding along on a deletion. `findings` is
+# cache-locked and thread-safe, so flip this deliberately as its own change; `parallel=true` still
+# opts in per call.
+_default_parallel(::Symbol) = false
 
 function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
     if parallel && length(items) > 1
@@ -94,7 +97,7 @@ any failure, `:none` just returns the findings (the default — it is a reportin
 """
 function check_all(;
         guarantees = nothing, fail::Symbol = :none,
-        mode::Symbol = analysis_mode(), parallel::Bool = _default_parallel(mode),
+        mode::Symbol = :fast, parallel::Bool = _default_parallel(mode),
     )
     items = Any[
         (f, types, guarantees === nothing ? meta.guarantees : guarantees)
@@ -104,7 +107,7 @@ function check_all(;
 end
 
 """
-    check_signatures(pairs; guarantees = (:typestable, :noalloc), fail = :none, mode = analysis_mode())
+    check_signatures(pairs; guarantees = (:typestable, :noalloc), fail = :none, mode = :fast)
 
 Check an explicit list of `(f, types)` pairs — the declarative "check what I promise" path that
 needs **no `src` annotations**. A test suite can list a library's guaranteed entry points without
@@ -114,7 +117,7 @@ the library itself depending on StrictMode:
 check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel, (Matrix{Float64},))]; fail = :error)
 ```
 """
-function check_signatures(pairs; guarantees = (:typestable, :noalloc), fail::Symbol = :none, mode::Symbol = analysis_mode())
+function check_signatures(pairs; guarantees = (:typestable, :noalloc), fail::Symbol = :none, mode::Symbol = :fast)
     items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
     return _run_and_report(_map_findings(items, _default_parallel(mode), mode), :check_signatures, "signatures", fail)
 end
@@ -123,7 +126,7 @@ end
 # nothing; honors fail_mode.
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
-function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false, mode::Symbol = analysis_mode())
+function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false, mode::Symbol = :fast)
     out = StrictFinding[]
     for ((f, types), meta) in STRICT_REGISTRY
         _mod_sym(f) === nameof(mod) || continue
@@ -298,7 +301,7 @@ function check_compiled(
         fail::Symbol = :none,
         only = nothing,
         exempt = (),
-        mode::Symbol = analysis_mode(),
+        mode::Symbol = :fast,
         parallel::Bool = _default_parallel(mode),
     )
     items = Any[]

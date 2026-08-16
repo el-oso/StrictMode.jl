@@ -39,15 +39,10 @@ function _assert_opt(target, @nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
-# The type-stability *check* expression (no value), branched on the active analysis mode. Shared
-# by `@assert_typestable` and `@strict`.
+# The type-stability *check* expression (no value). Shared by `@assert_typestable` and `@strict`.
+# The rigorous JET `@report_opt` escalation lives in StrictModeTest, whose macros shadow these.
 function _typestable_check_expr(target, fe, types)
-    base = :($(_typestable_fast)($target, $fe, $types))
-    ANALYSIS_MODE === :full || return base
-    return quote
-        $base
-        $(_assert_opt)($target, $fe, $types)
-    end
+    return :($(_typestable_fast)($target, $fe, $types))
 end
 
 """
@@ -57,11 +52,11 @@ end
 
 Fail unless `f(args...)` is type stable.
 
-Both [`analysis_mode`](@ref)s check that the inferred return type is a single concrete type, using
+Both engines check that the inferred return type is a single concrete type, using
 `Base.return_types`, and additionally check the IR boxing signal (`StrictMode._alloc_signals`) for
 internal dynamic dispatch hiding behind a concrete return — the classic "the return type is fine
-but something inside dispatches at runtime" shape. On top of that, `:full` also runs JET's
-optimization analysis, which needs the AllocCheck+JET backend; `:fast` does not. Each argument is
+but something inside dispatches at runtime" shape. `StrictModeTest` shadows this macro with a
+version that additionally runs JET's optimization analysis. Each argument is
 evaluated once, the macro returns the call's value, and disabled builds expand to the bare call.
 
 **Keyword arguments** are supported: `f(x; k=v)` is checked at its real specialization (the call is
