@@ -74,7 +74,7 @@ ext/
   StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,
                               ~680MiB — never a test/CI default, see test/mca_test.jl's live-path guard)
 test/
-  runtests.jl         — uses ReTestItems.runtests(StrictMode); loads AllocCheck+JET backend
+  runtests.jl         — uses TestItemRunner @run_package_tests; loads AllocCheck+JET backend
   Project.toml        — has [preferences.StrictMode] checks_enabled=true, fail_mode="error"
   round5_test.jl      — kernel_report / @assert_vectorized (F10–F15, F38)
   kernel_test.jl      — @kernel macro
@@ -92,10 +92,10 @@ julia --project=test test/runtests.jl
 ```
 
 The test `Project.toml` enables checks and loads the AllocCheck/JET backend. Tests use
-`@testitem` (ReTestItems.jl). Run a single item by name with:
+`@testitem` (TestItemRunner.jl, macros from TestItems.jl). Run a single item by name with:
 
 ```bash
-julia --project=test -e 'using ReTestItems, StrictMode, AllocCheck, JET; runtests(StrictMode; name=r"F10")'
+julia --project=test -e 'using TestItemRunner, StrictMode, AllocCheck, JET, TrimCheck; @run_package_tests filter = ti -> occursin(r"F10", ti.name)'
 ```
 
 ## Key invariants

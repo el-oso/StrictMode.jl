@@ -17,3 +17,4 @@ Manifest.toml
 
 # Editor / OS
 .DS_Store
+Manifest-v*.toml

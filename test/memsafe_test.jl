@@ -1,9 +1,9 @@
-@testsetup module MemsafeFixtures
-export memsafe_inbounds_kernel!, memsafe_oob_read_kernel!, memsafe_oob_write_kernel!,
-    memsafe_align64_check_kernel!, MEMSAFE_KERNELS_FILE
+@testmodule MemsafeFixtures begin
+    export memsafe_inbounds_kernel!, memsafe_oob_read_kernel!, memsafe_oob_write_kernel!,
+        memsafe_align64_check_kernel!, MEMSAFE_KERNELS_FILE
 
-const MEMSAFE_KERNELS_FILE = joinpath(@__DIR__, "memsafe_kernels.jl")
-include(MEMSAFE_KERNELS_FILE)
+    const MEMSAFE_KERNELS_FILE = joinpath(@__DIR__, "memsafe_kernels.jl")
+    include(MEMSAFE_KERNELS_FILE)
 end
 
 @testitem "@assert_memsafe / memsafe_report pass cleanly on an in-bounds kernel (both modes)" setup = [MemsafeFixtures] begin

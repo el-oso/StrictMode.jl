@@ -78,3 +78,36 @@ end
     @test occursin("Tuple", msg)
     @test StrictMode._box_msg("boxing (fast heuristic)", sg) == "boxing (fast heuristic)"   # no enrichment when clean
 end
+
+@testitem "KNOWN DIVERGENCE: :noboxing is laxer than the proof on an abstract-VALUE dict" begin
+    using StrictMode, AllocCheck, JET
+    # PureBLAS's `_l3ws` shape. AllocCheck classifies the `Any`-valued read as boxing, so `:full`
+    # fails; the fast engine files it under `dictlookup` and reports `boxing=false`,
+    # `abscontainer=nothing`, so `:noboxing` passes. That matters because after the tier split
+    # `:fast` is the only engine most users get, and this is the LAX direction.
+    #
+    # The obvious fix — widening the abstract-container signal to a dict's `valtype` and
+    # propagating it through `:invoke` — does not work: an `IdDict`'s storage field is
+    # `Memory{Any}` regardless of its declared value type, so recursion into Base's own internals
+    # flags EVERY `IdDict`, including the concretely-typed rare-type-tail fallback that
+    # `static_ownership` prescribes (see the next item, and issue #7).
+    const _WS = IdDict{Symbol, Any}()
+    helper() = get!(() -> Int[], _WS, :k)::Vector{Int}
+    caller() = length(helper())::Int
+    caller()
+    @test any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :full))
+    @test_broken any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :fast))
+end
+
+@testitem "the GKH rare-type-tail Dict fallback must stay clean (issue #7)" begin
+    using StrictMode
+    # `static_ownership` is advisory-only precisely because its own prescribed fallback — a Dict for
+    # the rare-type tail — must not trip a hard gate. Guards against a future abstract-container
+    # widening that would flag it: this is CONCRETELY valued, so nothing here boxes.
+    const _WS_OK = IdDict{Symbol, Vector{Int}}()
+    okhelper() = get!(() -> Int[], _WS_OK, :k)
+    okcaller() = length(okhelper())::Int
+    okcaller()
+    @test StrictMode._alloc_signals(okcaller, ()).abscontainer === nothing
+    @test all(f -> f.status === :pass, findings(okcaller, (); guarantees = (:noboxing,), mode = :fast))
+end

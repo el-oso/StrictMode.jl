@@ -1,39 +1,39 @@
-@testsetup module NoSpillFixtures
-export CleanAccumKernel, SpillyAccumKernel, clean_accum_kernel!, spilly_accum_kernel!
+@testmodule NoSpillFixtures begin
+    export CleanAccumKernel, SpillyAccumKernel, clean_accum_kernel!, spilly_accum_kernel!
 
-# A manually unrolled kernel with N independent SIMD accumulators — each `acc[k] += a[i]*b[i]+k`
-# promotes to its own live vector register under `@simd`. With N below the target's vector
-# register count the kernel is clean; well past it, LLVM's allocator has no choice but to spill
-# to the stack. Generated (via `eval` at THIS module's top level, not inside a `@testitem` body —
-# doing it there hits Julia 1.12's stricter world-age rules the moment the definition is used
-# through a nested macro like `@test_throws`) rather than hand-unrolled, since the whole point is
-# varying N.
-function _accum_kernel_expr(name::Symbol, n::Int)
-    accs = [Symbol(:acc, k) for k in 1:n]
-    inits = [:($(accs[k]) = 0.0) for k in 1:n]
-    updates = [:($(accs[k]) += a[i] * b[i] + $(Float64(k))) for k in 1:n]
-    stores = [:(out[$k] = $(accs[k])) for k in 1:n]
-    return quote
-        function $name(out::Vector{Float64}, a::Vector{Float64}, b::Vector{Float64})
-            $(inits...)
-            @inbounds @simd for i in eachindex(a, b)
-                $(updates...)
+    # A manually unrolled kernel with N independent SIMD accumulators — each `acc[k] += a[i]*b[i]+k`
+    # promotes to its own live vector register under `@simd`. With N below the target's vector
+    # register count the kernel is clean; well past it, LLVM's allocator has no choice but to spill
+    # to the stack. Generated (via `eval` at THIS module's top level, not inside a `@testitem` body —
+    # doing it there hits Julia 1.12's stricter world-age rules the moment the definition is used
+    # through a nested macro like `@test_throws`) rather than hand-unrolled, since the whole point is
+    # varying N.
+    function _accum_kernel_expr(name::Symbol, n::Int)
+        accs = [Symbol(:acc, k) for k in 1:n]
+        inits = [:($(accs[k]) = 0.0) for k in 1:n]
+        updates = [:($(accs[k]) += a[i] * b[i] + $(Float64(k))) for k in 1:n]
+        stores = [:(out[$k] = $(accs[k])) for k in 1:n]
+        return quote
+            function $name(out::Vector{Float64}, a::Vector{Float64}, b::Vector{Float64})
+                $(inits...)
+                @inbounds @simd for i in eachindex(a, b)
+                    $(updates...)
+                end
+                @inbounds begin
+                    $(stores...)
+                end
+                return nothing
             end
-            @inbounds begin
-                $(stores...)
-            end
-            return nothing
         end
     end
-end
 
-eval(_accum_kernel_expr(:clean_accum_kernel!, 4))     # well under any x86-64 vector register file
-# 80: past 16 ymm (AVX2) AND past 32 zmm (AVX-512) with real margin — 32 was found to land exactly
-# on the AVX-512 register count on some CI runners (zero margin, no spill observed).
-eval(_accum_kernel_expr(:spilly_accum_kernel!, 80))
+    eval(_accum_kernel_expr(:clean_accum_kernel!, 4))     # well under any x86-64 vector register file
+    # 80: past 16 ymm (AVX2) AND past 32 zmm (AVX-512) with real margin — 32 was found to land exactly
+    # on the AVX-512 register count on some CI runners (zero margin, no spill observed).
+    eval(_accum_kernel_expr(:spilly_accum_kernel!, 80))
 
-const CleanAccumKernel = clean_accum_kernel!
-const SpillyAccumKernel = spilly_accum_kernel!
+    const CleanAccumKernel = clean_accum_kernel!
+    const SpillyAccumKernel = spilly_accum_kernel!
 end
 
 @testitem "@assert_no_spill passes on a register-clean kernel" setup = [NoSpillFixtures] begin

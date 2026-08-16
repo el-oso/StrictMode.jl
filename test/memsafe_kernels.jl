@@ -3,7 +3,7 @@
 # `isolate=true` runs the guarded probe in a FRESH `julia` subprocess, which locates `f`'s source
 # file via `which(f, ...).file` and `include`s it directly — so these kernels must live in a real,
 # self-contained file on disk (no reliance on their including module's context), not be `eval`'d
-# inline inside a `@testitem`/`@testsetup` body (those aren't reachable from a fresh process).
+# inline inside a `@testitem`/`@testmodule` body (those aren't reachable from a fresh process).
 
 function memsafe_inbounds_kernel!(out::Vector{Float64}, a::Vector{Float64})
     @inbounds for i in eachindex(a)
