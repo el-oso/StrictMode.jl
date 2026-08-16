@@ -416,11 +416,14 @@ unit(::Type{Int})     = 1                   # method table entry, const-folds
 unit(::Type{Float64}) = 1.0
 ```
 
-(Base's own `one(::Type{T})` works exactly this way — it was never going to be a dict.)
 
-**What problem it solves.** A type/symbol-keyed `Dict`/`IdDict` lookup is often type-stable and
-non-allocating on the warm hit — so `@assert_typestable`, `@assert_noalloc`, and
-`@assert_noboxing` all pass on it. Nothing else in this package would tell you it's there. But it
+(Base's own `one(::Type{T})` works exactly this way — it was never going to be a dict.)
+**What problem it solves.** A type/symbol-keyed `Dict`/`IdDict` lookup is often non-allocating on
+the warm hit (measured: 0 bytes) — and when its result is narrowed, by a type assert or a
+concretely-typed dict, `@assert_typestable`, `@assert_noalloc` and `@assert_noboxing` all pass on
+it. Nothing else in this package would tell you it's there. (The bare form above is *not* narrowed:
+`UNITS[T]` on an `IdDict{Type,Any}` infers to `Any`, so it fails all three on the return type alone
+— narrow it with `::T` and the guarantees go quiet while the probe remains.) But it
 still costs a real hash/eq-table probe on every call (measured ~130 ns) — for a hot inner-loop
 accessor, that's dozens of FLOPs worth of latency spent fetching a pointer that could have cost
 zero. Because it's latency, not allocation or instability, only a benchmark or a structural IR

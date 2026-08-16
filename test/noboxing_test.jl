@@ -79,35 +79,35 @@ end
     @test StrictMode._box_msg("boxing (fast heuristic)", sg) == "boxing (fast heuristic)"   # no enrichment when clean
 end
 
-@testitem "KNOWN DIVERGENCE: :noboxing is laxer than the proof on an abstract-VALUE dict" begin
+@testitem "warm dict lookup: :fast is RIGHT and AllocCheck is conservative (measured)" begin
     using StrictMode, AllocCheck, JET
-    # PureBLAS's `_l3ws` shape. AllocCheck classifies the `Any`-valued read as boxing, so `:full`
-    # fails; the fast engine files it under `dictlookup` and reports `boxing=false`,
-    # `abscontainer=nothing`, so `:noboxing` passes. That matters because after the tier split
-    # `:fast` is the only engine most users get, and this is the LAX direction.
-    #
-    # The obvious fix — widening the abstract-container signal to a dict's `valtype` and
-    # propagating it through `:invoke` — does not work: an `IdDict`'s storage field is
-    # `Memory{Any}` regardless of its declared value type, so recursion into Base's own internals
-    # flags EVERY `IdDict`, including the concretely-typed rare-type-tail fallback that
-    # `static_ownership` prescribes (see the next item, and issue #7).
-    const _WS = IdDict{Symbol, Any}()
-    helper() = get!(() -> Int[], _WS, :k)::Vector{Int}
+    # The PureBLAS `_l3ws` / GKH-ownership shape. Ground truth first: warm, this allocates NOTHING.
+    # `Any` only boxes an *isbits* value on STORE; reading is always free, and storing a heap object
+    # (the workspace itself) is free too. AllocCheck's all-paths proof still reports boxing here —
+    # it has to assume the `Any` slot could hold an isbits value and that the cold-miss branch runs.
+    # So on this shape `:fast` gives the correct verdict and `:full` is the conservative one. This
+    # is the direction that matters after the tier split, so it is pinned rather than left implicit.
+    const _L3 = IdDict{Symbol, Any}()
+    helper() = get!(() -> Int[], _L3, :k)::Vector{Int}
     caller() = length(helper())::Int
     caller()
+    for _ in 1:5
+        caller()
+    end
+    @test @allocated(caller()) == 0                                                   # ground truth
+    @test all(f -> f.status === :pass, findings(caller, (); guarantees = (:noboxing,), mode = :fast))
     @test any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :full))
-    @test_broken any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :fast))
 end
 
-@testitem "the GKH rare-type-tail Dict fallback must stay clean (issue #7)" begin
+@testitem "an UNNARROWED Any-returning lookup correctly fails all three" begin
     using StrictMode
-    # `static_ownership` is advisory-only precisely because its own prescribed fallback — a Dict for
-    # the rare-type tail — must not trip a hard gate. Guards against a future abstract-container
-    # widening that would flag it: this is CONCRETELY valued, so nothing here boxes.
-    const _WS_OK = IdDict{Symbol, Vector{Int}}()
-    okhelper() = get!(() -> Int[], _WS_OK, :k)
-    okcaller() = length(okhelper())::Int
-    okcaller()
-    @test StrictMode._alloc_signals(okcaller, ()).abscontainer === nothing
-    @test all(f -> f.status === :pass, findings(okcaller, (); guarantees = (:noboxing,), mode = :fast))
+    # The counterpart: `docs/src/guarantees.md`'s own `unit` example returns `Any` unnarrowed, so it
+    # is genuinely unstable and every guarantee fails on the return type alone — even though it too
+    # is 0-alloc warm. Narrowing is what separates this from the item above; the doc used to claim
+    # all three passed on it.
+    const _U = IdDict{Type, Any}(Int => 1, Float64 => 1.0)
+    unit(::Type{T}) where {T} = _U[T]
+    unit(Float64)
+    @test_throws StrictViolation @assert_typestable unit(Float64)
+    @test_throws StrictViolation @assert_noboxing unit(Float64)
 end
