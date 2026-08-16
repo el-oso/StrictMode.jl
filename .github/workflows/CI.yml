@@ -12,12 +12,20 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} – ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The 1.13 entry is a pre-release readiness check, not a gate: an RC can change under us, so a
+    # red run there must not block a PR. Remove `continue-on-error` once 1.13.0 final ships.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
-        # JET (a core dependency) tracks Julia's compiler internals and requires 1.12.
         version: ["1.12"]
         os: [ubuntu-latest, macOS-latest, windows-latest]
+        include:
+          # `"1.13"` would NOT match a pre-release (setup-julia excludes them from plain ranges);
+          # `~1.13.0-rc1` matches the current rc and every later 1.13, including the eventual final.
+          - version: "~1.13.0-rc1"
+            os: ubuntu-latest
+            experimental: true
     steps:
       - uses: actions/checkout@v6
       - uses: julia-actions/setup-julia@v3
@@ -30,12 +38,12 @@ jobs:
       - run: julia --project=test --code-coverage=user test/runtests.jl
         env:
           JULIA_NUM_THREADS: 2
-      # Collect & upload coverage from the Linux job only (avoids duplicate uploads and
-      # Windows path quirks).
+      # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the
+      # pre-release job, and Windows path quirks).
       - uses: julia-actions/julia-processcoverage@v1
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1.12'
       - name: Upload coverage to Coveralls
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1.12'
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
