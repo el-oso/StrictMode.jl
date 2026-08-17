@@ -32,12 +32,22 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
-      # test/Project.toml sets [preferences.StrictMode] checks_enabled=true, so the failing-path
-      # test items actually exercise the guarantees in CI.
-      - run: julia --project=test -e 'import Pkg; Pkg.instantiate()'
-      - run: julia --project=test --code-coverage=user test/runtests.jl
+      # `Pkg.test()`, NOT `runtests.jl` directly: it builds the proper test environment and forces
+      # `--check-bounds=yes`, which changes codegen. Running the file directly leaves bounds checking
+      # at `auto` and silently skips that whole configuration — it is how five vectorization-shape
+      # failures stayed invisible here. test/Project.toml sets [preferences.StrictMode]
+      # checks_enabled=true, so the failing-path items actually exercise the guarantees.
+      - run: julia --project=. -e 'import Pkg; Pkg.test(; coverage = true)'
         env:
           JULIA_NUM_THREADS: 2
+      # The split's premise, and the ONLY place it can be checked: StrictMode with no analysis
+      # backend installed. Every item in test/ runs with StrictModeTest loaded, so none of them can
+      # catch a guarantee that has re-acquired a hard AllocCheck/JET/TrimCheck dependency — which
+      # would break StrictMode as a plain [deps] entry in a consumer's Project.toml.
+      - name: StrictMode standalone (no analysis backend)
+        run: |
+          julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
+          julia --project=test/standalone test/standalone/runtests.jl
       # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the
       # pre-release job, and Windows path quirks).
       - uses: julia-actions/julia-processcoverage@v1
