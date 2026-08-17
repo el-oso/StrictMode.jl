@@ -44,7 +44,7 @@ function _assert_enabled(enabled::Bool, ci::Bool)
             "silently (a green run with checks off proves nothing). Enable them by adding\n" *
             "    [preferences.StrictMode]\n    checks_enabled = true\n    fail_mode = \"error\"\n" *
             "to the test environment's Project.toml (or run `StrictMode.enable_checks!()` and " *
-            "restart), and make sure AllocCheck + JET are test deps for :full analysis."
+            "restart). For the `:full` proofs, add `StrictModeTest` to that environment."
     )
     return false
 end

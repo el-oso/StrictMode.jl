@@ -1,7 +1,7 @@
 # Heavy-analysis backend seam. AllocCheck and JET are big, so they are *weak* dependencies: a
 # package can depend on StrictMode and ship neither. With checks disabled the guarantee macros
 # expand to bare calls and nothing here is touched. When checks are enabled, add AllocCheck and
-# JET to the environment — the `StrictModeAnalysisExt` extension then provides methods for the
+# the StrictModeTest package to the environment — it then provides methods for the
 # four functions below (this is the *only* place that touches AllocCheck / JET).
 #
 # Recommended setups:
@@ -19,17 +19,33 @@ package depends on StrictMode without them — enabling checks then asks you to 
 """
 backend_available() = _BACKEND_AVAILABLE[]
 
-function _require_backend()
-    _BACKEND_AVAILABLE[] && return nothing
-    error(
-        "StrictMode: checks are enabled but the analysis backend is not loaded. AllocCheck and " *
-            "JET are optional (weak) dependencies — add BOTH to this environment to run the " *
-            "checks (e.g. your test/ or dev project). Production builds that leave checks off " *
-            "need neither."
+"""
+    BackendUnavailable <: Exception
+
+Thrown when the `:full` analysis tier is requested but `StrictModeTest` — which supplies the
+AllocCheck/JET/TrimCheck proofs — is not loaded. A distinct type rather than a bare `error()` so
+the sweep drivers can tell "this whole run cannot be analyzed" apart from "this one method could
+not be analyzed", which they otherwise swallow per item (see `_map_findings` in registry.jl).
+"""
+struct BackendUnavailable <: Exception end
+
+function Base.showerror(io::IO, ::BackendUnavailable)
+    print(
+        io,
+        "StrictMode: the `:full` analysis tier was requested but its backend is not loaded. The ",
+        "proofs (AllocCheck + JET + TrimCheck) live in the companion `StrictModeTest` package — ",
+        "add it to this environment (normally `test/Project.toml`) and `using StrictModeTest`. ",
+        "`StrictMode` alone analyzes with the value-free heuristic and needs no backend."
     )
+    return nothing
 end
 
-# The backend seam: the StrictModeAnalysisExt extension adds methods for these. They have no
+function _require_backend()
+    _BACKEND_AVAILABLE[] && return nothing
+    throw(BackendUnavailable())
+end
+
+# The backend seam: StrictModeTest adds methods for these. They have no
 # methods in the core package, so callers must go through `_require_backend()` first.
 function _be_check_allocs end   # (f, types) -> Vector of AllocCheck allocation instances
 function _be_is_boxing end      # (alloc_instance) -> Bool  (boxing / dynamic-dispatch subclass)

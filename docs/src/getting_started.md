@@ -147,7 +147,7 @@ live anyway.
 
 The per-call asserts run on cheap inference-only checks by default — there is no rigor/speed
 preference to set. The rigorous proofs live in the companion `StrictModeTest` package, whose
-macros shadow these ones; you add it to the test environment and leave it out everywhere else.
+backend is loaded; you add it to the test environment and leave it out everywhere else.
 
 | Package | Type stability | No-allocation / no-boxing | Backend | Per-method cost |
 |---|---|---|---|---|

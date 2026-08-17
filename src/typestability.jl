@@ -63,8 +63,8 @@ Fail unless `f(args...)` is type stable.
 Both engines check that the inferred return type is a single concrete type, using
 `Base.return_types`, and additionally check the IR boxing signal (`StrictMode._alloc_signals`) for
 internal dynamic dispatch hiding behind a concrete return — the classic "the return type is fine
-but something inside dispatches at runtime" shape. `StrictModeTest` shadows this macro with a
-version that additionally runs JET's optimization analysis. Each argument is
+but something inside dispatches at runtime" shape. When `StrictModeTest` is loaded, JET's
+optimization analysis runs on top of that. Each argument is
 evaluated once, the macro returns the call's value, and disabled builds expand to the bare call.
 
 **Keyword arguments** are supported: `f(x; k=v)` is checked at its real specialization (the call is

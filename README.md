@@ -45,7 +45,9 @@ you cannot forget to "turn it on" in a file.
 @assert_noalloc kernel!(C, A, B)     # heuristic while developing, AllocCheck proof under test
 ```
 
-Asking for `mode = :full` without `StrictModeTest` present is an error, not a silent downgrade.
+Asking for `mode = :full` without `StrictModeTest` present throws `BackendUnavailable` — including
+from the batch drivers (`audit`, `check_all`, `check_signatures`), which otherwise swallow per-item
+analysis errors and would report a vacuous green.
 
 ## Zero cost when disabled
 

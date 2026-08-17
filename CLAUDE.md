@@ -120,7 +120,7 @@ The backend-free premise has its own environment; run it whenever you touch a gu
 
 ```bash
 julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
-julia --project=test/standalone test/standalone/runtests.jl
+JULIA_LOAD_PATH="@:@stdlib" julia --project=test/standalone test/standalone/runtests.jl
 ```
 
 ## Key invariants

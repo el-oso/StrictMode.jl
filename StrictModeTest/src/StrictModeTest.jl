@@ -10,9 +10,20 @@ There is no preference to switch between them: **the tier is the dependency grap
 `StrictMode` and you get the heuristic; add `StrictModeTest` to your test environment and the same
 declarations are re-checked against the proofs.
 
-Write `using StrictModeTest` **alone** in a test file. It re-exports StrictMode's surface, and
-importing both packages is a hard `UndefVarError` at macro expansion rather than a silent
-downgrade — the tier cannot be selected by accident.
+This package defines **no macros and exports nothing**. It implements StrictMode's backend seam and
+flips `StrictMode.backend_available()` on in `__init__`; the guarantees then escalate by reading
+that flag at CALL time, so one already-compiled call site runs the heuristic in a package's own
+environment and the proof under test, with nothing recompiled. Use it as:
+
+```julia
+using StrictMode, StrictModeTest    # both — StrictModeTest supplies no API of its own
+```
+
+Two consequences worth knowing. Escalation is process-wide and takes effect the moment this package
+loads, so load it once at the top of `test/runtests.jl` rather than inside individual test items.
+And `@strict_function` / `@strict module` can never escalate: they run at the annotated module's own
+precompile, where a test-environment dependency is not loadable by construction. Re-check those
+signatures from test code with `check_signatures` or `audit`, which run at runtime.
 """
 module StrictModeTest
 

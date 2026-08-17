@@ -55,17 +55,27 @@ exempt_strict() = STRICT_EXEMPT
 # opts in per call.
 _default_parallel(::Symbol) = false
 
+# A per-item analysis error is swallowed so one unanalyzable method can't sink a whole sweep. But a
+# MISSING BACKEND is not a per-item problem — it fails every item identically, and swallowing it
+# turns `mode = :full` into a silent, vacuous green: the same sweep that reports 53 findings at
+# `:fast` reported 0 findings / 0 failures at `:full` with no backend loaded, exit code 0. That is
+# the exact failure mode `assert_enabled` exists to prevent, reached through a different door, and it
+# lands in `audit` — the driver the Stop hook and the consumer gate scripts run. Rethrow it.
+_is_fatal_sweep_error(err) = err isa StrictViolation || err isa BackendUnavailable
 function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
     if parallel && length(items) > 1
         results = Vector{Vector{StrictFinding}}(undef, length(items))
+        fatal = Ref{Any}(nothing)
         Threads.@threads for i in eachindex(items)
             f, types, gs = items[i]
             results[i] = try
                 findings(f, types; guarantees = gs, mode)
-            catch
+            catch err
+                _is_fatal_sweep_error(err) && (fatal[] = err)
                 StrictFinding[]
             end
         end
+        fatal[] === nothing || throw(fatal[])
         return reduce(vcat, results; init = StrictFinding[])
     end
     out = StrictFinding[]
@@ -73,7 +83,7 @@ function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
         try
             append!(out, findings(f, types; guarantees = gs, mode))
         catch err
-            err isa StrictViolation && rethrow()
+            _is_fatal_sweep_error(err) && rethrow()
         end
     end
     return out

@@ -180,8 +180,9 @@ allocations — while **allowing** legitimate typed heap allocations (a `Vector`
 
 This is the relaxed sibling of [`@assert_noalloc`](@ref): use it for a hot path that may
 allocate a buffer but must never box (the runtime-tuple-index trap, captured-variable `Core.Box`,
-or accidental dynamic dispatch). It is always a static [AllocCheck] analysis — it must classify
-each allocation — so it needs the AllocCheck backend from `StrictModeTest`. Each argument is evaluated
+or accidental dynamic dispatch). With `StrictModeTest` loaded it is AllocCheck's static analysis,
+which classifies each allocation; without it, the same value-free IR boxing signal the `:fast`
+engine uses. Each argument is evaluated
 once; the macro evaluates to the call's value; disabled builds expand to the bare call.
 
 ```julia

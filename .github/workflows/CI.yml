@@ -47,6 +47,7 @@ jobs:
       - name: StrictMode standalone (no analysis backend)
         run: |
           julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
+          JULIA_LOAD_PATH="@:@stdlib" \
           julia --project=test/standalone test/standalone/runtests.jl
       # StrictModeTest's own suite: the `_be_*` seam implementations (allocation classification,
       # ignore_throw, the JET and TrimCheck drivers). StrictMode cannot test these — over there the

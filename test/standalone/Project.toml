@@ -1,6 +1,3 @@
-name = "StrictModeStandalone"
-uuid = "3f1a2b6c-9d4e-4a7b-8c5d-2e6f0a1b3c4d"
-
 [deps]
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

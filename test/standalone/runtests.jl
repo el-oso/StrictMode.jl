@@ -10,7 +10,10 @@ using Test
     @test StrictMode.checks_enabled()
     @test !StrictMode.backend_available()
     @test !StrictMode.trimcheck_available()
-    # The backends must not even be installed in this environment.
+    # The backends must not even be RESOLVABLE here. This needs an isolated LOAD_PATH
+    # (`JULIA_LOAD_PATH="@:@stdlib"`): `--project=X` alone keeps the global `@v#.#` environment on
+    # the path, so `identify_package` finds anything installed there and this suite would then be
+    # testing the developer's machine rather than the repo. CI sets it; so does the CLAUDE.md recipe.
     @test Base.identify_package("AllocCheck") === nothing
     @test Base.identify_package("JET") === nothing
     @test Base.identify_package("StrictModeTest") === nothing
@@ -58,6 +61,18 @@ using Test
 
     @testset "asking for :full without the backend fails loudly, not silently" begin
         # It must NOT quietly downgrade to the heuristic and report a pass.
-        @test_throws Exception findings(dot3, (typeof(A), typeof(A)); mode = :full)
+        @test_throws StrictMode.BackendUnavailable findings(dot3, (typeof(A), typeof(A)); mode = :full)
+        # …and that must hold for the BATCH drivers too. They swallow per-item analysis errors so one
+        # unanalyzable method cannot sink a sweep, which used to eat the missing-backend error and
+        # return a vacuous green: the same sweep reporting 53 findings at :fast returned 0 findings,
+        # 0 failures, exit 0 at :full. `audit` is the driver the Stop hook and consumer gate scripts
+        # run, so that silence landed exactly where it does the most damage.
+        @test_throws StrictMode.BackendUnavailable audit(
+            StrictMode; sweep = true, mode = :full,
+            guarantees = (:typestable,), format = :text, io = devnull, exit_on_fail = false
+        )
+        @test_throws StrictMode.BackendUnavailable check_signatures(
+            [(dot3, (typeof(A), typeof(A)))]; mode = :full, fail = :error
+        )
     end
 end

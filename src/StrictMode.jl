@@ -25,7 +25,7 @@ See the README and `docs/cookbook.md` for the trap → macro mapping.
 """
 module StrictMode
 
-# AllocCheck and JET are loaded only by the StrictModeAnalysisExt extension (weak deps).
+# AllocCheck and JET are not dependencies of this package at all; StrictModeTest supplies them.
 using Preferences: Preferences, @load_preference, @set_preferences!
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
@@ -47,6 +47,7 @@ export static_ownership_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, backend_available
+export BackendUnavailable
 export register_alloc_barrier!, ignore_barrier, set_ignore_barrier!
 
 include("preferences.jl")
@@ -76,6 +77,6 @@ include("audit.jl")
 include("golden.jl")
 
 # The heavy analysis (AllocCheck + JET) and its precompile warmup live in
-# ext/StrictModeAnalysisExt.jl, loaded when both weak deps are present.
+# StrictModeTest, which fills them unconditionally.
 
 end # module StrictMode
