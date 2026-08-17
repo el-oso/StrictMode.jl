@@ -78,19 +78,32 @@ GitHub issues are the source of truth for anything with a number; the notes here
   exists (`trimsafe.jl`'s heuristic caveat, `register_alloc_barrier!`, `memsafe.jl`,
   `no_spill`/`mca.jl`) and close them if so. Not audited.
 
-## Open — split follow-ups
 
-- [ ] **Register `StrictModeTest`.** It is a subdirectory package; Registrator supports that
-  via `subdir=`. Needs a decision on whether it stays a subdir or gets its own repo, and
-  whether its version tracks StrictMode's in lockstep (currently both 0.4.0).
+## Open — added by the 0.4.0 split itself
 
-- [ ] **Reconcile `SPLIT-PROPOSAL.md` with what shipped.** It is at revision 6 and predates
-  the implementation. Known drift: §H.4 specifies shadowing macros, which were dropped for
-  auto-escalation; its anti-vacuous argument for shadowing does not hold (shadowing only
-  errors when BOTH packages are imported, the harmless case). Under adversarial review.
+- [ ] **The registry leg of "checked twice" does not work.** `@strict_function` registers via a
+  `register_strict!` Dict insert executed at the consumer's precompile; that cross-package mutation
+  is discarded on cached pkgimage load, so `check_all()` in a consumer's test process sees an empty
+  registry and reports green. `check_signatures`/`audit` are unaffected (they enumerate directly).
+  SPLIT-PROPOSAL §H.3 identified this mechanism and it was never applied to `registry.jl`.
+  *Fix:* marker method definitions (§H.1) rather than a Dict, or document `check_all` as
+  same-process-only.
 
-- [ ] **Neither `Manifest.toml` in a consumer layout is exercised.** `test/standalone` proves
-  StrictMode works with no backend, and `test/` proves the escalated path, but nothing tests
-  a *consumer* shape: `StrictMode` in `Project.toml`, `StrictModeTest` in `test/Project.toml`,
-  with `@strict_function` in `src/` firing at the consumer's own precompile. That is the
-  layout the split exists to serve and it is currently only verified by hand.
+- [ ] **No test exercises the real consumer layout.** `test/standalone` proves StrictMode works with
+  no backend and `test/` proves the escalated path, but nothing tests `StrictMode` in
+  `Project.toml` + `StrictModeTest` in `test/Project.toml` + `@strict_function` in `src/` firing at
+  the consumer's own precompile. That is the arrangement the split exists to serve.
+
+- [ ] **`:suspect` is a new public status.** It appears in the JSON findings. Anything matching
+  `status == "fail"` now silently skips fast-tier allocation findings. Documented in
+  `docs/src/agents.md`; the four consumer `strictmode_audit.jl` scripts are OUT OF SCOPE for this
+  repo but will need the same audit.
+
+- [ ] **Register `StrictModeTest`.** Subdirectory package; Registrator supports `subdir=`. Needs a
+  decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).
+## Done
+
+- [x] **Reconcile `SPLIT-PROPOSAL.md` with what shipped** — revision 7. §H.4 and §5 rewritten to
+  describe auto-escalation rather than the shadowing macros that were never built, and a new §7
+  records all ten divergences with the reason for each. The document is now a decision record, not
+  a proposal.
