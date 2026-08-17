@@ -50,8 +50,34 @@ Each finding is one object (here pretty-printed):
 
 `guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |
 no_scalar_loops | no_spill | trimsafe | trim_compatible`, and `status` is one of
-`fail | pass | skip | info` (`info` is advisory — never a failure, e.g.
-[`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)). The `suggestion` field is
+`fail | pass | skip | suspect | info`:
+
+| status | meaning | counts as a failure? |
+|---|---|---|
+| `pass` / `fail` | a verdict to act on | `fail` does |
+| `skip` | not analyzable (non-concrete signature, unsupported construct) | no |
+| `info` | advisory ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)) | no |
+| `suspect` | **a `:fast`-engine allocation verdict — a structural guess, not a proof** | **yes** |
+
+`suspect` is the one to understand if you are consuming this programmatically. Without
+`StrictModeTest` loaded, `noalloc`/`noboxing` are decided by a value-free scan of typed IR, where an
+allocation site LLVM will later elide is still present. That over-flags: on one real consumer, 19 of
+68 such findings were false, every one measuring 0 bytes. So the verdict is labelled as a guess.
+
+Two consequences for an agent:
+
+- **`suspect` still counts.** [`nfailures`](@ref) includes it and `exit_on_fail` still trips on it —
+  a sweep must not go green while sitting on a real allocation regression. Use [`nsuspect`](@ref) to
+  report the confidence split, and treat `suspect` as "investigate", not "ignore". If you are
+  matching on `status`, match `fail` **or** `suspect`, or you will silently skip these.
+- **It never aborts a load.** [`@strict_function`](@ref), which runs at the annotated module's own
+  precompile where the proof is unreachable by construction, emits a warning rather than throwing on
+  a `suspect` verdict. A build should not be decidable by a guess.
+
+To resolve them, add `StrictModeTest` to the environment: every `suspect` is then re-issued as a
+proved `pass` or `fail`.
+
+The `suggestion` field is
 the structured version of what [`@explain`](@ref) would tell a person, so an agent can act on it
 as-is. All of it comes from the [`StrictFinding`](@ref) record, which you can also gather
 directly with [`findings`](@ref).

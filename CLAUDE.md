@@ -131,6 +131,16 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=test/standalone test/standalone/runt
 - `@contract`-style macro headers in the sibling TypeContracts package can't be module-qualified (e.g. `@contract Base.AbstractLock` fails to parse — needs `import Base: AbstractLock` first) — worth knowing if you're pairing `@strict_contract`/`@verify_strict` with a foreign type.
 - AllocCheck/JET/TrimCheck are **not dependencies of StrictMode at all** — not even weak ones. They are hard deps of `StrictModeTest`, which fills the `_be_*` stubs. Never import them from `src/`, and never add them back to `Project.toml`: `test/standalone` exists to fail if you do.
 - **Tier selection is auto-escalation, decided at CALL time** (`backend_available()` inside `_assert_*`), never at macro expansion. That is what lets one precompiled call site run the heuristic in a consumer's own environment and the proof under test. Consequence: `@strict_function`/`@strict module` can NEVER escalate — they run at the annotated module's own precompile, where `StrictModeTest` is not loadable — so the suite re-checks those signatures via `check_signatures`/`audit` at runtime instead.
+- **`:fast` allocation verdicts are `:suspect`, not `:fail`.** `_findings_fast` emits `:suspect` for
+  `:noalloc`/`:noboxing` because that engine reads typed IR and cannot see what LLVM elides (~28%
+  false on a real consumer, issue #17). `:suspect` **still counts** — `nfailures` includes it and
+  sweeps still gate; what it buys is that it renders distinctly, is separately countable via
+  `nsuspect`, and that `@strict_function` WARNS rather than aborting a consumer's precompile, where
+  the proof is unreachable by construction (issue #18). Do not downgrade it to non-failing: that was
+  prototyped and rejected, because a sweep reporting green on a real regression is the vacuous-green
+  shape this package exists to remove. `:typestable` is deliberately NOT downgraded — return-type
+  concreteness is exact. Tests should assert `StrictMode._failed(f)` ("counts against you") rather
+  than `f.status === :fail`, which pins a symbol instead of the intent.
 - `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly.
 - `ignore_throw = true` is the default for AllocCheck calls — throw-path allocations don't count.
 - `kernel_report` and `@assert_vectorized` work from `InteractiveUtils.code_llvm` — no backend needed. `_CACHE_BYTES` is a tunable `Ref` for cache-residency annotation thresholds.

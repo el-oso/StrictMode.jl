@@ -93,6 +93,33 @@ explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
 auto-recognized (its implementation has no detectable non-inlined callee boundary to key off of —
 wrap it in your own function and register that instead).
 
+
+### `:suspect` — when the verdict is a guess
+
+Without `StrictModeTest` loaded, `@assert_noalloc` and `@assert_noboxing` are decided by a value-free
+scan of **typed IR**. AllocCheck works on **LLVM IR**, after the optimizer has run, so an allocation
+LLVM elides is invisible to the proof and still plainly visible to the scan. The classic shape:
+
+```julia
+mkvec(n::Int) = length(Vector{Float64}(undef, n))
+@allocated mkvec(4)     # => 0   — the array is never materialized
+```
+
+The heuristic flags it; AllocCheck does not; the truth is 0 bytes. On one real consumer package,
+19 of 68 such findings were false, every one measuring 0 bytes.
+
+So these verdicts carry `status = :suspect` rather than `:fail`. They render as `?` instead of `✗`,
+[`nsuspect`](@ref) counts them separately — and they **still count as failures**: [`nfailures`](@ref)
+includes them, and `check`/`audit` still throw. A sweep that went green while sitting on a real
+allocation regression would be worse than a noisy one.
+
+The exception is load time. [`@strict_function`](@ref) runs at the annotated module's own precompile,
+where `StrictModeTest` is a test-environment dependency and therefore not loadable by construction —
+so there a `:suspect` verdict emits a **warning** instead of throwing. A module load should not be
+decidable by a structural guess, and the declaration is registered either way, so the same signature
+is re-checked against the proof when the test suite runs.
+
+Add `StrictModeTest` and every `:suspect` becomes a proved `:pass` or `:fail`.
 ## `@assert_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It only objects to the

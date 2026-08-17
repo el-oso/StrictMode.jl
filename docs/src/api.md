@@ -150,6 +150,7 @@ static_ownership_suggestions
 StrictFinding
 format_findings
 nfailures
+nsuspect
 ```
 
 ## Fast↔full divergence

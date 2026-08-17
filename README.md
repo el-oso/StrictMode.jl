@@ -49,6 +49,13 @@ Asking for `mode = :full` without `StrictModeTest` present throws `BackendUnavai
 from the batch drivers (`audit`, `check_all`, `check_signatures`), which otherwise swallow per-item
 analysis errors and would report a vacuous green.
 
+Because the heuristic reads typed IR and cannot see allocations LLVM later elides, its
+`noalloc`/`noboxing` verdicts are labelled `:suspect` — a structural guess, rendered `?` and counted
+by `nsuspect`. They **still fail a sweep** (`nfailures` includes them), with one exception:
+`@strict_function` runs at your package's own precompile, where the proof is unreachable by
+construction, so there a `:suspect` verdict warns instead of breaking your build. Adding
+`StrictModeTest` re-issues every one of them as a proved pass or fail.
+
 ## Zero cost when disabled
 
 Every check sits behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
@@ -201,7 +208,7 @@ You can gate a library's performance from its test suite, without ever adding St
    ```
 
 The choice between the two is the main trade-off. Per-call `@assert_*` is cheap and targeted; the
-whole-package `audit`/sweep is broad but needs scoping. Assert the few hot kernels you care about,
+| `@assert_noalloc f(args...)` | call is allocation-free (AllocCheck under `StrictModeTest`; a value-free IR scan otherwise, reported `:suspect`) |
 or sweep everything and exempt the rest.
 
 ## API
