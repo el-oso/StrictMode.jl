@@ -79,14 +79,25 @@ end
     @test StrictMode._box_msg("boxing (fast heuristic)", sg) == "boxing (fast heuristic)"   # no enrichment when clean
 end
 
-@testitem "warm dict lookup: :fast is RIGHT and AllocCheck is conservative (measured)" begin
+@testitem "the two engines answer DIFFERENT questions on a memoized accessor" begin
     using StrictMode, StrictModeTest
-    # The PureBLAS `_l3ws` / GKH-ownership shape. Ground truth first: warm, this allocates NOTHING.
-    # `Any` only boxes an *isbits* value on STORE; reading is always free, and storing a heap object
-    # (the workspace itself) is free too. AllocCheck's all-paths proof still reports boxing here —
-    # it has to assume the `Any` slot could hold an isbits value and that the cold-miss branch runs.
-    # So on this shape `:fast` gives the correct verdict and `:full` is the conservative one. This
-    # is the direction that matters after the tier split, so it is pinned rather than left implicit.
+    # The PureBLAS `_l3ws` / GKH-ownership shape, and a correction: an earlier version of this item
+    # claimed `:fast` was RIGHT here and AllocCheck merely conservative. That was a category error.
+    # It measured `@allocated` WARM — steady state — and then credited whichever engine agreed with
+    # it. AllocCheck does not answer that question. It proves "cannot allocate on ANY path", and
+    # this accessor genuinely allocates on its first call: measured 64 B cold, 0 B warm for the
+    # equivalent `get_ws` shape. Flagging it is correct for the question AllocCheck is asked.
+    #
+    # So there are three different questions in play, and they must not be conflated:
+    #   `@allocated` warm  — does the steady state allocate?
+    #   AllocCheck         — can ANY path allocate?
+    #   the fast heuristic — does the typed IR contain an allocation site? (a guess at AllocCheck's
+    #                        question, made without LLVM, so it cannot see what LLVM elides)
+    #
+    # What this pins is the DIVERGENCE, not a winner: on a narrowed dict read the heuristic passes
+    # `:noboxing` and the proof fails it. That matters because after the tier split `:fast` is the
+    # only engine most consumers get, so the disagreement is user-visible and should not drift
+    # silently.
     const _L3 = IdDict{Symbol, Any}()
     helper() = get!(() -> Int[], _L3, :k)::Vector{Int}
     caller() = length(helper())::Int
@@ -94,9 +105,48 @@ end
     for _ in 1:5
         caller()
     end
-    @test @allocated(caller()) == 0                                                   # ground truth
+    @test @allocated(caller()) == 0                          # steady state: nothing
     @test all(f -> f.status === :pass, findings(caller, (); guarantees = (:noboxing,), mode = :fast))
     @test any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :full))
+end
+
+@testitem ":noboxing permits a typed allocation — the heuristic over-flags one, the proof does not" begin
+    using StrictMode, StrictModeTest
+    # The other half of the correction, and the direction that actually matters: here the HEURISTIC
+    # is wrong. `bad` allocates a `Vector{_Foo}` (96 B measured) and dispatches over its abstract
+    # elements. That vector is a legitimate TYPED heap allocation, which `:noboxing` explicitly
+    # permits — so AllocCheck passing is correct. The heuristic fails it because it treats an
+    # abstract-eltype container as boxing, which is a code smell, not a boxing proof.
+    #
+    # Together with issue #17 (19/68 false failures on PureIPM, every one measuring 0 B), this is
+    # the honest summary: there is no measured case where the heuristic beats AllocCheck. Its one
+    # advantage is needing no backend, which is exactly why it is the tier that ships without one.
+    abstract type _Foo end
+    struct _A <: _Foo
+        x::Int
+    end
+    struct _B <: _Foo
+        y::Float64
+    end
+    _val(a::_A) = a.x
+    _val(b::_B) = round(Int, b.y)
+    function bad(n)
+        v = _Foo[]
+        push!(v, _A(n))
+        push!(v, _B(2.0))
+        s = 0
+        for f in v
+            s += _val(f)
+        end
+        return s
+    end
+    bad(1)
+    @test @allocated(bad(1)) > 0                             # it really does allocate...
+    @test all(f -> f.status === :pass, findings(bad, (Int,); guarantees = (:noboxing,), mode = :full))
+    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noboxing,), mode = :fast))
+    # ...and :noalloc, which asks the broader question, agrees across both engines.
+    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noalloc,), mode = :fast))
+    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noalloc,), mode = :full))
 end
 
 @testitem "an UNNARROWED Any-returning lookup correctly fails all three" begin
