@@ -145,8 +145,11 @@ function divergence_report(
     )
     ff = findings(f, types; guarantees, mode = :fast)
     fl = findings(f, types; guarantees, mode = :full)
-    fmap = Dict(x.guarantee => (x.status === :fail) for x in ff)
-    lmap = Dict(x.guarantee => (x.status === :fail) for x in fl)
+    # `_failed`, not `status === :fail`: a `:fast` allocation verdict is `:suspect`, and treating
+    # that as "did not flag" would report a divergence for every one of them — the exact inverse of
+    # what this function is for. What matters here is whether the engine flagged the call at all.
+    fmap = Dict(x.guarantee => _failed(x) for x in ff)
+    lmap = Dict(x.guarantee => _failed(x) for x in fl)
     diverged = Tuple{Symbol, Bool, Bool}[]
     for g in guarantees
         a = get(fmap, g, false)

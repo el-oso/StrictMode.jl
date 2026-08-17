@@ -72,3 +72,23 @@
         rm(path; force = true)
     end
 end
+
+@testitem "divergence is about FLAGGED-ness, not the status symbol" begin
+    using StrictMode, StrictModeTest
+    # Regression guard. A `:fast` allocation verdict is `:suspect`, not `:fail`. When this map was
+    # built with `x.status === :fail` it recorded every such finding as "fast did not flag", so a
+    # call BOTH engines flag reported as a divergence — the exact inverse of what divergence_report
+    # is for, and it fired on every fast allocation finding rather than on real disagreements.
+    boxy(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+    T = (Tuple{Int, Float64, Float32},)
+    ff = findings(boxy, T; guarantees = (:noalloc, :noboxing), mode = :fast)
+    fl = findings(boxy, T; guarantees = (:noalloc, :noboxing), mode = :full)
+    @test all(f -> f.status === :suspect, ff)      # fast labels its guess...
+    @test all(f -> f.status === :fail, fl)         # ...full proves it
+    @test all(StrictMode._failed, vcat(ff, fl))    # but BOTH flagged the call
+    @test isempty(divergence_report(boxy, T; guarantees = (:noalloc, :noboxing)).diverged)
+end

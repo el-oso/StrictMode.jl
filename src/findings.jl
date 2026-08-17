@@ -120,7 +120,7 @@ function _fmt_text(io::IO, fs)
     )
     for f in fs
         println(io, "  ", f)
-        if _failed(f) || f.status === :info || f.status === :suspect
+        if _failed(f) || f.status === :info
             f.file != "" && println(io, "      at ", f.file, ":", f.line)
             f.suggestion != "" && println(io, "      → ", f.suggestion)
         end

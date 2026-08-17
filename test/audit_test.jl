@@ -62,7 +62,10 @@ end
 
     @test any(StrictMode._failed, check_compiled(KW; guarantees = (:noalloc,)))      # flagged
     # exempt by the BASE name must skip the mangled kwsorter method too
-    @test isempty(filter(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,), exempt = [:kwf])))
+    # `_failed`, not `status === :fail`: this is a NEGATIVE assertion, and a `:fast` noalloc verdict
+    # is `:suspect` — filtering on `:fail` alone would pass vacuously if the exempt silently stopped
+    # working and left a suspect behind.
+    @test isempty(filter(StrictMode._failed, check_compiled(KW; guarantees = (:noalloc,), exempt = [:kwf])))
 end
 
 @testitem "check_signatures checks an explicit (f, types) list (E2)" begin
