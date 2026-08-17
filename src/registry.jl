@@ -89,8 +89,17 @@ function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
     return out
 end
 
-function _run_and_report(fs::Vector{StrictFinding}, kind::Symbol, target, fail::Symbol)
-    failed = filter(_failed, fs)
+# `fail_on_suspect` lets a consumer opt OUT of treating the `:fast` engine's structural guesses as
+# failures. Default `true`: nothing is disarmed, because a sweep that stops gating allocations reads
+# green while sitting on a real regression, and the only signal is a count in a line of text. What
+# `:suspect` buys is that it renders distinctly, is separately countable, and cannot abort a build at
+# LOAD time. A consumer who wants a non-blocking precompile passes `false` here. The durable
+# answer is to add `StrictModeTest`, which re-issues every one of these as a proved `:pass`/`:fail`.
+function _run_and_report(
+        fs::Vector{StrictFinding}, kind::Symbol, target, fail::Symbol;
+        fail_on_suspect::Bool = true
+    )
+    failed = filter(f -> f.status === :fail || (fail_on_suspect && f.status === :suspect), fs)
     if !isempty(failed) && fail !== :none
         msg = sprint(io -> format_findings(io, failed; format = :text))
         fail === :error ? throw(StrictViolation(kind, target, msg)) : @warn msg

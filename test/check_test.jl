@@ -72,7 +72,40 @@ end
     T = (Tuple{Int, Float64, Float32},)
     # :fast is the default engine; the heuristic still catches boxing.
     fs = findings(boxy, T; guarantees = (:noboxing,), mode = :fast)
-    @test any(f -> f.status === :fail, fs)
+    @test any(StrictMode._failed, fs)
     # check honors the override too.
     @test_throws StrictViolation check(boxy, T; guarantees = (:noboxing,), mode = :fast)
+end
+
+@testitem ":fast allocation verdicts are :suspect, and :suspect still gates" begin
+    using StrictMode
+    # The `:fast` engine reads typed IR, where an allocation site LLVM will later elide is still
+    # present, so its allocation verdicts are structural GUESSES rather than the proof AllocCheck
+    # gives — measured ~28% false on a real consumer (issue #17: 19 of 68, every one 0 bytes). They
+    # therefore carry `:suspect` rather than `:fail`, which does three things: they render
+    # distinctly, `nsuspect` counts them separately, and — the part that matters — `@strict_function`
+    # WARNS instead of aborting a consumer's precompile, where the proof is unreachable by
+    # construction (issue #18 part 2).
+    #
+    # What it deliberately does NOT do is stop gating. `nfailures` still counts `:suspect`, because a
+    # sweep that reports green while sitting on a real allocation regression is the vacuous-green
+    # shape this package exists to remove. Opting out is per-call, not the default.
+    boxy(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+    T = (Tuple{Int, Float64, Float32},)
+
+    fs = findings(boxy, T; guarantees = (:noalloc,), mode = :fast)
+    @test only(fs).status === :suspect          # a guess, labelled as one...
+    @test nsuspect(fs) == 1
+    @test nfailures(fs) == 1                    # ...but it still counts against you
+    @test StrictMode._failed(only(fs))
+    @test_throws StrictViolation check(boxy, T; guarantees = (:noalloc,))
+
+    # :typestable is NOT downgraded — return-type concreteness is exact, not a guess.
+    ts = findings(boxy, T; guarantees = (:typestable,), mode = :fast)
+    @test all(f -> f.status in (:pass, :fail), ts)
+    @test nsuspect(ts) == 0
 end

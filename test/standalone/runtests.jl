@@ -41,22 +41,30 @@ using Test
 
     @testset "load-time enforcement (the reason src/ can depend on StrictMode alone)" begin
         # @strict_function runs at the annotated module's PRECOMPILE, where StrictModeTest is not
-        # loadable by construction. It must therefore never require a backend.
+        # loadable by construction. It must therefore never require a backend...
         @strict_function sf_ok(x::Float64, y::Float64) = x * y + 1.0
         @test sf_ok(2.0, 3.0) === 7.0
-        @test_throws StrictViolation StrictMode._verify_strict_def(
+        # ...and must WARN rather than throw on a heuristic verdict: under `fail_mode = :error` a
+        # structural guess would otherwise abort a consumer's module load for code that may be
+        # provably clean (issue #18 part 2, ~28% false positives per issue #17). The declaration is
+        # still registered, so a test run with StrictModeTest loaded re-checks it against AllocCheck.
+        @test_logs (:warn,) match_mode = :any StrictMode._verify_strict_def(
             boxy, (typeof(het),), "boxy(::Tuple{Int,Float64,Float32})"
         )
     end
 
     @testset "batch API defaults to :fast and works" begin
         @test all(f -> f.status === :pass, findings(dot3, (typeof(A), typeof(A))))
-        @test any(f -> f.status === :fail, findings(boxy, (typeof(het),); guarantees = (:noalloc,)))
-        fs = audit(
+        # A `:fast` allocation verdict is `:suspect` — a structural guess — but it still counts:
+        # `nfailures` includes it, so a sweep does not go green on a real regression.
+        fs = findings(boxy, (typeof(het),); guarantees = (:noalloc,))
+        @test only(fs).status === :suspect
+        @test nfailures(fs) == 1
+        fsw = audit(
             StrictMode; sweep = true, guarantees = (:typestable,), format = :text,
             io = devnull, exit_on_fail = false
         )
-        @test fs isa Vector
+        @test fsw isa Vector
     end
 
     @testset "asking for :full without the backend fails loudly, not silently" begin

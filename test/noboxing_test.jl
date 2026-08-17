@@ -143,9 +143,9 @@ end
     bad(1)
     @test @allocated(bad(1)) > 0                             # it really does allocate...
     @test all(f -> f.status === :pass, findings(bad, (Int,); guarantees = (:noboxing,), mode = :full))
-    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noboxing,), mode = :fast))
+    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noboxing,), mode = :fast))
     # ...and :noalloc, which asks the broader question, agrees across both engines.
-    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noalloc,), mode = :fast))
+    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noalloc,), mode = :fast))
     @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noalloc,), mode = :full))
 end
 

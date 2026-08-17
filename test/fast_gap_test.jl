@@ -8,7 +8,7 @@
     using StrictMode
     mkshape(x::UInt8, n::Int) = sum(ntuple(i -> x + UInt8(i), n))
     fs = StrictMode.findings(mkshape, (UInt8, Int); guarantees = (:typestable, :noboxing), mode = :fast)
-    @test all(f.status === :fail for f in fs)
+    @test all(StrictMode._failed(f) for f in fs)
 end
 
 @testitem "fast follows non-inlined callees for allocations" begin
@@ -18,7 +18,7 @@ end
     @noinline hidden_alloc(n::Int) = zeros(n)
     outer(n::Int) = length(hidden_alloc(n))
     fs = StrictMode.findings(outer, (Int,); guarantees = (:noalloc,), mode = :fast)
-    @test only(fs).status === :fail
+    @test StrictMode._failed(only(fs))
 end
 
 @testitem "fast flags Memory allocation (Core.memorynew builtin)" begin
@@ -27,7 +27,7 @@ end
     using StrictMode
     memv(n::Int) = Memory{Int}(undef, n)
     fs = StrictMode.findings(memv, (Int,); guarantees = (:noalloc,), mode = :fast)
-    @test only(fs).status === :fail
+    @test StrictMode._failed(only(fs))
 end
 
 @testitem "fast ignores throw-path allocations (F8 semantics)" begin
@@ -63,7 +63,7 @@ end
     @noinline workspace(n::Int) = hidden_alloc(n)
     driver(n::Int) = length(workspace(n))
     fs = StrictMode.findings(driver, (Int,); guarantees = (:noalloc,), mode = :fast)
-    @test only(fs).status === :fail
+    @test StrictMode._failed(only(fs))
 end
 
 @testitem "fast propagates a non-inlined callee's own boxing signal (F36, GH #8)" begin
@@ -83,5 +83,5 @@ end
     @noinline dispatch_sum(v::Vector{Shape}) = sum(a -> area(a), v)
     caller(v::Vector{Shape}) = dispatch_sum(v)
     fs = StrictMode.findings(caller, (Vector{Shape},); guarantees = (:noboxing,), mode = :fast)
-    @test only(fs).status === :fail
+    @test StrictMode._failed(only(fs))
 end

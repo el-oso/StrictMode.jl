@@ -58,7 +58,19 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
     if !backend_available()
         sig = _alloc_signals(f, types)
         if sig.alloc || sig.boxing || sig.abscontainer !== nothing
-            _fail(:strict_function, target, _box_msg("allocates / boxes (fast heuristic)", sig))
+            # WARN, never throw. This runs at the enclosing module's precompile, where the proof is
+            # unreachable by construction — so under `fail_mode = :error` a heuristic false positive
+            # would abort the consumer's module load for code that may be provably clean. That is
+            # exactly what made checks-on unusable in PureBLAS (issue #18 part 2, a `trmv!` false
+            # positive), and the heuristic's measured false-positive rate on a real consumer is ~28%
+            # (issue #17: 19 of 68, every one measuring 0 bytes). A build must not be decidable by a
+            # structural guess. The declaration is registered either way, so a test run with
+            # `StrictModeTest` loaded re-checks this same signature against AllocCheck and DOES fail.
+            @warn "@strict_function $target: " *
+                _box_msg(
+                "allocates / boxes (fast heuristic — a structural guess, not a proof; " *
+                    "add StrictModeTest to your test environment to resolve it)", sig
+            )
         end
         return nothing
     end

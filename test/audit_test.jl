@@ -60,7 +60,7 @@ end
     end
     KW.kwf(3; k = 2)                                    # compile the kwsorter
 
-    @test any(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,)))      # flagged
+    @test any(StrictMode._failed, check_compiled(KW; guarantees = (:noalloc,)))      # flagged
     # exempt by the BASE name must skip the mangled kwsorter method too
     @test isempty(filter(f -> f.status === :fail, check_compiled(KW; guarantees = (:noalloc,), exempt = [:kwf])))
 end
@@ -88,7 +88,7 @@ end
     end
     Mix2.hotk(1); Mix2._planhelper(3)             # compile both
 
-    flagged(fs) = any(f -> f.func == "_planhelper" && f.status === :fail, fs)
+    flagged(fs) = any(f -> f.func == "_planhelper" && StrictMode._failed(f), fs)
     @test flagged(check_compiled(Mix2; guarantees = (:noalloc,), mode = :fast))                  # no filter → flagged
     @test !flagged(check_compiled(Mix2; guarantees = (:noalloc,), exempt = r"^_plan", mode = :fast))   # regex
     @test !flagged(

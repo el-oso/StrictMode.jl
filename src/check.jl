@@ -37,8 +37,10 @@ function _first_loc(allocs, boxing_only::Bool)
     return ("", 0)
 end
 
-_mkfinding(md, fn, sg, g, fail::Bool, reason, file, line) = StrictFinding(
-    md, fn, sg, g, fail ? :fail : :pass, file, line, fail ? reason : "", fail ? _suggestion(g) : ""
+# `flagged_status` is what a positive verdict becomes. It defaults to `:fail`, and is `:suspect` for
+# the `:fast` engine's allocation guarantees — see `_findings_fast`.
+_mkfinding(md, fn, sg, g, fail::Bool, reason, file, line; flagged_status::Symbol = :fail) = StrictFinding(
+    md, fn, sg, g, fail ? flagged_status : :pass, file, line, fail ? reason : "", fail ? _suggestion(g) : ""
 )
 
 # Guarantees with a single, backend-independent computation — identical in :fast and :full, so
@@ -207,10 +209,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0))
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || sig.abscontainer !== nothing
-            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (fast heuristic)", sig), sig.file, sig.line))
+            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (fast heuristic)", sig), sig.file, sig.line; flagged_status = :suspect))
         elseif g === :noboxing
             fail = sig.boxing || sig.abscontainer !== nothing
-            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig), sig.file, sig.line))
+            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig), sig.file, sig.line; flagged_status = :suspect))
         elseif g === :trim_compatible
             push!(out, _trim_compatible_finding(f, types, md, fn, sg, :fast))
         else

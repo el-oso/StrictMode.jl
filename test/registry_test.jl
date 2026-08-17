@@ -90,6 +90,6 @@ end
     Swept.g((1, 2.0, 3.0f0))                       # compile a boxing instance
 
     fs = check_compiled(Swept; guarantees = (:noalloc, :noboxing))
-    @test any(f -> f.func == "g" && f.status === :fail, fs)
+    @test any(f -> f.func == "g" && StrictMode._failed(f), fs)
     @test any(f -> f.func == "f" && f.status === :pass, fs)
 end

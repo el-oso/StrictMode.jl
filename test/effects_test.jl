@@ -49,7 +49,7 @@ end
     @test all(f -> f.status === :pass, cf)
 
     bf = StrictMode._findings_fast(boxy, (Tuple{Int, Float64, Float32},), (:noalloc, :noboxing), :M, "boxy", "()")
-    @test all(f -> f.status === :fail, bf)              # boxes → both noalloc and noboxing fail
+    @test all(StrictMode._failed, bf)              # boxes → both noalloc and noboxing fail
 end
 
 @testitem "_alloc_signals catches an escaping non-isbits immutable :new (F38)" begin

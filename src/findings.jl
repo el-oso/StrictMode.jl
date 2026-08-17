@@ -9,9 +9,18 @@ A single guarantee result for one `(function, signature)`. Flat and serializable
 record feeds the human (`:text`) and agent (`:json`) reporting paths.
 
 Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/
-`:inlined`/…), `status` (`:fail`/`:pass`/`:skip`/`:info` — `:info` is an advisory, never a
-failure, e.g. [`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)), `file`, `line`,
-`reason`, `suggestion`.
+`:inlined`/…), `status`, `file`, `line`, `reason`, `suggestion`.
+
+`status` is one of:
+- `:pass` / `:fail` — a verdict to act on.
+- `:skip` — not analyzable (non-concrete signature, unsupported construct).
+- `:info` — advisory, never a failure ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)).
+- `:suspect` — **the `:fast` engine flagged an allocation guarantee.** That engine reads typed IR,
+  where an allocation site LLVM will later elide is still present, so a positive verdict is a
+  structural guess rather than the proof AllocCheck gives. Counted by [`nsuspect`](@ref), NOT by
+  [`nfailures`](@ref), so a heuristic guess cannot abort a build under `fail_mode = :error` — which
+  is what made a 28%-false-positive tier unusable at a consumer's own precompile (issue #17/#18).
+  Load `StrictModeTest` and the same finding is re-issued as `:pass`/`:fail` by the proof.
 """
 struct StrictFinding
     mod::Symbol
@@ -39,7 +48,11 @@ function _suggestion(guarantee::Symbol)
     return ""
 end
 
-_failed(f::StrictFinding) = f.status === :fail
+# "Counts against you." `:suspect` is included: a heuristic guess is still a finding a gate should
+# act on (default B). What `:suspect` buys is that it renders distinctly and is separately countable
+# via `nsuspect`, and that the LOAD-TIME path (`@strict_function`) warns rather than aborting a build
+# it cannot possibly resolve — not that sweeps stop gating.
+_failed(f::StrictFinding) = f.status === :fail || f.status === :suspect
 
 """
     nfailures(findings) -> Int
@@ -50,9 +63,18 @@ loop: `exit(nfailures(audit(MyPkg)))`.
 """
 nfailures(fs::AbstractVector{StrictFinding}) = count(_failed, fs)
 
+"""
+    nsuspect(findings) -> Int
+
+How many findings are `:suspect` — flagged by the `:fast` engine's structural guess rather than
+proved. Deliberately separate from [`nfailures`](@ref): a gate should be able to report these
+without failing on them, and to fail on them explicitly if it wants to.
+"""
+nsuspect(fs::AbstractVector{StrictFinding}) = count(f -> f.status === :suspect, fs)
+
 # Single-line REPL display.
 function Base.show(io::IO, f::StrictFinding)
-    mark = f.status === :fail ? "✗" : (f.status === :pass ? "✓" : "•")
+    mark = f.status === :fail ? "✗" : f.status === :pass ? "✓" : f.status === :suspect ? "?" : "•"
     print(io, "[", mark, " ", f.guarantee, "] ", f.func, f.signature)
     f.status !== :pass && f.reason != "" && print(io, " — ", f.reason)
     return nothing
@@ -91,10 +113,14 @@ function _fmt_text(io::IO, fs)
         return nothing
     end
     nf = nfailures(fs)
-    println(io, "StrictMode: ", length(fs), " finding(s), ", nf, " failing.")
+    ns = nsuspect(fs)
+    println(
+        io, "StrictMode: ", length(fs), " finding(s), ", nf, " failing",
+        ns == 0 ? "" : ", $ns suspect (heuristic guess — load StrictModeTest to resolve)", "."
+    )
     for f in fs
         println(io, "  ", f)
-        if _failed(f) || f.status === :info
+        if _failed(f) || f.status === :info || f.status === :suspect
             f.file != "" && println(io, "      at ", f.file, ":", f.line)
             f.suggestion != "" && println(io, "      → ", f.suggestion)
         end
