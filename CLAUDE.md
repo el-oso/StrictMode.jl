@@ -4,7 +4,10 @@
 
 StrictMode.jl is a Julia package that makes performance guarantees (no allocations, type
 stability, vectorization) enforceable at dev/CI time and free in production. The macros
-expand to the bare call when checks are off; they run JET + AllocCheck analysis when on.
+expand to the bare call when checks are off. **The analysis tier is the dependency graph, not a
+preference:** `StrictMode` alone analyzes with a value-free Base-inference heuristic and needs no
+backend; adding `StrictModeTest` (a `test/Project.toml` dep) supplies AllocCheck + JET + TrimCheck
+and every guarantee escalates to the proof at CALL time, with nothing recompiled.
 
 ## Key architecture
 
@@ -42,7 +45,9 @@ src/
   divergence.jl       — divergence_report/StrictDivergence (fast-vs-full comparison), save_divergence
   cache.jl            — (method, world, signature, mode) → findings cache
   report.jl           — StrictViolation exception
-  backend.jl          — AllocCheck/JET backend glue (_be_*), _require_backend, set_ignore_throw!,
+  backend.jl          — the backend SEAM only (`_be_*` stubs, backend_available/trimcheck_available,
+                        _require_backend, set_ignore_throw!). StrictModeTest fills the stubs; nothing
+                        here imports AllocCheck/JET/TrimCheck. Also
                         _checked_allocs/set_ignore_barrier! (issue #14: substitutes the barrier-
                         aware :fast heuristic for AllocCheck's proof on a barrier-containing call
                         — filtering AllocCheck's own per-instance backtraces does not work, ~half
@@ -66,16 +71,24 @@ src/
                         CLI hard-fails on an unrecognized -mcpu, unlike Julia's own codegen path, so
                         this validates against `-mcpu=help` and falls back to "generic")
 ext/
-  StrictModeAnalysisExt.jl  — AllocCheck + JET backend (weak dep, loaded on `using AllocCheck, JET`)
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
   StrictModeCpuIdExt.jl     — CPU-specific _CACHE_BYTES override (weak dep, `using CpuId`)
   StrictModeReviseExt.jl    — cache invalidation on code change
-  StrictModeTrimExt.jl      — TrimCheck-backed juliac --trim=safe verifier (weak dep, `using TrimCheck`)
   StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,
                               ~680MiB — never a test/CI default, see test/mca_test.jl's live-path guard)
+StrictModeTest/       — the :full tier, a SEPARATE package (subdir), test-environment only
+  src/StrictModeTest.jl — AllocCheck/JET/TrimCheck as HARD deps; fills StrictMode's `_be_*` stubs and
+                        flips backend_available()/trimcheck_available() in __init__. No macros of its
+                        own: tier selection is auto-escalation inside StrictMode, decided at call
+                        time, so `using StrictMode, StrictModeTest` is harmless and there is no
+                        duplicate macro surface to keep in sync.
 test/
-  runtests.jl         — uses TestItemRunner @run_package_tests; loads AllocCheck+JET backend
-  Project.toml        — has [preferences.StrictMode] checks_enabled=true, fail_mode="error"
+  runtests.jl         — TestItemRunner @run_package_tests; `using StrictModeTest` supplies the proofs
+  Project.toml        — [preferences.StrictMode] checks_enabled=true, fail_mode="error"
+  standalone/         — a StrictMode-ONLY environment (deps: StrictMode + Test). The only place the
+                        split's premise can be falsified: every item under test/ runs with the backend
+                        loaded, so none of them can catch a guarantee that re-acquires a hard
+                        AllocCheck/JET dependency. Run as its own CI step.
   round5_test.jl      — kernel_report / @assert_vectorized (F10–F15, F38)
   kernel_test.jl      — @kernel macro
   *_test.jl           — one file per guarantee
@@ -86,16 +99,28 @@ the file you touched rather than trusting this list; it has drifted before (veri
 
 ## Running tests
 
+`Pkg.test()` from the MAIN environment — not `test/runtests.jl` directly. Running the file directly
+leaves bounds checking at `auto`, whereas `Pkg.test()` forces `--check-bounds=yes`, and the two
+generate different code: five vectorization-shape tests only fail under forced bounds checks, which
+is how they stayed invisible in CI. `+release` selects 1.12 when 1.13 is the juliaup default.
+
 ```bash
-julia --project=test -e 'import Pkg; Pkg.instantiate()'
-julia --project=test test/runtests.jl
+julia +release --project=. -e 'import Pkg; Pkg.test()'
 ```
 
-The test `Project.toml` enables checks and loads the AllocCheck/JET backend. Tests use
-`@testitem` (TestItemRunner.jl, macros from TestItems.jl). Run a single item by name with:
+The test `Project.toml` enables checks and depends on `StrictModeTest`, which supplies the
+AllocCheck/JET/TrimCheck proofs. Tests use `@testitem` (TestItemRunner.jl, macros from TestItems.jl
+— `@testmodule`, not ReTestItems' `@testsetup`). Iterate on one item by name through the warm daemon:
 
 ```bash
-julia --project=test -e 'using TestItemRunner, StrictMode, AllocCheck, JET, TrimCheck; @run_package_tests filter = ti -> occursin(r"F10", ti.name)'
+JULIAUP_CHANNEL=release jl -e 'using StrictMode, StrictModeTest, TestItemRunner; @run_package_tests filter = ti -> occursin(r"F10", ti.name)'
+```
+
+The backend-free premise has its own environment; run it whenever you touch a guarantee's dispatch:
+
+```bash
+julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
+julia --project=test/standalone test/standalone/runtests.jl
 ```
 
 ## Key invariants
@@ -104,7 +129,8 @@ julia --project=test -e 'using TestItemRunner, StrictMode, AllocCheck, JET, Trim
 - **No new main-Project.toml deps** for test-only packages — those go in `test/Project.toml`.
 - `_gate(checked, fallback)` in `preferences.jl` is the zero-cost expansion switch — every macro routes through it. The `checks_enabled` preference is a compile-time const baked at precompile; changing it requires a restart.
 - `@contract`-style macro headers in the sibling TypeContracts package can't be module-qualified (e.g. `@contract Base.AbstractLock` fails to parse — needs `import Base: AbstractLock` first) — worth knowing if you're pairing `@strict_contract`/`@verify_strict` with a foreign type.
-- AllocCheck/JET are **weak deps** (`[weakdeps]` in Project.toml, loaded via extension). Never import them unconditionally from `src/`.
+- AllocCheck/JET/TrimCheck are **not dependencies of StrictMode at all** — not even weak ones. They are hard deps of `StrictModeTest`, which fills the `_be_*` stubs. Never import them from `src/`, and never add them back to `Project.toml`: `test/standalone` exists to fail if you do.
+- **Tier selection is auto-escalation, decided at CALL time** (`backend_available()` inside `_assert_*`), never at macro expansion. That is what lets one precompiled call site run the heuristic in a consumer's own environment and the proof under test. Consequence: `@strict_function`/`@strict module` can NEVER escalate — they run at the annotated module's own precompile, where `StrictModeTest` is not loadable — so the suite re-checks those signatures via `check_signatures`/`audit` at runtime instead.
 - `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly.
 - `ignore_throw = true` is the default for AllocCheck calls — throw-path allocations don't count.
 - `kernel_report` and `@assert_vectorized` work from `InteractiveUtils.code_llvm` — no backend needed. `_CACHE_BYTES` is a tunable `Ref` for cache-residency annotation thresholds.

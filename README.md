@@ -18,25 +18,34 @@ the property or fails, at test time or even at module load.
 > quietly boxed and cost a measured **135× slowdown** — the kind of thing you only find by profiling.
 
 It covers both halves of the job. There's the forcing half, which pushes your code onto the fast
-path, and the telling half, which speaks up when you've fallen off it. Underneath, it's a thin,
-failing-loud layer over [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
-[JET.jl](https://github.com/aviatesk/JET.jl). Those two are optional, weak dependencies, pulled in
-only when you turn the checks on, so a package can depend on StrictMode and ship neither.
+path, and the telling half, which speaks up when you've fallen off it. StrictMode itself analyzes
+with a value-free engine built on Base's own inference — no heavy dependencies at all — and the
+rigorous proofs from [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
+[JET.jl](https://github.com/aviatesk/JET.jl) live in a companion package you add to `test/`.
 
-## Dependencies are weak
+## The tier is the dependency graph
 
-AllocCheck and JET are heavy, so StrictMode keeps them as weak dependencies behind an extension.
-Add whichever ones suit each environment:
+There is no preference to switch between "quick" and "rigorous". Which engine runs is decided by
+what's in the environment:
 
 | Environment | Add | What you get |
 |---|---|---|
-| **Production** | nothing (just StrictMode) | lightweight; checks off → macros are bare calls |
-| **Dev (human)** | `Revise`, `AllocCheck`, `JET` | the live [`watch`](https://el-oso.github.io/StrictMode.jl/dev/automating) loop with real checks |
-| **CI / agent** | `AllocCheck`, `JET` | `audit` / the full check set |
+| **Production** | nothing | checks off → macros are bare calls |
+| **Your `Project.toml`** | `StrictMode` | the value-free heuristic; no backend, cheap enough to run at load time |
+| **Your `test/Project.toml`** | `+ StrictModeTest` | AllocCheck + JET + TrimCheck; every guarantee escalates to the proof |
 
-For the extension to switch on, those packages need to be loaded (`using AllocCheck, JET`), not
-just listed as dependencies. If checks are enabled but the backend isn't loaded, the `:full` checks
-will tell you to add them; the `:fast` triage needs no backend at all.
+The escalation happens at **call time**, not macro-expansion time, so the *same* precompiled code in
+your `src/` runs the heuristic while you develop and the proof under test — nothing is recompiled,
+and no import line selects it. Adding `StrictModeTest` to the test environment is the whole switch;
+you cannot forget to "turn it on" in a file.
+
+```julia
+# Project.toml            [deps] StrictMode
+# test/Project.toml       [deps] StrictMode, StrictModeTest
+@assert_noalloc kernel!(C, A, B)     # heuristic while developing, AllocCheck proof under test
+```
+
+Asking for `mode = :full` without `StrictModeTest` present is an error, not a silent downgrade.
 
 ## Zero cost when disabled
 
@@ -171,8 +180,8 @@ silently disabled, is a red build instead of a vacuous green. See
 You can gate a library's performance from its test suite, without ever adding StrictMode to its
 `src`:
 
-1. Add `StrictMode`, `AllocCheck`, `JET` to the **test** `Project.toml`, and `using AllocCheck,
-   JET` in your tests (the backend only loads when those packages are *loaded*, not just listed).
+1. Add `StrictMode` and `StrictModeTest` to the **test** `Project.toml`. Nothing goes in your
+   package's own `Project.toml` unless you also want load-time checks there.
 2. Commit the preference in the test `Project.toml` so CI runs the checks (`checks_enabled` must
    be set at **precompile**):
    ```toml
@@ -181,7 +190,7 @@ You can gate a library's performance from its test suite, without ever adding St
    ```
 3. List the guaranteed entry points — no `src` annotations needed:
    ```julia
-   using StrictMode, AllocCheck, JET
+   using StrictMode, StrictModeTest
    check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel!, (Matrix{Float64},))]; fail = :error)
    ```
    Or sweep what actually compiled, scoping out cold/plan-time helpers with a regex or predicate:
@@ -206,7 +215,7 @@ or sweep everything and exempt the rest.
 | `@assert_no_scalar_loops f(args...)` | fail if a scalar (non-vectorized) hot loop is detected between audited kernels (best-effort) |
 | `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
 | `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee; static scan only) |
-| `@assert_trim_compatible f(args...)` | like `@assert_trim_safe`, but escalates to juliac's authoritative verifier (`TrimCheck`) in `:full` mode |
+| `@assert_trim_compatible f(args...)` | like `@assert_trim_safe`, but escalates to juliac's authoritative verifier when `TrimCheck` is loaded (i.e. under `StrictModeTest`) |
 | `@assert_concurrency_safe f(plan, args...)` | fail unless `f` treats its plan arg as read-only (no write of, or through, the plan) — proof that one plan is safe to share across concurrent tasks |
 | `@assert_no_threadid_state f(args...)` | fail on mutable state indexed by `Threads.threadid()` (the task-migration hazard) |
 | `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |

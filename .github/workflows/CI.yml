@@ -48,6 +48,11 @@ jobs:
         run: |
           julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
           julia --project=test/standalone test/standalone/runtests.jl
+      # StrictModeTest's own suite: the `_be_*` seam implementations (allocation classification,
+      # ignore_throw, the JET and TrimCheck drivers). StrictMode cannot test these — over there the
+      # seam is a set of undefined stub functions.
+      - name: StrictModeTest suite
+        run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test()'
       # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the
       # pre-release job, and Windows path quirks).
       - uses: julia-actions/julia-processcoverage@v1
