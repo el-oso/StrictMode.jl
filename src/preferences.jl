@@ -34,19 +34,57 @@ end
 Reports the **build** state (the precompile-baked preference), which is what CI must check:
 a preference flipped without a restart does not count.
 """
-assert_enabled() = _assert_enabled(checks_enabled(), !isempty(get(ENV, "CI", "")))
+assert_enabled() = _assert_enabled(
+    checks_enabled(), !isempty(get(ENV, "CI", "")), _backend_declared_but_unloaded()
+)
 
-# Pure core, unit-testable without touching ENV or the baked const.
-function _assert_enabled(enabled::Bool, ci::Bool)
-    enabled && return true
-    ci && error(
-        "StrictMode checks are DISABLED in this build, but CI is set — refusing to skip " *
-            "silently (a green run with checks off proves nothing). Enable them by adding\n" *
-            "    [preferences.StrictMode]\n    checks_enabled = true\n    fail_mode = \"error\"\n" *
-            "to the test environment's Project.toml (or run `StrictMode.enable_checks!()` and " *
-            "restart). For the `:full` proofs, add `StrictModeTest` to that environment."
+# Is `StrictModeTest` a declared dependency of the ACTIVE project while its backend is NOT loaded?
+#
+# This restores the one loudness the tier split gave up. Before the split, intent (`analysis =
+# "full"`, a preference read from a file) and capability (a backend actually loaded) were separate
+# facts that could disagree, and `_require_backend` fired on the disagreement. The split merged them
+# — loading `StrictModeTest` IS asking for the proof — which removes the mismatch except in one
+# place: a package can be *listed* as a dependency and never `using`ed. Then every guarantee runs on
+# the heuristic while the environment advertises the proof, silently.
+#
+# Read the project file directly rather than `Base.identify_package`, which searches the entire
+# LOAD_PATH and would fire on a copy sitting in the user's global `@v#.#` environment. That is the
+# same over-broad check that made test/standalone's isolation proof pass for the wrong reason.
+# Failure to read or parse the project is NOT a mismatch — this must never turn a working setup red.
+function _backend_declared_but_unloaded()
+    backend_available() && return false
+    proj = Base.active_project()
+    (proj isa AbstractString && isfile(proj)) || return false
+    tbl = try
+        TOML.parsefile(proj)
+    catch
+        return false
+    end
+    deps = get(tbl, "deps", nothing)
+    return deps isa AbstractDict && haskey(deps, "StrictModeTest")
+end
+
+# Pure core, unit-testable without touching ENV, the baked const, or the filesystem.
+function _assert_enabled(enabled::Bool, ci::Bool, backend_declared_but_unloaded::Bool = false)
+    if !enabled
+        ci && error(
+            "StrictMode checks are DISABLED in this build, but CI is set — refusing to skip " *
+                "silently (a green run with checks off proves nothing). Enable them by adding\n" *
+                "    [preferences.StrictMode]\n    checks_enabled = true\n    fail_mode = \"error\"\n" *
+                "to the test environment's Project.toml (or run `StrictMode.enable_checks!()` and " *
+                "restart). For the `:full` proofs, add `StrictModeTest` to that environment."
+        )
+        return false
+    end
+    backend_declared_but_unloaded && error(
+        "StrictMode: `StrictModeTest` is a dependency of this environment but has not been loaded, " *
+            "so every guarantee here runs on the value-free heuristic while the environment " *
+            "advertises the proof — a green run would not mean what it appears to mean. Add\n" *
+            "    using StrictModeTest\n" *
+            "once, above this call, at the top of your test entry point. (If you reach this from a " *
+            "test file, note the load is process-wide: `test/runtests.jl` is the right place.)"
     )
-    return false
+    return true
 end
 
 """

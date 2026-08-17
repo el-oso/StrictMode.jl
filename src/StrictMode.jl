@@ -27,6 +27,7 @@ module StrictMode
 
 # AllocCheck and JET are not dependencies of this package at all; StrictModeTest supplies them.
 using Preferences: Preferences, @load_preference, @set_preferences!
+using TOML: TOML
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
 
