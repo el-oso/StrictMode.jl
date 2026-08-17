@@ -33,7 +33,13 @@
         end
         idx
     end
-    @test StrictMode.scalar_fp_loops(first_gt, (Vector{Int64}, Int64))
+    # `--check-bounds=yes` (Pkg.test's default) reshapes the loop so the scalar-FP-loop signature
+    # is no longer present; the scan is about vectorizable loop shape, which forced bounds checks remove.
+    if Base.JLOptions().check_bounds != 1
+        @test StrictMode.scalar_fp_loops(first_gt, (Vector{Int64}, Int64))
+    else
+        @test_skip false
+    end
 
     # render check: int ops show up in sprint(show, r)
     s = sprint(show, r)

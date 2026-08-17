@@ -44,7 +44,10 @@ end
 
 @testitem "@assert_no_spill throws on a register-starved kernel" setup = [NoSpillFixtures] begin
     using StrictMode
-    if Sys.ARCH === :x86_64
+    # `--check-bounds=yes` (Pkg.test's default) blocks `@simd` vectorization, so there are no vector
+    # registers left to spill and `vec_spills` is 0 regardless of accumulator count — the guarantee
+    # under test only exists in vectorized code.
+    if Sys.ARCH === :x86_64 && Base.JLOptions().check_bounds != 1
         @test_throws StrictViolation (@assert_no_spill spilly_accum_kernel!(zeros(80), zeros(3), zeros(3)))
     else
         @test_skip false   # spill/register-count shape is x86-64-specific (ymm/zmm)
@@ -53,7 +56,10 @@ end
 
 @testitem "spill_report and the :no_spill findings/check path agree" setup = [NoSpillFixtures] begin
     using StrictMode
-    if Sys.ARCH === :x86_64
+    # `--check-bounds=yes` (Pkg.test's default) blocks `@simd` vectorization, so there are no vector
+    # registers left to spill and `vec_spills` is 0 regardless of accumulator count — the guarantee
+    # under test only exists in vectorized code.
+    if Sys.ARCH === :x86_64 && Base.JLOptions().check_bounds != 1
         types = (Vector{Float64}, Vector{Float64}, Vector{Float64})
 
         clean = StrictMode.spill_report(clean_accum_kernel!, types)

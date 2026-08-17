@@ -35,11 +35,18 @@ end
 
 @testitem "register_alloc_barrier! exempts a hand-rolled memoization pattern" begin
     using StrictMode, StrictModeTest
+    # The allocated buffer ESCAPES into a global sink. Without that, its only use is `length`, and
+    # both Julia versions' optimizers elide the allocation entirely (measured 0 B) — AllocCheck then
+    # correctly reports nothing to flag and the "reds like any allocating steady state" premise below
+    # is vacuous. Escaping it keeps the cold path a real, provable allocation on 1.12 and 1.13 alike.
+    const _SINK = Ref{Any}(nothing)
     const _HANDROLLED = Ref{Union{Nothing, Int}}(nothing)
     @noinline function _handrolled_calibrator()
         v = _HANDROLLED[]
         v === nothing || return v
-        v2 = length(rand(4))
+        a = rand(4)
+        _SINK[] = a
+        v2 = length(a)
         _HANDROLLED[] = v2
         return v2
     end
@@ -60,7 +67,9 @@ end
 
 @testitem "a genuinely-allocating steady state (no barrier involved) still fails unconditionally" begin
     using StrictMode, StrictModeTest
-    really_allocates(x::Int) = x + length(rand(4))
+    # Same escape trick: `length(rand(4))` alone is elided by both optimizers (0 B measured).
+    _sink2 = Ref{Any}(nothing)
+    really_allocates(x::Int) = (a = rand(4); _sink2[] = a; x + length(a))
     @test_throws StrictViolation (@assert_noalloc really_allocates(1))
 
     sig = StrictMode._alloc_signals(really_allocates, (Int,))
