@@ -1,4 +1,4 @@
-@testsetup module MemsafeFixtures
+@testmodule MemsafeFixtures begin
 export memsafe_inbounds_kernel!, memsafe_oob_read_kernel!, memsafe_oob_write_kernel!,
     memsafe_align64_check_kernel!, MEMSAFE_KERNELS_FILE
 
