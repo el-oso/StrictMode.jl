@@ -432,7 +432,17 @@ function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     end
     for r in regions
         occursin(_VEC_RE, r) && continue   # this loop vectorized → fine
-        if (occursin(_LOOP_RE, r) && occursin(_SCALAR_FP_RE, r)) ||
+        # A region returned by `_loop_regions` IS a loop by construction (it was found by its
+        # back-edge), so requiring a loop-carried FP accumulator (`phi double`) on top of that is both
+        # redundant and WRONG: a scalar TAIL is a pure store loop — load, compute, store, no
+        # accumulator — and so carries no FP phi. That is the exact shape this per-region scan was
+        # added for, and it was being missed. Measured: an explicit `while i + W <= n` SIMD body
+        # followed by a `while i < n` scalar cleanup reported `false` while its optimized IR still
+        # held 13 scalar FP ops. The docstring's "pure store loops" false-negative caveat named this
+        # case; inside a known loop region it is simply unnecessary. See issue #22.
+        # The INTEGER branch keeps its phi requirement: every loop has induction/address arithmetic,
+        # so `_SCALAR_INT_RE` alone would fire on essentially any loop.
+        if occursin(_SCALAR_FP_RE, r) ||
                 (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
             return true
         end
@@ -623,7 +633,13 @@ function register_report(@nospecialize(f), @nospecialize(types::Tuple))
     target = _func_name(f) * _sig_string(types)
     s = _native_asm(f, types)
     isempty(s) && return RegisterReport(target, 0, 0, 0)
-    zmm_regs = Set(m[1] for m in eachmatch(r"%zmm(\d+)\b", s))
+    # SYNTAX-AGNOSTIC by construction: `\b` before `zmm` matches AT&T's `%zmm4` (the sigil is a
+    # non-word char, so there is a boundary after it) AND Intel's bare `zmm4`. The old `%zmm(\d+)`
+    # required the AT&T sigil, so on any Julia emitting Intel syntax (the default here on 1.13) it
+    # matched nothing and this returned used=0/total=0 — silently, and in the SAFE-LOOKING direction:
+    # "0/32" reads as ample register headroom exactly when a kernel is at the ceiling. Same reasoning
+    # the `_SPILL_RELOAD_RE`/`_VEC_REG_RE` pair below already documents. See issue #21.
+    zmm_regs = Set(m[1] for m in eachmatch(r"\bzmm(\d+)\b", s))
     spills = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
     total = isempty(zmm_regs) ? 0 : 32
     return RegisterReport(target, length(zmm_regs), total, spills)

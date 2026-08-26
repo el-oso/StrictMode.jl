@@ -60,6 +60,70 @@ end
     @test sprint(show, rr) isa String
 end
 
+@testitem "F32 scalar_fp_loops sees a scalar TAIL after a SIMD body (issue #22 regression)" begin
+    using StrictMode
+    using SIMD: Vec, vload, vstore
+    # The canonical defect: an explicit `while i + W <= n` SIMD body followed by a `while i < n`
+    # scalar cleanup. A tail is a pure STORE loop (load, compute, store) and carries no loop-carried
+    # FP accumulator, so the old per-region test — which required a `phi double` on top of a region
+    # already known to be a loop — missed it while the IR still held scalar FP ops.
+    function tail_scalar!(p::Ptr{Float64}, n::Int, a::Float64)
+        V = Vec{8, Float64}; i = 0
+        while i + 8 <= n
+            vstore(muladd(vload(V, p + i * 8), V(a), vload(V, p + i * 8)), p + i * 8); i += 8
+        end
+        while i < n
+            unsafe_store!(p, muladd(a, unsafe_load(p, i + 1), unsafe_load(p, i + 1)), i + 1); i += 1
+        end
+        return nothing
+    end
+    # Same kernel with the tail MASKED — the fix for the defect, and it must read clean.
+    function tail_masked!(p::Ptr{Float64}, n::Int, a::Float64)
+        V = Vec{8, Float64}; i = 0
+        while i + 8 <= n
+            vstore(muladd(vload(V, p + i * 8), V(a), vload(V, p + i * 8)), p + i * 8); i += 8
+        end
+        if i < n
+            m = Vec((1, 2, 3, 4, 5, 6, 7, 8)) <= (n - i)
+            vstore(muladd(vload(V, p + i * 8, m), V(a), vload(V, p + i * 8, m)), p + i * 8, m)
+        end
+        return nothing
+    end
+    @test scalar_fp_loops(tail_scalar!, (Ptr{Float64}, Int, Float64))         # the defect
+    @test !scalar_fp_loops(tail_masked!, (Ptr{Float64}, Int, Float64))        # the fix reads clean
+end
+
+@testitem "F31 register_report counts registers in BOTH asm syntaxes (issue #21 regression)" begin
+    using StrictMode
+    using SIMD: Vec, vload, vstore
+    using InteractiveUtils: code_native
+    # The shape-only test above passes when `vec_regs_used == 0`, which is exactly how the AT&T-only
+    # regex (`%zmm…`) went unnoticed: Julia emits INTEL syntax by default here, so the match set was
+    # always empty and every kernel reported 0/0 — silently, and in the safe-looking direction.
+    # This pins the report against the assembly itself: if the asm names zmm registers, so must the
+    # report. Self-gating, so it is meaningful on AVX-512 and inert elsewhere.
+    function zkernel!(p::Ptr{Float64}, n::Int)
+        V = Vec{8, Float64}; i = 0
+        while i + 8 <= n
+            vstore(vload(V, p + i * 8) * V(2.0), p + i * 8); i += 8
+        end
+        return nothing
+    end
+    io = IOBuffer()
+    code_native(io, zkernel!, (Ptr{Float64}, Int); debuginfo = :none)
+    asm = String(take!(io))
+    rr = register_report(zkernel!, (Ptr{Float64}, Int))
+    if occursin(r"\bzmm\d+\b", asm)          # AVX-512 host: the report must SEE them
+        @test rr.vec_regs_used > 0
+        @test rr.vec_regs_total == 32
+    else
+        @test rr.vec_regs_used == 0          # no zmm in the asm ⇒ zeros are correct
+    end
+    # Syntax independence directly: the regex must match an AT&T operand as well as an Intel one.
+    @test occursin(r"\bzmm(\d+)\b", "vaddpd %zmm1, %zmm2, %zmm3")   # AT&T
+    @test occursin(r"\bzmm(\d+)\b", "vaddpd zmm3, zmm2, zmm1")      # Intel
+end
+
 @testitem "scheduling asserts validate a real SIMD.jl Vec kernel (item 4)" begin
     using StrictMode
     using SIMD: Vec, vload, vstore
