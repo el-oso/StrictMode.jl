@@ -1,4 +1,4 @@
-@testsetup module NoSpillFixtures
+@testmodule NoSpillFixtures begin
 export CleanAccumKernel, SpillyAccumKernel, clean_accum_kernel!, spilly_accum_kernel!
 
 # A manually unrolled kernel with N independent SIMD accumulators — each `acc[k] += a[i]*b[i]+k`
