@@ -1,6 +1,6 @@
-# `@explain` — diagnostics mode. Where the assert macros *fail loudly*, `@explain` *tells you
-# why*: it aggregates `@code_warntype`, JET `@report_opt` and AllocCheck into one digestible
-# `StrictReport` instead of a raw tool dump.
+# `@explain` — diagnostics. Where the assert macros report a verdict, `@explain` says why: it
+# gathers the inferred return type, the typed-IR allocation/boxing signals, and `@code_warntype`
+# into one `StrictReport` instead of a raw tool dump.
 
 """
     StrictReport
@@ -10,112 +10,115 @@ prints a sectioned, human-readable report; the fields are also available program
 
 - `target::String` — the analyzed call.
 - `return_type` / `return_concrete::Bool` — the inferred return type and whether it is concrete.
-- `opt_result` / `opt_reports` — JET `@report_opt` result and its reports (type instability,
-  runtime dispatch, boxing).
-- `allocs` — AllocCheck allocation sites (`nothing` if static analysis could not run).
-- `alloc_error::Union{Nothing,String}` — why AllocCheck could not run, if applicable.
+- `signals` — the typed-IR scan result (`alloc`, `boxing`, `dictlookup`, `abscontainer`, `barrier`,
+  and the source location of the first signal), or `nothing` if the scan could not run.
+- `local_boxing::Bool` — dynamic dispatch in *this* function's own IR, as opposed to a callee's.
+- `scan_error::Union{Nothing,String}` — why the IR scan could not run, if applicable.
 - `warntype::String` — captured `@code_warntype` output.
 """
 struct StrictReport
     target::String
     return_type::Any
     return_concrete::Bool
-    opt_result::Any
-    opt_reports::Any
-    allocs::Union{Nothing, Vector}
-    alloc_error::Union{Nothing, String}
+    signals::Any
+    local_boxing::Bool
+    scan_error::Union{Nothing, String}
     warntype::String
 end
 
-# Convenience predicates mirroring what the assert macros would conclude.
-would_fail_typestable(r::StrictReport) = !r.return_concrete || !isempty(r.opt_reports)
-would_fail_noalloc(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && !isempty(r.allocs)
-would_fail_noboxing(r::StrictReport) = r.alloc_error === nothing && r.allocs !== nothing && any(_be_is_boxing, r.allocs)
+# Convenience predicates mirroring what the assert macros conclude from the same signals.
+would_fail_typestable(r::StrictReport) = !r.return_concrete || r.local_boxing
+would_fail_noalloc(r::StrictReport) =
+    !isnothing(r.signals) && (r.signals.alloc || r.signals.boxing || !isnothing(r.signals.abscontainer))
+would_fail_noboxing(r::StrictReport) =
+    !isnothing(r.signals) && (r.signals.boxing || !isnothing(r.signals.abscontainer))
 
-function _explain(target, @nospecialize(f), @nospecialize(types::Tuple), opt_result)
+function _strict_report(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = try
         Base.return_types(f, Tuple{types...})
     catch
         Any[Any]
     end
     rt = isempty(rts) ? Any : reduce((a, b) -> Union{a, b}, rts)
-    opt_reports = opt_result === nothing ? [] : _be_opt_reports(opt_result)
-    allocs, alloc_error = try
-        (first(_checked_allocs(f, types)), nothing)
+    signals, local_boxing, scan_error = try
+        (_alloc_signals(f, types), _alloc_signals(f, types; depth = 0).boxing, nothing)
     catch err
         err isa StrictViolation && rethrow()
-        (nothing, sprint(showerror, err))
+        (nothing, false, sprint(showerror, err))
     end
     warntype = try
         sprint(io -> InteractiveUtils.code_warntype(io, f, types))
     catch err
         "(@code_warntype unavailable: $(sprint(showerror, err)))"
     end
-    return StrictReport(target, rt, _is_typestable_return(rt), opt_result, opt_reports, allocs, alloc_error, warntype)
+    return StrictReport(target, rt, _is_typestable_return(rt), signals, local_boxing, scan_error, warntype)
 end
 
 _indent(io, text, prefix) = foreach(ln -> println(io, prefix, ln), eachline(IOBuffer(text)))
+
+# What the IR scan found, as a human-readable list.
+function _signal_labels(s)
+    labels = String[]
+    s.alloc && push!(labels, "allocation")
+    s.boxing && push!(labels, "boxing / dynamic dispatch")
+    s.dictlookup && push!(labels, "runtime AbstractDict lookup")
+    isnothing(s.abscontainer) || push!(labels, "abstract-eltype container (`$(s.abscontainer)`)")
+    s.barrier && push!(labels, "one-time-init allocation barrier (not counted)")
+    return labels
+end
 
 function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
     println(io, "StrictMode @explain — ", r.target)
     println(io)
 
-    # Return type
     mark = r.return_concrete ? "✓ concrete" : "✗ not concrete"
     println(io, "  Return type:    ", r.return_type, "  ", mark)
 
-    # Type stability (JET)
-    if r.opt_result === nothing
-        println(io, "  Type stability: ? JET analysis did not run — UNKNOWN, not clean")
-    elseif isempty(r.opt_reports)
-        println(io, "  Type stability: ✓ no issues (JET @report_opt)")
-    else
-        println(io, "  Type stability: ✗ ", length(r.opt_reports), " issue(s) (JET @report_opt):")
-        _indent(io, rstrip(sprint(show, r.opt_result)), "    │ ")
-    end
+    println(
+        io, "  Local dispatch: ",
+        r.local_boxing ? "✗ this function's own IR dispatches dynamically" : "✓ none in this function's own IR"
+    )
 
-    # Allocations (AllocCheck)
-    if r.alloc_error !== nothing
-        println(io, "  Allocations:    ? could not analyze statically: ", r.alloc_error)
-    elseif isempty(r.allocs)
-        println(io, "  Allocations:    ✓ none (AllocCheck)")
+    if !isnothing(r.scan_error)
+        println(io, "  IR signals:     ? could not scan: ", r.scan_error)
     else
-        println(io, "  Allocations:    ✗ ", length(r.allocs), " site(s) (AllocCheck):")
-        for (i, a) in enumerate(r.allocs)
-            println(io, "    [", i, "] ", a)
+        labels = _signal_labels(r.signals)
+        if isempty(labels)
+            println(io, "  IR signals:     ✓ none")
+        else
+            println(io, "  IR signals:     ✗ ", join(labels, ", "))
+            r.signals.file == "" || println(io, "                  at ", r.signals.file, ":", r.signals.line)
         end
     end
 
-    # Verdict
     println(io)
     println(io, "  Verdict:")
-    if r.opt_result === nothing
-        # JET did not run (it errored, or no backend). Saying "would pass" here would be a claim the
-        # analysis never made — the same "could not check" == "is fine" conflation that made a
-        # crashed backend report `:pass` in a `mode = :full` sweep.
-        println(io, "    ? @assert_typestable could not be fully determined (JET analysis did not run)")
-    else
-        println(
-            io, "    ", would_fail_typestable(r) ? "✗ @assert_typestable would fail" :
-                "✓ @assert_typestable would pass"
-        )
-    end
-    if r.alloc_error !== nothing
-        println(io, "    ? @assert_noalloc could not be statically determined (try `static = false`)")
-    else
+    println(
+        io, "    ", would_fail_typestable(r) ? "✗ @assert_typestable would fail" :
+            "✓ @assert_typestable would pass"
+    )
+    if isnothing(r.scan_error)
         println(
             io, "    ", would_fail_noalloc(r) ? "✗ @assert_noalloc would fail" :
                 "✓ @assert_noalloc would pass"
         )
         # Only worth mentioning the relaxed check when it differs from no-alloc (i.e. there are
-        # allocations, but are any of them *boxing*?).
+        # allocation signals, but are any of them *boxing*?).
         if would_fail_noalloc(r)
             println(
                 io, "    ", would_fail_noboxing(r) ? "✗ @assert_noboxing would fail (boxing / dispatch)" :
                     "✓ @assert_noboxing would pass (allocations are not boxing)"
             )
         end
+    else
+        println(io, "    ? @assert_noalloc could not be determined (the IR scan did not run)")
     end
+    println(io)
+    println(
+        io, "  These verdicts come from a value-free engine: it reads typed IR, where an allocation\n",
+        "  LLVM will later elide is still present. `StrictModeTest`'s `@test_noalloc` /\n",
+        "  `@test_typestable` run AllocCheck and JET over the same signature for a proof."
+    )
 
     # Full @code_warntype, but only when there is an instability worth digging into.
     if would_fail_typestable(r)
@@ -127,10 +130,8 @@ function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
 end
 
 function Base.show(io::IO, r::StrictReport)
-    # "stable?" not "stable" when JET did not run — the compact form must not assert a verdict the
-    # analysis never produced, same rule as the full rendering above.
-    ts = r.opt_result === nothing ? "stable?" : (would_fail_typestable(r) ? "unstable" : "stable")
-    na = r.alloc_error !== nothing ? "alloc?" : (would_fail_noalloc(r) ? "allocates" : "noalloc")
+    ts = would_fail_typestable(r) ? "unstable" : "stable"
+    na = isnothing(r.scan_error) ? (would_fail_noalloc(r) ? "allocates" : "noalloc") : "alloc?"
     print(io, "StrictReport(", r.target, ": ", ts, ", ", na, ")")
     return nothing
 end
@@ -138,15 +139,17 @@ end
 """
     @explain f(args...)
 
-Diagnose `f(args...)` without throwing. It gathers `@code_warntype`, JET's `@report_opt`, and
-AllocCheck into a single [`StrictReport`](@ref) that explains why a guarantee would fail (a
-non-concrete return type, runtime dispatch or boxing, allocation sites), along with a verdict for
-what [`@assert_typestable`](@ref) and [`@assert_noalloc`](@ref) would conclude.
+Diagnose `f(args...)` without throwing. It gathers the inferred return type, a scan of the typed IR
+for allocation and dynamic-dispatch signals, and `@code_warntype` into a single
+[`StrictReport`](@ref) that explains why a guarantee would fail, along with a verdict for what
+[`@assert_typestable`](@ref) and [`@assert_noalloc`](@ref) would conclude.
 
-Think of it as the "tell me why" companion to the fail-loud asserts: reach for it when a
-[`StrictViolation`](@ref) needs explaining. It returns the report, which the REPL prints; assign it
-if you'd rather read the fields yourself. Like the asserts, it's gated by `checks_enabled` and
-expands to the bare call when disabled.
+Think of it as the "tell me why" companion to the assert macros: reach for it when a verdict needs
+explaining. It returns the report, which the REPL prints; assign it if you'd rather read the fields
+yourself. It's gated by `checks_enabled` and expands to the bare call when disabled.
+
+The engine is the value-free one, so its allocation verdict is a structural guess — for the proof,
+add `StrictModeTest` and run `@test_noalloc` / `@test_typestable` on the same call.
 
 ```julia
 state = (1, 2.0, "three")
@@ -156,8 +159,8 @@ component(s, i) = s[i]
 # StrictMode @explain — component(state, rand(1:3))
 #
 #   Return type:    Union{Float64, Int64, String}  ✗ not concrete
-#   Type stability: ✗ 1 issue(s) (JET @report_opt): …
-#   Allocations:    ✗ 1 site(s) (AllocCheck): …
+#   Local dispatch: ✗ this function's own IR dispatches dynamically
+#   IR signals:     ✗ boxing / dynamic dispatch
 #
 #   Verdict:
 #     ✗ @assert_typestable would fail
@@ -173,7 +176,7 @@ macro explain(args...)
 
     checked = quote
         $(p.binds...)
-        $(_strict_report)($target, $(p.checkfn), $(p.types))   # builds the report via the analysis backend
+        $(_strict_report)($target, $(p.checkfn), $(p.types))
     end
     return _gate(checked, esc(call))
 end

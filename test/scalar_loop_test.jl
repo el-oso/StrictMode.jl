@@ -1,7 +1,7 @@
 # F20: scalar_fp_loops / @assert_no_scalar_loops
 
 @testitem "F20 scalar loop scan — positive and negative" tags = [:f20] begin
-    using StrictMode
+    using StrictMode, StrictModeTest
 
     # Positive case: a scalar FP accumulator loop. The loop-carried `phi double` survives
     # even after unrolling, and no `<N x double>` vector ops are emitted (no @simd, no Vec).
@@ -36,22 +36,19 @@
     # vec_scale!: explicit Vec → vectorized → false.
     @test scalar_fp_loops(vec_scale!, (Vector{Float64}, Vector{Float64})) == false
 
-    # @assert_no_scalar_loops throws on the scalar case.
-    @test_throws StrictViolation @assert_no_scalar_loops scalar_sum(A, 64)
+    # @assert_no_scalar_loops reports the scalar case (a heuristic, so it warns).
+    @test_logs (:warn,) match_mode = :any (@assert_no_scalar_loops scalar_sum(A, 64))
 
     # @assert_no_scalar_loops passes on the vectorized case.
     y = zeros(64)
     @test (@assert_no_scalar_loops vec_scale!(y, A)) === y
 
-    # Batch path: :no_scalar_loops is a first-class guarantee in findings/check (value-free,
-    # so identical in :fast and :full).
-    for m in (:fast, :full)
-        fs = findings(scalar_sum, (Vector{Float64}, Int); guarantees = (:no_scalar_loops,), mode = m)
-        @test only(fs).status === :fail
-        gs = findings(vec_scale!, (Vector{Float64}, Vector{Float64}); guarantees = (:no_scalar_loops,), mode = m)
-        @test only(gs).status === :pass
-    end
-    @test_throws StrictViolation check(scalar_sum, (Vector{Float64}, Int); guarantees = (:no_scalar_loops,), fail = :error)
+    # Batch path: :no_scalar_loops is a first-class guarantee in `findings` (value-free).
+    fs = findings(scalar_sum, (Vector{Float64}, Int); guarantees = (:no_scalar_loops,))
+    @test only(fs).status === :fail
+    gs = findings(vec_scale!, (Vector{Float64}, Vector{Float64}); guarantees = (:no_scalar_loops,))
+    @test only(gs).status === :pass
+    @test_throws StrictViolation test_signatures([(scalar_sum, (Vector{Float64}, Int))]; guarantees = (:no_scalar_loops,))
 end
 
 @testitem "F20 scalar loop scan — hand-written tail vs. LLVM epilogue (issue #22)" tags = [:f20] begin

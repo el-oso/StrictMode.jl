@@ -10,7 +10,7 @@
     @test :xbyname in StrictMode.exempt_strict()
 end
 
-@testitem "exempt functions are skipped by check_all" begin
+@testitem "exempt functions are skipped by the registry sweep" begin
     using StrictMode
     empty!(StrictMode.exempt_strict())
     empty!(StrictMode.registered_strict())
@@ -22,10 +22,10 @@ end
         end; s
     )
     StrictMode.register_strict!(xboxy, (Tuple{Int, Float64, Float32},))
-    @test nfailures(check_all(; fail = :none)) ≥ 1
+    @test nfailures(StrictMode._findings_all()) ≥ 1
 
     StrictMode._exempt!(:xboxy)                          # opt it out
-    @test nfailures(check_all(; fail = :none)) == 0
+    @test nfailures(StrictMode._findings_all()) == 0
 
     empty!(StrictMode.exempt_strict())                  # don't leak into other test items
     empty!(StrictMode.registered_strict())

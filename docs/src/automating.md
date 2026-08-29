@@ -8,37 +8,44 @@ covers the higher-level options. Quick reference for which to reach for:
 | Check one call at a call site | `@assert_*` / `@strict` / `@kernel` |
 | Check one function against its declared types | `@strict_function` |
 | Mark a whole module strict | `@strict module … end` |
-| Programmatically check `(f, types)` | `check` / `findings` |
-| Whole-package CI sweep | `audit` |
+| Programmatically report on `(f, types)` | `findings` |
+| Programmatically **gate** on `(f, types)` | `StrictModeTest.test_signatures` |
+| Whole-package report | `audit` |
+| Whole-package CI gate | `StrictModeTest.test_compiled` / `test_registered` |
 | Live feedback while editing | `watch` + Revise |
 
 (For wiring `audit` into an AI agent or CI pipeline, see [Agentic feedback](agents.md).)
 
-## The function API — `check`
+## The function API — `findings` and `test_signatures`
 
-[`check`](@ref) runs the guarantees on a `(function, signature)` pair. It's an ordinary function
-call over *types*, so it never has to parse a call expression — reach for it when you already have a
-signature in hand, or when you're building tooling on top. (The macros now accept keyword-argument
-calls and an explicit `types = (…)` signature override directly, so you rarely need `check` just to
-work around syntax — see [Guarantees](guarantees.md).)
+[`findings`](@ref) runs the guarantees on a `(function, signature)` pair and returns the results.
+It's an ordinary function call over *types*, so it never has to parse a call expression — reach for
+it when you already have a signature in hand, or when you're building tooling on top. (The macros
+accept keyword-argument calls and an explicit `types = (…)` signature override directly, so you
+rarely need it just to work around syntax — see [Guarantees](guarantees.md).)
 
 ```@example auto
 using StrictMode
 
 dot3(a, b) = a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
-check(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))   # all :pass
+findings(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))   # all :pass
 ```
 
-Pick the guarantees and the failure behavior:
+Nothing actually runs here; the analysis works purely from the types. That means it is happy even
+with calls you wouldn't want to execute for real — a `10000×10000` signature costs nothing.
+
+`findings` never throws: it is the data half of the API, and the caller decides what a finding is
+worth. To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
+`test_signatures` takes the same list, runs AllocCheck and JET instead of the value-free scan, and
+throws a `StrictViolation` collecting every failure:
 
 ```julia
-check(kernel, (Matrix{Float64}, Vector{Float64});
-      guarantees = (:typestable, :noalloc, :noboxing, :inlined),
-      fail = :error)          # :error throws, :warn logs, :none just returns the findings
+using StrictMode, StrictModeTest
+test_signatures([
+    (dot3, (NTuple{3,Float64}, NTuple{3,Float64})),
+    (kernel, (Matrix{Float64}, Vector{Float64})),
+]; guarantees = (:typestable, :noalloc, :noboxing, :inlined))
 ```
-
-Nothing actually runs here; the analysis works purely from the types. That means `check` is happy
-even with calls you wouldn't want to execute for real.
 
 ## Strict by default — one switch, not per-function
 
@@ -55,10 +62,10 @@ helper out with [`@strict_exempt`](@ref).
 end
 ```
 
-A hot definition that boxes or allocates stops the module from loading (in `:error` mode), while
-the cold `plan` is skipped everywhere: by the load check, by `check_all`, by `audit`, and by the
-sweep. The load check itself uses the cheap `:fast` triage, so it needs no AllocCheck or JET
-backend and stays affordable to run on every load.
+A hot definition whose return type is not concrete stops the module from loading, while
+the cold `plan` is skipped everywhere: by the load check, by `audit`, by `test_registered`, and by
+the sweep. The load check uses the value-free engine, so it needs no AllocCheck or JET backend and
+stays affordable to run on every load — which is also why an allocation verdict there only warns.
 
 If you'd rather mark a single function than a whole module, [`@strict_function`](@ref) registers
 and verifies one definition at a time.
@@ -72,11 +79,14 @@ gated on `checks_enabled`, so a production build pays nothing, and the analyzers
 ### Re-check on demand
 
 ```julia
-check_all()                   # re-check the whole mark-once registry, returns the findings
+audit(:registered)            # report on the whole mark-once registry, returns the findings
 registered_strict()           # the registry: (f, types) => (; guarantees)
+
+# …and from the test environment, where StrictModeTest supplies the proofs:
+test_registered()             # re-prove every registered signature; throws on any failure
 ```
 
-## Usage-driven sweep — `check_compiled`
+## Usage-driven sweep
 
 This is the hybrid option: check whatever concrete method instances a module actually compiled,
 whether that was during your tests, a run, or precompilation. No annotations needed.
@@ -84,7 +94,8 @@ whether that was during your tests, a run, or precompilation. No annotations nee
 ```julia
 using MyPkg
 # … exercise MyPkg (run your tests / a workload) …
-check_compiled(MyPkg; guarantees = (:noalloc, :noboxing))
+audit(MyPkg; sweep = true, guarantees = (:noalloc, :noboxing))   # report
+test_compiled(MyPkg; guarantees = (:noalloc, :noboxing))          # prove and gate
 ```
 
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
@@ -100,13 +111,13 @@ exported/`public` function of the module that is neither registered nor exempted
 ```julia
 # in your test suite: registration is the manifest, the gate enforces completeness
 StrictMode.register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:typestable, :noalloc))
-check_all()                                       # the declared guarantees hold…
+test_registered()                                 # the declared guarantees hold…
 @test nfailures(audit(MyPkg; require = :public)) == 0   # …and nothing public is undeclared
 ```
 
 A new public function now cannot ship silently unchecked: either it gets registered with its
 guarantees, or it is opted out **visibly** (`@strict_exempt` / the `exempt` kwarg) where a
-reviewer can see it. Scope with `only`/`exempt` exactly as in [`check_compiled`](@ref).
+reviewer can see it. Scope with `only`/`exempt` exactly as in the sweep above.
 
 ## Live feedback with Revise — `watch`
 

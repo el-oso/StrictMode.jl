@@ -20,7 +20,7 @@ end
 end
 
 @testitem "@unroll removes the runtime-tuple-index boxing (the founding trap)" begin
-    using StrictMode
+    using StrictMode, StrictModeTest
     htup = (1, 2.0, 3.0f0)
     function naive(t)
         acc = 0.0
@@ -39,7 +39,7 @@ end
     @test naive(htup) == unrolled(htup)          # same answer
     # The naive loop is type-stable (concrete Float64 return) yet still allocates — exactly the
     # silent trap @assert_noalloc exists to catch — while the unrolled version is clean.
-    @test_throws StrictViolation (@assert_noalloc naive(htup))
+    @test_throws StrictViolation (@test_noalloc naive(htup))
     @test (@assert_noalloc unrolled(htup)) == 6.0
 end
 

@@ -34,7 +34,7 @@ end
 
     ms = SlowMetric()
     xs = [1.0, 2.0, 3.0]
-    @test_throws StrictViolation @verify_strict SlowMetric begin
+    @test_logs (:warn,) match_mode = :any @verify_strict SlowMetric begin
         score2(ms, xs)
     end
 end

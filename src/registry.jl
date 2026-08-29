@@ -1,6 +1,6 @@
-# Mark-once registry + drivers. `@strict_function`/`@strict module` register `(f, types)` here;
-# `check_all` re-checks the registry, `check_compiled` does the usage-driven sweep, and
-# `_auto_check_module` is the automatic-at-load hook.
+# Mark-once registry + the shared item builders. `@strict_function`/`@strict module` register
+# `(f, types)` here; `audit` renders findings for them, `StrictModeTest`'s `test_*` drivers gate on
+# the same lists, and `_auto_check_module` is the automatic-at-load hook.
 
 const STRICT_REGISTRY = Dict{Any, @NamedTuple{guarantees::Any}}()
 
@@ -8,8 +8,8 @@ const STRICT_REGISTRY = Dict{Any, @NamedTuple{guarantees::Any}}()
     register_strict!(f, types; guarantees = (:typestable, :noalloc))
 
 Record that `f` with concrete signature `types` should satisfy `guarantees`, so the automatic
-drivers ([`check_all`](@ref), `@strict module`, the Revise loop) re-check it. Non-concrete
-signatures are dropped with a warning (nothing to analyze).
+drivers (`audit`, `@strict module`, the Revise loop, and `StrictModeTest.test_registered`) re-check
+it. Non-concrete signatures are dropped with a warning (nothing to analyze).
 """
 function register_strict!(@nospecialize(f), @nospecialize(types); guarantees = (:typestable, :noalloc))
     tt = Tuple(types)
@@ -48,69 +48,34 @@ The set of function names marked cold/exempt by `@strict_exempt`.
 """
 exempt_strict() = STRICT_EXEMPT
 
-# ponytail: pinned to `false`. This was `mode === :fast && nthreads() > 1` — serial for `:full`,
-# since AllocCheck/JET hold global compiler state. Now that `:fast` is the default it would flip
-# threading ON by default, which is a behaviour change riding along on a deletion. `findings` is
-# cache-locked and thread-safe, so flip this deliberately as its own change; `parallel=true` still
-# opts in per call.
-_default_parallel(::Symbol) = false
-
-# A per-item analysis error is swallowed so one unanalyzable method can't sink a whole sweep. But a
-# MISSING BACKEND is not a per-item problem — it fails every item identically, and swallowing it
-# turns `mode = :full` into a silent, vacuous green: the same sweep that reports 53 findings at
-# `:fast` reported 0 findings / 0 failures at `:full` with no backend loaded, exit code 0. That is
-# the exact failure mode `assert_enabled` exists to prevent, reached through a different door, and it
-# lands in `audit` — the driver the Stop hook and the consumer gate scripts run. Rethrow it.
-_is_fatal_sweep_error(err) = err isa StrictViolation || err isa BackendUnavailable
-# A per-item analysis error is not fatal to the sweep — one unanalyzable method must not sink it.
+# A per-item analysis error is not fatal to a sweep — one unanalyzable method must not sink it.
 # But it must not VANISH either: silently dropping the item means a sweep reports success for a
 # method it never checked, which is the same "could not check" == "is fine" conflation that made a
-# crashed backend report `:pass`. Emit a `:skip` finding naming the method and the error instead.
-function _skips_for(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
+# crashed backend report `:pass`. Emit a failing finding naming the method and the error instead.
+function _errored_findings(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
     fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
     why = "analysis errored for this signature: " * sprint(showerror, err)
-    return StrictFinding[_skipfinding(md, fn, sg, g, why) for g in gs]
+    return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in gs]
 end
 
-function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
-    if parallel && length(items) > 1
-        results = Vector{Vector{StrictFinding}}(undef, length(items))
-        fatal = Ref{Any}(nothing)
-        Threads.@threads for i in eachindex(items)
-            f, types, gs = items[i]
-            results[i] = try
-                findings(f, types; guarantees = gs, mode)
-            catch err
-                _is_fatal_sweep_error(err) && (fatal[] = err)
-                _skips_for(f, types, gs, err)
-            end
-        end
-        fatal[] === nothing || throw(fatal[])
-        return reduce(vcat, results; init = StrictFinding[])
-    end
+# Run `analyze(f, types, guarantees)` over `items`, collecting every result. Shared by StrictMode's
+# reporting drivers and `StrictModeTest`'s gating ones, so both keep the same shape: no item is
+# dropped, and one method that cannot be analyzed leaves the other 299 evaluated.
+function _map_findings(analyze, items)
     out = StrictFinding[]
     for (f, types, gs) in items
         try
-            append!(out, findings(f, types; guarantees = gs, mode))
+            append!(out, analyze(f, types, gs))
         catch err
-            _is_fatal_sweep_error(err) && rethrow()
-            append!(out, _skips_for(f, types, gs, err))
+            err isa StrictViolation && rethrow()
+            append!(out, _errored_findings(f, types, gs, err))
         end
     end
     return out
 end
 
-# `fail_on_suspect` lets a consumer opt OUT of treating the `:fast` engine's structural guesses as
-# failures. Default `true`: nothing is disarmed, because a sweep that stops gating allocations reads
-# green while sitting on a real regression, and the only signal is a count in a line of text. What
-# `:suspect` buys is that it renders distinctly, is separately countable, and cannot abort a build at
-# LOAD time. A consumer who wants a non-blocking precompile passes `false` here. The durable
-# answer is to add `StrictModeTest`, which re-issues every one of these as a proved `:pass`/`:fail`.
-function _run_and_report(
-        fs::Vector{StrictFinding}, kind::Symbol, target, fail::Symbol;
-        fail_on_suspect::Bool = true
-    )
-    failed = filter(f -> f.status === :fail || (fail_on_suspect && f.status === :suspect), fs)
+function _run_and_report(fs::Vector{StrictFinding}, kind::Symbol, target, fail::Symbol)
+    failed = filter(_failed, fs)
     if !isempty(failed) && fail !== :none
         msg = sprint(io -> format_findings(io, failed; format = :text))
         fail === :error ? throw(StrictViolation(kind, target, msg)) : @warn msg
@@ -118,77 +83,49 @@ function _run_and_report(
     return fs
 end
 
-"""
-    check_all(; guarantees = nothing, fail = :none) -> Vector{StrictFinding}
-
-Re-check every entry in the mark-once registry and return all findings. `guarantees = nothing`
-uses each entry's own setting; pass a tuple to override. `fail = :error`/`:warn` raises/logs on
-any failure, `:none` just returns the findings (the default — it is a reporting driver).
-
-!!! warning "Same-process only"
-    The registry is a plain `Dict` populated at *declaration* time. `@strict_function` runs at its
-    own module's precompile, and that cross-package mutation is discarded when the module is loaded
-    from a cached pkgimage — so **a consumer's test process sees an empty registry however many
-    declarations its `src/` carries**, and this driver would then return zero findings and exit 0.
-    It warns loudly in that case rather than reporting a silent green. For a consumer, use
-    [`check_signatures`](@ref) or `audit(MyPkg; sweep = true)`, which enumerate directly.
-"""
-function check_all(;
-        guarantees = nothing, fail::Symbol = :none,
-        mode::Symbol = :fast, parallel::Bool = _default_parallel(mode),
-    )
-    items = Any[
-        (f, types, guarantees === nothing ? meta.guarantees : guarantees)
+# The registry as `(f, types, guarantees)` items, with exempted functions dropped. `guarantees`
+# overrides each entry's own setting when given. `StrictModeTest.test_registered` re-runs exactly
+# this list against the proofs, so both tiers agree on what "registered" means.
+function _registry_items(guarantees = nothing)
+    return Any[
+        (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
             for ((f, types), meta) in STRICT_REGISTRY if !_is_exempt(f)
     ]
-    if isempty(items)
-        # An empty registry renders exactly like a clean one: zero findings, exit 0. That is the
-        # whole failure mode this package exists to remove, and it is REACHABLE BY DEFAULT in a
-        # consumer, not just when nothing was declared: `@strict_function` registers through a
-        # `register_strict!` Dict insert executed at the ANNOTATED MODULE'S OWN PRECOMPILE, and that
-        # cross-package mutation is discarded when the module is loaded from its cached pkgimage. So
-        # a consumer's test process sees an empty registry no matter how many declarations its
-        # `src/` carries. `check_signatures`/`audit(mod; sweep=true)` are unaffected — they
-        # enumerate directly instead of reading this Dict.
-        @warn "check_all: the registry is EMPTY (0 checks) — this result proves nothing. " *
-            "`@strict_function` registers at its own module's precompile, and that registration " *
-            "does not survive a cached pkgimage load, so a consumer's test process sees no entries " *
-            "even when its `src/` is fully annotated. Use `check_signatures([(f, types), …])` or " *
-            "`audit(MyPkg; sweep = true)`, which enumerate directly. (An empty registry is also " *
-            "legitimate when nothing is declared, or everything is exempt.)"
-    end
-    return _run_and_report(_map_findings(items, parallel, mode), :check_all, "registry", fail)
 end
 
-"""
-    check_signatures(pairs; guarantees = (:typestable, :noalloc), fail = :none, mode = :fast)
+# An empty registry renders exactly like a clean one: zero findings, nothing to report. That is the
+# failure mode this package exists to remove, and it is REACHABLE BY DEFAULT in a consumer, not
+# just when nothing was declared: `@strict_function` registers through a `register_strict!` Dict
+# insert executed at the ANNOTATED MODULE'S OWN PRECOMPILE, and that cross-package mutation is
+# discarded when the module is loaded from its cached pkgimage. So a consumer's test process sees
+# an empty registry no matter how many declarations its `src/` carries. The signature-list and
+# module-sweep paths are unaffected — they enumerate directly instead of reading this Dict.
+function _warn_empty_registry(driver::AbstractString, alternative::AbstractString)
+    @warn "$driver: the registry is EMPTY (0 checks) — this result proves nothing. " *
+        "`@strict_function` registers at its own module's precompile, and that registration " *
+        "does not survive a cached pkgimage load, so a consumer's test process sees no entries " *
+        "even when its `src/` is fully annotated. Use $alternative, which enumerate directly. " *
+        "(An empty registry is also legitimate when nothing is declared, or everything is exempt.)"
+    return nothing
+end
 
-Check an explicit list of `(f, types)` pairs — the declarative "check what I promise" path that
-needs **no `src` annotations**. A test suite can list a library's guaranteed entry points without
-the library itself depending on StrictMode:
-
-```julia
-check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel, (Matrix{Float64},))]; fail = :error)
-```
-"""
-function check_signatures(pairs; guarantees = (:typestable, :noalloc), fail::Symbol = :none, mode::Symbol = :fast)
-    items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
-    return _run_and_report(_map_findings(items, _default_parallel(mode), mode), :check_signatures, "signatures", fail)
+# Findings for every registered signature. Reporting only — `audit` renders these.
+function _findings_all(; guarantees = nothing)
+    items = _registry_items(guarantees)
+    isempty(items) && _warn_empty_registry("audit(:registered)", "`audit(MyPkg; sweep = true)`")
+    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
 end
 
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
-function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false, mode::Symbol = :fast)
+function _registered_findings_in(mod::Module; guarantees = nothing)
     out = StrictFinding[]
     for ((f, types), meta) in STRICT_REGISTRY
         _mod_sym(f) === nameof(mod) || continue
         _is_exempt(f) && continue                        # cold / @strict_exempt → skip
-        gs = guarantees === nothing ? meta.guarantees : guarantees
+        gs = isnothing(guarantees) ? meta.guarantees : guarantees
         try
-            fs = fast ?
-                _findings_fast(f, types, gs, _mod_sym(f), _func_name(f), _sig_string(types)) :
-                findings(f, types; guarantees = gs, mode)
-            append!(out, fs)
+            append!(out, findings(f, types; guarantees = gs))
         catch err
             err isa StrictViolation && rethrow()
         end
@@ -196,12 +133,12 @@ function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool =
     return out
 end
 
-# Whole-module strict check at load. Always uses the cheap `:fast` triage (no AllocCheck/JET
-# backend needed), so opting a module into strict mode stays affordable on every load — the
-# rigorous `:full` proof is run explicitly via `audit`/`check_all` in CI.
+# Whole-module strict check at load. Uses the value-free engine, which is what makes opting a
+# module into strict mode affordable on every load; the proofs run from the test environment, where
+# `StrictModeTest` is loadable and this module's own precompile is not happening.
 function _auto_check_module(mod::Module)
     CHECKS_ENABLED || return nothing
-    _run_and_report(_registered_findings_in(mod; fast = true), :strict_module, string(nameof(mod)), :error)
+    _run_and_report(_registered_findings_in(mod), :strict_module, string(nameof(mod)), :error)
     return nothing
 end
 
@@ -302,7 +239,7 @@ function _name_matcher(spec)
 end
 
 # Shared module-sweep core: every `(f, tt)` pair — a concrete dispatch-tuple specialization `mod`
-# has actually compiled — across its own functions matching `only`/`exempt`. `check_compiled`,
+# has actually compiled — across its own functions matching `only`/`exempt`. The compiled sweep,
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
 function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
@@ -329,49 +266,31 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
     return nothing
 end
 
-"""
-    check_compiled(mod::Module; guarantees = (:typestable, :noalloc), fail = :none,
-                   only = nothing, exempt = ()) -> Vector{StrictFinding}
-
-Usage-driven sweep: check the concrete method instances `mod`'s functions have **actually
-compiled** (during your tests / a run / the precompile workload). No annotation needed, but
-coverage is whatever executed, and a module that mixes hot and cold (plan-time) helpers will be
-noisy — cold helpers that legitimately allocate show up too. Scope it with:
-
-- `only` / `exempt` — each a collection of functions / name `Symbol`s, a **`Regex`** matched
-  against the (demangled) name, or a **predicate** `f -> Bool`. `@strict_exempt` names are always
-  excluded. So `exempt = r"^_plan"` or `exempt = f -> startswith(string(nameof(f)), "_")` scales
-  a mixed hot/cold library without a hand-listed set.
-
-Prefer the *declared-guarantee* path ([`@strict_function`](@ref) / `@strict module` /
-[`check_all`](@ref)) for "check what I promised"; this sweep is "check what actually ran".
-Best-effort — it walks compiler reflection defensively and skips anything it cannot analyze.
-"""
-function check_compiled(
-        mod::Module;
-        guarantees = (:typestable, :noalloc),
-        fail::Symbol = :none,
-        only = nothing,
-        exempt = (),
-        mode::Symbol = :fast,
-        parallel::Bool = _default_parallel(mode),
-    )
+# Every `(f, tt, guarantees)` item for the usage-driven sweep of `mod`: the concrete method
+# instances its functions have ACTUALLY COMPILED. Coverage is therefore whatever executed, and a
+# module that mixes hot and cold helpers is noisy unless scoped with `only`/`exempt`.
+# `StrictModeTest.test_compiled` builds the same list, so both tiers sweep the same set.
+function _compiled_items(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
     items = Any[]
     _module_specializations(mod; only, exempt) do f, tt
         push!(items, (f, tt, guarantees))
     end
-    if isempty(items)
-        @warn "check_compiled: no compiled method specializations matched in `$(nameof(mod))` " *
-            "(0 checks). Warm the kernels first — call them once so a concrete specialization exists " *
-            "— and note `only`/`exempt` and generically-typed signatures can also exclude everything."
-    end
-    return _run_and_report(_map_findings(items, parallel, mode), :check_compiled, string(nameof(mod)), fail)
+    isempty(items) && @warn "StrictMode: no compiled method specializations matched in " *
+        "`$(nameof(mod))` (0 checks). Warm the kernels first — call them once so a concrete " *
+        "specialization exists — and note `only`/`exempt` and generically-typed signatures can " *
+        "also exclude everything."
+    return items
+end
+
+function _findings_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    items = _compiled_items(mod; guarantees, only, exempt)
+    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
 end
 
 # Coverage gate (`audit(mod; require = :public)`): one :fail finding per exported/public
 # function of `mod` that is neither registered (`register_strict!` / `@strict_function`) nor
 # exempted. Turns "every kernel declares its guarantees" from a convention into a red test.
-# Not a checkable guarantee — findings are built directly, never routed through _build_finding.
+# Not a checkable guarantee — findings are built directly, never routed through the engines.
 function _coverage_findings(mod::Module; only = nothing, exempt = ())
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
@@ -392,7 +311,8 @@ function _coverage_findings(mod::Module; only = nothing, exempt = ())
                 nameof(mod), s, "", :coverage, :fail, string(m.file), Int(m.line),
                 "public function `$s` has no registered StrictMode guarantee",
                 "declare it: `StrictMode.register_strict!($s, (T1, …); guarantees = (:typestable, :noalloc))` " *
-                    "in the test setup (then `check_all()` enforces it), or opt it out explicitly " *
+                    "in the test setup (then `audit` reports it and `StrictModeTest.test_registered` gates on " *
+                    "it), or opt it out explicitly " *
                     "with `@strict_exempt $s` / the `exempt` kwarg if it is cold by design."
             )
         )

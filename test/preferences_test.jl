@@ -1,5 +1,5 @@
 @testitem "checks are enabled in the test environment" begin
-    using StrictMode
+    using StrictMode, StrictModeTest
     @test StrictMode.checks_enabled() === true
 end
 
@@ -29,11 +29,11 @@ end
 
 @testitem "assert_enabled is loud when StrictModeTest is declared but never loaded" begin
     using StrictMode
-    # The tier split merged "intent" (which package you depend on) with "capability" (which backend
-    # is loaded), which removed the mismatch `_require_backend` used to shout about — except in one
-    # place: a package can be LISTED as a dependency and never `using`ed. Then every guarantee runs
-    # on the heuristic while the environment advertises the proof. The pure core is tested directly
-    # so this needs no filesystem or environment fixture.
+    # A package can be LISTED as a dependency and never `using`ed. Then every guarantee runs on the
+    # value-free scan while the environment advertises the proofs, and none of the `test_*` gates
+    # exist to be called. The pure core is tested directly so this needs no filesystem or
+    # environment fixture.
+
     @test StrictMode._assert_enabled(true, false, false) === true      # checks on, nothing declared
     @test StrictMode._assert_enabled(true, true, false) === true       # …same under CI
     @test_throws ErrorException StrictMode._assert_enabled(true, false, true)
@@ -44,7 +44,7 @@ end
     @test_throws ErrorException StrictMode._assert_enabled(false, true, true)   # the CI rule still wins
 
     # And the detector itself must be quiet in this environment, where StrictModeTest IS loaded.
-    @test StrictMode.backend_available()
+    @test StrictMode.proofs_loaded()
     @test !StrictMode._backend_declared_but_unloaded()
     @test StrictMode.assert_enabled()
 end

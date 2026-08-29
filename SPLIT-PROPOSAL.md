@@ -658,7 +658,7 @@ runner assigns `Test.TESTSET_PRINT_ENABLE[]`, which became a `ScopedValue` in Ju
 the entire suite before a single item ran), and three Julia 1.13 fixes — two of them silent false
 negatives in `@assert_inlined` and `@assert_no_threadid_state`.
 
-## 8. Revision 8 — a companion macro in StrictModeTest, not a mode switch
+## 8. Revision 8 — a companion macro in StrictModeTest, not a mode switch — IMPLEMENTED
 
 Owner decision, superseding §H.4 (shadowing macros) and §7 item 1 (auto-escalation). Both earlier
 mechanisms answered "which engine does this call site use?" with machinery. This answers it with the
@@ -788,7 +788,7 @@ file was edited since `f` was defined in the parent session, the probe checks di
 real call runs. Wrong in either direction, including a false pass. Relevant to a Revise-heavy loop;
 no cheap fix, since a named function cannot be serialized by value.
 
-## 10. Revision 9 — the reporting/gating split, and what it resolves
+## 10. Revision 9 — the reporting/gating split, and what it resolves — IMPLEMENTED
 
 Owner decisions, resolving §8's first open question. The rule: **StrictMode reports, StrictModeTest
 gates.** Nothing in StrictMode can break a build.
@@ -862,7 +862,7 @@ already uses only the return-type half, so the split exists in one place already
    of that. Candidate: when `StrictModeTest` is loaded, `@assert_*` emits a once-per-session notice
    that this site is the heuristic and the proof is `@test_*`.
 
-## 11. Revision 10 — the remaining three answers
+## 11. Revision 10 — the remaining three answers — IMPLEMENTED
 
 **`StrictModeTest.__init__` asserts `StrictMode.checks_enabled()`.** Not because the const is
 unfixable — preferences are per active project and StrictMode gets a separate pkgimage per value
@@ -902,3 +902,32 @@ package's headline claim, "enforceable at dev/CI time and free in production".
 
 Unresolved. Note the cost is lower than it was — under §10 StrictMode only reports, so a default-on
 consumer gets warnings and analysis time, not a broken build.
+
+## 12. What §8–§11 actually shipped, and where it differed
+
+§8–§11 are implemented. Three things the design did not name, decided while building:
+
+- **`divergence_report` moved to `StrictModeTest`.** It compares the two engines, so it needs both;
+  with the seam gone there is no way for `StrictMode` to reach the proof. `save_divergence` and
+  `StrictDivergence` moved with it. That makes it a fifth public name leaving `StrictMode`, on top of
+  §10's four.
+- **`@explain`/`StrictReport` stayed, rebuilt on the value-free engine.** It is a *reporting* tool,
+  which §10 puts squarely on the StrictMode side. Its `opt_result`/`allocs` fields (JET and
+  AllocCheck objects) are replaced by `signals` (the IR scan result), `local_boxing`, and
+  `scan_error`.
+- **`ignore_throw`/`set_ignore_throw!` stayed in `StrictMode`.** The scan's dead-end mask implements
+  the same semantics as AllocCheck's `ignore_throw`, so one switch has to drive both or the two
+  tiers answer different questions. `ignore_barrier`/`set_ignore_barrier!` did move, since that one
+  is purely about exempting a call from AllocCheck's all-paths proof.
+
+And two mechanisms worth naming, because the reason for each is easy to lose:
+
+- **`@test_*` is not wrapped in `_gate`.** A gate that compiles itself away under a preference is a
+  gate that can vanish silently. `StrictModeTest.__init__` refuses to load with checks disabled, so
+  the question does not arise.
+- **`_guarantee_gates` is a whitelist by exclusion**, listing the guarantees that only report. A new
+  guarantee therefore gates by default, which fails loudly rather than quietly.
+
+`checks_enabled` now defaults to `true` (§11's open question). Neither `test/Project.toml` nor
+`test/standalone/Project.toml` carries a `[preferences.StrictMode]` block any more, so both exercise
+that default rather than masking it.

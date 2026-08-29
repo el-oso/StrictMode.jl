@@ -1,4 +1,5 @@
-# Reporting layer. The drivers (`check`, `check_all`, `check_compiled`) all produce a flat list of
+# Reporting layer. Every driver — StrictMode's `findings`/`audit` and `StrictModeTest`'s `test_*` —
+# produces a flat list of
 # `StrictFinding`s; formatters render that list for each sink — `:text` for humans (Revise), and
 # `:json` / `:jsonlines` / `:github` for agents and CI. One source of truth, many sinks.
 
@@ -12,20 +13,13 @@ Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:nobo
 `:inlined`/…), `status`, `file`, `line`, `reason`, `suggestion`.
 
 `status` is one of:
-- `:pass` / `:fail` — a verdict to act on.
+- `:pass` / `:fail` — a verdict to act on. A guarantee the analysis could not evaluate is `:fail`
+  carrying the error text, never `:pass`: "could not check" and "is fine" must not render the same.
 - `:info` — advisory, never a failure ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)).
-- `:skip` — **the analysis did not run** (non-concrete signature, or the backend errored on this
-  signature). Not counted as a failure, but deliberately NOT `:pass`: "could not check" and "is
-  fine" must never render the same.
-- `:suspect` — **the `:fast` engine flagged an allocation guarantee.** That engine reads typed IR,
-  where an allocation site LLVM will later elide is still present, so a positive verdict is a
-  structural guess rather than the proof AllocCheck gives (~28% false on a real consumer, issue
-  #17). It IS counted by [`nfailures`](@ref) and does fail `check`/`audit` under
-  `fail_mode = :error` — a sweep must not go green on a real allocation regression. What the status
-  buys is that it renders distinctly, is separately countable via [`nsuspect`](@ref), and that
-  `@strict_function` WARNS instead of aborting a consumer's precompile, where the proof is
-  unreachable by construction (issue #18). Load `StrictModeTest` and the same finding is re-issued
-  as a proved `:pass`/`:fail`.
+
+How much a `:fail` is worth is a property of where it came from, not a field: StrictMode's findings
+are a value-free engine's verdicts and nothing gates on them, while `StrictModeTest`'s are proofs
+and its drivers do gate.
 """
 struct StrictFinding
     mod::Symbol
@@ -53,33 +47,19 @@ function _suggestion(guarantee::Symbol)
     return ""
 end
 
-# "Counts against you." `:suspect` is included: a heuristic guess is still a finding a gate should
-# act on (default B). What `:suspect` buys is that it renders distinctly and is separately countable
-# via `nsuspect`, and that the LOAD-TIME path (`@strict_function`) warns rather than aborting a build
-# it cannot possibly resolve — not that sweeps stop gating.
-_failed(f::StrictFinding) = f.status === :fail || f.status === :suspect
+_failed(f::StrictFinding) = f.status === :fail
 
 """
     nfailures(findings) -> Int
 
-The number of failing findings in a `Vector{StrictFinding}` (as returned by [`check`](@ref),
-[`check_all`](@ref), [`check_compiled`](@ref), or [`audit`](@ref)). Use it for the exit-code
-loop: `exit(nfailures(audit(MyPkg)))`.
+The number of failing findings in a `Vector{StrictFinding}` (as returned by [`findings`](@ref),
+[`audit`](@ref), or `StrictModeTest`'s `test_*` drivers).
 """
 nfailures(fs::AbstractVector{StrictFinding}) = count(_failed, fs)
 
-"""
-    nsuspect(findings) -> Int
-
-How many findings are `:suspect` — flagged by the `:fast` engine's structural guess rather than
-proved. Deliberately separate from [`nfailures`](@ref): a gate should be able to report these
-without failing on them, and to fail on them explicitly if it wants to.
-"""
-nsuspect(fs::AbstractVector{StrictFinding}) = count(f -> f.status === :suspect, fs)
-
 # Single-line REPL display.
 function Base.show(io::IO, f::StrictFinding)
-    mark = f.status === :fail ? "✗" : f.status === :pass ? "✓" : f.status === :suspect ? "?" : "•"
+    mark = f.status === :fail ? "✗" : f.status === :pass ? "✓" : "•"
     print(io, "[", mark, " ", f.guarantee, "] ", f.func, f.signature)
     f.status !== :pass && f.reason != "" && print(io, " — ", f.reason)
     return nothing
@@ -117,12 +97,7 @@ function _fmt_text(io::IO, fs)
         println(io, "StrictMode: ✓ no findings.")
         return nothing
     end
-    nf = nfailures(fs)
-    ns = nsuspect(fs)
-    println(
-        io, "StrictMode: ", length(fs), " finding(s), ", nf, " failing",
-        ns == 0 ? "" : ", $ns suspect (heuristic guess — load StrictModeTest to resolve)", "."
-    )
+    println(io, "StrictMode: ", length(fs), " finding(s), ", nfailures(fs), " failing.")
     for f in fs
         println(io, "  ", f)
         if _failed(f) || f.status === :info

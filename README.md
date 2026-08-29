@@ -23,38 +23,34 @@ with a value-free engine built on Base's own inference — no heavy dependencies
 rigorous proofs from [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
 [JET.jl](https://github.com/aviatesk/JET.jl) live in a companion package you add to `test/`.
 
-## The tier is the dependency graph
+## Two packages: one reports, one gates
 
-There is no preference to switch between "quick" and "rigorous". Which engine runs is decided by
-what's in the environment:
+There is no preference to switch between "quick" and "rigorous", and no ambient state deciding
+which engine runs. **The macro you wrote is the engine.**
 
 | Environment | Add | What you get |
 |---|---|---|
-| **Production** | nothing | checks off → macros are bare calls |
-| **Your `Project.toml`** | `StrictMode` | the value-free heuristic; no backend, cheap enough to run at load time |
-| **Your `test/Project.toml`** | `+ StrictModeTest` | AllocCheck + JET + TrimCheck; every guarantee escalates to the proof |
-
-The escalation happens at **call time**, not macro-expansion time, so the *same* precompiled code in
-your `src/` runs the heuristic while you develop and the proof under test — nothing is recompiled,
-and no import line selects it. Adding `StrictModeTest` to the test environment is the whole switch;
-you cannot forget to "turn it on" in a file.
+| **Production** | nothing | `disable_checks!()` → macros are bare calls |
+| **Your `Project.toml`** | `StrictMode` | `@assert_*`: a value-free scan, no backend, cheap enough to run at load time |
+| **Your `test/Project.toml`** | `+ StrictModeTest` | `@test_*` and `test_*`: AllocCheck + JET + TrimCheck |
 
 ```julia
 # Project.toml            [deps] StrictMode
+@assert_noalloc kernel!(C, A, B)     # value-free scan; warns on a violation
+
 # test/Project.toml       [deps] StrictMode, StrictModeTest
-@assert_noalloc kernel!(C, A, B)     # heuristic while developing, AllocCheck proof under test
+@test_noalloc kernel!(C, A, B)       # AllocCheck's all-paths proof; throws on a violation
 ```
 
-Asking for `mode = :full` without `StrictModeTest` present throws `BackendUnavailable` — including
-from the batch drivers (`audit`, `check_all`, `check_signatures`), which otherwise swallow per-item
-analysis errors and would report a vacuous green.
+Nothing in `StrictMode` can break a build. Its `noalloc`/`noboxing` verdicts come from a scan of
+typed IR, where an allocation LLVM will later elide is still present — measured ~28% false on a real
+consumer — and a check that guesses must not be able to abort a build. So those report. The
+guarantees whose check *observes* compiled output rather than inferring about it (`typestable`'s
+return-type layer, `memsafe`, `vectorized`, `no_spill`, …) do throw.
 
-Because the heuristic reads typed IR and cannot see allocations LLVM later elides, its
-`noalloc`/`noboxing` verdicts are labelled `:suspect` — a structural guess, rendered `?` and counted
-by `nsuspect`. They **still fail a sweep** (`nfailures` includes them), with one exception:
-`@strict_function` runs at your package's own precompile, where the proof is unreachable by
-construction, so there a `:suspect` verdict warns instead of breaking your build. Adding
-`StrictModeTest` re-issues every one of them as a proved pass or fail.
+`StrictModeTest` is the authority: `@test_*` for a call site, and `test_signatures` /
+`test_compiled` / `test_registered` for a whole scope — each collects every failure and raises once,
+so one unanalyzable method never leaves the rest unchecked.
 
 ## Zero cost when disabled
 
@@ -169,19 +165,23 @@ end
 Per-call macros aren't the only way in. StrictMode can also check on its own:
 
 ```julia
-check(f, (T1, T2))                 # function API — never collides with other macros/syntax
+findings(f, (T1, T2))              # function API — never collides with other macros/syntax
 @strict module Kernels … end       # mark a module; checked automatically when it loads
-check_compiled(MyPkg)              # usage-driven: check whatever actually compiled
 StrictMode.watch()                 # live re-checking on each edit (with `using Revise`)
-audit(MyPkg; format = :json, exit_on_fail = true)  # one-shot, structured, exit-coded — for AI agents / CI
+audit(MyPkg; format = :json)       # one-shot, structured report — for AI agents and the dev loop
 audit(MyPkg; require = :public)    # coverage gate: FAIL any public function with no declared guarantee
 assert_enabled()                   # first line of your strictmode tests: errors under CI if checks are off
+
+# …and from the test environment, where StrictModeTest supplies the proofs:
+test_signatures([(f, (T1, T2))])   # gate an explicit list of signatures
+test_compiled(MyPkg)               # gate whatever actually compiled
+test_registered()                  # re-prove everything @strict_function declared
 ```
 
 `audit` emits machine-readable findings (with a `file`, `line`, `reason`, and an actionable
-`suggestion` per violation) and returns the failure count. `require = :public` and
-`assert_enabled()` make non-use loud: an unregistered public function, or a CI run with checks
-silently disabled, is a red build instead of a vacuous green. See
+`suggestion` per violation) and returns them. `require = :public` and `assert_enabled()` make
+non-use loud: an unregistered public function, or a CI run with checks silently disabled, is a red
+build instead of a vacuous green. See
 [Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) and
 [Agentic feedback](https://el-oso.github.io/StrictMode.jl/dev/agents).
 
@@ -192,40 +192,36 @@ You can gate a library's performance from its test suite, without ever adding St
 
 1. Add `StrictMode` and `StrictModeTest` to the **test** `Project.toml`. Nothing goes in your
    package's own `Project.toml` unless you also want load-time checks there.
-2. Commit the preference in the test `Project.toml` so CI runs the checks (`checks_enabled` must
-   be set at **precompile**):
-   ```toml
-   [preferences.StrictMode]
-   checks_enabled = true
-   ```
+2. Nothing else to configure: `checks_enabled` defaults to `true`, and `StrictModeTest` refuses to
+   load if something has turned it off — a suite that silently disarmed would pass vacuously.
 3. List the guaranteed entry points — no `src` annotations needed:
    ```julia
    using StrictMode, StrictModeTest
-   check_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel!, (Matrix{Float64},))]; fail = :error)
+   test_signatures([(dot3, (NTuple{3,Float64}, NTuple{3,Float64})), (kernel!, (Matrix{Float64},))])
    ```
    Or sweep what actually compiled, scoping out cold/plan-time helpers with a regex or predicate:
    ```julia
-   audit(MyPkg; sweep = true, mode = :fast, exempt = r"^_plan")
+   test_compiled(MyPkg; exempt = r"^_plan")
    ```
 
-The choice between the two is the main trade-off. Per-call `@assert_*` is cheap and targeted; the
-| `@assert_noalloc f(args...)` | call is allocation-free (AllocCheck under `StrictModeTest`; a value-free IR scan otherwise, reported `:suspect`) |
-or sweep everything and exempt the rest.
+The choice between the two is the main trade-off. A signature list is targeted and says what you
+promised; a sweep is broad but noisy, since it covers whatever happened to compile. Annotate the hot
+kernels, or sweep everything and exempt the rest.
 
 ## API
 
 | Macro / function | Guarantee |
 |---|---|
-| `@assert_noalloc f(args...)` | call is allocation-free (AllocCheck; `@allocated` fallback) |
+| `@assert_noalloc f(args...)` | report if the call allocates (value-free IR scan, or `@allocated` with `static=false`) |
 | `@assert_noboxing f(args...)` | forbid boxing / dynamic dispatch, but **allow** legitimate buffer allocation |
 | `@assert_owned f(args...)` | fail on a runtime `AbstractDict` lookup on the hot path (GKH-ownership: an owned scratch/workspace must resolve via a const-dispatched accessor, not a keyed probe) |
-| `@assert_typestable f(args...)` | concrete return type + no internal instability/dispatch (JET + `@inferred`) |
+| `@assert_typestable f(args...)` | concrete return type (throws) + an internal-dispatch IR signal (warns) |
 | `@assert_inlined f(args...)` | fail unless the call is inlined (best-effort; not part of `@strict`) |
 | `@assert_vectorized f(args...)` | fail unless the loop SIMD-vectorized (best-effort, LLVM IR scan) |
 | `@assert_no_scalar_loops f(args...)` | fail if a scalar (non-vectorized) hot loop is detected between audited kernels (best-effort) |
 | `@assert_effects f(args...) (…)` | verify the compiler's inferred effects (`Base.infer_effects`) |
 | `@assert_trim_safe f(args...)` | fail on dynamic dispatch / reflection that `juliac --trim=safe` rejects (`:trimsafe` guarantee; static scan only) |
-| `@assert_trim_compatible f(args...)` | like `@assert_trim_safe`, but escalates to juliac's authoritative verifier when `TrimCheck` is loaded (i.e. under `StrictModeTest`) |
+| `@assert_trim_compatible f(args...)` | the same static scan, under the name that pairs with `@test_trim_compatible` (juliac's authoritative verifier) |
 | `@assert_concurrency_safe f(plan, args...)` | fail unless `f` treats its plan arg as read-only (no write of, or through, the plan) — proof that one plan is safe to share across concurrent tasks |
 | `@assert_no_threadid_state f(args...)` | fail on mutable state indexed by `Threads.threadid()` (the task-migration hazard) |
 | `descend(f, types)` | drop into Cthulhu to *see* inlining/effects/LLVM (weak dep) |
@@ -237,15 +233,15 @@ or sweep everything and exempt the rest.
 | `@strict_function def` | verify the definition's contract at precompile time |
 | `@strict_contract I begin … end` | declare a TypeContracts interface carrying perf guarantees |
 | `@verify_strict T begin … end` | verify an implementation's surface *and* performance |
-| `@explain f(args...)` | aggregate `@code_warntype` + JET + AllocCheck into one "why did it fail" report (never throws) |
+| `@explain f(args...)` | aggregate `@code_warntype`, the inferred return type, and the IR signals into one "why did it fail" report (never throws) |
 | `@unroll for i in lo:hi …` | fully unroll a fixed-count loop with literal indices (kills runtime-tuple-index boxing); not gated |
 | `staticval(n)` | lift a count into the type domain (`Val{n}`) for compile-time specialization |
-| `check(f, types)` | function API — guarantees on a `(function, signature)`, no macro interference |
+| `findings(f, types)` | function API — guarantees on a `(function, signature)`, no macro interference |
 | `@strict module … end` | mark a whole module; checked automatically at load |
-| `check_all` / `check_compiled` | re-check the registry / sweep what actually compiled |
-| `check_signatures(pairs)` | check an explicit `(f, types)` list — no `src` annotations needed |
 | `audit` / `watch` | structured one-shot report for agents / live Revise loop for humans |
-| `divergence_report(f, types)` | compare `:fast` vs `:full` verdicts for a signature; `save_divergence` persists a corpus sweep |
+| `@test_noalloc` / `@test_noboxing` / `@test_typestable` / `@test_trim_compatible` | **StrictModeTest**: the proofs of the same properties, and they throw |
+| `test_signatures` / `test_compiled` / `test_registered` | **StrictModeTest**: gate a signature list / what actually compiled / the registry |
+| `divergence_report(f, types)` | **StrictModeTest**: compare the scan's and the proof's verdicts for a signature; `save_divergence` persists a corpus sweep |
 | `pool_balance_report(...)` | diagnostic for `@assert_no_threadid_state`-adjacent thread-pool balance questions |
 | `enable_checks!` / `disable_checks!` / `checks_enabled` | toggle / query the compile-time gate |
 
@@ -259,11 +255,10 @@ See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 
 ### Status
 Working through the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps):
-the time tax (a cheap `:fast` triage over all properties, an incremental cache, and threaded
-sweeps), staying opt-in (`@strict module` checks everything automatically, and `@strict_exempt`
-opts cold code out), and scheduling visibility (`@assert_vectorized`, `@assert_effects`, and
-Cthulhu's `descend`). It all sits on a v0.3 ergonomics layer (`check`, `audit`, `watch`) over the
-v0.2 guarantee set.
+the time tax (a cheap value-free triage over all properties, plus an incremental cache), staying
+opt-in (`@strict module` checks everything automatically, and `@strict_exempt` opts cold code out),
+and scheduling visibility (`@assert_vectorized`, `@assert_effects`, and Cthulhu's `descend`). It all
+sits on an ergonomics layer (`findings`, `audit`, `watch`) over the guarantee set.
 
 ## Installation
 

@@ -35,7 +35,7 @@ end
     using StrictMode
     # The interprocedural eqtable rule is deliberately IdDict-shaped (a known, documented
     # precision/recall tradeoff — see the comment in static_ownership.jl), but a plain (non-IdDict)
-    # value-keyed Dict reached through a callee must still not be flagged: check_compiled and the
+    # value-keyed Dict reached through a callee must still not be flagged: the compiled sweep and the
     # direct rule (`_mi_typekey_dict_lookup`) require a Type/Symbol key, so a hash-Dict-based
     # config-style lookup one level down stays clean.
     const _SO_ITP_STR = Dict{String, Int}("a" => 1)

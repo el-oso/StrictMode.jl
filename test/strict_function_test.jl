@@ -4,11 +4,16 @@
     @test square(7) == 49
 end
 
-@testitem "@strict_function rejects an allocating definition at definition time" begin
-    using StrictMode
-    @test_throws StrictViolation begin
-        @strict_function leaky(n::Int) = sum(collect(1:n))
-    end
+@testitem "@strict_function reports an allocating definition at definition time" begin
+    using StrictMode, StrictModeTest
+    # The declaration runs at the enclosing module's precompile, where the proof is unreachable by
+    # construction, so a value-free guess must not be able to abort the load. Reaching the next line
+    # at all is the assertion that it did not throw.
+    @strict_function leaky(n::Int) = sum(collect(1:n))
+    @test leaky(3) == 6
+    @test_logs (:warn,) match_mode = :any StrictMode._verify_strict_def(leaky, (Int,), "leaky(Int)")
+    # …and it registers, so the test environment re-proves the same signature and DOES fail.
+    @test_throws StrictViolation test_signatures([(leaky, (Int,))]; guarantees = (:noalloc,))
 end
 
 @testitem "@strict_function rejects a type-unstable definition" begin

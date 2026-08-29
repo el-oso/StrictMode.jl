@@ -1,26 +1,31 @@
-# Agentic feedback: a one-shot, structured, exit-coded counterpart to the Revise loop. An AI
-# coding agent (or a CI / pre-commit hook) runs `audit`, reads the machine-readable findings, and
-# drives an edit→check→fix loop. Unlike the macros it never throws on violations — the caller
-# reads the report and the exit code.
+# Agentic feedback: a one-shot, structured counterpart to the Revise loop. An AI coding agent (or a
+# human at a prompt) runs `audit`, reads the machine-readable findings, and drives an
+# edit→check→fix loop. It reports; it never throws, and it never sets an exit status. Its verdicts
+# come from the value-free engine, whose allocation findings are structural guesses — a tool that
+# reports is allowed to be wrong, a tool that gates is not. `StrictModeTest`'s `test_*` drivers gate.
 
 """
-    audit(target = :registered; format = :json, io = stdout, exit_on_fail = false,
+    audit(target = :registered; format = :json, io = stdout,
           guarantees = nothing, sweep = false, require = nothing,
           only = nothing, exempt = ()) -> Vector{StrictFinding}
 
 Run the strict checks once, write the findings to `io` in a machine-readable `format`, and return
-them, the same `Vector{StrictFinding}` you get from [`check`](@ref), [`check_all`](@ref), and
-[`check_compiled`](@ref). [`nfailures`](@ref) gives you the count, and `exit_on_fail = true` sets
-the process exit status to the number of failures. That's the entry point for an agent or for CI:
+them, the same `Vector{StrictFinding}` you get from [`findings`](@ref). [`nfailures`](@ref) gives
+you the count. That's the discovery entry point for an agent or for a dev loop:
 
 ```bash
-julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json, exit_on_fail = true)'
+julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json)'
 ```
 
+**This is a discovery tool, not a gate.** Its verdicts come from a value-free engine whose
+allocation findings are structural guesses, so it reports and never sets an exit status; a human or
+an agent reads the output and judges. To gate a build, add `StrictModeTest` to the test environment
+and use its `test_*` drivers, which run the proofs.
+
 `target`:
-- `:registered` — the mark-once registry ([`check_all`](@ref)), the "check what I promised" scope.
+- `:registered` — the mark-once registry, the "check what I promised" scope.
 - a `Module` — by default, the registered functions declared in that module. Pass `sweep = true` to
-  also run the usage-driven [`check_compiled`](@ref) over everything the module compiled. That's
+  also sweep everything the module has actually compiled. That's
   noisier, so scope it with `only` / `exempt`.
 
 `format` is `:json`, `:jsonlines`, `:github`, or `:text`. Each JSON finding carries `guarantee`,
@@ -36,7 +41,7 @@ unchecked; opting out requires a visible exempt.
 `inline_suggest = true` additionally runs [`inline_suggestions`](@ref): informational
 "consider `@inline` on X" findings (`guarantee = :inline_suggestion`, `status = :info`) for
 `@generated` / in-loop callees the compiler left non-inlined. They are **never failures**
-(`nfailures`/`exit_on_fail` ignore them) — a prompt to benchmark, not a gate.
+(`nfailures` ignores them) — a prompt to benchmark, not a gate.
 
 `static_ownership_suggest = true` additionally runs [`static_ownership_suggestions`](@ref):
 informational "consider GKH ownership" findings (`guarantee = :static_ownership`,
@@ -48,13 +53,11 @@ function audit(
         target = :registered;
         format::Symbol = :json,
         io::IO = stdout,
-        exit_on_fail::Bool = false,
         guarantees = nothing,
         sweep::Bool = false,
         require::Union{Nothing, Symbol} = nothing,
         only = nothing,
         exempt = (),
-        mode::Symbol = :fast,
         inline_suggest::Bool = false,
         static_ownership_suggest::Bool = false,
     )
@@ -64,7 +67,7 @@ function audit(
         throw(ArgumentError("audit: require = :public needs a Module target"))
     fs = StrictFinding[]
     if target === :registered
-        append!(fs, check_all(; guarantees, fail = :none, mode))
+        append!(fs, _findings_all(; guarantees))
         if inline_suggest || static_ownership_suggest
             for ((f, types), _) in STRICT_REGISTRY
                 _is_exempt(f) && continue
@@ -77,10 +80,10 @@ function audit(
             end
         end
     elseif target isa Module
-        append!(fs, _registered_findings_in(target; guarantees, mode))   # declared scope (quiet)
+        append!(fs, _registered_findings_in(target; guarantees))   # declared scope (quiet)
         if sweep
             gs = guarantees === nothing ? (:typestable, :noalloc) : guarantees
-            append!(fs, check_compiled(target; guarantees = gs, fail = :none, only, exempt, mode))
+            append!(fs, _findings_compiled(target; guarantees = gs, only, exempt))
         end
         require === :public && append!(fs, _coverage_findings(target; only, exempt))
         # Inline / static-ownership suggestions are informational (status :info, never failures)
@@ -91,6 +94,5 @@ function audit(
         throw(ArgumentError("audit target must be :registered or a Module, got $(target)"))
     end
     format_findings(io, fs; format)
-    exit_on_fail && nfailures(fs) > 0 && exit(nfailures(fs))
     return fs
 end

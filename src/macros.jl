@@ -5,7 +5,7 @@
 # Split a call expression into `(function-expr, [positional-arg-exprs], [(kwname, valexpr)...])`.
 # Handles plain calls `f(a, b)`, keyword calls `f(a; k=v)` / `f(a, k=v)`, and broadcasts
 # `f.(a, b)` (rewritten to `broadcast(f, a, b)`). Genuinely unsupported forms (bare macrocalls,
-# blocks, non-calls) get a clear error pointing at the interference-proof `StrictMode.check`.
+# blocks, non-calls) get a clear error pointing at the interference-proof `StrictMode.findings`.
 function _callinfo(call)
     # Broadcasting: `f.(xs...)` parses as `Expr(:., f, Expr(:tuple, xs...))`.
     if Meta.isexpr(call, :., 2) && Meta.isexpr(call.args[2], :tuple)
@@ -15,7 +15,7 @@ function _callinfo(call)
         ArgumentError(
             "StrictMode guarantee macros expect a call `f(args...)` or broadcast `f.(args...)`, " *
                 "got: $call. For blocks or other forms, use the function API: " *
-                "`StrictMode.check(f, (T1, T2, …))`."
+                "`StrictMode.findings(f, (T1, T2, …))`."
         )
     )
     fexpr = call.args[1]
@@ -44,7 +44,7 @@ function _collect_kw!(kwexprs, p)
         throw(
             ArgumentError(
                 "StrictMode guarantee macros can't handle the keyword form `$p` (e.g. `; kw...` " *
-                    "splats). Use the function API instead: `StrictMode.check(f, (T1, T2, …))`."
+                    "splats). Use the function API instead: `StrictMode.findings(f, (T1, T2, …))`."
             )
         )
     end

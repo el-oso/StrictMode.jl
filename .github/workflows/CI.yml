@@ -35,23 +35,23 @@ jobs:
       # `Pkg.test()`, NOT `runtests.jl` directly: it builds the proper test environment and forces
       # `--check-bounds=yes`, which changes codegen. Running the file directly leaves bounds checking
       # at `auto` and silently skips that whole configuration — it is how five vectorization-shape
-      # failures stayed invisible here. test/Project.toml sets [preferences.StrictMode]
-      # checks_enabled=true, so the failing-path items actually exercise the guarantees.
+      # failures stayed invisible here. checks_enabled defaults to true, so the failing-path items
+      # actually exercise the guarantees, and StrictModeTest refuses to load if that is not so.
       - run: julia --project=. -e 'import Pkg; Pkg.test(; coverage = true)'
         env:
           JULIA_NUM_THREADS: 2
-      # The split's premise, and the ONLY place it can be checked: StrictMode with no analysis
-      # backend installed. Every item in test/ runs with StrictModeTest loaded, so none of them can
+      # The split's premise, and the ONLY place it can be checked: StrictMode with no
+      # proofs installed. Every item in test/ runs with StrictModeTest loaded, so none of them can
       # catch a guarantee that has re-acquired a hard AllocCheck/JET/TrimCheck dependency — which
       # would break StrictMode as a plain [deps] entry in a consumer's Project.toml.
-      - name: StrictMode standalone (no analysis backend)
+      - name: StrictMode standalone (no proofs installed)
         run: |
           julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
           JULIA_LOAD_PATH="@:@stdlib" \
           julia --project=test/standalone test/standalone/runtests.jl
-      # StrictModeTest's own suite: the `_be_*` seam implementations (allocation classification,
-      # ignore_throw, the JET and TrimCheck drivers). StrictMode cannot test these — over there the
-      # seam is a set of undefined stub functions.
+      # StrictModeTest's own suite: the proof primitives (allocation classification, ignore_throw,
+      # the JET and TrimCheck drivers) and the @test_* / test_* gating surface. StrictMode cannot test
+      # these: it does not depend on AllocCheck, JET, or TrimCheck at all.
       - name: StrictModeTest suite
         run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test()'
       # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the

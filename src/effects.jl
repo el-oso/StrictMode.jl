@@ -107,9 +107,8 @@ end
 # So the exemption is granted at the STATIC-IR level instead (the same reliable technique
 # `_mi_dict_lookup` already uses for `@assert_owned`): recognize a call that routes through a
 # barrier via its resolved `:invoke` callee type, and skip recursing into it for alloc/boxing/
-# dictlookup signals — the barrier's cold-path cost is not a steady-state cost. `:full` mode then
-# substitutes this (already-correct) heuristic for AllocCheck's proof on a barrier-containing call
-# — see `_checked_allocs` in backend.jl.
+# dictlookup signals — the barrier's cold-path cost is not a steady-state cost. `StrictModeTest`
+# substitutes this (already-correct) heuristic for AllocCheck's proof on a barrier-containing call.
 
 # `OncePerTask` is deliberately NOT included: unlike `OncePerProcess`/`OncePerThread` (which
 # resolve to a non-inlined `init_perprocesss`/`init_perthreads`-style cold-path closure — the
@@ -132,17 +131,16 @@ const _ALLOC_BARRIERS = Base.IdSet{Any}()
     register_alloc_barrier!(f)
 
 Mark `f` as a one-time-init allocation barrier: a function that allocates on its first call (per
-process/thread/task) and is alloc-free on every subsequent call. `@assert_noalloc`/
-`@assert_noboxing` (and `findings`/`check`) then treat a call reaching `f` as exempt from
-`:full`'s all-paths AllocCheck proof for that call, the same way `Base.OncePerProcess`/
-`OncePerThread` are recognized automatically — use this for a hand-rolled memoization pattern
-that doesn't use one of those two `Base` types (this includes `Base.OncePerTask`, which is
-**not** auto-recognized — see the note on `_BASE_BARRIER_TYPES` — wrap it in your own function
-and register that instead).
+process/thread/task) and is alloc-free on every subsequent call. The allocation scan then stops at
+`f` instead of counting its initializer, the same way `Base.OncePerProcess`/`OncePerThread` are
+recognized automatically — use this for a hand-rolled memoization pattern that doesn't use one of
+those two `Base` types (this includes `Base.OncePerTask`, which is **not** auto-recognized — see
+the note on `_BASE_BARRIER_TYPES` — wrap it in your own function and register that instead).
+`StrictModeTest` honors the same registration: it substitutes this heuristic for AllocCheck's
+all-paths proof on a call whose only allocation risk is the barrier.
 
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
-the findings cache (it changes `:full` `:noalloc`/`:noboxing` verdicts for every caller of `f`).
-See [`set_ignore_barrier!`](@ref) to disable the exemption globally.
+the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).
 
 ```julia
 @noinline function _my_calibrator()
@@ -242,10 +240,35 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     return (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
 end
 
+const _IGNORE_THROW = Ref(true)
+
+"""
+    ignore_throw() -> Bool
+
+Whether allocation analysis ignores allocations on never-taken throw branches — a `BoundsError`
+construction and the like (default `true`). Hot-path semantics: a runtime-zero-alloc kernel with
+bounds checks is not a violation. Both tiers honor it, so the scan and `StrictModeTest`'s
+AllocCheck proof answer the same question. See [`set_ignore_throw!`](@ref).
+"""
+ignore_throw() = _IGNORE_THROW[]
+
+"""
+    set_ignore_throw!(b::Bool)
+
+Set whether allocation analysis ignores throw-branch allocations. `true` (default) gives hot-path
+semantics; `false` counts allocations on error branches that never execute. Clears the findings
+cache, since it changes `:noalloc`/`:noboxing` results.
+"""
+function set_ignore_throw!(b::Bool)
+    _IGNORE_THROW[] = b
+    clear_cache!()
+    return b
+end
+
 # Per-statement "this straight-line region ends in an unreachable return" mask — the throw-path
 # approximation of AllocCheck's `ignore_throw = true`: error branches build messages/exceptions
-# (real allocations, but never taken on the success path), and `:full` doesn't count them, so the
-# heuristic must not either. A region is [previous terminator + 1 .. terminator]; it is dead-end
+# (real allocations, but never taken on the success path), and the proof doesn't count them, so the
+# scan must not either. A region is [previous terminator + 1 .. terminator]; it is dead-end
 # when its terminator is `ReturnNode()` with no value (= unreachable, i.e. after a throw).
 function _deadend_mask(code::Vector{Any})
     dead = falses(length(code))

@@ -35,11 +35,10 @@ fail are shown as annotated code, so the build itself stays green.
 using StrictMode
 ```
 
-## `@assert_noalloc` — no heap allocations
+## `@assert_noalloc` / `@test_noalloc` — no heap allocations
 
-For this one, StrictMode hands the call to [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl)
-and asks it to prove there's no way the call can allocate. Dynamic dispatch and boxing both show up
-as allocations, so they get caught here as well.
+`@assert_noalloc` scans the call's typed IR for allocation sites. Dynamic dispatch and boxing both
+show up as allocations, so they get caught here as well.
 
 ```@example guide
 dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
@@ -47,14 +46,14 @@ dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 @assert_noalloc dot3((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 ```
 
-When static analysis can't run on a call, `static = false` falls back to measuring it directly
-with `@allocated`, after a warmup pass:
+`static = false` measures the call directly with `@allocated` after a warmup pass instead — a
+value-dependent measurement of what actually ran, rather than a signature-level verdict:
 
 ```julia
-@assert_noalloc static = false stream_step!(buffer, x)   # measures @allocated, not a static proof
+@assert_noalloc static = false stream_step!(buffer, x)
 ```
 
-An allocating hot loop gets turned away:
+An allocating hot loop gets reported:
 
 ```julia
 function grow_and_sum(n)
@@ -66,9 +65,23 @@ function grow_and_sum(n)
 end
 
 @assert_noalloc grow_and_sum(10)
+# ┌ Warning: StrictViolation (@noalloc): guarantee not satisfied
+# │   target:  grow_and_sum(10)
+# │   reason:  allocates / boxes (value-free IR scan) …
+# └   note:    StrictMode's `@noalloc` check is a heuristic, so it reports rather than gating.
+```
+
+**Reported, not thrown** — see [Why `@assert_noalloc` reports instead of
+gating](#Why-@assert_noalloc-reports-instead-of-gating) below. The proof is
+`StrictModeTest`'s `@test_noalloc`, which hands the call to
+[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and asks it to prove there is no way the
+call can allocate, on any path:
+
+```julia
+using StrictMode, StrictModeTest        # test/Project.toml
+@test_noalloc grow_and_sum(10)
 # ERROR: StrictViolation (@noalloc): guarantee not satisfied
-#   target:  grow_and_sum(10)
-#   reason:  call provably allocates (… site(s)): …
+#   reason:  allocates (… site(s)) …
 ```
 
 ### One-time-init calibration doesn't have to break this
@@ -94,33 +107,40 @@ auto-recognized (its implementation has no detectable non-inlined callee boundar
 wrap it in your own function and register that instead).
 
 
-### `:suspect` — when the verdict is a guess
+### Why `@assert_noalloc` reports instead of gating
 
-Without `StrictModeTest` loaded, `@assert_noalloc` and `@assert_noboxing` are decided by a value-free
-scan of **typed IR**. AllocCheck works on **LLVM IR**, after the optimizer has run, so an allocation
-LLVM elides is invisible to the proof and still plainly visible to the scan. The classic shape:
+`@assert_noalloc` and `@assert_noboxing` are decided by a value-free scan of **typed IR**.
+AllocCheck works on **LLVM IR**, after the optimizer has run, so an allocation LLVM elides is
+invisible to the proof and still plainly visible to the scan. The classic shape:
 
 ```julia
 mkvec(n::Int) = length(Vector{Float64}(undef, n))
 @allocated mkvec(4)     # => 0   — the array is never materialized
 ```
 
-The heuristic flags it; AllocCheck does not; the truth is 0 bytes. On one real consumer package,
-19 of 68 such findings were false, every one measuring 0 bytes.
+The scan flags it; AllocCheck does not; the truth is 0 bytes. On one real consumer package, 19 of
+68 such findings were false, every one measuring 0 bytes.
 
-So these verdicts carry `status = :suspect` rather than `:fail`. They render as `?` instead of `✗`,
-[`nsuspect`](@ref) counts them separately — and they **still count as failures**: [`nfailures`](@ref)
-includes them, and `check`/`audit` still throw. A sweep that went green while sitting on a real
-allocation regression would be worse than a noisy one.
+A check that guesses must not be able to abort a build, so these emit a **warning** rather than
+throwing a [`StrictViolation`](@ref). That matters most at load time: [`@strict_function`](@ref)
+runs at the annotated module's own precompile, where `StrictModeTest` is a test-environment
+dependency and therefore not loadable by construction — a structural guess there would break a
+consumer's module load for code that may be provably clean.
 
-The exception is load time. [`@strict_function`](@ref) runs at the annotated module's own precompile,
-where `StrictModeTest` is a test-environment dependency and therefore not loadable by construction —
-so there a `:suspect` verdict emits a **warning** instead of throwing. A module load should not be
-decidable by a structural guess, and the declaration is registered either way, so the same signature
-is re-checked against the proof when the test suite runs.
+The declaration is registered either way, so the proof still gets its turn:
 
-Add `StrictModeTest` and every `:suspect` becomes a proved `:pass` or `:fail`.
-## `@assert_noboxing` — forbid boxing, allow buffers
+```julia
+using StrictMode, StrictModeTest     # in test/
+@test_noalloc kernel!(C, A, B)       # AllocCheck's all-paths proof — throws
+test_registered()                    # …or re-prove everything that was declared
+```
+
+Guarantees whose check *observes* compiled output rather than inferring about it — `:typestable`'s
+return-type layer, `:memsafe`, `:vectorized`, `:no_spill`, `:inlined`, `:owned` — throw from
+StrictMode directly. The ones that guess (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
+`:trimsafe`/`:trim_compatible`, and `:typestable`'s IR boxing signal) report.
+
+## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It only objects to the
 allocations that come from type uncertainty: boxing (the runtime-tuple-index trap, or a captured
@@ -143,7 +163,9 @@ That same call doesn't get past `@assert_noalloc`, which forbids allocation of a
 
 ```julia
 @assert_noalloc fill_sum(3)
-# ERROR: StrictViolation (@noalloc): call provably allocates … Vector{Float64} …
+# ┌ Warning: StrictViolation (@noalloc): allocates / boxes … Vector{Float64} …
+@test_noalloc fill_sum(3)
+# ERROR: StrictViolation (@noalloc): allocates (1 site(s)) …
 ```
 
 Boxing and dynamic dispatch, though, are still out:
@@ -151,17 +173,19 @@ Boxing and dynamic dispatch, though, are still out:
 ```julia
 boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, runtime index
 @assert_noboxing boxy((1, 2.0, 3.0f0))
-# ERROR: StrictViolation (@noboxing): call boxes / dynamically dispatches …
-#   Allocating runtime call to "jl_get_nth_field_checked" …
+# ┌ Warning: StrictViolation (@noboxing): boxing / dynamic dispatch (value-free IR scan)
 ```
 
-Because it has to classify each allocation, it always runs the static AllocCheck analysis, so it
-needs the backend that `StrictModeTest` provides.
+Classifying an allocation as *boxing* specifically is what AllocCheck does exactly, so
+`@test_noboxing` is where the distinction is proved — the scan treats an abstract-eltype container
+as boxing, which is a code smell rather than a boxing proof.
 
-## `@assert_typestable` — concrete, stable types
+## `@assert_typestable` / `@test_typestable` — concrete, stable types
 
-This one pairs two checks: `Test.@inferred` insists the return type is concrete, and
-`JET.@report_opt` insists there's no instability or runtime dispatch hiding inside.
+Two layers, graded differently. `@assert_typestable` insists the return type is concrete —
+exact for the question it asks, so a violation **throws** — and adds an IR signal for internal
+dispatch hiding behind a concrete return, which is a heuristic and so only **warns**.
+`@test_typestable` replaces that second layer with `JET.@report_opt`, and throws on it.
 
 ```@example guide
 affine(x) = 2x + 1
@@ -258,7 +282,8 @@ reflecty(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection →
 As an engine guarantee it is `:trim_compatible` (with `:trimsafe` the static subset):
 
 ```julia
-check(reflecty, (Int,); guarantees = (:trim_compatible,))
+findings(reflecty, (Int,); guarantees = (:trim_compatible,))     # report
+test_signatures([(reflecty, (Int,))]; guarantees = (:trim_compatible,))   # prove (StrictModeTest)
 ```
 
 ## `@strict` — every per-call guarantee at once

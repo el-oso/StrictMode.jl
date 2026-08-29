@@ -1,19 +1,11 @@
-# `@assert_noalloc` — fail if a call allocates. Static proof via AllocCheck where possible,
-# empirical `@allocated` fallback when static analysis bails (e.g. a construct it can't reason
-# about). Dynamic dispatch / boxing surface here too, since AllocCheck reports them as
-# allocating.
-
-function _format_allocs(results; header = "call provably allocates")
-    io = IOBuffer()
-    println(io, header, " (", length(results), " site(s)):")
-    for (i, a) in enumerate(results)
-        print(io, "  [", i, "] ")
-        # AllocCheck instances `show` with their source location and reason; reuse that.
-        print(io, a)
-        i < length(results) && println(io)
-    end
-    return String(take!(io))
-end
+# `@assert_noalloc` — report if a call allocates. A value-free scan of typed IR by default, or an
+# empirical `@allocated` measurement on request. Dynamic dispatch / boxing surface here too, since
+# both count as allocation.
+#
+# Both engines are heuristics, so both REPORT rather than gate (see `_guarantee_gates` in
+# report.jl): typed IR still carries an allocation LLVM will later elide, and `@allocated` reads a
+# `gc_num` counter that shows a per-call delta on SIMD/`GC.@preserve` code with nothing allocated.
+# The proof is `StrictModeTest`'s `@test_noalloc`, which runs AllocCheck.
 
 # Force specialization on the thunk type (`where {F}`): otherwise calling a Function-typed
 # argument is a dynamic dispatch that itself allocates, producing a false positive in the
@@ -21,77 +13,37 @@ end
 @inline _allocated(thunk::F) where {F} = @allocated thunk()
 
 # Resolve @assert_noalloc's (and @strict's/@kernel's) check strategy. `static_opt` is the parsed
-# `static=` keyword value, or `nothing` if not given. An explicit value always wins: `true` forces
-# AllocCheck's static proof (which needs the StrictModeTest backend), `false` forces the empirical
-# `@allocated` path. With no override the default is the value-free `_alloc_signals` heuristic —
-# not `@allocated`, which is value-dependent and reserved for the explicit opt-out.
+# `static=` keyword value, or `nothing` if not given. `false` forces the empirical `@allocated`
+# path; the default is the value-free `_alloc_signals` scan, which is a signature-level verdict
+# rather than a measurement of one call's inputs.
 _noalloc_mode(static_opt::Union{Nothing, Bool}) =
-    static_opt === nothing ? :heuristic : static_opt ? :static : :empirical
+    isnothing(static_opt) ? :heuristic : static_opt ? :static : :empirical
 
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; mode::Symbol) where {F}
-    # `:heuristic` means "no explicit `static=`, use the best engine available". When StrictModeTest
-    # is loaded it supplies AllocCheck, so the default escalates to the proof at CALL time — the same
-    # compiled call site runs the heuristic in a dev session and the proof under test. An explicit
-    # `static = true`/`false` is a user decision and is never overridden.
-    mode === :heuristic && backend_available() && (mode = :static)
+    mode === :static && throw(
+        ArgumentError(
+            "@assert_noalloc: `static = true` requested AllocCheck's static proof, which lives in " *
+                "the companion `StrictModeTest` package. Add it to this environment and write " *
+                "`@test_noalloc $target` — that macro IS the proof, and unlike this one it gates. " *
+                "Drop `static = true` here to keep the value-free scan."
+        )
+    )
     val = thunk()                 # warm up / force compilation, and capture the call's value
-    if mode === :static
-        _require_backend()
-        try
-            results, _ = _checked_allocs(f, types)
-            if !isempty(results)
-                _fail(:noalloc, target, _format_allocs(results))
-            end
-            return val
-        catch err
-            err isa StrictViolation && rethrow()
-            # Static analysis could not run on this call; fall through to the empirical path.
-        end
-    elseif mode === :heuristic
-        # F38 — the :fast default (no explicit `static=`). A value-free IR scan (`_alloc_signals`,
-        # the same engine `findings(...; mode=:fast)` uses), not the value-dependent `@allocated`
-        # measurement below: matches what the batch API promises ("quick triage, no
-        # execution"), which this macro's default path had been
-        # silently missing — it always fell straight to `@allocated`, an empirical measurement of
-        # THIS call's inputs, not a signature-level verdict.
+    if mode === :heuristic
         sig = _alloc_signals(f, types)
-        if sig.alloc || sig.boxing || sig.abscontainer !== nothing
-            _fail(:noalloc, target, _box_msg("allocates / boxes (fast heuristic)", sig))
+        if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
+            _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
         end
         return val
     end
-    # mode === :empirical (explicit `static=false`), or :static's fallback when AllocCheck
-    # could not analyze this call.
     n = _allocated(thunk)         # measure the steady-state call (gc_num delta)
     if n > 0
-        # `@allocated` is the `gc_num().allocd` delta, which can be **nonzero with no real allocation** — a
-        # GC accounting artifact (SIMD / `GC.@preserve`-heavy kernels show a fixed per-call delta even when
-        # AllocCheck and `--track-allocation` prove the call allocates nothing). So a nonzero number alone
-        # is not proof. If the static backend (AllocCheck) is loaded, it is authoritative — escalate to it:
-        # only fail if it *also* finds a real allocation site; if it proves the call clean, the `@allocated`
-        # number was an artifact, so pass (with a note).
-        if backend_available()
-            results = try
-                first(_checked_allocs(f, types))
-            catch err
-                err isa StrictViolation && rethrow()
-                nothing
-            end
-            if results !== nothing && isempty(results)
-                @warn "StrictMode @assert_noalloc: `$target` measured @allocated=$n B, but AllocCheck " *
-                    "proves the call allocates nothing — a gc_num accounting artifact (common in SIMD / " *
-                    "GC.@preserve kernels), not an allocation. Treating as alloc-free." maxlog = 1
-                return val
-            end
-            results !== nothing && !isempty(results) && _fail(:noalloc, target, _format_allocs(results))
-        end
         _fail(
             :noalloc, target,
             "call allocated $n bytes at runtime (@allocated). NOTE: `@allocated` measures the gc_num " *
                 "counter, which can report a per-call artifact with no real allocation on SIMD / " *
-                "GC.@preserve-heavy code — load AllocCheck and use `:full` mode for a definitive static " *
-                "proof. If the call references a non-`const` global, the allocation may be the binding " *
-                "(global access boxes), not the function — make it `const`/local."
+                "GC.@preserve-heavy code. If the call references a non-`const` global, the allocation " *
+                "may be the binding (global access boxes), not the function — make it `const`/local."
         )
     end
     return val
@@ -103,33 +55,36 @@ end
     @assert_noalloc static=false f(args...)
     @assert_noalloc f(args...) types=(T1, T2, …)
 
-Fail unless the call `f(args...)` is allocation-free.
+Report if the call `f(args...)` allocates.
 
-By default StrictMode uses the same value-free IR heuristic that
-`findings(...; mode=:fast)` uses (`StrictMode._alloc_signals` — no execution beyond the one
-warmup call every path needs to produce the return value). Pass `static = false` to force the
-empirical `@allocated`-after-warmup path instead (useful when the heuristic can't reason about a
-construct, or per E3, when a non-`const` global's binding boxing is the actual culprit); `static =
-true` forces the AllocCheck proof regardless of mode.
+**This reports; it does not gate.** Both of its engines are heuristics — typed IR still carries an
+allocation LLVM will later elide, and `@allocated` reads a counter that shows a per-call delta on
+SIMD code that allocates nothing — so a violation is a `@warn`, not a thrown
+[`StrictViolation`](@ref). A check that guesses must not be able to abort a build. For the proof,
+add `StrictModeTest` to the test environment and use `@test_noalloc`, which runs AllocCheck's
+all-paths static analysis and does gate.
 
-Each argument is evaluated exactly once. With checks disabled (the production default) this expands
-to the bare call, with no overhead left behind.
+By default this is the same value-free IR scan [`findings`](@ref) uses
+(`StrictMode._alloc_signals` — no execution beyond the one warmup call every path needs to produce
+the return value). Pass `static = false` to force the empirical `@allocated`-after-warmup path
+instead, which is value-dependent but sees what actually ran (useful when the scan can't reason
+about a construct, or when a non-`const` global's binding boxing is the actual culprit).
 
-**Keyword arguments** are supported: `f(x; k=v)` is proved at its real specialization (routed
-through `Core.kwcall`, so AllocCheck sees the keyword sorter's method). **`types = (…)`** pins the
-analyzed signature explicitly, mirroring [`@assert_typestable`](@ref) — handy for type-argument
-functions where `typeof.(args)` would not name the real call-site specialization.
+Each argument is evaluated exactly once. With checks disabled this expands to the bare call, with
+no overhead left behind.
+
+**Keyword arguments** are supported: `f(x; k=v)` is analyzed at its real specialization (routed
+through `Core.kwcall`). **`types = (…)`** pins the analyzed signature explicitly, mirroring
+[`@assert_typestable`](@ref) — handy for type-argument functions where `typeof.(args)` would not
+name the real call-site specialization.
 
 ```julia
-@assert_noalloc sum(rand(100))         # ok
-@assert_noalloc grows_a_vector(1000)   # throws StrictViolation listing the allocation
-@assert_noalloc fill!(buf, x; offset=0)  # ok: keyword call proved as-is
+@assert_noalloc sum(rand(100))           # ok
+@assert_noalloc grows_a_vector(1000)     # warns, naming the allocation
+@assert_noalloc fill!(buf, x; offset=0)  # ok: keyword call analyzed as-is
 ```
 """
 macro assert_noalloc(args...)
-    # Default to AllocCheck's static proof in :full analysis, the value-free _alloc_signals
-    # heuristic in :fast; an explicit `static = …` always wins (`false` forces the empirical
-    # @allocated path — see `_noalloc_mode`).
     pos, opts = _macro_call(args, (:static, :types))
     mode = _noalloc_mode(haskey(opts, :static) ? opts[:static]::Bool : nothing)
     isempty(pos) && throw(ArgumentError("@assert_noalloc needs a call expression"))
@@ -145,29 +100,11 @@ macro assert_noalloc(args...)
 end
 
 # --- @assert_noboxing: the boxing/dispatch subclass of allocations specifically ---
-# Classifying an AllocCheck instance as boxing lives in `StrictModeTest`, behind `_be_is_boxing`,
-# since it pattern-matches AllocCheck's instance types. Without that backend this falls back to the
-# same value-free IR signal `findings(...; mode=:fast)` uses for `:noboxing` — `sig.boxing ||
-# sig.abscontainer !== nothing` — so the macro is usable in a plain `StrictMode` environment rather
-# than erroring on a missing backend.
+
 function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
-    if !backend_available()
-        sig = _alloc_signals(f, types)
-        if sig.boxing || sig.abscontainer !== nothing
-            _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (fast heuristic)", sig))
-        end
-        return nothing
-    end
-    results = try
-        first(_checked_allocs(f, types))
-    catch err
-        err isa StrictViolation && rethrow()
-        _fail(:noboxing, target, "AllocCheck could not analyze this call: $(sprint(showerror, err))")
-        return nothing
-    end
-    boxing = filter(_be_is_boxing, results)
-    if !isempty(boxing)
-        _fail(:noboxing, target, _format_allocs(boxing; header = "call boxes / dynamically dispatches"))
+    sig = _alloc_signals(f, types)
+    if sig.boxing || !isnothing(sig.abscontainer)
+        _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig))
     end
     return nothing
 end
@@ -175,19 +112,19 @@ end
 """
     @assert_noboxing f(args...)
 
-Fail if the call boxes or dynamically dispatches — the *type-uncertainty* subclass of
+Report if the call boxes or dynamically dispatches — the *type-uncertainty* subclass of
 allocations — while **allowing** legitimate typed heap allocations (a `Vector`, a `Memory`, …).
 
 This is the relaxed sibling of [`@assert_noalloc`](@ref): use it for a hot path that may
 allocate a buffer but must never box (the runtime-tuple-index trap, captured-variable `Core.Box`,
-or accidental dynamic dispatch). With `StrictModeTest` loaded it is AllocCheck's static analysis,
-which classifies each allocation; without it, the same value-free IR boxing signal the `:fast`
-engine uses. Each argument is evaluated
-once; the macro evaluates to the call's value; disabled builds expand to the bare call.
+or accidental dynamic dispatch). Like `@assert_noalloc` it reads typed IR and therefore **reports
+rather than gates**; `StrictModeTest`'s `@test_noboxing` classifies AllocCheck's allocation
+instances and does gate. Each argument is evaluated once; the macro evaluates to the call's value;
+disabled builds expand to the bare call.
 
 ```julia
 @assert_noboxing fill_buffer!(buf, xs)        # ok: allocates a buffer, but no boxing
-@assert_noboxing sum_runtime_index(htuple)    # throws: jl_get_nth_field_checked (tuple boxing)
+@assert_noboxing sum_runtime_index(htuple)    # warns: runtime tuple index (boxing)
 ```
 """
 macro assert_noboxing(args...)

@@ -18,10 +18,10 @@
     @test err isa StrictViolation
 
     # batch path: isbits union → :pass
-    fs = check(finds_it, (Vector{Int}, Int); guarantees = (:typestable,), fail = :none)
+    fs = findings(finds_it, (Vector{Int}, Int); guarantees = (:typestable,))
     @test first(fs).status === :pass
 
     # batch path: non-isbits union → :fail
-    fs2 = check(unstable, (Int,); guarantees = (:typestable,), fail = :none)
+    fs2 = findings(unstable, (Int,); guarantees = (:typestable,))
     @test first(fs2).status === :fail
 end

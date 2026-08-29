@@ -128,20 +128,16 @@ The function API, the mark-once registry, and the usage-driven sweep. See
 [Automating checks](automating.md).
 
 ```@docs
-check
 findings
 register_strict!
 registered_strict
-check_all
-check_compiled
-check_signatures
 watch
 unwatch
 ```
 
 ## Agentic feedback
 
-One-shot, structured, exit-coded reporting for AI agents and CI. See
+One-shot, structured reporting for AI agents and the dev loop. See
 [Agentic feedback](agents.md).
 
 ```@docs
@@ -151,21 +147,30 @@ static_ownership_suggestions
 StrictFinding
 format_findings
 nfailures
-nsuspect
 ```
 
-## Fast↔full divergence
+## The proof tier — `StrictModeTest`
 
-The `:fast` heuristic and the `:full` proof occasionally disagree (e.g. internal dynamic dispatch with a
-concrete return, which `:fast` misses). `divergence_report` runs both and, on a disagreement, captures an
-**IP-free** record — anonymized signature shape, signal *categories*, and versions only — that you can send
-to the maintainers to fix the heuristic.
+Everything above **reports**. The companion `StrictModeTest` package adds the proofs — AllocCheck's
+static no-allocation analysis, JET's optimization analysis, and TrimCheck's `juliac --trim=safe`
+verifier — and **gates**: a violation throws a [`StrictViolation`](@ref). Add it to your
+`test/Project.toml` and `using StrictModeTest`.
 
-```@docs
-divergence_report
-StrictDivergence
-StrictMode.save_divergence
-```
+| report (StrictMode) | prove and gate (StrictModeTest) |
+| --- | --- |
+| `@assert_noalloc f(x)` | `@test_noalloc f(x)` |
+| `@assert_noboxing f(x)` | `@test_noboxing f(x)` |
+| `@assert_typestable f(x)` | `@test_typestable f(x)` |
+| `@assert_trim_compatible f(x)` | `@test_trim_compatible f(x)` |
+| `findings(f, types)` | `test_signatures(pairs)` |
+| `audit(mod; sweep = true)` | `test_compiled(mod)` |
+| — | `test_registered()` |
+
+It also carries `proof_findings` (the data half of the gating API), `ignore_barrier` /
+`set_ignore_barrier!` (whether a recognized one-time-init barrier is exempt from AllocCheck's
+all-paths proof), and `divergence_report` / `StrictDivergence`, which run both engines on one
+signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
+*categories*, and versions only — that you can send to the maintainers to fix the scan.
 
 ## TypeContracts integration
 
@@ -212,9 +217,8 @@ Checks are gated behind a compile-time setting, on by default. Toggling it write
 enable_checks!
 disable_checks!
 checks_enabled
+proofs_loaded
 assert_enabled
-backend_available
-StrictMode.trimcheck_available
 mca_available
 ignore_throw
 set_ignore_throw!

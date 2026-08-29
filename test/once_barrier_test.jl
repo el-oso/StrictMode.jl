@@ -1,4 +1,4 @@
-@testitem "OncePerProcess-memoized calibrator passes :full @assert_noalloc (issue #14 acceptance)" begin
+@testitem "OncePerProcess-memoized calibrator passes @test_noalloc (issue #14 acceptance)" begin
     using StrictMode, StrictModeTest
     # The `ger!` DRAM-path repro shape: a per-process calibration measured once via
     # Base.OncePerProcess, alloc-free on every steady-state call thereafter.
@@ -12,7 +12,7 @@
     @test !sig.alloc
     @test !sig.boxing
 
-    val = @assert_noalloc steady(1)
+    val = @test_noalloc steady(1)
     @test val == 5
 end
 
@@ -22,15 +22,15 @@ end
     const _NP_ONCE2 = Base.OncePerProcess{Int}(_measure_np2)
     steady2(x::Int) = x + _NP_ONCE2()
 
-    old = StrictMode.ignore_barrier()
-    StrictMode.set_ignore_barrier!(false)
+    old = StrictModeTest.ignore_barrier()
+    StrictModeTest.set_ignore_barrier!(false)
     try
-        @test_throws StrictViolation (@assert_noalloc steady2(1) static = true)
+        @test_throws StrictViolation (@test_noalloc steady2(1))
     finally
-        StrictMode.set_ignore_barrier!(old)
+        StrictModeTest.set_ignore_barrier!(old)
     end
     # restored: exemption active again
-    @test (@assert_noalloc steady2(2) static = true) == 6
+    @test (@test_noalloc steady2(2)) == 6
 end
 
 @testitem "register_alloc_barrier! exempts a hand-rolled memoization pattern" begin
@@ -53,12 +53,12 @@ end
     hr(x::Int) = x + _handrolled_calibrator()
 
     # Not registered yet — reds like any other allocating steady state.
-    @test_throws StrictViolation (@assert_noalloc hr(1))
+    @test_throws StrictViolation (@test_noalloc hr(1))
 
     memoized = _handrolled_calibrator()   # warm it up so the expected value is known
     StrictMode.register_alloc_barrier!(_handrolled_calibrator)
     try
-        @test (@assert_noalloc hr(1)) == 1 + memoized
+        @test (@test_noalloc hr(1)) == 1 + memoized
     finally
         empty!(StrictMode._ALLOC_BARRIERS)
         StrictMode.clear_cache!()
@@ -70,7 +70,7 @@ end
     # Same escape trick: `length(rand(4))` alone is elided by both optimizers (0 B measured).
     _sink2 = Ref{Any}(nothing)
     really_allocates(x::Int) = (a = rand(4); _sink2[] = a; x + length(a))
-    @test_throws StrictViolation (@assert_noalloc really_allocates(1))
+    @test_throws StrictViolation (@test_noalloc really_allocates(1))
 
     sig = StrictMode._alloc_signals(really_allocates, (Int,))
     @test !sig.barrier
@@ -93,10 +93,10 @@ end
     @test sig.barrier         # the OncePerProcess call inside `caller` is still correctly recognized
     @test sig.alloc           # but `helper`'s OWN allocation must NOT be hidden by that recognition
 
-    @test_throws StrictViolation (@assert_noalloc caller(4))
+    @test_throws StrictViolation (@test_noalloc caller(4))
 end
 
-@testitem "a barrier call that ALSO reads an abstract-eltype container is not exempted (:full must not be laxer than :fast)" begin
+@testitem "a barrier call that ALSO reads an abstract-eltype container is not exempted (the proof must not be laxer than the scan)" begin
     using StrictMode, StrictModeTest
     # Without also checking `abscontainer`, the exemption gate would pass :full while :fast's own
     # `_findings_fast` correctly fails via `sig.abscontainer !== nothing` (check.jl) — a barrier
@@ -114,7 +114,7 @@ end
     @test !sig.boxing
     @test sig.abscontainer !== nothing
 
-    @test_throws StrictViolation (@assert_noalloc lenplus(AbsContainerHolder(Real[1, 2])))
+    @test_throws StrictViolation (@test_noalloc lenplus(AbsContainerHolder(Real[1, 2])))
 end
 
 @testitem "OncePerThread is also recognized end-to-end (not just the bare type predicate)" begin
@@ -131,7 +131,7 @@ end
     @test sig.barrier
     @test !sig.alloc
     @test !sig.boxing
-    @test (@assert_noalloc pt_steady(1)) == 1 + _PT_ONCE()
+    @test (@test_noalloc pt_steady(1)) == 1 + _PT_ONCE()
 end
 
 @testitem "OncePerTask is NOT auto-recognized (different Base implementation, no detectable :invoke)" begin
@@ -155,7 +155,7 @@ end
     ptk_wrapped(x::Int) = x + _ptk_wrapper()
     StrictMode.register_alloc_barrier!(_ptk_wrapper)
     try
-        @test (@assert_noalloc ptk_wrapped(1)) == 1 + _PTK_ONCE()
+        @test (@test_noalloc ptk_wrapped(1)) == 1 + _PTK_ONCE()
     finally
         empty!(StrictMode._ALLOC_BARRIERS)
         StrictMode.clear_cache!()
@@ -183,23 +183,21 @@ end
     @test sig.boxing
 end
 
-@testitem "the barrier exemption is consistent across every :full noalloc entry point" begin
+@testitem "the barrier exemption is consistent across every noalloc entry point" begin
     using StrictMode, StrictModeTest
-    # _checked_allocs was originally wired into @assert_noalloc/@assert_noboxing/findings/check
-    # only — @strict_function (a SEPARATE :full noalloc entry point, at module-load time) and
-    # divergence_report's diagnostic signal labels (a separate, auxiliary raw-AllocCheck call,
-    # NOT the .diverged comparison itself — that already went through `findings`/`_checked_allocs`)
-    # both still called `_be_check_allocs` directly, so a barrier-exempted function could pass
-    # @assert_noalloc/check while still reding at @strict_function load time, or showing a phantom
-    # "full:alloc-sites=N" label in a divergence_report that no longer actually diverges.
+    # The barrier exemption lives in one place (`_checked_allocs`), and every entry point that runs
+    # AllocCheck must route through it: a `@test_noalloc` gate, the drivers, and `divergence_report`'s
+    # diagnostic signal labels (an auxiliary raw-AllocCheck call, not the `.diverged` comparison
+    # itself). Otherwise a barrier-exempted function passes one entry point while reding at another,
+    # or shows a phantom "proof:alloc-sites=N" label in a report that no longer actually diverges.
     _measure_cc() = length(rand(4))
     const _CC_ONCE = Base.OncePerProcess{Int}(_measure_cc)
     steady_cc(x::Int) = x + _CC_ONCE()
 
-    @strict_function steady_cc2(x::Int) = x + _CC_ONCE()   # would previously red at load time
+    @strict_function steady_cc2(x::Int) = x + _CC_ONCE()
     @test steady_cc2(1) == 1 + _CC_ONCE()
 
     d = divergence_report(steady_cc, (Int,); guarantees = (:noalloc,))
     @test isempty(d)
-    @test !any(l -> startswith(l, "full:alloc-sites="), d.full_signals)
+    @test !any(l -> startswith(l, "proof:alloc-sites="), d.proof_signals)
 end

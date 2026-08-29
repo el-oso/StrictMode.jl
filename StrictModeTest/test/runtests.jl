@@ -1,36 +1,22 @@
-# StrictModeTest is a thin package: it implements StrictMode's `_be_*` backend seam and flips the
-# availability flags. These tests cover exactly that seam — the classification and plumbing that
-# StrictMode itself cannot test, because in StrictMode's own suite the seam is a set of undefined
-# stub functions. What the guarantees DO with these results is tested over in StrictMode.
+# StrictModeTest owns the proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` API
+# that gates on them. These tests cover exactly that: the primitives StrictMode itself cannot test,
+# because StrictMode does not depend on those packages at all.
 using StrictModeTest
 using StrictMode
-using AllocCheck
 using Test
 
 # Top level: `const` is not allowed inside a `@testset` (local scope). The sink is what makes the
 # allocation below ESCAPE, so neither optimizer can elide it — see StrictMode's once_barrier fixtures.
 const SINK = Ref{Any}(nothing)
 
-@testset "StrictModeTest — the :full backend seam" begin
+@testset "StrictModeTest — the proof tier" begin
 
-    @testset "__init__ flips both availability flags" begin
-        # Anti-vacuity: with checks disabled every `@assert_*` below is a bare call and passes
-        # regardless. test/Project.toml sets this; assert it rather than trust it.
+    @testset "loading requires checks to be enabled" begin
+        # Anti-vacuity: with checks disabled every `@assert_*` is a bare call, nothing registers,
+        # and `test_registered()` would sweep an empty registry and pass. `__init__` refuses to load
+        # in that state, so reaching this line at all is the assertion — state it anyway.
         @test StrictMode.checks_enabled()
-        @test StrictMode.backend_available()
-        @test StrictMode.trimcheck_available()
-    end
-
-    @testset "every seam stub has an implementation" begin
-        # A stub with no methods would make the corresponding guarantee throw at :full, which is the
-        # failure mode this package exists to prevent.
-        for f in (
-                StrictMode._be_check_allocs, StrictMode._be_is_boxing,
-                StrictMode._be_opt_result, StrictMode._be_opt_reports,
-                StrictMode._be_trim_validate,
-            )
-            @test !isempty(methods(f))
-        end
+        @test StrictMode.proofs_loaded()
     end
 
     clean(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
@@ -44,20 +30,20 @@ const SINK = Ref{Any}(nothing)
 
     allocs(n::Int) = (v = rand(n); SINK[] = v; length(v))
 
-    @testset "_be_check_allocs finds real allocations and clears clean code" begin
-        @test isempty(StrictMode._be_check_allocs(clean, T3))
-        @test !isempty(StrictMode._be_check_allocs(allocs, (Int,)))
+    @testset "the AllocCheck primitive finds real allocations and clears clean code" begin
+        @test isempty(StrictModeTest._raw_allocs(clean, T3))
+        @test !isempty(StrictModeTest._raw_allocs(allocs, (Int,)))
     end
 
-    @testset "_be_is_boxing separates boxing from a plain typed allocation" begin
+    @testset "_is_boxing separates boxing from a plain typed allocation" begin
         # Runtime-indexing a heterogeneous tuple boxes; allocating a Vector does not.
-        boxing_insts = StrictMode._be_check_allocs(boxy, Thet)
+        boxing_insts = StrictModeTest._raw_allocs(boxy, Thet)
         @test !isempty(boxing_insts)
-        @test any(StrictMode._be_is_boxing, boxing_insts)
-        @test !any(StrictMode._be_is_boxing, StrictMode._be_check_allocs(allocs, (Int,)))
+        @test any(StrictModeTest._is_boxing, boxing_insts)
+        @test !any(StrictModeTest._is_boxing, StrictModeTest._raw_allocs(allocs, (Int,)))
     end
 
-    @testset "_be_check_allocs honors ignore_throw" begin
+    @testset "the AllocCheck primitive honors ignore_throw" begin
         # A bounds-check throw branch is an allocation site AllocCheck can see; ignore_throw (the
         # default) must exclude it, since it is not on the hot path.
         sum_unchecked(a::Vector{Float64}, n::Int) = (
@@ -70,42 +56,75 @@ const SINK = Ref{Any}(nothing)
         old = StrictMode.ignore_throw()
         try
             StrictMode.set_ignore_throw!(true)
-            @test isempty(StrictMode._be_check_allocs(sum_unchecked, (Vector{Float64}, Int)))
+            @test isempty(StrictModeTest._raw_allocs(sum_unchecked, (Vector{Float64}, Int)))
             StrictMode.set_ignore_throw!(false)
-            @test !isempty(StrictMode._be_check_allocs(sum_unchecked, (Vector{Float64}, Int)))
+            @test !isempty(StrictModeTest._raw_allocs(sum_unchecked, (Vector{Float64}, Int)))
         finally
             StrictMode.set_ignore_throw!(old)
             StrictMode.clear_cache!()
         end
     end
 
-    @testset "_be_opt_result / _be_opt_reports drive JET" begin
-        @test isempty(StrictMode._be_opt_reports(StrictMode._be_opt_result(clean, T3)))
+    @testset "the JET primitive reports internal dispatch" begin
+        @test isempty(StrictModeTest._opt_reports("clean", clean, T3))
         dispatchy(x) = (v = Any[1, 2.0]; sum(a -> a + x, v))
         dispatchy(1)
-        @test !isempty(StrictMode._be_opt_reports(StrictMode._be_opt_result(dispatchy, (Int,))))
+        @test !isempty(StrictModeTest._opt_reports("dispatchy", dispatchy, (Int,)))
     end
 
-    @testset "_be_trim_validate returns (passed, findings)" begin
-        passed, findings = StrictMode._be_trim_validate(clean, Tuple{NTuple{3, Float64}, NTuple{3, Float64}})
+    @testset "_trim_validate returns (passed, findings)" begin
+        passed, findings = StrictModeTest._trim_validate(clean, Tuple{NTuple{3, Float64}, NTuple{3, Float64}})
         @test passed
         @test isempty(findings)
-        # It also accepts a plain tuple of types, which is the other shape StrictMode calls it with.
-        p2, _ = StrictMode._be_trim_validate(clean, T3)
+        # It also accepts a plain tuple of types, which is the other shape it is called with.
+        p2, _ = StrictModeTest._trim_validate(clean, T3)
         @test p2 === passed
         # A non-inferrable signature is reported, not thrown.
-        bad, why = StrictMode._be_trim_validate(identity, (Any,))
+        bad, why = StrictModeTest._trim_validate(identity, (Any,))
         @test bad isa Bool
         @test why isa Vector{String}
     end
 
-    @testset "loading this package escalates StrictMode's guarantees end to end" begin
-        # The point of the split: the heuristic passes `mkvec` (LLVM elides the allocation) and so
-        # does the proof — but a REAL escaping allocation must fail through the proof path, and
-        # `_noalloc_mode(nothing)` must still be `:heuristic` (the default that escalates), not a
-        # baked `:static`.
-        @test StrictMode._noalloc_mode(nothing) === :heuristic
-        @test_throws StrictViolation @assert_noalloc allocs(4)
-        @test (@assert_noalloc clean((1.0, 2.0, 3.0), (1.0, 2.0, 3.0))) === 14.0
+    @testset "the @test_* macros gate where the @assert_* macros only report" begin
+        # This is the split's whole premise: the same property, two macros, and only one of them
+        # can break a build.
+        @test_throws StrictViolation @test_noalloc allocs(4)
+        @test (@test_noalloc clean((1.0, 2.0, 3.0), (1.0, 2.0, 3.0))) === 14.0
+        @test_throws StrictViolation @test_noboxing boxy((1, 2.0, 3.0f0))
+        @test (@test_typestable clean((1.0, 2.0, 3.0), (1.0, 2.0, 3.0))) === 14.0
+        @test (@test_trim_compatible clean((1.0, 2.0, 3.0), (1.0, 2.0, 3.0))) === 14.0
+
+        # …while StrictMode's own macro warns on the very same call.
+        @test_logs (:warn,) match_mode = :any (@assert_noalloc allocs(4))
+    end
+
+    @testset "the drivers collect every failure and raise once" begin
+        err = try
+            test_signatures([(clean, T3), (allocs, (Int,)), (boxy, Thet)]; guarantees = (:noalloc,))
+            nothing
+        catch e
+            e
+        end
+        @test err isa StrictViolation
+        # Both failing signatures must appear: a gate that stops at the first bad method leaves the
+        # rest unevaluated, which is how a sweep reports less than it checked.
+        @test occursin("allocs", err.details)
+        @test occursin("boxy", err.details)
+    end
+
+    @testset "test_registered reports its count and re-proves the registry" begin
+        old = copy(StrictMode.STRICT_REGISTRY)
+        try
+            empty!(StrictMode.STRICT_REGISTRY)
+            StrictMode.register_strict!(clean, T3; guarantees = (:noalloc,))
+            @test_logs (:info,) match_mode = :any test_registered()
+            StrictMode.register_strict!(allocs, (Int,); guarantees = (:noalloc,))
+            @test_throws StrictViolation test_registered()
+        finally
+            empty!(StrictMode.STRICT_REGISTRY)
+            merge!(StrictMode.STRICT_REGISTRY, old)
+        end
     end
 end
+
+include("divergence_test.jl")

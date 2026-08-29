@@ -99,11 +99,11 @@ end
     @test occursin("leaf!", err.details)   # the message points at the leaf kernel
 end
 
-@testitem "check_compiled warns on an empty sweep; :vectorized is a guarantee (F12)" begin
+@testitem "the compiled sweep warns when empty; :vectorized is a guarantee (F12)" begin
     using StrictMode
     using SIMD: Vec, vload, vstore
     module EmptyMod end
-    @test_logs (:warn, r"no compiled method specializations") check_compiled(EmptyMod; mode = :fast)
+    @test_logs (:warn, r"no compiled method specializations") StrictMode._findings_compiled(EmptyMod)
 
     # :vectorized is now a valid engine guarantee (what F12's audit invocation passed).
     vk!(y::Vector{Float64}, x::Vector{Float64}) = (
@@ -111,7 +111,7 @@ end
             vstore(vload(Vec{8, Float64}, x, i) * 2.0, y, i)
         end; y
     )
-    fs = check(vk!, (Vector{Float64}, Vector{Float64}); guarantees = (:vectorized,), fail = :none, mode = :fast)
+    fs = findings(vk!, (Vector{Float64}, Vector{Float64}); guarantees = (:vectorized,))
     @test first(fs).status === :pass
 end
 

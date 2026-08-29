@@ -13,7 +13,7 @@ end
     @test_throws StrictViolation @assert_typestable pick(heterogeneous, rand(1:3))
 end
 
-@testitem "_typestable_fast (the :fast-mode check) passes/fails correctly" begin
+@testitem "_typestable_fast passes/fails correctly" begin
     using StrictMode
     stable(x) = 2x + 1
     @test StrictMode._typestable_fast("t", stable, (Float64,)) === nothing   # concrete return
@@ -27,13 +27,13 @@ end
     using StrictMode
     # A concrete return can hide runtime dispatch: `c.f` is `::Function` (abstract), so `c.f(1)`
     # dynamically dispatches even though the `::Int` annotation makes the overall return concrete.
-    # findings(...; mode=:fast) already caught this via the IR boxing signal (check.jl's
-    # _findings_fast); _typestable_fast (the macro's :fast path) had been missing it.
+    # The IR boxing signal catches this shape. It is a heuristic — a guarded `@warn` in a numeric
+    # function reads the same way — so this layer reports rather than gating.
     struct CB38
         f::Function
     end
     callit(c::CB38) = (c.f(1))::Int
-    @test_throws StrictViolation StrictMode._typestable_fast("callit", callit, (CB38,))
+    @test_logs (:warn,) match_mode = :any StrictMode._typestable_fast("callit", callit, (CB38,))
 
     # A genuinely stable call with no internal dispatch still passes.
     stable(x) = 2x + 1
@@ -41,8 +41,8 @@ end
 end
 
 @testitem "typestable is this-level (depth-0): a resolved :invoke to a boxy helper is not the caller's instability" begin
-    using StrictMode
-    # Regression for the 0.3.6 :fast false positive on PureBLAS complex herk!/_cpotrf_lower!. Those call
+    using StrictMode, StrictModeTest
+    # Regression guard, from a false positive on PureBLAS complex herk!/_cpotrf_lower!. Those call
     # the complex `_l3ws` workspace accessor, a `get!` on an abstract-valued IdDict that boxes internally
     # but whose result is narrowed by a `::L3Workspace{T}` assert. The caller has NO dispatch of its own
     # (only a resolved :invoke), so it is type-stable — JET's :full opt-analysis agrees. The typestable
@@ -51,15 +51,15 @@ end
     boxy_helper() = get!(() -> Int[], _BOXD, :k)::Vector{Int}   # boxes internally; result narrowed
     stable_caller() = length(boxy_helper())::Int                # only a resolved :invoke to the helper
     @test StrictMode._typestable_fast("stable_caller", stable_caller, ()) === nothing        # :fast passes
-    @test all(f -> f.status === :pass, check(stable_caller, (); guarantees = (:typestable,), fail = :none))
+    @test all(f -> f.status === :pass, findings(stable_caller, (); guarantees = (:typestable,)))
     # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
-    @test any(f -> f.status === :fail, check(stable_caller, (); guarantees = (:noboxing,), fail = :none, mode = :full))
+    @test any(f -> f.status === :fail, proof_findings(stable_caller, (); guarantees = (:noboxing,)))
     # And a DIRECT dynamic dispatch (F38's shape) is still caught at this level.
     struct _CB
         f::Function
     end
     callit(c::_CB) = (c.f(1))::Int
-    @test_throws StrictViolation StrictMode._typestable_fast("callit", callit, (_CB,))
+    @test_logs (:warn,) match_mode = :any StrictMode._typestable_fast("callit", callit, (_CB,))
 end
 
 @testitem "@assert_typestable accepts keyword arguments (issue #4)" begin
@@ -84,31 +84,22 @@ end
     @test (@assert_typestable g(Float64) types = (Type{Float64},)) isa Vector{Float64}
 end
 
-@testitem "@assert_typestable :full path names the check when the backend itself fails (issue #25)" begin
-    using StrictMode
-    # A backend failure — most commonly JET's `report_opt` expanding a runtime-dead `@generated`
-    # branch whose generator throws — must surface as `StrictMode.AnalysisError`, naming the
-    # checked call and signature, rather than as the bare exception raised inside the backend.
-    #
-    # On this Julia version, Core.Compiler absorbs a `@generated` generator's exception during
-    # ordinary type inference into an inference failure (the callee's return type widens to `Any`)
-    # instead of propagating it, so a real generator failure can't be driven through JET to exercise
-    # this path directly. Add a method to the backend seam scoped to a private test function
-    # instead: it produces the exact `_be_opt_result` failure `_assert_opt` (typestability.jl) must
-    # turn into a located diagnostic.
+@testitem "a JET failure names the check instead of surfacing raw (issue #25)" begin
+    using StrictMode, StrictModeTest
+    # A backend failure — in the field, JET's `report_opt` expanding a runtime-dead `@generated`
+    # branch whose generator throws — must surface as `StrictModeTest.AnalysisError`, naming the
+    # checked call and signature, rather than as the bare exception raised inside JET. A signature
+    # with no matching method makes JET throw for real, which drives the same wrapper.
     mystery_kernel_25(x::Int) = x + 1
-    StrictMode._be_opt_result(::typeof(mystery_kernel_25), types) =
-        throw(AssertionError("AVX-512 only"))
-
     err = try
-        StrictMode.@assert_typestable mystery_kernel_25(1)
+        StrictModeTest._opt_reports("mystery_kernel_25(1)", mystery_kernel_25, (String,))
         nothing
     catch e
         e
     end
-    @test err isa StrictMode.AnalysisError
+    @test err isa StrictModeTest.AnalysisError
     msg = sprint(showerror, err)
     @test occursin("mystery_kernel_25(1)", msg)          # names the checked call
-    @test occursin("AssertionError: AVX-512 only", msg)  # preserves the original error
+    @test occursin("String", msg)                        # …and the analyzed signature
     @test occursin("@generated", msg)                    # points at the likely cause and the fix
 end

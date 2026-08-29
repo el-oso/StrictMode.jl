@@ -4,14 +4,14 @@
     unsafe_fn(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection → trim-unsafe
 
     @test (@assert_trim_safe safe_fn(3)) == 7                        # passes → returns the value
-    @test_throws StrictViolation @assert_trim_safe unsafe_fn(3)      # reflection → fails loudly
+    @test_logs (:warn,) match_mode = :any (@assert_trim_safe unsafe_fn(3))   # reflection → reported
 
-    # As an engine guarantee — value-free, so identical in :fast and :full (no backend needed).
-    @test all(f -> f.status === :pass, check(safe_fn, (Int,); guarantees = (:trimsafe,), fail = :none, mode = :fast))
-    @test any(f -> f.status === :fail, check(unsafe_fn, (Int,); guarantees = (:trimsafe,), fail = :none, mode = :full))
+    # As an engine guarantee — value-free, no backend needed.
+    @test all(f -> f.status === :pass, findings(safe_fn, (Int,); guarantees = (:trimsafe,)))
+    @test any(f -> f.status === :fail, findings(unsafe_fn, (Int,); guarantees = (:trimsafe,)))
 end
 
-@testitem ":trimsafe flows through check_compiled / audit (sweep)" begin
+@testitem ":trimsafe flows through the compiled sweep" begin
     using StrictMode
     module TrimMix
     hotk(x::Int) = x + 1
@@ -19,7 +19,7 @@ end
     end
     TrimMix.hotk(1); TrimMix.reflecty(1)                                # compile both
 
-    fs = check_compiled(TrimMix; guarantees = (:trimsafe,), mode = :fast)
+    fs = StrictMode._findings_compiled(TrimMix; guarantees = (:trimsafe,))
     @test any(f -> f.func == "reflecty" && f.status === :fail, fs)
     @test any(f -> f.func == "hotk" && f.status === :pass, fs)
 end
@@ -35,9 +35,9 @@ end
     using StrictMode
     # status/reason on the structured StrictFinding are deliberately untouched by the issue #13
     # caveat — this pins the back-compat contract explicitly (a heuristic PASS is not distinguishable
-    # from an authoritative one via `findings`/`check`; the caveat is macro-path-only visibility).
+    # from an authoritative one via `findings`; the caveat is macro-path-only visibility).
     safe_fn(x::Int) = x * 2 + 1
-    fs = only(check(safe_fn, (Int,); guarantees = (:trimsafe,), fail = :none, mode = :fast))
+    fs = only(findings(safe_fn, (Int,); guarantees = (:trimsafe,)))
     @test fs.status === :pass
     @test fs.reason == ""
 

@@ -43,14 +43,12 @@ export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export @golden
 export StrictViolation, StrictReport, StrictFinding
-export check, findings, check_all, check_compiled, check_signatures, audit, format_findings, nfailures, nsuspect, watch, unwatch
+export findings, audit, format_findings, nfailures, watch, unwatch
 export inline_suggestions
 export static_ownership_suggestions
-export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
-export enable_checks!, disable_checks!, checks_enabled, assert_enabled, backend_available
-export BackendUnavailable, AnalysisError
-export register_alloc_barrier!, ignore_barrier, set_ignore_barrier!
+export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
+export register_alloc_barrier!
 
 include("preferences.jl")
 include("report.jl")
@@ -73,12 +71,13 @@ include("cache.jl")
 include("check.jl")
 include("memsafe.jl")
 include("mca.jl")
-include("divergence.jl")
 include("registry.jl")
 include("audit.jl")
 include("golden.jl")
 
-# The heavy analysis (AllocCheck + JET) and its precompile warmup live in
-# StrictModeTest, which fills them unconditionally.
+# The proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` gating API live in the
+# companion `StrictModeTest` package. Nothing here calls them, and nothing here is a stub they fill.
+
+__init__() = _announce_tier()
 
 end # module StrictMode

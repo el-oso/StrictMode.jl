@@ -7,7 +7,7 @@
     # Old fast passed (return concrete, dynamic :call result concrete); JET-full flags it.
     using StrictMode
     mkshape(x::UInt8, n::Int) = sum(ntuple(i -> x + UInt8(i), n))
-    fs = StrictMode.findings(mkshape, (UInt8, Int); guarantees = (:typestable, :noboxing), mode = :fast)
+    fs = StrictMode.findings(mkshape, (UInt8, Int); guarantees = (:typestable, :noboxing))
     @test all(StrictMode._failed(f) for f in fs)
 end
 
@@ -17,7 +17,7 @@ end
     using StrictMode
     @noinline hidden_alloc(n::Int) = zeros(n)
     outer(n::Int) = length(hidden_alloc(n))
-    fs = StrictMode.findings(outer, (Int,); guarantees = (:noalloc,), mode = :fast)
+    fs = StrictMode.findings(outer, (Int,); guarantees = (:noalloc,))
     @test StrictMode._failed(only(fs))
 end
 
@@ -26,7 +26,7 @@ end
     # :foreigncall, so the old scan missed direct Memory allocation entirely.
     using StrictMode
     memv(n::Int) = Memory{Int}(undef, n)
-    fs = StrictMode.findings(memv, (Int,); guarantees = (:noalloc,), mode = :fast)
+    fs = StrictMode.findings(memv, (Int,); guarantees = (:noalloc,))
     @test StrictMode._failed(only(fs))
 end
 
@@ -36,7 +36,7 @@ end
     # kernel false-positives (pfft! did, during development).
     using StrictMode
     guarded(x::Float64) = (x < 0 && throw(ArgumentError("negative")); 2x)
-    fs = StrictMode.findings(guarded, (Float64,); guarantees = (:noalloc, :typestable), mode = :fast)
+    fs = StrictMode.findings(guarded, (Float64,); guarantees = (:noalloc, :typestable))
     @test all(f.status === :pass for f in fs)
 end
 
@@ -48,9 +48,9 @@ end
     usplit(x::Int) = (y = maybe(x); y === nothing ? 0 : y)
     @noinline maybevec(x::Int) = x > 0 ? Int[] : nothing
     usplitheap(x::Int) = maybevec(x) === nothing
-    fs = StrictMode.findings(usplit, (Int,); guarantees = (:typestable, :noboxing), mode = :fast)
+    fs = StrictMode.findings(usplit, (Int,); guarantees = (:typestable, :noboxing))
     @test all(f.status === :pass for f in fs)
-    fs = StrictMode.findings(usplitheap, (Int,); guarantees = (:noboxing,), mode = :fast)
+    fs = StrictMode.findings(usplitheap, (Int,); guarantees = (:noboxing,))
     @test only(fs).status === :pass
 end
 
@@ -62,7 +62,7 @@ end
     @noinline hidden_alloc(n::Int) = zeros(n)
     @noinline workspace(n::Int) = hidden_alloc(n)
     driver(n::Int) = length(workspace(n))
-    fs = StrictMode.findings(driver, (Int,); guarantees = (:noalloc,), mode = :fast)
+    fs = StrictMode.findings(driver, (Int,); guarantees = (:noalloc,))
     @test StrictMode._failed(only(fs))
 end
 
@@ -82,6 +82,6 @@ end
     area(s::Sq) = s.s^2
     @noinline dispatch_sum(v::Vector{Shape}) = sum(a -> area(a), v)
     caller(v::Vector{Shape}) = dispatch_sum(v)
-    fs = StrictMode.findings(caller, (Vector{Shape},); guarantees = (:noboxing,), mode = :fast)
+    fs = StrictMode.findings(caller, (Vector{Shape},); guarantees = (:noboxing,))
     @test StrictMode._failed(only(fs))
 end

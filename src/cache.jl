@@ -1,7 +1,7 @@
-# Incremental cache for `findings`, keyed by method identity + world + signature + guarantees +
-# mode. A re-run of `audit`/`check_all` only re-analyzes methods that actually changed: a
-# redefined method (a Revise edit) gets a fresh `Method` identity → cache miss → re-analyzed;
-# everything unchanged hits. This is what makes a whole-package re-check near-instant.
+# Incremental cache for `findings`, keyed by method identity + world + signature + guarantees.
+# A re-run of `audit` only re-analyzes methods that actually changed: a redefined method (a Revise
+# edit) gets a fresh `Method` identity → cache miss → re-analyzed; everything unchanged hits. This
+# is what makes a whole-package re-check near-instant.
 #
 # Limitation (documented): the key is the *checked* method, not its callees — editing a callee
 # without touching the caller can leave the caller's cached finding stale until `clear_cache!()`.
@@ -11,13 +11,13 @@ const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
 
-function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees, mode::Symbol)
+function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     m = try
         which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    return (objectid(m), m.primary_world, types, Tuple(guarantees), mode, _IGNORE_THROW[])
+    return (objectid(m), m.primary_world, types, Tuple(guarantees))
 end
 
 """

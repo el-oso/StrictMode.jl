@@ -1,10 +1,9 @@
-@testitem "divergence_report — flags fast↔full disagreement, IP-free" begin
-    using StrictMode
+@testset "divergence_report — flags scan-vs-proof disagreement, IP-free" begin
 
     # Internal dynamic dispatch through an abstract eltype, but with a concrete (`Float64`) return,
     # buried two non-inlined hops below the entry point — deeper than `_FAST_ALLOC_DEPTH[]` (2)
-    # follows by default. `:fast` misses it (concrete return + out-of-reach depth fools the boxing
-    # heuristic) and `:full` (AllocCheck/JET) catches it regardless of depth.
+    # follows by default. The scan misses it (concrete return + out-of-reach depth fools the boxing
+    # heuristic) and the AllocCheck/JET proof catches it regardless of depth.
     #
     # SIX concrete subtypes, deliberately: with only two, Julia 1.13's optimizer union-splits the
     # `area` call and devirtualizes the whole thing — measured 32 B on 1.12 vs 0 B on 1.13 — so
@@ -43,7 +42,7 @@
     @test !isempty(d)
     # Which guarantee surfaces it is an optimizer detail (1.12 and 1.13 both report :noalloc and
     # :noboxing here, but that is not something to pin). What must hold is the
-    # DIRECTION — some dispatch-driven guarantee where :fast passes and :full catches it.
+    # DIRECTION — some dispatch-driven guarantee where the scan passes and the proof catches it.
     @test any(t -> t[1] in (:typestable, :noalloc, :noboxing) && t[2] == false && t[3] == true, d.diverged)
 
     s = sprint(show, d)
@@ -54,7 +53,7 @@
     @test !occursin("total", s)
     # but the anonymized shape, category labels, and versions must
     @test occursin("T1", s)
-    @test occursin("full:", s)
+    @test occursin("proof:", s)
     @test occursin("julia=", s) && occursin("StrictMode=", s)
 
     # An agreeing function → no divergence
@@ -64,7 +63,7 @@
     # save_divergence writes the same IP-free content to a file
     path = tempname()
     try
-        StrictMode.save_divergence(d, path)
+        StrictModeTest.save_divergence(d, path)
         txt = read(path, String)
         @test !occursin("Shape", txt)
         @test occursin("versions", txt)
@@ -73,22 +72,19 @@
     end
 end
 
-@testitem "divergence is about FLAGGED-ness, not the status symbol" begin
-    using StrictMode, StrictModeTest
-    # Regression guard. A `:fast` allocation verdict is `:suspect`, not `:fail`. When this map was
-    # built with `x.status === :fail` it recorded every such finding as "fast did not flag", so a
-    # call BOTH engines flag reported as a divergence — the exact inverse of what divergence_report
-    # is for, and it fired on every fast allocation finding rather than on real disagreements.
+@testset "divergence is about FLAGGED-ness, not the status symbol" begin
+    # Regression guard: this map must be built from `_failed`, the one predicate that decides what
+    # counts. A hand-written status comparison here recorded findings as "the scan did not flag", so
+    # a call BOTH engines flag reported as a divergence — the exact inverse of what
+    # divergence_report is for.
     boxy(t) = (
         s = 0.0; for i in 1:3
             s += t[i]
         end; s
     )
     T = (Tuple{Int, Float64, Float32},)
-    ff = findings(boxy, T; guarantees = (:noalloc, :noboxing), mode = :fast)
-    fl = findings(boxy, T; guarantees = (:noalloc, :noboxing), mode = :full)
-    @test all(f -> f.status === :suspect, ff)      # fast labels its guess...
-    @test all(f -> f.status === :fail, fl)         # ...full proves it
-    @test all(StrictMode._failed, vcat(ff, fl))    # but BOTH flagged the call
+    ff = findings(boxy, T; guarantees = (:noalloc, :noboxing))
+    fl = proof_findings(boxy, T; guarantees = (:noalloc, :noboxing))
+    @test all(StrictMode._failed, vcat(ff, fl))    # BOTH engines flagged the call
     @test isempty(divergence_report(boxy, T; guarantees = (:noalloc, :noboxing)).diverged)
 end

@@ -1,5 +1,5 @@
 @testitem "noalloc ignores never-taken throw branches by default (F8)" begin
-    using StrictMode
+    using StrictMode, StrictModeTest
     @test StrictMode.ignore_throw() === true
 
     # Runtime zero-alloc, but has a bounds-check throw branch (no @inbounds) — AllocCheck with
@@ -11,11 +11,11 @@
     )
     A = rand(8)
 
-    @test (@assert_noalloc f(A, 8) static = true) isa Float64          # default: throw branch ignored → clean
+    @test (@test_noalloc f(A, 8)) isa Float64                         # default: throw branch ignored → clean
 
     StrictMode.set_ignore_throw!(false)
     try
-        @test_throws StrictViolation @assert_noalloc f(A, 8) static = true   # now the throw branch is counted
+        @test_throws StrictViolation @test_noalloc f(A, 8)            # now the throw branch is counted
     finally
         StrictMode.set_ignore_throw!(true)                # restore the default
     end

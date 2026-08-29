@@ -39,7 +39,8 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
             "$(types); precompile guarantees skipped (call sites can still use @strict)."
         nothing
     end
-    # Record it so the automatic drivers (check_all, @strict module, the Revise loop) re-check it.
+    # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
+    # StrictModeTest.test_registered) re-check it.
     register_strict!(f, types)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
@@ -50,36 +51,24 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
         )
     end
     # Allocation-freedom (subsumes runtime dispatch / boxing, which show as allocations). This runs
-    # at the enclosing module's PRECOMPILE, so it must not require an analysis backend: a package
+    # at the enclosing module's PRECOMPILE, so it cannot use an analysis backend: a package
     # annotating its own `src/` depends on `StrictMode` alone, and AllocCheck/JET live in
-    # `StrictModeTest`, which is a test-environment dependency and is not loadable here. With the
-    # backend absent we use the value-free IR heuristic; a test run that adds `StrictModeTest`
-    # re-checks the same declarations against the proof.
-    if !backend_available()
-        sig = _alloc_signals(f, types)
-        if sig.alloc || sig.boxing || sig.abscontainer !== nothing
-            # WARN, never throw. This runs at the enclosing module's precompile, where the proof is
-            # unreachable by construction — so under `fail_mode = :error` a heuristic false positive
-            # would abort the consumer's module load for code that may be provably clean. That is
-            # exactly what made checks-on unusable in PureBLAS (issue #18 part 2, a `trmv!` false
-            # positive), and the heuristic's measured false-positive rate on a real consumer is ~28%
-            # (issue #17: 19 of 68, every one measuring 0 bytes). A build must not be decidable by a
-            # structural guess. The declaration is registered either way, so a test run with
-            # `StrictModeTest` loaded re-checks this same signature against AllocCheck and DOES fail.
-            @warn "@strict_function $target: " *
-                _box_msg(
-                "allocates / boxes (fast heuristic — a structural guess, not a proof; " *
-                    "add StrictModeTest to your test environment to resolve it)", sig
-            )
-        end
-        return nothing
-    end
-    try
-        results, _ = _checked_allocs(f, types)
-        isempty(results) || _fail(:strict_function, target, _format_allocs(results))
-    catch err
-        err isa StrictViolation && rethrow()
-        @warn "@strict_function $target: AllocCheck could not analyze this signature ($err)"
+    # `StrictModeTest`, a test-environment dependency that is not loadable here.
+    #
+    # So this WARNS, never throws — a heuristic false positive must not abort the consumer's module
+    # load for code that may be provably clean. That is exactly what made checks-on unusable in
+    # PureBLAS (issue #18 part 2, a `trmv!` false positive), and the scan's measured false-positive
+    # rate on a real consumer is ~28% (issue #17: 19 of 68, every one measuring 0 bytes). The
+    # declaration is registered either way, so `StrictModeTest.test_registered()` re-checks this
+    # same signature against AllocCheck from the test environment and DOES fail.
+    sig = _alloc_signals(f, types)
+    if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
+        @warn "@strict_function $target: " *
+            _box_msg(
+            "allocates / boxes (value-free IR scan — a structural guess, not a proof; " *
+                "add StrictModeTest to your test environment and call test_registered() to " *
+                "resolve it)", sig
+        )
     end
     return nothing
 end
@@ -127,8 +116,8 @@ in `@strict_exempt`, rather than annotating all the hot code.
 
 The definition form defines the function and records its name as exempt; the name form
 (`@strict_exempt foo` or `@strict_exempt :foo`) just records the name. Exempt functions are skipped
-by `check_all`, `audit`, the whole-module load check, and `check_compiled` sweeps. It's never
-gated; the exemption always applies.
+by `audit`, the whole-module load check, and `StrictModeTest`'s `test_registered`/`test_compiled`
+gates. It's never gated itself; the exemption always applies.
 """
 macro strict_exempt(arg)
     if Meta.isexpr(arg, (:function, :(=)))

@@ -181,7 +181,7 @@ This is the automatic, whole-function/whole-module counterpart of [`@assert_inli
 name the call site, the scan finds them.
 
 The `(f, types)` form walks `f`'s own IR. The `Module` form sweeps every concrete method specialization
-the module has compiled (like [`check_compiled`](@ref); warm your kernels first), scoping with
+the module has compiled (warm your kernels first), scoping with
 `only` / `exempt` (a collection of names/functions, a `Regex`, or a predicate).
 
 Callees are **flagged** when they are `@generated` and/or appear **inside a loop** in the caller's IR —

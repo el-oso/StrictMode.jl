@@ -1,29 +1,34 @@
 """
     StrictModeTest
 
-The rigorous half of StrictMode. `StrictMode` itself analyzes with a value-free, Base-inference-only
-engine that needs no backend and is cheap enough to run at load time; `StrictModeTest` adds the
-proofs — AllocCheck's static no-allocation proof, JET's optimization analysis, and TrimCheck's
-`juliac --trim=safe` verifier — and is meant for a package's `test/` environment only.
+The proving half of StrictMode, for a package's `test/` environment.
 
-There is no preference to switch between them: **the tier is the dependency graph.** Depend on
-`StrictMode` and you get the heuristic; add `StrictModeTest` to your test environment and the same
-declarations are re-checked against the proofs.
+`StrictMode` analyzes with a value-free engine — inferred return types plus a scan of typed IR —
+that needs no backend and is cheap enough to run at load time. It **reports**: its allocation
+verdicts are structural guesses, so nothing in it can break a build. `StrictModeTest` adds the
+proofs — AllocCheck's static no-allocation analysis, JET's optimization analysis, and TrimCheck's
+`juliac --trim=safe` verifier — and it **gates**.
 
-This package defines **no macros and exports nothing**. It implements StrictMode's backend seam and
-flips `StrictMode.backend_available()` on in `__init__`; the guarantees then escalate by reading
-that flag at CALL time, so one already-compiled call site runs the heuristic in a package's own
-environment and the proof under test, with nothing recompiled. Use it as:
+There is no preference to switch and no ambient state to read: **which engine a call site uses is
+the macro you wrote.**
+
+| report (StrictMode) | prove and gate (StrictModeTest) |
+| --- | --- |
+| `@assert_noalloc f(x)` | `@test_noalloc f(x)` |
+| `@assert_noboxing f(x)` | `@test_noboxing f(x)` |
+| `@assert_typestable f(x)` | `@test_typestable f(x)` |
+| `@assert_trim_compatible f(x)` | `@test_trim_compatible f(x)` |
+| `findings(f, types)` | [`test_signatures`](@ref) |
+| `audit(mod; sweep = true)` | [`test_compiled`](@ref) |
+| — | [`test_registered`](@ref) |
 
 ```julia
-using StrictMode, StrictModeTest    # both — StrictModeTest supplies no API of its own
+using StrictMode, StrictModeTest    # in test/runtests.jl
 ```
 
-Two consequences worth knowing. Escalation is process-wide and takes effect the moment this package
-loads, so load it once at the top of `test/runtests.jl` rather than inside individual test items.
-And `@strict_function` / `@strict module` can never escalate: they run at the annotated module's own
-precompile, where a test-environment dependency is not loadable by construction. Re-check those
-signatures from test code with `check_signatures` or `audit`, which run at runtime.
+Loading this package requires `StrictMode.checks_enabled()`. With checks off every `@assert_*` is a
+bare call, nothing registers, and `test_registered()` would sweep an empty registry and report
+success — so it refuses to load rather than gate on nothing.
 """
 module StrictModeTest
 
@@ -34,121 +39,57 @@ using TrimCheck
 using TypeContracts   # its TrimDiagnostics parses the trim verifier's output
 using PrecompileTools: @setup_workload, @compile_workload
 
-# ── AllocCheck / JET backend ─────────────────────────────────────────────────────────────────────
-# These fill the seam functions declared in StrictMode's src/backend.jl. They used to live in a
-# package extension gated on AllocCheck+JET being present as weak dependencies; here they are
-# unconditional, because a package that depends on StrictModeTest has asked for exactly this.
+export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible
+export test_signatures, test_compiled, test_registered
+export proof_findings, AnalysisError
+export ignore_barrier, set_ignore_barrier!
+export divergence_report, StrictDivergence
 
-# `ignore_throw` (default true, via `StrictMode.set_ignore_throw!`): don't count allocations on
-# never-taken error/throw branches (BoundsError etc.) — they are not on the hot path and produce
-# false positives on runtime-zero-alloc code.
-StrictMode._be_check_allocs(@nospecialize(f), @nospecialize(types)) =
-    AllocCheck.check_allocs(f, types; ignore_throw = StrictMode._IGNORE_THROW[])
+include("proofs.jl")
+include("macros.jl")
+include("drivers.jl")
+include("divergence.jl")
 
-StrictMode._be_opt_result(@nospecialize(f), @nospecialize(types)) = JET.report_opt(f, types)
-
-StrictMode._be_opt_reports(@nospecialize(r)) = JET.get_reports(r)
-
-# Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
-# uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
-function StrictMode._be_is_boxing(@nospecialize(inst))
-    inst isa AllocCheck.DynamicDispatch && return true
-    if inst isa AllocCheck.AllocatingRuntimeCall
-        n = inst.name
-        # jl_box_int64 (boxing a primitive), jl_get_nth_field_checked (runtime tuple/field index
-        # → boxing). Excludes array-grow / string runtime calls.
-        return occursin("box", lowercase(n)) || occursin("get_nth_field", n)
-    end
-    inst isa AllocCheck.AllocationSite && return inst.type === Core.Box   # captured-variable box
-    return false
-end
-
-# ── TrimCheck backend ────────────────────────────────────────────────────────────────────────────
-# TrimCheck's public API (`@validate` / `validate_function`) only accepts a call-expr or a
-# single-method function eval'd in `Main` — it cannot check an arbitrary concrete `(f, types)`. So we
-# drive its core directly: the same `hook_verify_typeinf_trim() do … typeinf_ext_toplevel(…,
-# TRIM_SAFE) end` that `validate_function` runs, but for our exact signature. We reference
-# TrimCheck's own `Compiler` binding (as `validate_function` does) so we hit the same verifier.
-#
-# (f, types) -> (passed::Bool, findings::Vector{String}). `types` may be a `Type{<:Tuple}`
-# (e.g. `Tuple{Int,Float64}`, as the AllocCheck/JET seam receives) or a plain tuple of types.
-function StrictMode._be_trim_validate(@nospecialize(f), @nospecialize(types))
-    argtypes = (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
-    rts = Base.return_types(f, Tuple{argtypes...})
-    if length(rts) != 1
-        return (
-            false, [
-                "could not infer a single concrete return type ($(length(rts)) results); " *
-                    "trim verification needs a fully-inferred signature",
-            ],
-        )
-    end
-    ret_type = rts[1]
-    Comp = TrimCheck.Compiler
-    try
-        TrimCheck.hook_verify_typeinf_trim() do
-            Comp.typeinf_ext_toplevel(
-                Any[Core.svec(ret_type, Tuple{typeof(f), argtypes...})],
-                [Base.get_world_counter()],
-                Comp.TRIM_SAFE,
-            )
-        end
-        return (true, String[])
-    catch err
-        if err isa TrimCheck.TrimVerificationErrors
-            # Route the raw verifier output through TypeContracts' `TrimDiagnostics` — the same parser
-            # `explain_trim` uses — for deduplicated, source-mapped sites (statement + user frame),
-            # instead of hand-filtering the raw dump.
-            raw = try
-                sprint(show, err)
-            catch
-                ""
-            end
-            tf = TypeContracts.explain_trim_failure(raw)
-            if !tf.recognized || isempty(tf.sites)
-                return (false, ["juliac --trim=safe rejected this signature (verifier output not recognized)"])
-            end
-            findings = String[]
-            for s in tf.sites
-                # frames are innermost-first ⇒ the outermost frame is the user-relevant call site.
-                loc = isempty(s.frames) ? "" :
-                    "  [" * basename(last(s.frames).file) * ":" * string(last(s.frames).line) * "]"
-                push!(findings, s.statement * loc)
-            end
-            if length(findings) > 8
-                extra = length(findings) - 8
-                findings = vcat(findings[1:8], ["… (+$extra more call site(s))"])
-            end
-            return (false, findings)
-        end
-        rethrow(err)
-    end
-end
-
-# Warm JET + AllocCheck into this package's precompile image so the first check in a test run is
-# fast — but only when checks are enabled (otherwise nobody runs them).
+# Warm JET + AllocCheck into this package's precompile image so the first proof in a test run is
+# fast.
 @setup_workload begin
     wk_dot(a, b) = @inbounds a[1] * b[1] + a[2] * b[2]
     A = (1.0, 2.0)
     B = (3.0, 4.0)
     types = (typeof(A), typeof(B))
     @compile_workload begin
-        if StrictMode.CHECKS_ENABLED
-            StrictMode._BACKEND_AVAILABLE[] = true
-            try
-                StrictMode.check(wk_dot, types; guarantees = (:typestable, :noalloc, :noboxing, :inlined), fail = :none)
-                StrictMode._strict_report("warmup", wk_dot, types)   # warms @explain (+ @code_warntype)
-            catch
-            finally
-                StrictMode._BACKEND_AVAILABLE[] = false               # reset; __init__ sets it at load
-            end
+        try
+            _proof_findings(wk_dot, types, (:typestable, :noalloc, :noboxing, :inlined))
+        catch
         end
     end
 end
 
+# The state worth announcing is the TIER, not the on/off switch: with this package loaded,
+# `@assert_*` still only reports and the `@test_*` surface is what gates.
+function _announce()
+    # Quiet while a dependent package is being precompiled — see StrictMode's `_announce_tier`.
+    iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
+    printstyled(stderr, "┌ StrictMode: checks ENABLED — proof tier (StrictModeTest loaded).\n"; color = :green)
+    printstyled(
+        stderr,
+        "│ @assert_* still only report. @test_noalloc / @test_typestable /\n" *
+            "└ test_signatures / test_compiled / test_registered gate on AllocCheck + JET + TrimCheck.\n";
+        color = :green
+    )
+    return nothing
+end
+
 function __init__()
-    StrictMode._BACKEND_AVAILABLE[] = true
-    StrictMode._TRIMCHECK_AVAILABLE[] = true
+    StrictMode.checks_enabled() || error(
+        "StrictModeTest was loaded but `StrictMode.checks_enabled()` is false in this " *
+            "environment, so every `@assert_*` expands to a bare call and nothing registers — " *
+            "`test_registered()` would sweep an empty registry and report success. Checks are on " *
+            "by default, so something set them off: remove `checks_enabled = false` from this " *
+            "environment's `[preferences.StrictMode]` block (or its LocalPreferences.toml) and " *
+            "restart."
+    )
+    _announce()
     return nothing
 end
 

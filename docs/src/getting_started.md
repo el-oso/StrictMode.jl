@@ -7,19 +7,23 @@ using Pkg
 Pkg.add("StrictMode")
 ```
 
-The real analysis is done by [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and
-[JET.jl](https://github.com/aviatesk/JET.jl). Both are heavyweight, so StrictMode keeps them as
-weak dependencies and asks you to add them only in the places you actually run checks:
+`StrictMode` on its own analyzes with a value-free engine — inferred return types plus a scan of
+typed IR — that needs no extra dependency and is cheap enough to run at load time. It **reports**.
+
+The proofs — [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl),
+[JET.jl](https://github.com/aviatesk/JET.jl), and TrimCheck.jl — are heavyweight, so they live in a
+companion package you add to your test environment only:
 
 ```julia
-# in your dev / test / CI environment, alongside StrictMode:
-Pkg.add(["AllocCheck", "JET"])
+# in test/Project.toml, alongside StrictMode:
+Pkg.add("StrictModeTest")
 ```
 
-The backend switches on once you load them (`using AllocCheck, JET`), and
-`StrictMode.backend_available()` will tell you whether it's on. Production code that depends on
-StrictMode with the checks off needs neither package. If you want the live feedback loop, add
-`Revise` too.
+`StrictModeTest` **gates**: it supplies `@test_noalloc` / `@test_typestable` and the
+`test_signatures` / `test_compiled` / `test_registered` drivers, which throw on a violation. Which
+engine a call site uses is decided by the macro you wrote, not by ambient state:
+`StrictMode.proofs_loaded()` tells you which tier a session is in. Production code that depends on
+StrictMode needs neither package. If you want the live feedback loop, add `Revise` too.
 
 ## Enable the checks
 
@@ -141,39 +145,35 @@ live anyway.
 
 ### The two analysis engines
 
-The per-call asserts run on cheap inference-only checks by default — there is no rigor/speed
-preference to set. The rigorous proofs live in the companion `StrictModeTest` package, whose
-backend is loaded; you add it to the test environment and leave it out everywhere else.
+`@assert_*` runs the cheap value-free engine; `@test_*` runs the proof. There is no rigor/speed
+preference to set and no ambient state to read — the macro name selects the engine.
 
-| Package | Type stability | No-allocation / no-boxing | Backend | Per-method cost |
-|---|---|---|---|---|
-| `StrictMode` | `Base.return_types` concreteness | `code_typed` IR + `infer_effects` heuristic | none needed | ~70 µs |
-| `StrictModeTest` | JET `@report_opt` | AllocCheck static proof | AllocCheck + JET | ~900 µs |
+| Package | Macro | Type stability | No-allocation / no-boxing | Per-method cost | On a violation |
+|---|---|---|---|---|---|
+| `StrictMode` | `@assert_*` | `Base.return_types` concreteness + an IR boxing signal | `code_typed` IR + `infer_effects` scan | ~70 µs | reports |
+| `StrictModeTest` | `@test_*` | JET `@report_opt` | AllocCheck static proof | ~900 µs | throws |
 
 `StrictMode`'s engine is a quick triage over all the properties at once, type stability as well as
 allocation and boxing, built entirely on Base's own inference. Because of that it needs no
-AllocCheck or JET backend and runs roughly 10× cheaper per method than the proof (see
-`bench/timetax.jl`). It catches the usual suspects, like explicit heap allocation, boxing, dynamic
-dispatch, and non-concrete returns. Being a heuristic, it can occasionally miss or over-flag
-something that AllocCheck's LLVM-level proof would get exactly right. The split that works well in
-practice: `StrictMode` alone while you iterate, `StrictModeTest` in CI.
+AllocCheck or JET and runs roughly 10× cheaper per method than the proof (see `bench/timetax.jl`).
+It catches the usual suspects, like explicit heap allocation, boxing, dynamic dispatch, and
+non-concrete returns. Being a scan of typed IR it can miss or over-flag something that AllocCheck's
+LLVM-level proof would get exactly right — which is exactly why it reports rather than gating. The
+split that works well in practice: `StrictMode`'s `@assert_*` while you iterate, `StrictModeTest`'s
+`@test_*` and `test_*` drivers in CI.
+
+Two guarantees are graded per layer rather than per package. `@assert_typestable`'s return-type
+concreteness is exact for the question it asks, so it throws; its IR boxing signal is a heuristic,
+so that layer warns. And `@assert_memsafe`, `@assert_vectorized`, `@assert_no_spill` and friends all
+throw, because they *observe* compiled output rather than inferring about it.
 
 ### Incremental re-checks
 
-`findings`, `check`, `audit`, and `check_all` cache their results per `(method, world, signature,
-mode)`. A re-run only re-analyzes the methods that actually changed, so editing one method and
-running `audit` again comes back almost instantly while everything else is a cache hit. Heuristic
-analysis can spread across threads (pass `parallel = true`). [`cache_stats`](@ref) shows you
+`findings` and `audit` cache their results per `(method, world, signature, guarantees)`. A re-run
+only re-analyzes the methods that actually changed, so editing one method and running `audit` again
+comes back almost instantly while everything else is a cache hit. [`cache_stats`](@ref) shows you
 the hits and misses, and [`clear_cache!`](@ref) is there for the one case the cache can't see: when
 you edit a *callee* of a checked method rather than the method itself.
-
-The batch API (`findings`/`check`/`audit`/`check_all`) takes a `mode` keyword if you want to pick
-the engine explicitly for one run:
-
-```julia
-audit(MyPkg; sweep = true, mode = :fast)   # the default
-check(f, types; mode = :full)              # needs the StrictModeTest backend
-```
 
 From here, the [Guarantees](guarantees.md) guide walks through each macro in turn, with examples
 you can run.

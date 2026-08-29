@@ -6,11 +6,10 @@
 using StrictMode
 using Test
 
-@testset "StrictMode standalone (no analysis backend)" begin
+@testset "StrictMode standalone (no proofs installed)" begin
     @test StrictMode.checks_enabled()
-    @test !StrictMode.backend_available()
-    @test !StrictMode.trimcheck_available()
-    # The backends must not even be RESOLVABLE here. This needs an isolated LOAD_PATH
+    @test !StrictMode.proofs_loaded()
+    # The proofs must not even be RESOLVABLE here. This needs an isolated LOAD_PATH
     # (`JULIA_LOAD_PATH="@:@stdlib"`): `--project=X` alone keeps the global `@v#.#` environment on
     # the path, so `identify_package` finds anything installed there and this suite would then be
     # testing the developer's machine rather than the repo. CI sets it; so does the CLAUDE.md recipe.
@@ -27,7 +26,7 @@ using Test
     )
     het = (1, 2.0, 3.0f0)
 
-    @testset "call-site guarantees run on the heuristic" begin
+    @testset "call-site guarantees run on the value-free scan" begin
         @test (@assert_noalloc dot3(A, A)) === 14.0
         @test (@assert_noboxing dot3(A, A)) === 14.0
         @test (@assert_typestable dot3(A, A)) === 14.0
@@ -35,8 +34,25 @@ using Test
     end
 
     @testset "and are not vacuous — they still catch bad code" begin
-        @test_throws StrictViolation @assert_noalloc boxy(het)
-        @test_throws StrictViolation @assert_noboxing boxy(het)
+        # Reported, not thrown: this engine cannot see what LLVM elides, and a check that guesses
+        # must not be able to abort a build. The proof that does gate is `StrictModeTest`'s
+        # `@test_noalloc`, which is unavailable here by construction.
+        @test_logs (:warn,) match_mode = :any (@assert_noalloc boxy(het))
+        @test_logs (:warn,) match_mode = :any (@assert_noboxing boxy(het))
+        # …and the guarantee whose scan layer IS exact still throws, with no backend in sight.
+        unstable(x::Int) = x > 0 ? 1 : "negative"
+        @test_throws StrictViolation (@assert_typestable unstable(1))
+    end
+
+    @testset "asking a StrictMode macro for a proof is refused, not silently downgraded" begin
+        err = try
+            @assert_noalloc static = true dot3(A, A)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("StrictModeTest", err.msg)
     end
 
     @testset "load-time enforcement (the reason src/ can depend on StrictMode alone)" begin
@@ -44,43 +60,34 @@ using Test
         # loadable by construction. It must therefore never require a backend...
         @strict_function sf_ok(x::Float64, y::Float64) = x * y + 1.0
         @test sf_ok(2.0, 3.0) === 7.0
-        # ...and must WARN rather than throw on a heuristic verdict: under `fail_mode = :error` a
-        # structural guess would otherwise abort a consumer's module load for code that may be
-        # provably clean (issue #18 part 2, ~28% false positives per issue #17). The declaration is
-        # still registered, so a test run with StrictModeTest loaded re-checks it against AllocCheck.
+        # ...and must WARN rather than throw on a scan verdict: a structural guess would otherwise
+        # abort a consumer's module load for code that may be provably clean (issue #18 part 2,
+        # ~28% false positives per issue #17). The declaration is still registered, so a test run
+        # with StrictModeTest loaded re-checks it against AllocCheck.
         @test_logs (:warn,) match_mode = :any StrictMode._verify_strict_def(
             boxy, (typeof(het),), "boxy(::Tuple{Int,Float64,Float32})"
         )
     end
 
-    @testset "batch API defaults to :fast and works" begin
+    @testset "the reporting API works and counts its findings" begin
         @test all(f -> f.status === :pass, findings(dot3, (typeof(A), typeof(A))))
-        # A `:fast` allocation verdict is `:suspect` — a structural guess — but it still counts:
-        # `nfailures` includes it, so a sweep does not go green on a real regression.
         fs = findings(boxy, (typeof(het),); guarantees = (:noalloc,))
-        @test only(fs).status === :suspect
+        @test only(fs).status === :fail
         @test nfailures(fs) == 1
         fsw = audit(
-            StrictMode; sweep = true, guarantees = (:typestable,), format = :text,
-            io = devnull, exit_on_fail = false
+            StrictMode; sweep = true, guarantees = (:typestable,), format = :text, io = devnull
         )
         @test fsw isa Vector
     end
 
-    @testset "asking for :full without the backend fails loudly, not silently" begin
-        # It must NOT quietly downgrade to the heuristic and report a pass.
-        @test_throws StrictMode.BackendUnavailable findings(dot3, (typeof(A), typeof(A)); mode = :full)
-        # …and that must hold for the BATCH drivers too. They swallow per-item analysis errors so one
-        # unanalyzable method cannot sink a sweep, which used to eat the missing-backend error and
-        # return a vacuous green: the same sweep reporting 53 findings at :fast returned 0 findings,
-        # 0 failures, exit 0 at :full. `audit` is the driver the Stop hook and consumer gate scripts
-        # run, so that silence landed exactly where it does the most damage.
-        @test_throws StrictMode.BackendUnavailable audit(
-            StrictMode; sweep = true, mode = :full,
-            guarantees = (:typestable,), format = :text, io = devnull, exit_on_fail = false
-        )
-        @test_throws StrictMode.BackendUnavailable check_signatures(
-            [(dot3, (typeof(A), typeof(A)))]; mode = :full, fail = :error
-        )
+    @testset "the gating API is absent, not silently substituted" begin
+        # Nothing here can gate a build, and the names that would are simply not defined — a
+        # StrictMode that grew its own `test_*` fallback would be reporting a proof it never ran.
+        for nm in (:test_signatures, :test_compiled, :test_registered, :proof_findings)
+            @test !isdefined(StrictMode, nm)
+        end
+        for nm in (Symbol("@test_noalloc"), Symbol("@test_typestable"))
+            @test !isdefined(StrictMode, nm)
+        end
     end
 end

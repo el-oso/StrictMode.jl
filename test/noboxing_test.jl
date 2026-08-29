@@ -4,28 +4,29 @@
     @test (@assert_noboxing dot3((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))) === 32.0
 end
 
-@testitem "@assert_noboxing fails on runtime tuple indexing (boxing)" begin
-    using StrictMode
+@testitem "the noboxing macros flag runtime tuple indexing (boxing)" begin
+    using StrictMode, StrictModeTest
     heterogeneous = (1, 2.0, 3.0f0)
     boxy(t) = (
         s = 0.0; for i in 1:3
             s += t[i]
         end; s
     )
-    @test_throws StrictViolation @assert_noboxing boxy(heterogeneous)
+    @test_logs (:warn,) match_mode = :any (@assert_noboxing boxy(heterogeneous))
+    @test_throws StrictViolation @test_noboxing boxy(heterogeneous)
 end
 
-@testitem "@assert_noboxing fails on dynamic dispatch" begin
-    using StrictMode
+@testitem "the noboxing proof flags dynamic dispatch" begin
+    using StrictMode, StrictModeTest
     struct AnyBox
         x::Any
     end
     usebox(b) = b.x + 1
-    @test_throws StrictViolation @assert_noboxing usebox(AnyBox(2))
+    @test_throws StrictViolation @test_noboxing usebox(AnyBox(2))
 end
 
-@testitem "@assert_noboxing ALLOWS a legitimate buffer allocation (unlike @assert_noalloc)" begin
-    using StrictMode
+@testitem "noboxing ALLOWS a legitimate buffer allocation (unlike noalloc)" begin
+    using StrictMode, StrictModeTest
     # Allocates a Vector but never boxes — the whole reason @assert_noboxing exists.
     function fill_sum(n)
         v = Vector{Float64}(undef, n)
@@ -34,8 +35,8 @@ end
         end
         return sum(v)
     end
-    @test_throws StrictViolation @assert_noalloc fill_sum(3)   # it does allocate
-    @test (@assert_noboxing fill_sum(3)) == 6.0               # …but it does not box
+    @test_throws StrictViolation @test_noalloc fill_sum(3)   # it does allocate
+    @test (@test_noboxing fill_sum(3)) == 6.0                # …but it does not box
 end
 
 @testitem "abstract-eltype container is detected as a boxing anti-pattern (F34)" begin
@@ -73,10 +74,10 @@ end
     @test sb.abscontainer === _Foo
     @test sg.abscontainer === nothing
     # …and the finding message names the root cause + the fix:
-    msg = StrictMode._box_msg("boxing (fast heuristic)", sb)
+    msg = StrictMode._box_msg("boxing (IR scan)", sb)
     @test occursin("abstract-eltype container", msg)
     @test occursin("Tuple", msg)
-    @test StrictMode._box_msg("boxing (fast heuristic)", sg) == "boxing (fast heuristic)"   # no enrichment when clean
+    @test StrictMode._box_msg("boxing (IR scan)", sg) == "boxing (IR scan)"   # no enrichment when clean
 end
 
 @testitem "the two engines answer DIFFERENT questions on a memoized accessor" begin
@@ -106,8 +107,8 @@ end
         caller()
     end
     @test @allocated(caller()) == 0                          # steady state: nothing
-    @test all(f -> f.status === :pass, findings(caller, (); guarantees = (:noboxing,), mode = :fast))
-    @test any(f -> f.status === :fail, findings(caller, (); guarantees = (:noboxing,), mode = :full))
+    @test all(f -> f.status === :pass, findings(caller, (); guarantees = (:noboxing,)))
+    @test any(f -> f.status === :fail, proof_findings(caller, (); guarantees = (:noboxing,)))
 end
 
 @testitem ":noboxing permits a typed allocation — the heuristic over-flags one, the proof does not" begin
@@ -142,15 +143,15 @@ end
     end
     bad(1)
     @test @allocated(bad(1)) > 0                             # it really does allocate...
-    @test all(f -> f.status === :pass, findings(bad, (Int,); guarantees = (:noboxing,), mode = :full))
-    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noboxing,), mode = :fast))
+    @test all(f -> f.status === :pass, proof_findings(bad, (Int,); guarantees = (:noboxing,)))
+    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noboxing,)))
     # ...and :noalloc, which asks the broader question, agrees across both engines.
-    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noalloc,), mode = :fast))
-    @test any(f -> f.status === :fail, findings(bad, (Int,); guarantees = (:noalloc,), mode = :full))
+    @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noalloc,)))
+    @test any(f -> f.status === :fail, proof_findings(bad, (Int,); guarantees = (:noalloc,)))
 end
 
 @testitem "an UNNARROWED Any-returning lookup correctly fails all three" begin
-    using StrictMode
+    using StrictMode, StrictModeTest
     # The counterpart: `docs/src/guarantees.md`'s own `unit` example returns `Any` unnarrowed, so it
     # is genuinely unstable and every guarantee fails on the return type alone — even though it too
     # is 0-alloc warm. Narrowing is what separates this from the item above; the doc used to claim
@@ -159,27 +160,27 @@ end
     unit(::Type{T}) where {T} = _U[T]
     unit(Float64)
     @test_throws StrictViolation @assert_typestable unit(Float64)
-    @test_throws StrictViolation @assert_noboxing unit(Float64)
+    @test_throws StrictViolation @test_noboxing unit(Float64)
 end
 
-@testitem "the tier is the dependency graph: guarantees escalate when StrictModeTest is loaded" begin
+@testitem "the tier is the macro you wrote, not ambient state" begin
     using StrictMode, StrictModeTest
-    # This is what makes the two-package split work without a preference: the engine is chosen at
-    # CALL time, not at macro expansion, so ONE compiled call site runs the heuristic in a package's
-    # own dev/precompile environment (StrictMode alone) and the AllocCheck/JET proof under test
-    # (StrictModeTest present). Nothing is recompiled and no import line selects it.
-    @test StrictMode.backend_available()
-    @test StrictMode.trimcheck_available()
-    # `:heuristic` is the "no explicit static=" default and is the thing that escalates...
-    @test StrictMode._noalloc_mode(nothing) === :heuristic
-    # ...while an explicit user decision is never overridden in either direction.
-    @test StrictMode._noalloc_mode(true) === :static
-    @test StrictMode._noalloc_mode(false) === :empirical
-    # With the backend up, the default path is the proof: this boxes, and AllocCheck says so.
+    # What makes the two-package split work without a preference: `@assert_noboxing` IS the
+    # value-free scan and `@test_noboxing` IS the proof, decided at macro expansion by the name.
+    # Nothing reads a flag at call time, so there is no state that can silently pick the other one.
     boxy(t) = (
         s = 0.0; for i in 1:3
             s += t[i]
         end; s
     )
-    @test_throws StrictViolation @assert_noalloc boxy((1, 2.0, 3.0f0))
+    tup = (1, 2.0, 3.0f0)
+    @test_logs (:warn,) match_mode = :any (@assert_noboxing boxy(tup))
+    @test_throws StrictViolation @test_noboxing boxy(tup)
+
+    # The scan is still the only engine `@assert_noalloc` has, even with the proofs loaded…
+    @test StrictMode._noalloc_mode(nothing) === :heuristic
+    @test StrictMode._noalloc_mode(false) === :empirical
+    # …and asking it for the proof is refused, not silently downgraded.
+    @test StrictMode._noalloc_mode(true) === :static
+    @test_throws ArgumentError StrictMode._assert_noalloc("boxy", boxy, (typeof(tup),), () -> boxy(tup); mode = :static)
 end

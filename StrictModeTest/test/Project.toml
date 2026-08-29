@@ -2,9 +2,3 @@
 AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-
-# Without this every `@assert_*` compiles to a bare call and the end-to-end escalation checks pass
-# VACUOUSLY — which is exactly what happened before this file existed. The suite asserts it below.
-[preferences.StrictMode]
-checks_enabled = true
-fail_mode = "error"

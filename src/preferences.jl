@@ -46,21 +46,25 @@ assert_enabled() = _assert_enabled(
     checks_enabled(), !isempty(get(ENV, "CI", "")), _backend_declared_but_unloaded()
 )
 
-# Is `StrictModeTest` a declared dependency of the ACTIVE project while its backend is NOT loaded?
-#
-# This restores the one loudness the tier split gave up. Before the split, intent (`analysis =
-# "full"`, a preference read from a file) and capability (a backend actually loaded) were separate
-# facts that could disagree, and `_require_backend` fired on the disagreement. The split merged them
-# — loading `StrictModeTest` IS asking for the proof — which removes the mismatch except in one
-# place: a package can be *listed* as a dependency and never `using`ed. Then every guarantee runs on
-# the heuristic while the environment advertises the proof, silently.
+"""
+    StrictMode.proofs_loaded() -> Bool
+
+Whether `StrictModeTest` — which supplies the AllocCheck/JET/TrimCheck proofs and the `@test_*` /
+`test_*` gating API — is loaded in this session. StrictMode itself never calls the proofs; this is
+for reporting which tier a session is in.
+"""
+proofs_loaded() = any(m -> nameof(m) === :StrictModeTest, values(Base.loaded_modules))
+
+# Is `StrictModeTest` a declared dependency of the ACTIVE project while never having been loaded?
+# Then the environment advertises the proofs and nothing runs them: every `@assert_*` is the
+# value-free scan, and none of the `test_*` gates exist to be called.
 #
 # Read the project file directly rather than `Base.identify_package`, which searches the entire
 # LOAD_PATH and would fire on a copy sitting in the user's global `@v#.#` environment. That is the
 # same over-broad check that made test/standalone's isolation proof pass for the wrong reason.
 # Failure to read or parse the project is NOT a mismatch — this must never turn a working setup red.
 function _backend_declared_but_unloaded()
-    backend_available() && return false
+    proofs_loaded() && return false
     proj = Base.active_project()
     (proj isa AbstractString && isfile(proj)) || return false
     tbl = try
@@ -87,13 +91,32 @@ function _assert_enabled(enabled::Bool, ci::Bool, backend_declared_but_unloaded:
     end
     backend_declared_but_unloaded && error(
         "StrictMode: `StrictModeTest` is a dependency of this environment but has not been loaded, " *
-            "so every guarantee here runs on the value-free heuristic while the environment " *
-            "advertises the proof — a green run would not mean what it appears to mean. Add\n" *
+            "so every guarantee here runs on the value-free scan while the environment " *
+            "advertises the proofs — a green run would not mean what it appears to mean. Add\n" *
             "    using StrictModeTest\n" *
             "once, above this call, at the top of your test entry point. (If you reach this from a " *
             "test file, note the load is process-wide: `test/runtests.jl` is the right place.)"
     )
     return true
+end
+
+# What a session gets, stated at load. The state worth announcing is not "checks are off" but
+# "checks are on, and `@assert_noalloc` is a scan rather than a proof" — StrictModeTest prints the
+# authoritative variant when it loads, so the two tiers are visibly different at a glance.
+function _announce_tier()
+    CHECKS_ENABLED || return nothing
+    # Quiet while a dependent package is being precompiled: that output is captured and replayed
+    # per package, so the banner would appear once per dependent instead of once per session.
+    iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
+    printstyled(stderr, "┌ StrictMode: checks ENABLED — reporting tier.\n"; color = :cyan)
+    printstyled(
+        stderr,
+        "│ @assert_* report and do not gate a build. To gate, add StrictModeTest\n" *
+            "│ and use @test_* / test_signatures / test_compiled / test_registered.\n" *
+            "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n";
+        color = :cyan
+    )
+    return nothing
 end
 
 """

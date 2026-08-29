@@ -11,10 +11,10 @@ end
     @test_throws StrictViolation @strict pick(heterogeneous, rand(1:3))
 end
 
-@testitem "@strict fails when the call allocates" begin
+@testitem "@strict reports when the call allocates" begin
     using StrictMode
     makevec(n) = collect(1:n)
-    @test_throws StrictViolation @strict makevec(8)
+    @test_logs (:warn,) match_mode = :any (@strict makevec(8))
 end
 
 @testitem "@strict accepts keyword arguments (issue #4)" begin

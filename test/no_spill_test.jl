@@ -55,7 +55,7 @@ end
 end
 
 @testitem "spill_report and the :no_spill findings/check path agree" setup = [NoSpillFixtures] begin
-    using StrictMode
+    using StrictMode, StrictModeTest
     # `--check-bounds=yes` (Pkg.test's default) blocks `@simd` vectorization, so there are no vector
     # registers left to spill and `vec_spills` is 0 regardless of accumulator count — the guarantee
     # under test only exists in vectorized code.
@@ -73,7 +73,7 @@ end
 
         fs_spilly = findings(spilly_accum_kernel!, types; guarantees = (:no_spill,))
         @test only(fs_spilly).status === :fail
-        @test_throws StrictViolation check(spilly_accum_kernel!, types; guarantees = (:no_spill,))
+        @test_throws StrictViolation test_signatures([(spilly_accum_kernel!, types)]; guarantees = (:no_spill,))
     else
         @test_skip false
     end

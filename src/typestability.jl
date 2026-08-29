@@ -1,7 +1,7 @@
-# `@assert_typestable` — fail on type instability. Two layers:
-#   - return-type concreteness via `Base.return_types` (no heavy deps) — both modes.
-#   - internal optimization failures via JET (`:full` mode only), through the backend seam.
-# (Routing JET through the backend keeps it a weak dependency; `:fast` mode needs no backend.)
+# `@assert_typestable` — fail on type instability. Two layers, graded differently:
+#   - return-type concreteness via `Base.return_types` — exact for the question it asks, so it gates.
+#   - a depth-0 IR boxing signal — a heuristic, so it reports.
+# JET's optimization analysis is the proof and lives in `StrictModeTest`'s `@test_typestable`.
 
 # Union{T,Nothing} and other small isbits unions don't box; treat as type-stable (F21).
 _is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(T)
@@ -25,34 +25,22 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
         _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")
         return nothing
     end
+    # The two layers are graded separately. Return-type concreteness above is exact for the
+    # question it asks, so it gates. This one is an IR signal: a guarded `@warn` inside an
+    # otherwise-clean numeric function reads as depth-0 boxing while JET's optimization analysis
+    # passes it, and that shape must not be able to abort a build.
     if _alloc_signals(f, types; depth = 0).boxing
-        _fail(:typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)")
+        _fail(
+            :typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)";
+            gates = false
+        )
     end
-    return nothing
-end
-
-# Internal-instability check via JET (`:full`). Requires the analysis backend. `_safe_opt_result`
-# (backend.jl) turns a backend failure into a located `AnalysisError` rather than a bare exception
-# from inside JET (see its docstring — the common cause is a runtime-dead `@generated` branch).
-function _assert_opt(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _require_backend()
-    r = _safe_opt_result(target, f, types)
-    isempty(_be_opt_reports(r)) || _fail(:typestable, target, sprint(show, r))
     return nothing
 end
 
 # The type-stability *check* expression (no value). Shared by `@assert_typestable` and `@strict`.
 function _typestable_check_expr(target, fe, types)
-    return :($(_typestable_checked)($target, $fe, $types))
-end
-
-# Concreteness of the inferred return + the this-level IR boxing signal always; JET's optimization
-# analysis on top when the backend is present (i.e. StrictModeTest is loaded). Decided at CALL time,
-# so one compiled call site serves both environments.
-function _typestable_checked(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _typestable_fast(target, f, types)
-    backend_available() && _assert_opt(target, f, types)
-    return nothing
+    return :($(_typestable_fast)($target, $fe, $types))
 end
 
 """
@@ -62,12 +50,16 @@ end
 
 Fail unless `f(args...)` is type stable.
 
-Both engines check that the inferred return type is a single concrete type, using
-`Base.return_types`, and additionally check the IR boxing signal (`StrictMode._alloc_signals`) for
-internal dynamic dispatch hiding behind a concrete return — the classic "the return type is fine
-but something inside dispatches at runtime" shape. When `StrictModeTest` is loaded, JET's
-optimization analysis runs on top of that. Each argument is
-evaluated once, the macro returns the call's value, and disabled builds expand to the bare call.
+Two layers, graded differently. The inferred return type must be a single concrete type
+(`Base.return_types`) — that is exact for the question it asks, so a violation **throws**. On top of
+that, the IR boxing signal (`StrictMode._alloc_signals`) looks for internal dynamic dispatch hiding
+behind a concrete return — the classic "the return type is fine but something inside dispatches at
+runtime" shape — and that layer is a heuristic (a guarded `@warn` in an otherwise-clean numeric
+function trips it), so a violation there **warns**. `StrictModeTest`'s `@test_typestable` adds
+JET's optimization analysis, which is the proof for the second layer and does throw.
+
+Each argument is evaluated once, the macro returns the call's value, and disabled builds expand to
+the bare call.
 
 **Keyword arguments** are supported: `f(x; k=v)` is checked at its real specialization (the call is
 routed through `Core.kwcall`, so the keyword sorter's signature is what inference sees).
