@@ -101,6 +101,33 @@ GitHub issues are the source of truth for anything with a number; the notes here
 
 - [ ] **Register `StrictModeTest`.** Subdirectory package; Registrator supports `subdir=`. Needs a
   decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).
+
+## Open — deferred from the whole-branch adversarial review
+
+- [ ] **`scalar_fp_loops`'s "hand-vectorized" discriminator is unsound (issue #22 follow-up).**
+  `a4fe1ca` distinguishes a hand-written scalar tail from LLVM's own `@simd` epilogue by asking
+  whether the function ALSO contains raw `<N x …>` ops without the loop-vectorizer's
+  `vector.ph`/`middle.block`/`scalar.ph` scaffolding. Demonstrated wrong: LLVM's **SLP vectorizer
+  and unroller** emit `<N x …>` ops with none of those labels, so an ordinary
+  `acc += z[i] * (a + 2.0im)` loop over `Vector{ComplexF64}` plus a separate `@simd` loop reads as
+  "hand-vectorized" and its epilogue gets flagged — the exact thing the commit says must never
+  fire. Complex arithmetic + `@simd` is a bread-and-butter shape for this package's own dogfood
+  targets (FFT), and `:no_scalar_loops` fails at `:fail`, not `:suspect`.
+  Not a regression (the shape false-positived before via the integer-phi branch), but the commit's
+  soundness argument and its docstring's "e.g. explicit SIMD.jl code" are both wrong.
+  *Fix:* find a discriminator SLP output cannot forge, or downgrade this guarantee to `:suspect`.
+
+- [ ] **`register_report`'s regression test is self-referential.** `test/round5_test.jl` re-implements
+  the register regex locally (`regs(s) = ...`) instead of driving `register_report`, and its
+  live-path assertion is `r.vec_regs_used >= 0`, which is vacuously true. A future regression of the
+  real regex would not be caught — the test tests a copy of the code, not the code.
+
+- [ ] **Aliased arguments diverge between probe and real call in `@assert_memsafe`.** `f(A, A)`
+  builds two INDEPENDENT guarded copies, so aliasing-dependent behaviour (in-place fast paths, or
+  index values read from the aliased buffer) differs between the probe and the real call, and the
+  verdict can be wrong in either direction. Undocumented; needs at least a scope sentence in
+  `memsafe_report`'s docstring alongside the existing Linux/macOS and `Array`-only caveats.
+
 ## Done
 
 - [x] **#21 — `register_report` always returned 0 registers.** Fixed in `df74181`. The regex
