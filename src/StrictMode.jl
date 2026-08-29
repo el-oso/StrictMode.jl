@@ -44,7 +44,7 @@ export @unroll, staticval
 export @golden
 export StrictViolation, StrictReport, StrictFinding
 export findings, audit, format_findings, nfailures, watch, unwatch
-export inline_suggestions
+export inline_suggestions, migration_report
 export static_ownership_suggestions
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
@@ -74,6 +74,7 @@ include("mca.jl")
 include("registry.jl")
 include("audit.jl")
 include("golden.jl")
+include("migration.jl")
 
 # The proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` gating API live in the
 # companion `StrictModeTest` package. Nothing here calls them, and nothing here is a stub they fill.

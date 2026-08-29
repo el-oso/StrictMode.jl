@@ -104,3 +104,45 @@ function test_registered(; guarantees = nothing, modules = nothing)
     end
     return _gate(items, :test_registered, "registry")
 end
+
+"""
+    proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+        -> Vector{StrictFinding}
+
+Every concrete method instance `mod`'s functions have **actually compiled**, proved and returned as
+data. The module-scope counterpart of [`proof_findings(f, types)`](@ref), and the non-raising
+counterpart of [`test_compiled`](@ref).
+
+Reach for it when you want the proofs but not the raise: `test_compiled` returns its findings only
+when everything passes and throws a `StrictViolation` carrying a formatted string otherwise, so it
+cannot hand you structured findings for a package that is currently failing — which is exactly when
+an agent wants them.
+"""
+proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ()) =
+    StrictMode._findings_compiled(_proof_findings, mod; guarantees, only, exempt)
+
+"""
+    proof_audit(target = :registered; format = :json, io = stdout, guarantees = nothing,
+                sweep = false, require = nothing, only = nothing, exempt = ())
+        -> Vector{StrictFinding}
+
+[`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, same formats, same
+`Vector{StrictFinding}` back, and it likewise **never throws and never sets an exit status**. The
+only difference is the engine — AllocCheck, JET and TrimCheck instead of the value-free scan.
+
+That is the whole point of it existing. `audit`'s allocation verdicts are structural guesses, which
+is fine for discovery but means an agent cannot tell a real regression from noise; the `test_*`
+drivers prove but raise, so they cannot hand back findings for a failing package. `proof_audit`
+is the missing corner: proved verdicts, as data.
+
+It costs what the proofs cost — roughly an order of magnitude more per method than `audit` — so
+scope a module sweep with `only`/`exempt` rather than pointing it at everything.
+
+```julia
+using MyPkg, StrictMode, StrictModeTest
+fs = proof_audit(MyPkg; sweep = true, format = :json, exempt = r"^_plan")
+nfailures(fs)        # proved failures, not guesses
+```
+"""
+proof_audit(target = :registered; kwargs...) =
+    StrictMode._audit(_proof_findings, "proof_audit", target; kwargs...)

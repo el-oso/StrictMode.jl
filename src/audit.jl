@@ -56,7 +56,15 @@ informational "consider GKH ownership" findings (`guarantee = :static_ownership`
 
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
-function audit(
+function audit(target = :registered; kwargs...)
+    return _audit(_scan_findings, "audit", target; kwargs...)
+end
+
+# The shared driver. `analyze(f, types, guarantees)` is the ONLY thing that differs between
+# StrictMode's `audit` (the value-free scan) and StrictModeTest's `proof_audit` (AllocCheck + JET
+# + TrimCheck), so they share one implementation rather than drifting apart.
+function _audit(
+        analyze, name::String,
         target = :registered;
         format::Symbol = :json,
         io::IO = stdout,
@@ -69,12 +77,12 @@ function audit(
         static_ownership_suggest::Bool = false,
     )
     require === nothing || require === :public ||
-        throw(ArgumentError("audit: require must be :public (or nothing), got $(require)"))
+        throw(ArgumentError("$name: require must be :public (or nothing), got $(require)"))
     require === :public && !(target isa Module) &&
-        throw(ArgumentError("audit: require = :public needs a Module target"))
+        throw(ArgumentError("$name: require = :public needs a Module target"))
     fs = StrictFinding[]
     if target === :registered
-        append!(fs, _findings_all(; guarantees))
+        append!(fs, _findings_all(analyze; guarantees))
         if inline_suggest || static_ownership_suggest
             for ((f, types), _) in STRICT_REGISTRY
                 _is_exempt(f) && continue
@@ -91,10 +99,10 @@ function audit(
             end
         end
     elseif target isa Module
-        append!(fs, _registered_findings_in(target; guarantees))   # declared scope (quiet)
+        append!(fs, _registered_findings_in(analyze, target; guarantees))   # declared scope (quiet)
         if sweep
             gs = guarantees === nothing ? (:typestable, :noalloc) : guarantees
-            append!(fs, _findings_compiled(target; guarantees = gs, only, exempt))
+            append!(fs, _findings_compiled(analyze, target; guarantees = gs, only, exempt))
         end
         require === :public && append!(fs, _coverage_findings(target; only, exempt))
         # Inline / static-ownership suggestions are informational (status :info, never failures)
@@ -102,7 +110,7 @@ function audit(
         inline_suggest && append!(fs, inline_suggestions(target; only, exempt))
         static_ownership_suggest && append!(fs, static_ownership_suggestions(target; only, exempt))
     else
-        throw(ArgumentError("audit target must be :registered or a Module, got $(target)"))
+        throw(ArgumentError("$name target must be :registered or a Module, got $(target)"))
     end
     format_findings(io, fs; format)
     return fs

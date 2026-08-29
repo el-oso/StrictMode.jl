@@ -40,7 +40,9 @@ using TypeContracts   # its TrimDiagnostics parses the trim verifier's output
 using PrecompileTools: @setup_workload, @compile_workload
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible
+export @test_strict, @test_kernel
 export test_signatures, test_compiled, test_registered
+export proof_audit
 export proof_findings, AnalysisError
 export ignore_barrier, set_ignore_barrier!
 export divergence_report, StrictDivergence

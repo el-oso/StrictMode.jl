@@ -138,3 +138,65 @@ const SINK = Ref{Any}(nothing)
 end
 
 include("divergence_test.jl")
+
+@testset "the composite proving macros" begin
+    clean2(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+    T3b = (NTuple{3, Float64}, NTuple{3, Float64})
+    SINK2 = Ref{Any}(nothing)
+    allocs2(n::Int) = (v = rand(n); SINK2[] = v; length(v))
+    allocs2(4)
+    @test @allocated(allocs2(4)) > 0          # the fixture must still be bad
+
+    @test (@test_strict clean2((1.0, 2.0, 3.0), (1.0, 2.0, 3.0))) === 14.0
+    @test_throws StrictViolation @test_strict allocs2(4)
+    # The exception names the COMPOSITE, not whichever bundled guarantee tripped first — otherwise
+    # `@test_strict` failures would be indistinguishable from `@test_noalloc` ones in a log.
+    err = try
+        @test_strict allocs2(4)
+        nothing
+    catch e
+        e
+    end
+    @test err.kind === :strict
+end
+
+module ProofAuditDemo
+    hot(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+    cold(t) = (
+        s = 0.0; for i in 1:3
+            s += t[i]
+        end; s
+    )
+end
+
+@testset "proof_findings / proof_audit return proved verdicts as DATA" begin
+    ProofAuditDemo.hot((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
+    ProofAuditDemo.cold((1, 2.0, 3.0f0))
+
+    # `test_compiled` throws on this module, so it cannot hand back findings for it — which is
+    # exactly the case an agent wants them in. `proof_findings`/`proof_audit` are the data half.
+    @test_throws StrictViolation test_compiled(ProofAuditDemo; guarantees = (:noboxing,))
+
+    fs = proof_findings(ProofAuditDemo; guarantees = (:noboxing,))
+    @test fs isa Vector{StrictMode.StrictFinding}
+    @test any(f -> f.func == "cold" && StrictMode._failed(f), fs)
+    @test any(f -> f.func == "hot" && f.status === :pass, fs)
+
+    buf = IOBuffer()
+    fa = proof_audit(ProofAuditDemo; sweep = true, guarantees = (:noboxing,), format = :json, io = buf)
+    @test fa isa Vector{StrictMode.StrictFinding}
+    @test StrictMode.nfailures(fa) >= 1
+    @test occursin("\"status\":\"fail\"", String(take!(buf)))
+
+    # …and it is genuinely the PROOF, not the scan: `:noboxing` is the guarantee where the two
+    # engines are known to disagree — the scan calls an abstract-eltype container boxing, AllocCheck
+    # does not — so a `proof_audit` that had quietly fallen back to the scan would differ here.
+    abstract type _PA end
+    struct _PA1 <: _PA
+        x::Int
+    end
+    absc(n::Int) = (v = _PA[_PA1(n)]; length(v))
+    absc(1)
+    @test StrictMode._failed(only(StrictMode.findings(absc, (Int,); guarantees = (:noboxing,))))
+    @test only(proof_findings(absc, (Int,); guarantees = (:noboxing,))).status === :pass
+end

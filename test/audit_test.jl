@@ -101,3 +101,45 @@ end
         )
     )                          # predicate
 end
+
+@testitem "migration_report finds the sites that stopped gating, and ignores src/" begin
+    using StrictMode
+    # A throwaway package layout: the same macro in `src/` (correct as-is) and in `test/`
+    # (silently non-gating since 0.4).
+    root = mktempdir()
+    mkpath(joinpath(root, "src")); mkpath(joinpath(root, "test"))
+    write(
+        joinpath(root, "src", "MyPkg.jl"), """
+        module MyPkg
+        f(x) = @assert_noalloc g(x)
+        end
+        """
+    )
+    write(
+        joinpath(root, "test", "runtests.jl"), """
+        @assert_noalloc kernel!(C, A, B)
+        # @assert_noboxing commented_out(x)
+        @kernel axpy!(y, a, x)
+        @assert_no_scalar_loops glue!(z)
+        @strict_function keep(x::Int) = x
+        """
+    )
+    buf = IOBuffer()
+    n = migration_report(root; io = buf)
+    out = String(take!(buf))
+
+    @test n == 3                                     # test/ only: noalloc, kernel, no_scalar_loops
+    @test occursin("@assert_noalloc", out) && occursin("→  @test_noalloc", out)
+    @test occursin("@kernel", out) && occursin("→  @test_kernel", out)
+    @test occursin("no proving counterpart", out)    # @assert_no_scalar_loops has none
+    @test !occursin("MyPkg.jl", out)                 # src/ is deliberately not scanned
+    @test !occursin("commented_out", out)            # comment lines skipped
+    @test !occursin("@strict_function", out)         # word boundary: `@strict` must not match it
+
+    # A clean package reports zero rather than saying nothing.
+    clean = mktempdir(); mkpath(joinpath(clean, "test"))
+    write(joinpath(clean, "test", "runtests.jl"), "@test_noalloc already_migrated(x)\n")
+    b2 = IOBuffer()
+    @test migration_report(clean; io = b2) == 0
+    @test occursin("nothing to change", String(take!(b2)))
+end

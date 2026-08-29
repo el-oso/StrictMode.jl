@@ -7,18 +7,20 @@
 # a preference is a gate that can vanish silently. `__init__` refuses to load with checks disabled,
 # so the question does not arise.
 
-# Run one guarantee's proof and raise if it fails.
-function _test_guarantee(g::Symbol, target, @nospecialize(f), @nospecialize(types::Tuple))
-    fs = _proof_findings(f, types, (g,))
+# Prove `guarantees` and raise if any fails. `kind` names the macro in the exception, so a
+# composite reports as `@strict`/`@kernel` rather than as whichever of its parts failed first.
+function _test_guarantee(kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple))
+    fs = _proof_findings(f, types, guarantees)
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return nothing
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
-    throw(StrictMode.StrictViolation(g, target, msg))
+    throw(StrictMode.StrictViolation(kind, target, msg))
 end
 
 # Shared expansion for every `@test_*`: evaluate each argument once, run the call for its value,
-# prove the guarantee, hand the value back.
-function _test_macro_expr(g::Symbol, macroname::String, args)
+# prove the guarantees, hand the value back. One `_proof_findings` call covers a composite, so
+# `@test_kernel` runs AllocCheck once rather than once per bundled guarantee.
+function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, args)
     pos, opts = StrictMode._macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("$macroname needs a call expression"))
     call = pos[1]
@@ -27,7 +29,7 @@ function _test_macro_expr(g::Symbol, macroname::String, args)
     return quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(_test_guarantee)($(QuoteNode(g)), $target, $(p.checkfn), $(p.types))
+        $(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types))
         _val
     end
 end
@@ -52,7 +54,7 @@ as is a call whose only allocation is a recognized one-time-init barrier
 ```
 """
 macro test_noalloc(args...)
-    return _test_macro_expr(:noalloc, "@test_noalloc", args)
+    return _test_macro_expr(:noalloc, (:noalloc,), "@test_noalloc", args)
 end
 
 """
@@ -68,7 +70,7 @@ to [`StrictMode.@assert_noboxing`](@ref).
 ```
 """
 macro test_noboxing(args...)
-    return _test_macro_expr(:noboxing, "@test_noboxing", args)
+    return _test_macro_expr(:noboxing, (:noboxing,), "@test_noboxing", args)
 end
 
 """
@@ -87,7 +89,7 @@ second layer.
 ```
 """
 macro test_typestable(args...)
-    return _test_macro_expr(:typestable, "@test_typestable", args)
+    return _test_macro_expr(:typestable, (:typestable,), "@test_typestable", args)
 end
 
 """
@@ -103,5 +105,36 @@ reachability-limit union-splits.
 ```
 """
 macro test_trim_compatible(args...)
-    return _test_macro_expr(:trim_compatible, "@test_trim_compatible", args)
+    return _test_macro_expr(:trim_compatible, (:trim_compatible,), "@test_trim_compatible", args)
+end
+
+"""
+    @test_strict f(args...)
+
+Fail unless `f(args...)` is both type stable and allocation-free — the proving counterpart of
+[`StrictMode.@strict`](@ref), which bundles the same two guarantees but only reports the allocation
+half.
+
+```julia
+@test_strict kernel!(C, A, B)
+```
+"""
+macro test_strict(args...)
+    return _test_macro_expr(:strict, (:typestable, :noalloc), "@test_strict", args)
+end
+
+"""
+    @test_kernel f(args...)
+
+Fail unless `f(args...)` is type stable, allocation-free **and** vectorized — the proving
+counterpart of [`StrictMode.@kernel`](@ref). `:vectorized` is a best-effort LLVM-IR scan in both
+tiers (it observes compiled output, so it already gated); what this adds over `@kernel` is
+AllocCheck's proof for the allocation half and JET's for the stability half.
+
+```julia
+@test_kernel axpy!(y, a, x)
+```
+"""
+macro test_kernel(args...)
+    return _test_macro_expr(:kernel, (:typestable, :noalloc, :vectorized), "@test_kernel", args)
 end

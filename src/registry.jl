@@ -126,16 +126,21 @@ function _warn_empty_registry(driver::AbstractString, alternative::AbstractStrin
     return nothing
 end
 
+# The value-free engine as an `analyze(f, types, guarantees)` callable — the default every driver
+# below takes. `StrictModeTest` passes `_proof_findings` instead, which is the ONLY difference
+# between `audit` and `proof_audit`: same scopes, same shapes, same rendering, different engine.
+_scan_findings(@nospecialize(f), @nospecialize(types), guarantees) = findings(f, types; guarantees)
+
 # Findings for every registered signature. Reporting only — `audit` renders these.
-function _findings_all(; guarantees = nothing)
+function _findings_all(analyze = _scan_findings; guarantees = nothing)
     items = _registry_items(guarantees)
     isempty(items) && _warn_empty_registry("audit(:registered)", "`audit(MyPkg; sweep = true)`")
-    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
+    return _map_findings(analyze, items)
 end
 
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
-function _registered_findings_in(mod::Module; guarantees = nothing)
+function _registered_findings_in(analyze, mod::Module; guarantees = nothing)
     items = Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
             for ((f, types), meta) in STRICT_REGISTRY
@@ -144,7 +149,7 @@ function _registered_findings_in(mod::Module; guarantees = nothing)
     # Through `_map_findings`, so a signature whose analysis throws becomes a failing finding
     # naming the error rather than vanishing. This feeds `_auto_check_module` — the `@strict module`
     # load gate — where a dropped signature is a method that loads clean without being checked.
-    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
+    return _map_findings(analyze, items)
 end
 
 # Whole-module strict check at load. Uses the value-free engine, which is what makes opting a
@@ -296,9 +301,9 @@ function _compiled_items(mod::Module; guarantees = (:typestable, :noalloc), only
     return items
 end
 
-function _findings_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+function _findings_compiled(analyze, mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
     items = _compiled_items(mod; guarantees, only, exempt)
-    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
+    return _map_findings(analyze, items)
 end
 
 # Coverage gate (`audit(mod; require = :public)`): one :fail finding per exported/public
@@ -360,3 +365,8 @@ function unwatch()
     _REVISE_UNWATCH[] === nothing && return nothing
     return _REVISE_UNWATCH[]()
 end
+
+# Scan-engine convenience forms. The `analyze`-taking methods above are what `StrictModeTest` calls
+# with `_proof_findings`; these keep the common in-package spelling short.
+_registered_findings_in(mod::Module; kwargs...) = _registered_findings_in(_scan_findings, mod; kwargs...)
+_findings_compiled(mod::Module; kwargs...) = _findings_compiled(_scan_findings, mod; kwargs...)

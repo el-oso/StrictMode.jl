@@ -54,17 +54,16 @@ McaReport
 
 ## Static-binary compatibility
 
-Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` / the
-`:trim_compatible` guarantee **escalate** by whether `TrimCheck` is loaded: a cheap TypeContracts static
-scan without it, and juliac's authoritative `verify_typeinf_trim` verifier with it (`StrictModeTest`
-depends on `TrimCheck`).
-`@assert_trim_safe` is the static-only subset. The reactive `explain_trim` translates a real build log.
+Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` and
+`@assert_trim_safe` are the same TypeContracts static scan and both **report**; juliac's
+authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s `@test_trim_compatible`, which
+gates. The reactive `explain_trim` translates a real build log.
 
 The static-scan path has one known coverage gap it can't heuristically close without
 false-positiving on safe code: N simultaneous small-`Union` arguments whose specialization count
 can exceed juliac's reachability limit on a large/opaque callee. A PASS reached only via the
 static scan logs a one-time session note about this; see [`@assert_trim_safe`](@ref)'s docstring
-for why, and use `:full` + `TrimCheck` for the authoritative check when it matters.
+for why, and use `StrictModeTest.@test_trim_compatible` when it matters.
 
 ```@docs
 @assert_trim_compatible
@@ -129,6 +128,7 @@ The function API, the mark-once registry, and the usage-driven sweep. See
 
 ```@docs
 findings
+migration_report
 register_strict!
 registered_strict
 watch
@@ -162,11 +162,15 @@ verifier — and **gates**: a violation throws a [`StrictViolation`](@ref). Add 
 | `@assert_noboxing f(x)` | `@test_noboxing f(x)` |
 | `@assert_typestable f(x)` | `@test_typestable f(x)` |
 | `@assert_trim_compatible f(x)` | `@test_trim_compatible f(x)` |
+| `@strict f(x)` | `@test_strict f(x)` |
+| `@kernel f(x)` | `@test_kernel f(x)` |
 | `findings(f, types)` | `test_signatures(pairs)` |
 | `audit(mod; sweep = true)` | `test_compiled(mod)` |
+| — | `proof_findings(f, types)` / `proof_findings(mod)` — proved, as data |
+| — | `proof_audit(mod)` — proved, as data, formatted |
 | — | `test_registered()` |
 
-It also carries `proof_findings` (the data half of the gating API), `ignore_barrier` /
+It also carries `ignore_barrier` /
 `set_ignore_barrier!` (whether a recognized one-time-init barrier is exempt from AllocCheck's
 all-paths proof), and `divergence_report` / `StrictDivergence`, which run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
@@ -193,8 +197,8 @@ staticval
 
 ## Diagnostics
 
-Where the assert macros fail loudly, `@explain` quietly tells you why, without throwing. It
-gathers `@code_warntype`, JET, and AllocCheck into a single `StrictReport`.
+Where the assert macros report a verdict, `@explain` says why, without throwing. It gathers
+`@code_warntype`, the inferred return type, and the typed-IR signals into a single `StrictReport`.
 
 ```@docs
 @explain
