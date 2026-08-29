@@ -48,8 +48,8 @@ function _mmap_anon(nbytes::Int)
     return ptr
 end
 
-function _mprotect_none!(ptr::Ptr{Cvoid}, nbytes::Int)
-    r = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint), ptr, nbytes, _PROT_NONE)
+function _mprotect!(ptr::Ptr{Cvoid}, nbytes::Int, prot::Cint)
+    r = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint), ptr, nbytes, prot)
     r == 0 || error("StrictMode @assert_memsafe: mprotect failed (errno $(Base.Libc.errno()))")
     return nothing
 end
@@ -60,9 +60,19 @@ struct GuardedBuffer
     array::Array
     _base::Ptr{Cvoid}
     _total_bytes::Int
+    _poison::UInt8
 end
 
 _free_guarded!(gb::GuardedBuffer) = _munmap!(gb._base, gb._total_bytes)
+
+# Poison byte for buffer `i`. DISTINCT PER BUFFER, and that is load-bearing rather than tidy: with a
+# single shared value a kernel that copies between two guarded buffers launders it — the overrunning
+# load pulls the poison out of the source's canary and the overrunning store writes that same byte
+# into the destination's, so BOTH canaries read back clean on a kernel with an out-of-bounds read
+# AND an out-of-bounds write. Measured, on `out[i] = a[i]` with a one-element overrun — which is this
+# package's motivating kernel shape, not a corner case. Distinct bytes make the copied value differ
+# from the destination's own poison, so the store is detected.
+_poison_for(i::Integer) = UInt8(0xa5 ⊻ (UInt8(i % 251) * 0x11))
 
 """
     _guarded_array(src::Array; align = sizeof(eltype(src))) -> GuardedBuffer
@@ -78,7 +88,7 @@ Only catches overruns past the **end of the allocation** — an interior overrea
 load reading past a valid sub-row but still inside the same buffer) is invisible to this harness.
 There is no leading guard page in this version, so underruns are not caught either.
 """
-function _guarded_array(src::Array{T, N}; align::Int = sizeof(T)) where {T, N}
+function _guarded_array(src::Array{T, N}; align::Int = sizeof(T), guard_prot::Cint = _PROT_NONE, poison::UInt8 = _poison_for(1)) where {T, N}
     align > 0 || throw(ArgumentError("align must be positive, got $align"))
     n = length(src)
     databytes = n * sizeof(T)
@@ -96,7 +106,13 @@ function _guarded_array(src::Array{T, N}; align::Int = sizeof(T)) where {T, N}
     base = _mmap_anon(total_bytes)
     guard_ptr = base + data_region_bytes
     try
-        _mprotect_none!(guard_ptr, ps)
+        # Poison the guard page BEFORE protecting it. Under `_PROT_NONE` the bytes are unreadable and
+        # inert; under `_PROT_READ|_PROT_WRITE` they are the canary an out-of-bounds STORE disturbs
+        # without faulting — which is the only way left to localize a write, since Julia 1.12 turned
+        # a guard-page write fault into a fatal signal whose backtrace is destroyed (`unknown
+        # function (ip: …)`, zero frames), where 1.10/1.11 raised a catchable `ReadOnlyMemoryError`.
+        ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), guard_ptr, Cint(poison), ps)
+        _mprotect!(guard_ptr, ps, guard_prot)
     catch
         _munmap!(base, total_bytes)
         rethrow()
@@ -104,34 +120,70 @@ function _guarded_array(src::Array{T, N}; align::Int = sizeof(T)) where {T, N}
     data_start = guard_ptr - padded_bytes   # flush against the guard once `slack` is accounted for
     arr = unsafe_wrap(Array, Ptr{T}(data_start), size(src); own = false)
     copyto!(arr, src)
-    return GuardedBuffer(arr, base, total_bytes)
+    return GuardedBuffer(arr, base, total_bytes, poison)
 end
 
-# --- isolate=false: in-process probe, catches OOB WRITES only -----------------------------------
+# --- the canary classifier: detects an out-of-bounds STORE without faulting --------------------
+#
+# Leave the trailing page readable AND writable, pre-filled with a per-buffer poison byte. A store
+# past the end then lands in the canary instead of trapping, so it can be observed after the fact —
+# with the byte offset and the argument it belongs to. That is the replacement for the backtrace
+# Julia 1.12+ destroys on a guard-page write fault.
+#
+# Reads past the end are invisible to this probe by construction (a load disturbs nothing); the
+# PROT_NONE guard page is what detects those. The two are complementary, not redundant.
 
-function _memsafe_probe_inprocess(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
-    guarded = Any[]
-    handles = GuardedBuffer[]
-    for a in args
+# Byte offset of the first disturbed canary byte, or `nothing` if the page is untouched.
+function _canary_dirty(gb::GuardedBuffer)
+    ps = _pagesize()
+    p = Ptr{UInt8}(gb._base + gb._total_bytes - ps)
+    i = findfirst(k -> unsafe_load(p, k) != gb._poison, 1:ps)
+    return i === nothing ? nothing : i - 1
+end
+
+# Run `f` with every Array argument backed by a writable, poisoned canary. Returns `nothing` when
+# nothing stored past any end, or a description naming the argument, its type and the byte offset.
+function _canary_probe(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
+    probe_args = Any[]
+    handles = Tuple{Int, GuardedBuffer}[]
+    rw = _PROT_READ | _PROT_WRITE
+    for (i, a) in enumerate(args)
         if a isa Array
-            gb = _guarded_array(a; align = something(align, sizeof(eltype(a))))
-            push!(guarded, gb.array)
-            push!(handles, gb)
+            gb = _guarded_array(
+                a; align = something(align, sizeof(eltype(a))),
+                guard_prot = rw, poison = _poison_for(i)
+            )
+            push!(probe_args, gb.array)
+            push!(handles, (i, gb))
         else
-            push!(guarded, a)
+            push!(probe_args, a)
         end
     end
     try
-        f(guarded...)
-        return nothing
-    catch e
-        e isa ReadOnlyMemoryError && return "out-of-bounds WRITE detected (guard page triggered " *
-            "ReadOnlyMemoryError). isolate=false only catches stores, not loads — use the default " *
-            "isolate=true to also catch out-of-bounds reads."
-        rethrow()
+        f(probe_args...)
+        hits = String[]
+        for (i, gb) in handles
+            off = _canary_dirty(gb)
+            off === nothing && continue
+            push!(hits, "argument $i::$(typeof(gb.array)) at +$off byte(s) past its end")
+        end
+        return isempty(hits) ? nothing : join(hits, "; ")
     finally
-        foreach(_free_guarded!, handles)
+        foreach(h -> _free_guarded!(h[2]), handles)
     end
+end
+# --- isolate=false: in-process, catches out-of-bounds WRITES only -------------------------------
+#
+# This used to rely on Julia's segv handler turning a guard-page write fault into a catchable
+# `ReadOnlyMemoryError`. That worked on 1.10/1.11 and became a fatal SIGSEGV in 1.12 — measured on
+# 1.12.7 and 1.13.0-rc3 — which would take the caller's whole process down, including the test
+# runner. The canary reaches the same verdict without faulting at all, so the documented contract
+# ("cheaper, in-process, stores only") is unchanged; only the mechanism is.
+function _memsafe_probe_inprocess(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
+    hit = _canary_probe(f, args; align)
+    hit === nothing && return nothing
+    return "out-of-bounds WRITE detected: $hit. isolate=false only catches stores, not loads — " *
+        "use the default isolate=true to also catch out-of-bounds reads."
 end
 
 # --- isolate=true: subprocess probe, catches OOB READS and WRITES -------------------------------
@@ -168,24 +220,35 @@ function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_
     # script only scopes to its own statement, so it doesn't survive to the next line. Harmless
     # here: this is a throwaway one-shot process that exits right after.
     #
-    # An out-of-bounds WRITE against the guard page is catchable even in this (child) process, as a
-    # `ReadOnlyMemoryError` — it must be caught HERE and reported via a distinct stdout sentinel,
-    # not left to propagate: an uncaught exception exits nonzero with no signal, which the parent
-    # would otherwise (wrongly) treat as an unrelated script error rather than a memsafe violation.
-    # Any OTHER exception is a genuine bug in `f` unrelated to memory safety and must still propagate.
+    # ONE child does both jobs, in this order:
+    #
+    #   1. CLASSIFY with the writable poisoned canary. This cannot fault, so it always completes,
+    #      and it is the only thing that can tell an out-of-bounds WRITE from a READ now that a
+    #      write fault's backtrace is destroyed (Julia 1.12+ gives `unknown function (ip: …)` and
+    #      zero frames, where the read fault still names the kernel and line).
+    #   2. DETECT with the PROT_NONE guard page, which traps either access class and kills this
+    #      process.
+    #
+    # The classification line is printed and FLUSHED before step 2, and a flushed write survives the
+    # subsequent fatal signal into the parent's pipe — measured: `termsignal=11` with the sentinel
+    # present in the captured stdout. That is what makes a single spawn sufficient; classifying in a
+    # second child would double the cost of the clean path, which is the common one.
+    #
+    # No `try`/`catch` around step 2: nothing is catchable there any more, and a genuine exception
+    # from `f` must propagate so the parent reports an unrelated script error rather than a
+    # memory-safety verdict.
     return """
     using StrictMode, Serialization
     $mod_stmt
     __args = deserialize($(repr(args_path)))
     __f = getfield($lookup_mod, $(repr(fname)))
+    __hit = StrictMode._canary_probe(__f, __args; align=$(align === nothing ? "nothing" : align))
+    println(stdout, __hit === nothing ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * __hit)
+    flush(stdout)
     __guarded = map(__a -> __a isa Array ? StrictMode._guarded_array(__a$(align_kw)).array : __a, __args)
-    try
-        __f(__guarded...)
-        print(stdout, "STRICTMODE_MEMSAFE_OK")
-    catch __e
-        __e isa ReadOnlyMemoryError || rethrow()
-        print(stdout, "STRICTMODE_MEMSAFE_WRITE_VIOLATION")
-    end
+    __f(__guarded...)
+    print(stdout, "STRICTMODE_MEMSAFE_OK")
+    flush(stdout)
     """
 end
 
@@ -224,21 +287,33 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
         proc = run(pipeline(cmd; stdout = outbuf, stderr = errbuf); wait = false)
         wait(proc)
         out_s, err_s = String(take!(outbuf)), String(take!(errbuf))
+        # The canary line is printed and flushed BEFORE the guard probe, so it is present whether or
+        # not the child then died on the guard page.
+        canary = match(r"STRICTMODE_CANARY_DIRTY (.*)", out_s)
         if proc.termsignal != 0
             signame = _signal_name(proc.termsignal)
-            return "deterministic out-of-bounds access — the guarded probe subprocess was killed by " *
-                "$signame. Child's own signal report (names the faulting op):\n" * _indent(err_s)
-        elseif occursin("STRICTMODE_MEMSAFE_WRITE_VIOLATION", out_s)
-            # A WRITE fault is catchable even in the child (ReadOnlyMemoryError) — it exits 0 with
-            # this sentinel rather than a signal, so it must be checked before the exitcode branch.
-            return "out-of-bounds WRITE detected (guard page triggered ReadOnlyMemoryError in the " *
-                "guarded subprocess)."
+            if canary !== nothing
+                # A store past the end. Report the canary's own localization: on Julia 1.12+ the
+                # write fault's backtrace is destroyed (`unknown function (ip: …)`, zero frames), so
+                # the child's signal report carries nothing usable and the canary is all there is.
+                return "out-of-bounds WRITE detected: $(canary.captures[1]). (The guarded probe " *
+                    "subprocess was then killed by $signame; a write fault's own backtrace is not " *
+                    "usable, so the offset above comes from a writable poisoned canary.)"
+            end
+            return "out-of-bounds READ detected — the guarded probe subprocess was killed by " *
+                "$signame and nothing was stored past any argument's end. Child's own signal " *
+                "report (names the faulting op):\n" * _indent(err_s)
         elseif proc.exitcode != 0
             error(
                 "StrictMode @assert_memsafe: the guarded probe errored for a reason other than a " *
                     "memory fault (exit code $(proc.exitcode)) — this is not itself a memsafe " *
                     "violation, fix the underlying error:\n" * _indent(err_s)
             )
+        elseif canary !== nothing
+            # Stored past the end without tripping the guard page. Reachable when the store lands
+            # beyond the guard page rather than in it, or when the kernel writes and the guard probe
+            # happens not to fault.
+            return "out-of-bounds WRITE detected: $(canary.captures[1])."
         elseif !occursin("STRICTMODE_MEMSAFE_OK", out_s)
             error("StrictMode @assert_memsafe: internal error — the probe subprocess exited cleanly but did not report success.\nstdout:\n" * _indent(out_s) * "\nstderr:\n" * _indent(err_s))
         end

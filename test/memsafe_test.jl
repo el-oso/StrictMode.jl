@@ -54,7 +54,11 @@ end
         r = memsafe_report(memsafe_oob_write_kernel!, rand(8); isolate = false)
         @test r.violation !== nothing
         @test occursin("WRITE", r.violation)
-        @test occursin("ReadOnlyMemoryError", r.violation)
+        # The canary names the ARGUMENT and BYTE OFFSET. That is not cosmetic: since Julia 1.12 a
+        # guard-page write fault's backtrace is destroyed (`unknown function (ip: …)`, zero frames),
+        # so without this a write violation would carry no localizing information at all.
+        @test occursin(r"argument \d+::", r.violation)
+        @test occursin("past its end", r.violation)
     end
 end
 
@@ -66,7 +70,11 @@ end
         r = memsafe_report(memsafe_oob_write_kernel!, rand(8))   # isolate=true (default)
         @test r.violation !== nothing
         @test occursin("WRITE", r.violation)
-        @test occursin("ReadOnlyMemoryError", r.violation)
+        # The canary names the ARGUMENT and BYTE OFFSET. That is not cosmetic: since Julia 1.12 a
+        # guard-page write fault's backtrace is destroyed (`unknown function (ip: …)`, zero frames),
+        # so without this a write violation would carry no localizing information at all.
+        @test occursin(r"argument \d+::", r.violation)
+        @test occursin("past its end", r.violation)
 
         @test_throws StrictViolation (@assert_memsafe memsafe_oob_write_kernel!(rand(8)))
     end
@@ -94,20 +102,26 @@ end
     if Sys.iswindows()
         @test_skip false
     else
+        # isolate=false uses a READABLE, writable, poisoned canary page — a load past the end
+        # disturbs nothing, so it is invisible to this mode by construction. That is the same
+        # documented limitation as before ("stores only"), but the failure mode is now much better:
+        # it used to rely on a guard page, so an out-of-bounds READ under isolate=false KILLED the
+        # caller's process outright (SIGSEGV/SIGBUS). It now returns cleanly instead.
+        #
+        # The tradeoff is explicit: this mode misses reads SILENTLY. It is the cheap in-process
+        # option, and `isolate=true` (the default) is what catches loads — asserted directly above.
         script = """
         using StrictMode
         include($(repr(MEMSAFE_KERNELS_FILE)))
-        memsafe_report(memsafe_oob_read_kernel!, zeros(8), rand(8); isolate=false)
-        print(stdout, "SHOULD_NOT_REACH_HERE")
+        r = memsafe_report(memsafe_oob_read_kernel!, zeros(8), rand(8); isolate=false)
+        print(stdout, r.violation === nothing ? "SURVIVED_CLEAN" : "DETECTED")
         """
         cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`
         outbuf = IOBuffer()
         proc = run(pipeline(cmd; stdout = outbuf, stderr = devnull); wait = false)
         wait(proc)
-        # SIGSEGV(11) on Linux, SIGBUS(10) on macOS — the process died either way; isolate=false
-        # did not (could not) catch it.
-        @test proc.termsignal in (10, 11)
-        @test !occursin("SHOULD_NOT_REACH_HERE", String(take!(outbuf)))
+        @test proc.termsignal == 0                                   # no longer kills the process
+        @test occursin("SURVIVED_CLEAN", String(take!(outbuf)))      # …and misses the read, as documented
     end
 end
 
@@ -177,4 +191,35 @@ end
     bad = StrictMode.MemsafeReport("f(Int)", true, "boom")
     @test occursin("VIOLATION", sprint(show, bad))
     @test occursin("boom", sprint(show, bad))
+end
+
+@testitem "the canary poison is PER-BUFFER — a copy kernel cannot launder it" begin
+    using StrictMode
+    if Sys.iswindows()
+        @test_skip false
+    else
+        # Regression guard for a false negative that a single shared poison byte would produce, on
+        # this package's MOTIVATING kernel shape rather than some corner case.
+        #
+        # With one shared poison value, a kernel that copies between two guarded buffers launders it:
+        # the overrunning load pulls the poison out of the source's canary and the overrunning store
+        # writes that same byte into the destination's, so BOTH canaries read back clean on a kernel
+        # that overruns a read AND a write. Measured before the fix — source clean, destination
+        # clean, violation === nothing. Distinct per-buffer bytes make the copied value differ from
+        # the destination's own poison, so the store is seen.
+        function copy_overrun!(out::Vector{Float64}, a::Vector{Float64})
+            n = length(a) + 1                      # one element past the end of both
+            @inbounds for i in 1:n
+                unsafe_store!(pointer(out), unsafe_load(pointer(a), i), i)
+            end
+            return out
+        end
+        r = memsafe_report(copy_overrun!, zeros(8), ones(8); isolate = false)
+        @test r.violation !== nothing
+        @test occursin("WRITE", r.violation)
+        @test occursin("argument 1", r.violation)          # the destination is the one written past
+
+        # And the poison really is distinct per argument position.
+        @test StrictMode._poison_for(1) != StrictMode._poison_for(2)
+    end
 end

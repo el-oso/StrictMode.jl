@@ -117,5 +117,17 @@ end
     @test scalar_fp_loops(body_plus_masked_tail!, (Ptr{Float64}, Int, Float64)) == false
 
     # False positive (issue #22): LLVM's own `@simd` scalar epilogue must not be flagged.
-    @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) == false
+    #
+    # Guarded on forced bounds checking, like the other vectorization-shape tests (f22_test,
+    # no_spill_test). `Pkg.test()` runs with `--check-bounds=yes`, which prevents LLVM from
+    # vectorizing `vector_kernel!` at all. With no vector loop left, the fix's discriminator — "does
+    # this function ALSO contain a hand-vectorized loop?" — correctly finds none, and the remaining
+    # scalar loop is then flagged. That is the check being right about the code it was actually
+    # given: under forced bounds checks this kernel really is entirely scalar. The guarantee only
+    # means something in vectorizable codegen.
+    if Base.JLOptions().check_bounds != 1
+        @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) == false
+    else
+        @test_skip false
+    end
 end
