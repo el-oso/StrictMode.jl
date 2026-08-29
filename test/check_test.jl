@@ -109,3 +109,32 @@ end
     @test all(f -> f.status in (:pass, :fail), ts)
     @test nsuspect(ts) == 0
 end
+
+@testitem "a crashed :full backend reports :skip, never :pass" begin
+    using StrictMode, StrictModeTest
+    # The sixth vacuous-green bug on this branch. `would_fail_noalloc` returns false when AllocCheck
+    # errored, and a swallowed JET error leaves `opt_reports` empty — so `findings(...; mode=:full)`
+    # reported `:pass` for every method whose analysis CRASHED. In a sweep that is the CI gate
+    # reporting success for code it never checked, and the vacuous `:pass` was cached besides.
+    # "Could not check" and "is fine" must never render the same.
+    boom(x::Int) = x + 1
+    boom(1)
+    StrictMode._be_opt_result(::typeof(boom), types) = throw(AssertionError("JET crashed"))
+    StrictMode._be_check_allocs(::typeof(boom), types) = throw(AssertionError("AllocCheck crashed"))
+    StrictMode.clear_cache!()
+    try
+        for g in (:typestable, :noalloc, :noboxing)
+            f = only(findings(boom, (Int,); guarantees = (g,), mode = :full))
+            @test f.status === :skip
+            @test f.reason != ""
+        end
+        # …and @explain must not affirmatively claim the check passed.
+        rep = StrictMode._strict_report("boom(Int64)", boom, (Int,))
+        @test !occursin("✓ no issues (JET", sprint(io -> show(io, MIME"text/plain"(), rep)))
+        @test occursin("did not run", sprint(io -> show(io, MIME"text/plain"(), rep)))
+        s = sprint(io -> show(io, rep))
+        @test occursin("stable?", s)      # compact form must not assert "stable" either
+    finally
+        StrictMode.clear_cache!()
+    end
+end

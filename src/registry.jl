@@ -62,6 +62,16 @@ _default_parallel(::Symbol) = false
 # the exact failure mode `assert_enabled` exists to prevent, reached through a different door, and it
 # lands in `audit` — the driver the Stop hook and the consumer gate scripts run. Rethrow it.
 _is_fatal_sweep_error(err) = err isa StrictViolation || err isa BackendUnavailable
+# A per-item analysis error is not fatal to the sweep — one unanalyzable method must not sink it.
+# But it must not VANISH either: silently dropping the item means a sweep reports success for a
+# method it never checked, which is the same "could not check" == "is fine" conflation that made a
+# crashed backend report `:pass`. Emit a `:skip` finding naming the method and the error instead.
+function _skips_for(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
+    fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
+    why = "analysis errored for this signature: " * sprint(showerror, err)
+    return StrictFinding[_skipfinding(md, fn, sg, g, why) for g in gs]
+end
+
 function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
     if parallel && length(items) > 1
         results = Vector{Vector{StrictFinding}}(undef, length(items))
@@ -72,7 +82,7 @@ function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
                 findings(f, types; guarantees = gs, mode)
             catch err
                 _is_fatal_sweep_error(err) && (fatal[] = err)
-                StrictFinding[]
+                _skips_for(f, types, gs, err)
             end
         end
         fatal[] === nothing || throw(fatal[])
@@ -84,6 +94,7 @@ function _map_findings(items::Vector, parallel::Bool, mode::Symbol)
             append!(out, findings(f, types; guarantees = gs, mode))
         catch err
             _is_fatal_sweep_error(err) && rethrow()
+            append!(out, _skips_for(f, types, gs, err))
         end
     end
     return out

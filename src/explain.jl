@@ -65,7 +65,9 @@ function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
     println(io, "  Return type:    ", r.return_type, "  ", mark)
 
     # Type stability (JET)
-    if isempty(r.opt_reports)
+    if r.opt_result === nothing
+        println(io, "  Type stability: ? JET analysis did not run — UNKNOWN, not clean")
+    elseif isempty(r.opt_reports)
         println(io, "  Type stability: ✓ no issues (JET @report_opt)")
     else
         println(io, "  Type stability: ✗ ", length(r.opt_reports), " issue(s) (JET @report_opt):")
@@ -87,10 +89,17 @@ function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
     # Verdict
     println(io)
     println(io, "  Verdict:")
-    println(
-        io, "    ", would_fail_typestable(r) ? "✗ @assert_typestable would fail" :
-            "✓ @assert_typestable would pass"
-    )
+    if r.opt_result === nothing
+        # JET did not run (it errored, or no backend). Saying "would pass" here would be a claim the
+        # analysis never made — the same "could not check" == "is fine" conflation that made a
+        # crashed backend report `:pass` in a `mode = :full` sweep.
+        println(io, "    ? @assert_typestable could not be fully determined (JET analysis did not run)")
+    else
+        println(
+            io, "    ", would_fail_typestable(r) ? "✗ @assert_typestable would fail" :
+                "✓ @assert_typestable would pass"
+        )
+    end
     if r.alloc_error !== nothing
         println(io, "    ? @assert_noalloc could not be statically determined (try `static = false`)")
     else
@@ -118,7 +127,9 @@ function Base.show(io::IO, ::MIME"text/plain", r::StrictReport)
 end
 
 function Base.show(io::IO, r::StrictReport)
-    ts = would_fail_typestable(r) ? "unstable" : "stable"
+    # "stable?" not "stable" when JET did not run — the compact form must not assert a verdict the
+    # analysis never produced, same rule as the full rendering above.
+    ts = r.opt_result === nothing ? "stable?" : (would_fail_typestable(r) ? "unstable" : "stable")
     na = r.alloc_error !== nothing ? "alloc?" : (would_fail_noalloc(r) ? "allocates" : "noalloc")
     print(io, "StrictReport(", r.target, ": ", ts, ", ", na, ")")
     return nothing

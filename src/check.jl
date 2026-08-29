@@ -37,6 +37,11 @@ function _first_loc(allocs, boxing_only::Bool)
     return ("", 0)
 end
 
+# A guarantee the backend could not evaluate. NOT `:pass`: "I could not check this" and "this is
+# fine" must never render the same, which is how a crashed AllocCheck/JET run reported success for
+# every method in a `mode = :full` sweep.
+_skipfinding(md, fn, sg, g, why) = StrictFinding(md, fn, sg, g, :skip, "", 0, why, _suggestion(g))
+
 # `flagged_status` is what a positive verdict becomes. It defaults to `:fail`, and is `:suspect` for
 # the `:fast` engine's allocation guarantees — see `_findings_fast`.
 _mkfinding(md, fn, sg, g, fail::Bool, reason, file, line; flagged_status::Symbol = :fail) = StrictFinding(
@@ -70,7 +75,14 @@ end
 function _build_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), rep, md, fn, sg)
     shared = _mode_independent_finding(g, f, types, md, fn, sg)
     shared === nothing || return shared
-    if g === :typestable
+    if g === :typestable && rep.opt_result === nothing
+        return _skipfinding(
+            md, fn, sg, g,
+            "JET optimization analysis did not run for this signature — the verdict is UNKNOWN, not clean"
+        )
+    elseif (g === :noalloc || g === :noboxing) && rep.alloc_error !== nothing
+        return _skipfinding(md, fn, sg, g, "AllocCheck could not analyze this signature: $(rep.alloc_error)")
+    elseif g === :typestable
         fail = would_fail_typestable(rep)
         return _mkfinding(md, fn, sg, g, fail, "return type $(rep.return_type) is not concrete / internal instability", "", 0)
     elseif g === :noalloc

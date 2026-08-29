@@ -13,14 +13,19 @@ Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:nobo
 
 `status` is one of:
 - `:pass` / `:fail` — a verdict to act on.
-- `:skip` — not analyzable (non-concrete signature, unsupported construct).
 - `:info` — advisory, never a failure ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)).
+- `:skip` — **the analysis did not run** (non-concrete signature, or the backend errored on this
+  signature). Not counted as a failure, but deliberately NOT `:pass`: "could not check" and "is
+  fine" must never render the same.
 - `:suspect` — **the `:fast` engine flagged an allocation guarantee.** That engine reads typed IR,
   where an allocation site LLVM will later elide is still present, so a positive verdict is a
-  structural guess rather than the proof AllocCheck gives. Counted by [`nsuspect`](@ref), NOT by
-  [`nfailures`](@ref), so a heuristic guess cannot abort a build under `fail_mode = :error` — which
-  is what made a 28%-false-positive tier unusable at a consumer's own precompile (issue #17/#18).
-  Load `StrictModeTest` and the same finding is re-issued as `:pass`/`:fail` by the proof.
+  structural guess rather than the proof AllocCheck gives (~28% false on a real consumer, issue
+  #17). It IS counted by [`nfailures`](@ref) and does fail `check`/`audit` under
+  `fail_mode = :error` — a sweep must not go green on a real allocation regression. What the status
+  buys is that it renders distinctly, is separately countable via [`nsuspect`](@ref), and that
+  `@strict_function` WARNS instead of aborting a consumer's precompile, where the proof is
+  unreachable by construction (issue #18). Load `StrictModeTest` and the same finding is re-issued
+  as a proved `:pass`/`:fail`.
 """
 struct StrictFinding
     mod::Symbol

@@ -363,8 +363,10 @@ guarded buffers, so it stays a `@golden`-style value-based function/macro pair i
   (a SIGSEGV) is caught via the child's exit signal rather than crashing your session. This is the
   only mode that catches the motivating bug class (a masked SIMD load reading past a tile).
 - `isolate = false`: the probe runs **in-process** — cheaper, but only catches out-of-bounds
-  WRITES (caught as a `ReadOnlyMemoryError`); an out-of-bounds read is a fatal, uncatchable crash
-  in this mode.
+  WRITES, and it misses out-of-bounds READS **silently**. A load past the end reads the canary's
+  poison bytes and disturbs nothing, so this mode returns a CLEAN report for a read overrun (and the
+  kernel computes on poison garbage). Use the default `isolate = true` if reads matter — it is the
+  only mode that catches them.
 - `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
   — the default (the element's own size) is always exact-flush, no tradeoff.
 - `using_module`: for `isolate=true` when `f`'s defining file isn't self-contained (relies on its
