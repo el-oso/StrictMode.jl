@@ -702,8 +702,11 @@ The companion `@test_*` macros always throw; they are the authority.
   statically, so a per-finding field is redundant.
 - **`:skip`.** An authoritative checker that cannot answer throws `AnalysisError` rather than
   emitting a finding that reads as "not a failure".
-- **`fail_mode`**, if the per-guarantee rule above replaces it — leaving `checks_enabled` as the only
-  preference. Decide alongside.
+- **`fail_mode`, the PREFERENCE.** The per-guarantee rule replaces it: the guarantee decides whether
+  it throws or warns, not a global setting. `checks_enabled` becomes the only preference in the
+  package — one compile-time switch, off in production, and nothing else. Note this is the
+  PREFERENCE only: the `fail = :error/:warn/:none` KEYWORD on `check`/`audit`/`check_all` is a
+  per-call reporting choice (collect findings vs. raise) and is orthogonal, so it stays.
 
 Status surface reduces to `:pass` / `:fail` / `:info`. `AnalysisError` is retained: a backend that
 *crashes* is still possible and must never render as a pass.
