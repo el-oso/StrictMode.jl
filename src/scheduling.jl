@@ -623,7 +623,13 @@ function register_report(@nospecialize(f), @nospecialize(types::Tuple))
     target = _func_name(f) * _sig_string(types)
     s = _native_asm(f, types)
     isempty(s) && return RegisterReport(target, 0, 0, 0)
-    zmm_regs = Set(m[1] for m in eachmatch(r"%zmm(\d+)\b", s))
+    # `\bzmm(\d+)\b`, NOT `%zmm…`: `code_native` emits Intel syntax (bare `zmm0`) on this platform
+    # and AT&T (`%zmm0`) elsewhere, and which one you get varies by platform and Julia version. The
+    # word boundary matches both, since `%` is a non-word character. Pinning the AT&T sigil made this
+    # report a silent zero for every kernel on an Intel-syntax host — 201 `zmm` occurrences in the
+    # assembly, `used = 0` (issue #21). `@assert_no_spill` below already avoids this trap by reading
+    # LLVM's Spill/Reload comments instead of operand punctuation; this had not caught up.
+    zmm_regs = Set(m[1] for m in eachmatch(r"\bzmm(\d+)\b", s))
     spills = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
     total = isempty(zmm_regs) ? 0 : 32
     return RegisterReport(target, length(zmm_regs), total, spills)
