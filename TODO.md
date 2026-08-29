@@ -131,6 +131,13 @@ GitHub issues are the source of truth for anything with a number; the notes here
   `rev = "master"`, so merging this branch to master breaks it on the next resolve.
   `PureFFT.jl` pins `rev = "v0.3.3"`; the other three come from the registry and are pinned
   to 0.3.10 until 0.4 is registered.
+  **Migration trap, PureSparse specifically:** its script's ONLY verdict mechanism is
+  `@assert_noalloc static = false` throwing — its two `error(…)` calls are preconditions, and
+  it ends by printing "PASS". Under 0.4 it breaks loudly at `backend_available()`, which is
+  fine. But the naive fix — renaming that to `proofs_loaded()` — makes it SILENTLY VACUOUS:
+  all twelve assertions warn instead of throwing, the script prints PASS, exits 0, and the
+  hook stamps it green. It must move to `@test_noalloc` / `test_signatures`, not be renamed.
+
   *Migration per script:* `backend_available()` → `proofs_loaded()`; `check(…; mode = :full)`
   → `StrictModeTest.test_signatures`; `exit(nfailures(audit(…)))` → `test_compiled(MyPkg)`,
   since `audit` deliberately no longer gates or sets an exit status.
