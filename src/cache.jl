@@ -36,7 +36,8 @@ function clear_cache!()
         _CACHE_HITS[] = 0
         _CACHE_MISSES[] = 0
     end
-    @lock _SIGNAL_MEMO_LOCK empty!(_SIGNAL_MEMO)   # the fast-scan memo shares the staleness contract
+    @lock _SIGNAL_MEMO_LOCK empty!(_SIGNAL_MEMO)   # the scan memo shares the staleness contract
+    @lock _ESCAPE_MEMO_LOCK empty!(_ESCAPE_MEMO)   # …as does the escape-analysis memo
     return nothing
 end
 

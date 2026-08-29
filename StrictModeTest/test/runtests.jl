@@ -30,6 +30,16 @@ const SINK = Ref{Any}(nothing)
 
     allocs(n::Int) = (v = rand(n); SINK[] = v; length(v))
 
+    @testset "the negative fixtures are still negative" begin
+        # Every assertion in this file that says "the proof flags this" rests on these two fixtures
+        # actually exhibiting the defect. An optimizer that elides `allocs`, or a `boxy` that stops
+        # boxing, turns those assertions into tautologies while the suite stays green — the failure
+        # mode that has recurred most often in this repo.
+        allocs(4); boxy((1, 2.0, 3.0f0))                  # compile before measuring
+        @test @allocated(allocs(4)) > 0
+        @test StrictMode._alloc_signals(boxy, Thet).boxing
+    end
+
     @testset "the AllocCheck primitive finds real allocations and clears clean code" begin
         @test isempty(StrictModeTest._raw_allocs(clean, T3))
         @test !isempty(StrictModeTest._raw_allocs(allocs, (Int,)))

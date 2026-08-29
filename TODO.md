@@ -23,10 +23,30 @@ GitHub issues are the source of truth for anything with a number; the notes here
   `IdDict` including the concretely-typed rare-type-tail fallback `static_ownership`
   prescribes — the issue-#7 gate that must not exist. It also cost a measured 7.6× on
   fresh scans of signal-saturated functions.
-  *Mitigated, not fixed:* the issue's own second suggestion is implemented — `_guarantee_gates`
-  (report.jl) puts `:noalloc`/`:noboxing` in the reporting set, so a false positive warns instead
-  of aborting a build, and the proof that gates is `StrictModeTest`'s `@test_noalloc`. The
-  false-positive rate itself is unchanged, so `audit` output on a real consumer is still ~28% noise.
+  *Reported, and now largely fixed at the source.* Two independent changes:
+  (a) `_guarantee_gates` (report.jl) puts `:noalloc`/`:noboxing` in the reporting set, so a false
+      positive warns instead of aborting a build; the proof that gates is `@test_noalloc`.
+  (b) **Escape analysis**, `_all_news_nonescaping` in effects.jl. `Core.Compiler.EscapeAnalysis` on
+      the same signature discriminates exactly the shape `infer_effects` could not: the issue's own
+      reproducer reports `has_no_escape = true` on its `:new`, every shape that really allocates
+      reports `false`. Both the `:new` rule and the `Core.memorynew` rule are gated on it, so
+      `mkvec` now comes back clean. Measured over 11 shapes (escaping, runtime-size, 100k-element,
+      `IOBuffer`, `Dict`, `push!`-grown, bare `Memory`, and two clean controls): **zero false
+      negatives, one residual false positive** (`[n, n+1]`, still flagged, still the safe
+      direction). Cost: ~0.69 ms cold per signature, 0.08 ms warm; memoized and cleared with the
+      findings cache.
+  *Still owed:* a corpus re-measurement. The 19/68 figure came from a 68-signature PureIPM sweep
+  and the ~569-specialization corpus study; neither has been re-run against this, so the new rate is
+  unknown — 11 hand-built shapes plus a 649-assertion suite is not the same evidence.
+  *Caveat:* `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability
+  guarantee. Every failure falls back to "assume it escapes" (the previous behaviour), so a Julia
+  release that moves it degrades the rate rather than breaking the guarantee — but the fallback is
+  silent, so the corpus re-measurement is also how a future regression would be noticed.
+
+  The change immediately exposed a false-premise test: `once_barrier_test.jl` asserted a fixture
+  "genuinely allocates on every call" that measures **0 bytes** — a #17 false positive living inside
+  the suite and asserting itself as correct. The fixture now escapes its allocation, and the
+  `@allocated(...) > 0` guard added alongside is what catches that class.
 
 - [ ] **#18 — inert preferences / broken consumer precompile.** Both parts are addressed;
   what remains is confirming it on a real consumer.
@@ -94,8 +114,8 @@ GitHub issues are the source of truth for anything with a number; the notes here
 
 - [ ] **Register `StrictModeTest`.** Subdirectory package; Registrator supports `subdir=`. Needs a
   decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).
-  **Blocking for 0.4.0**: without it, a consumer upgrading to StrictMode 0.4 has no way to reach
-  the proofs at all, since every gating entry point moved there.
+  Not urgent: nothing consumes 0.4 yet. It becomes load-bearing the moment one does, since every
+  gating entry point lives there.
 
 - [ ] **No consumer has been migrated to the 0.4 surface.** PureBLAS alone has 27 `@assert_noalloc`
   and 85 `@assert_trim_compatible`; under 0.4 every one of them reports where it used to gate, and
@@ -133,39 +153,6 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 `test/standalone`'s isolation assertion was decorative (verified: it passes without
 `JULIA_LOAD_PATH`, so dropping the CI env var would leave the split-premise gate green).
 
-- [ ] **Negative fixtures do not assert they are still bad.** No test in either suite checks that an
-  intentionally-allocating fixture still allocates before asserting the check flags it. Make one
-  optimizable and every assertion around it stays green. This has already recurred once
-  (`test/unroll_test.jl`). *Fix:* `@test @allocated(fixture(args...)) > 0` beside each such fixture
-  in `test/once_barrier_test.jl`, `test/unroll_test.jl`, `StrictModeTest/test/divergence_test.jl`.
-
-- [ ] **`_guarantee_gates`'s partition is untested.** `src/report.jl` holds a hand-typed tuple;
-  appending one symbol converts a gate to a warning package-wide and no test observes it. Nothing
-  asserts throw-vs-warn at the macro boundary. *Fix:* the new `test/findings_test.jl` item that
-  enumerates `_GUARANTEES` for `_suggestion` is the template.
-
-- [ ] **`assert_enabled()` has one caller in the tree** (`StrictModeTest/src/drivers.jl`). A
-  StrictMode-only consumer running under `CI=1` with `checks_enabled = false` is fully green and
-  nothing invokes the guard that exists to make that loud.
-
-- [ ] **`@golden` passes while comparing nothing when the golden file is absent** (`src/golden.jl`).
-  Record-and-pass is correct on first run, but a CI checkout without `test/golden/` (gitignored, or
-  a `dir=` tmpdir) records every time and never compares. The only signal is an `@info`. `@golden`
-  is also the one guarantee macro not routed through `_gate`.
-
-- [ ] **`audit`'s advisory loops still swallow** (`src/audit.jl`): the `inline_suggest` /
-  `static_ownership_suggest` `catch` drops the item without an `_errored_findings` record — a second
-  copy of the swallow `_map_findings` was fixed for. Advisory-only (`:info`), so lower severity.
-
-- [ ] **`_call_parts` evaluates the function-position expression twice** (`src/macros.jl`). `fe` is
-  spliced into both the executed call and the analyzed `checkfn`, so `@assert_noalloc ws.kernel(x)`
-  or `@test_noalloc make_f()(x)` runs the getfield/factory twice and can analyze a *different*
-  callable than it ran. Pre-existing, not introduced by the split.
-
-- [ ] **`types = (…)` drops keyword args from the proved signature** (`src/macros.jl`): the override
-  takes the `checkfn = fe` branch, bypassing the `Core.kwcall` path, while the executed call still
-  passes the keywords. The proof then covers a signature the call does not have.
-
 - [ ] **Docs pages not updated for 0.4.** `tutorial.md`, `cookbook.md`, `index.md` and `concepts.md`
   were never touched by the split. Between them they call the deleted `check`, import AllocCheck/JET
   directly, say checks are "off by default", describe `@explain` as gathering JET + AllocCheck,
@@ -173,10 +160,6 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
   as escalating with TrimCheck. `README.md` links twice to `docs/rust_gaps`, a page absent from
   `docs/src/` and from `make.jl`. `src/StrictMode.jl`'s own top-level docstring still describes the
   deleted `:fast`/`:full` tiers.
-
-- [ ] **Cross-package registry pollution is still unaddressed** (SPLIT-PROPOSAL §10 item 3). The
-  registry key is `(f, types)` with no module, so `test_registered()` re-proves whatever a
-  dependency's executed `@assert_*` calls inserted, under the consumer's gate.
 
 ## Done
 
@@ -263,11 +246,3 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
   a proposal.
 
 
-- [ ] **No release notes for the 0.4 break.** SPLIT-PROPOSAL §8 flags the migration cost as
-  *silent*: the `StrictMode` spellings are unchanged, so a consumer's `@assert_noalloc` compiles and
-  runs exactly as before and merely stops gating. A rename would have been caught by the compiler;
-  this will not be. The load banner is the in-process mechanism, but there is no CHANGELOG, no
-  release note, and no migration table (`check` → `findings`/`test_signatures`, `check_all` →
-  `test_registered`, `check_compiled` → `test_compiled`, `audit(...; exit_on_fail)` → `test_*`,
-  `:suspect`/`nsuspect` → gone, `mode=`/`fail_mode` → gone, `divergence_report` → StrictModeTest).
-  Registering 0.4.0 without one ships a silent behaviour change to every consumer.

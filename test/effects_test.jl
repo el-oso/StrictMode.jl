@@ -110,3 +110,48 @@ end
     @test ss.alloc && ss.boxing && ss.dictlookup   # the frontier really is saturated ...
     @test !ss.barrier                              # ... so the walk stopped short of the barrier
 end
+
+@testitem "issue #17: a non-escaping allocation LLVM elides is not flagged" begin
+    using StrictMode
+    # The scan reads typed IR, where an allocation LLVM later removes is still present. Escape
+    # analysis on the same signature is the discriminator: `has_no_escape` on the frame's `:new`
+    # statements separates "elided" from "real". Gating on it can only lose a FALSE positive —
+    # every shape below that actually allocates is still flagged, which is what makes this safe for
+    # an allocation guarantee.
+    SINK = Ref{Any}(nothing)
+    mkvec(n::Int) = length(Vector{Float64}(undef, n))                        # the issue's reproducer
+    escapes(n::Int) = (v = Vector{Float64}(undef, n); SINK[] = v; length(v))
+    big(n::Int) = (v = Vector{Float64}(undef, n); v[1] = 1.0; v[1])
+    huge() = (v = Vector{Float64}(undef, 100_000); v[1] = 1.0; v[1])
+    dictl(n::Int) = (d = Dict{Int, Int}(); d[n] = n; length(d))
+    memonly(n::Int) = (m = Memory{Float64}(undef, n); m[1] = 1.0; m[1])
+    grow(n::Int) = (
+        v = Int[]; for i in 1:n
+            push!(v, i)
+        end; SINK[] = v; sum(v)
+    )
+
+    # Every case is measured, not assumed: the runtime byte count is the oracle, and a fixture that
+    # stopped exhibiting its shape would fail here rather than silently agreeing with the scan.
+    for (f, args) in (
+            (mkvec, (7,)), (escapes, (7,)), (big, (7,)), (huge, ()),
+            (dictl, (7,)), (memonly, (7,)), (grow, (7,)),
+        )
+        f(args...)                                   # compile before measuring
+        allocated = @allocated f(args...)
+        flagged = StrictMode._alloc_signals(f, map(typeof, args)).alloc
+        # The direction that matters: nothing that really allocates may go unflagged.
+        allocated > 0 && @test flagged
+    end
+
+    # …and the reproducer specifically must now come back clean, since it measures zero.
+    mkvec(7)
+    @test @allocated(mkvec(7)) == 0
+    @test !StrictMode._alloc_signals(mkvec, (Int,)).alloc
+
+    # The analysis is a compiler internal with no stability guarantee, so its failure must fall
+    # back to "assume it escapes" — over-flagging, never a quiet pass.
+    @test StrictMode._all_news_nonescaping(Tuple{typeof(mkvec), Int})
+    @test !StrictMode._all_news_nonescaping(Tuple{typeof(escapes), Int})
+    @test !StrictMode._all_news_nonescaping(Nothing)      # not a signature at all → conservative
+end

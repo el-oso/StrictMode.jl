@@ -43,3 +43,49 @@ end
         @test f.suggestion == StrictMode._suggestion(g)
     end
 end
+
+@testitem "the throw-vs-warn partition is exhaustive and each guarantee lands on the right side" begin
+    using StrictMode
+    # `_guarantee_gates` is a hand-typed tuple in src/report.jl. Appending one symbol to it converts
+    # a gate into a warning package-wide, and nothing else in the suite observes throw-vs-warn at
+    # the macro boundary — so this pins the partition itself.
+    #
+    # The rule it encodes: a check that OBSERVES compiled output gates; one that INFERS something it
+    # cannot see reports. Both lists are spelled out here rather than derived, precisely so that
+    # moving a guarantee between them has to be a deliberate edit in two places.
+    reports = (:noalloc, :noboxing, :no_scalar_loops, :trimsafe, :trim_compatible)
+    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill)
+    for g in reports
+        @test !StrictMode._guarantee_gates(g)
+    end
+    for g in gates
+        @test StrictMode._guarantee_gates(g)
+    end
+    # Exhaustive over the guarantee list: a new `_GUARANTEES` entry must be classified, not
+    # defaulted in by the blacklist's `!(kind in …)` without anyone noticing.
+    @test Set(reports) ∪ Set(gates) == Set(StrictMode._GUARANTEES)
+
+    # The value-based guarantees are not in `_GUARANTEES` (they never reach the findings pipeline),
+    # but they still route through `_fail`, and they gate.
+    for g in (:memsafe, :concurrency_safe, :no_threadid_state)
+        @test StrictMode._guarantee_gates(g)
+    end
+end
+
+@testitem "the warn path names macros that exist" begin
+    using StrictMode
+    # `_fail`'s note used to interpolate `@$kind` / `@test_$kind`, which sends a user to
+    # `@no_scalar_loops` and `@test_trimsafe` — neither of which exists. Only four guarantees have a
+    # proving counterpart at all, and `:trimsafe` is spelled `@assert_trim_safe`.
+    macro_exists(name) = isdefined(StrictMode, Symbol(name)) || isdefined(Main, Symbol(name))
+    for g in StrictMode._GUARANTEES
+        own, proof = StrictMode._macro_names(g)
+        @test isdefined(StrictMode, Symbol(own))
+        isnothing(proof) && continue
+        # The proving macros live in StrictModeTest; assert the NAME is one of the four that exist
+        # rather than reaching across the package boundary from here.
+        @test proof in ("@test_noalloc", "@test_noboxing", "@test_typestable", "@test_trim_compatible")
+    end
+    @test StrictMode._macro_names(:trimsafe)[1] == "@assert_trim_safe"
+    @test isnothing(StrictMode._macro_names(:no_scalar_loops)[2])
+end

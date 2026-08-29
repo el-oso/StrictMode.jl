@@ -131,3 +131,35 @@ end
     @test count(StrictMode._failed, fs) == 1
     @test occursin("backend crashed", fs[1].reason)
 end
+
+@testitem "the function position is evaluated exactly once" begin
+    using StrictMode, StrictModeTest
+    # `_call_parts` used to splice `esc(fexpr)` into both the executed call and the analyzed
+    # `checkfn`, so a function position with a side effect ran twice — and a factory (`make_f()(x)`)
+    # was PROVED on a different closure than the one that ran, which is a proof about code the user
+    # never executed.
+    calls = Ref(0)
+    plain(x) = 2x + 1
+    makef() = (calls[] += 1; plain)
+
+    calls[] = 0
+    @test (@assert_typestable (makef())(3.0)) === 7.0
+    @test calls[] == 1
+
+    calls[] = 0
+    @test (@test_noalloc (makef())(3.0)) === 7.0
+    @test calls[] == 1
+end
+
+@testitem "types= keeps a keyword call on its real kwcall signature" begin
+    using StrictMode, StrictModeTest
+    # With `types = (…)` AND keyword arguments, the override used to take the plain-positional
+    # branch: it analyzed `g(Int)` while the call actually dispatched through `Core.kwcall`. The
+    # proof then covered a method the call never reaches.
+    g(x::Int; k::Int = 1) = x + k
+    p = StrictMode._call_parts(:(g(1; k = 2)); types = :((Int,)))
+    @test p.checkfn === Core.kwcall
+
+    # End to end: the override still pins the positional types, and the call is proved as-is.
+    @test (@test_noalloc g(1; k = 2) types = (Int,)) === 3
+end

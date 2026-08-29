@@ -104,10 +104,24 @@ end
 # "checks are on, and `@assert_noalloc` is a scan rather than a proof" — StrictModeTest prints the
 # authoritative variant when it loads, so the two tiers are visibly different at a glance.
 function _announce_tier()
-    CHECKS_ENABLED || return nothing
     # Quiet while a dependent package is being precompiled: that output is captured and replayed
     # per package, so the banner would appear once per dependent instead of once per session.
     iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
+    if !CHECKS_ENABLED
+        # Silence is the correct default for a shipped application — but under CI it is the
+        # vacuous-green shape this package exists to remove: every `@assert_*` is a bare call, so a
+        # suite full of them passes while checking nothing. `assert_enabled` is the guard for that,
+        # and it only helps a suite that remembers to call it; announcing here covers the ones that
+        # do not. Loading `StrictModeTest` turns the same state into a hard error.
+        isempty(get(ENV, "CI", "")) || printstyled(
+            stderr,
+            "┌ StrictMode: checks are DISABLED and CI is set.\n" *
+                "│ Every @assert_* in this run is a bare call: a green suite proves nothing.\n" *
+                "└ Remove `checks_enabled = false` from this environment's preferences.\n";
+            color = :yellow, bold = true
+        )
+        return nothing
+    end
     printstyled(stderr, "┌ StrictMode: checks ENABLED — reporting tier.\n"; color = :cyan)
     printstyled(
         stderr,

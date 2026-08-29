@@ -70,6 +70,11 @@ end
     # Same escape trick: `length(rand(4))` alone is elided by both optimizers (0 B measured).
     _sink2 = Ref{Any}(nothing)
     really_allocates(x::Int) = (a = rand(4); _sink2[] = a; x + length(a))
+    # The fixture must still BE bad. An optimizer that learns to elide this allocation turns every
+    # assertion below into a tautology, and nothing else here would notice — that is how the
+    # escaping-sink shape had to be introduced in the first place.
+    really_allocates(1)                                   # compile before measuring
+    @test @allocated(really_allocates(1)) > 0
     @test_throws StrictViolation (@test_noalloc really_allocates(1))
 
     sig = StrictMode._alloc_signals(really_allocates, (Int,))
@@ -86,8 +91,19 @@ end
     # on every call, real bug this test pins down (a prior version wrongly reported it clean via
     # `mi.def.module` not being checked).
     const _NPBP_ONCE = Base.OncePerProcess{Int}(() -> 1)
-    @noinline helper(o::Base.OncePerProcess{Int}, n::Int) = o() + length(Vector{Float64}(undef, n))
+    const _NPBP_SINK = Ref{Any}(nothing)
+    # The allocation ESCAPES into a sink. Without that it feeds only `length`, LLVM removes it, and
+    # the call measures 0 bytes — so "the callee's own allocation is not hidden" would be asserted
+    # against a callee that does not allocate, and the assertion would hold for the wrong reason.
+    @noinline function helper(o::Base.OncePerProcess{Int}, n::Int)
+        v = Vector{Float64}(undef, n)
+        _NPBP_SINK[] = v
+        return o() + length(v)
+    end
     caller(n::Int) = helper(_NPBP_ONCE, n)
+
+    caller(4)                 # compile before measuring
+    @test @allocated(caller(4)) > 0
 
     sig = StrictMode._alloc_signals(caller, (Int,))
     @test sig.barrier         # the OncePerProcess call inside `caller` is still correctly recognized

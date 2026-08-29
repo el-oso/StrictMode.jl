@@ -62,10 +62,17 @@ end
 # `types = (...)` override pins the signature verbatim (fixes DataType-widening false positives).
 function _call_parts(call; types = nothing)
     fexpr, argexprs, kwexprs = _callinfo(call)
-    fe = esc(fexpr)
+
+    # The FUNCTION POSITION is bound like any argument, and bound FIRST (Julia evaluates the callee
+    # before the arguments). Splicing `esc(fexpr)` into both the executed call and the analyzed
+    # `checkfn` would evaluate it twice — so `@assert_noalloc ws.kernel(x)` runs the getfield twice,
+    # and `@test_noalloc make_f()(x)` analyzes a DIFFERENT closure than it ran, which is a proof
+    # about code the user never executed. The alloc thunk runs the call a second time, compounding it.
+    fnsym = gensym(:f)
+    binds = Any[:($fnsym = $(esc(fexpr)))]
 
     argsyms = [gensym(:arg) for _ in eachindex(argexprs)]
-    binds = Any[:($s = $(esc(e))) for (s, e) in zip(argsyms, argexprs)]
+    append!(binds, Any[:($s = $(esc(e))) for (s, e) in zip(argsyms, argexprs)])
 
     kwnames = Symbol[name for (name, _) in kwexprs]
     kwsyms = [gensym(:kw) for _ in eachindex(kwexprs)]
@@ -76,21 +83,29 @@ function _call_parts(call; types = nothing)
 
     if haskw
         params = Expr(:parameters, (Expr(:kw, n, s) for (n, s) in zip(kwnames, kwsyms))...)
-        litcall = Expr(:call, fe, params, argsyms...)
+        litcall = Expr(:call, fnsym, params, argsyms...)
     else
-        litcall = Expr(:call, fe, argsyms...)
+        litcall = Expr(:call, fnsym, argsyms...)
     end
     thunk = Expr(:->, Expr(:tuple), Expr(:block, litcall))
 
-    if types !== nothing
-        checkfn = fe
+    # A keyword call really dispatches through `Core.kwcall`, so that is the signature the engines
+    # must be handed — INCLUDING under a `types = (…)` override. Taking the plain `(fnsym, types)`
+    # branch there would analyze `f(types...)`, a method the executed call never reaches. The
+    # override keeps meaning "these are the POSITIONAL argument types"; the kwcall wrapper is added
+    # here so the analyzed signature and the executed one stay the same signature.
+    nt = Expr(:tuple, (Expr(:(=), n, s) for (n, s) in zip(kwnames, kwsyms))...)
+    if !isnothing(types) && haskw
+        checkfn = Core.kwcall
+        typesexpr = :((typeof($nt), typeof($fnsym), $(esc(types))...))
+    elseif !isnothing(types)
+        checkfn = fnsym
         typesexpr = esc(types)
     elseif haskw
-        nt = Expr(:tuple, (Expr(:(=), n, s) for (n, s) in zip(kwnames, kwsyms))...)
         checkfn = Core.kwcall
-        typesexpr = Expr(:tuple, :(typeof($nt)), :(typeof($fe)), (:(typeof($s)) for s in argsyms)...)
+        typesexpr = Expr(:tuple, :(typeof($nt)), :(typeof($fnsym)), (:(typeof($s)) for s in argsyms)...)
     else
-        checkfn = fe
+        checkfn = fnsym
         typesexpr = Expr(:tuple, (:(typeof($s)) for s in argsyms)...)
     end
     return (; binds, litcall, thunk, checkfn, types = typesexpr)

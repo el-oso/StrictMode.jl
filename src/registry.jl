@@ -86,11 +86,28 @@ end
 # The registry as `(f, types, guarantees)` items, with exempted functions dropped. `guarantees`
 # overrides each entry's own setting when given. `StrictModeTest.test_registered` re-runs exactly
 # this list against the proofs, so both tiers agree on what "registered" means.
-function _registry_items(guarantees = nothing)
+#
+# `modules` scopes the sweep by the defining module of each registered function. The registry is
+# process-global and keyed on `(f, types)` with no module of its own, so a dependency loaded from
+# source in the same session — a Revise/`dev` setup — contributes its own declarations to it. Left
+# unscoped, one package's gate then judges another package's kernels. `_registry_breakdown` makes
+# that visible even when nobody scopes.
+function _registry_items(guarantees = nothing; modules = nothing)
+    names = isnothing(modules) ? nothing : Set{Symbol}(m isa Module ? nameof(m) : Symbol(m) for m in modules)
     return Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
-            for ((f, types), meta) in STRICT_REGISTRY if !_is_exempt(f)
+            for ((f, types), meta) in STRICT_REGISTRY
+            if !_is_exempt(f) && (isnothing(names) || _mod_sym(f) in names)
     ]
+end
+
+# `module => count` over the registry, for a driver to report what it is about to sweep.
+function _registry_breakdown(items)
+    counts = Dict{Symbol, Int}()
+    for (f, _, _) in items
+        counts[_mod_sym(f)] = get(counts, _mod_sym(f), 0) + 1
+    end
+    return sort!(collect(counts); by = first)
 end
 
 # An empty registry renders exactly like a clean one: zero findings, nothing to report. That is the

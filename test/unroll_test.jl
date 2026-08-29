@@ -37,6 +37,10 @@ end
         return acc
     end
     @test naive(htup) == unrolled(htup)          # same answer
+    # The trap fixture must still spring the trap. If `naive` ever stops boxing, the assertion
+    # below passes for the wrong reason and `@unroll`'s whole premise goes untested.
+    naive(htup)                                  # compile before measuring
+    @test @allocated(naive(htup)) > 0
     # The naive loop is type-stable (concrete Float64 return) yet still allocates — exactly the
     # silent trap @assert_noalloc exists to catch — while the unrolled version is clean.
     @test_throws StrictViolation (@test_noalloc naive(htup))

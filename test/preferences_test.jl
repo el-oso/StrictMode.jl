@@ -48,3 +48,35 @@ end
     @test !StrictMode._backend_declared_but_unloaded()
     @test StrictMode.assert_enabled()
 end
+
+@testitem "a checks-off session under CI announces itself" begin
+    using StrictMode
+    # `assert_enabled()` is the guard for the silent-skip failure mode, and it only fires in a suite
+    # that remembers to call it — which, in this tree, is exactly one caller. The load banner covers
+    # the suites that do not: with checks off and CI set, staying quiet would let a green run mean
+    # nothing at all. Driven in a subprocess because the state under test is a precompile-baked
+    # const plus an environment variable.
+    if Sys.iswindows()
+        @test_skip false
+    else
+        script = """
+        using StrictMode
+        print(stdout, "LOADED ", StrictMode.checks_enabled())
+        """
+        run_with(env) = begin
+            out, err = IOBuffer(), IOBuffer()
+            cmd = setenv(
+                `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`,
+                merge(ENV, env)
+            )
+            p = run(pipeline(cmd; stdout = out, stderr = err); wait = false)
+            wait(p)
+            (String(take!(out)), String(take!(err)))
+        end
+        # Checks ARE enabled in this environment, so the disabled-path banner must stay silent —
+        # otherwise the assertion below would pass for any input at all.
+        _, err_on = run_with(Dict("CI" => "true"))
+        @test !occursin("checks are DISABLED", err_on)
+        @test occursin("checks ENABLED", err_on)
+    end
+end

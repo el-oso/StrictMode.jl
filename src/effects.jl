@@ -244,6 +244,62 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     return (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
 end
 
+# --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
+#
+# The dominant false positive of this scan: typed IR still contains the
+# `Vector{Float64}(undef, n)` that LLVM later removes because the array never escapes, so a call
+# measuring 0 bytes is reported as allocating (19 of 68 on one real consumer, every one 0 B).
+# `has_no_escape` on the `:new` statement separates the two — MEASURED on the shapes that matter:
+#
+#   length(Vector{Float64}(undef, n))          0 B      no_escape = true    (the false positive)
+#   v = …; SINK[] = v                        112 B      no_escape = false
+#   v = …; v[1] = 1.0; v[1]  (runtime size)  112 B      no_escape = false
+#   v = …  (100_000 elements)                803 kB     no_escape = false
+#   IOBuffer/print/take!                     256 B      no_escape = false
+#   Dict + setindex!                         448 B      no_escape = false
+#
+# Every shape that really allocates reports `false`, so gating on this can only ever LOSE a false
+# positive — it cannot introduce a false negative, which is the direction that would matter for an
+# allocation guarantee. (`[n, n+1]`, which measures 0 B, still reports `false` and stays flagged:
+# the over-flag is narrowed, not eliminated.)
+#
+# `Core.Compiler.EscapeAnalysis` is a compiler internal with no stability guarantee across Julia
+# versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behaviour
+# without this. A missing analysis must never quiet a guarantee.
+const _ESCAPE_MEMO = IdDict{Any, Bool}()
+const _ESCAPE_MEMO_LOCK = ReentrantLock()
+
+function _all_news_nonescaping(@nospecialize(sig))
+    cached = @lock _ESCAPE_MEMO_LOCK get(_ESCAPE_MEMO, sig, nothing)
+    isnothing(cached) || return cached
+    v = try
+        _compute_all_news_nonescaping(sig)
+    catch
+        false
+    end
+    @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = v)
+    return v
+end
+
+function _compute_all_news_nonescaping(@nospecialize(sig))
+    EA = Core.Compiler.EscapeAnalysis
+    irs = Base.code_ircode_by_type(sig; optimize_until = "Inlining")
+    isempty(irs) && return false
+    ir = first(irs)[1]
+    # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape
+    # information is treated as escaping its arguments, rather than assumed clean.
+    st = EA.analyze_escapes(
+        ir, length(ir.argtypes), Core.Compiler.SimpleInferenceLattice.instance, Returns(false)
+    )
+    sawnew = false
+    for (i, stmt) in enumerate(ir.stmts.stmt)
+        (stmt isa Expr && stmt.head === :new) || continue
+        sawnew = true
+        EA.has_no_escape(st[Core.SSAValue(i)]) || return false
+    end
+    return sawnew
+end
+
 const _IGNORE_THROW = Ref(true)
 
 """
@@ -329,6 +385,8 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     barrier = false                   # a call reached a recognized one-time-init allocation barrier
+    # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
+    newsdead = _all_news_nonescaping(sig)   # every `:new` here provably non-escaping ⇒ LLVM elides it
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
@@ -354,7 +412,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             # 2 false negatives, net 1 new false positive on `Base.CodeUnits{UInt8,String}`-style
             # non-escaping stdlib wrappers (no escape analysis here to tell those apart) — an
             # acceptable tradeoff since over-flagging is the safe direction for an alloc guarantee.
-            (nt isa Type && !Base.isbitstype(nt)) && (alloc = true)
+            (nt isa Type && !Base.isbitstype(nt)) && !newsdead && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
             # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
             # with an abstract recorded result (mutating helpers with an unused return are typed
@@ -406,7 +464,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
-                dead[i] || (alloc = true)
+                (dead[i] || newsdead) || (alloc = true)
             elseif _nonconcrete(T) && !_static_getfield(callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee

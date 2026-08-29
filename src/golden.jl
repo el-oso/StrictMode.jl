@@ -34,6 +34,22 @@ function _golden_tag(@nospecialize(x))
 end
 
 # Write golden file: magic + tag + length (8 bytes) + raw payload.
+# Recording is the right answer on a first local run and the WRONG one in CI: a golden that is not
+# on disk there means it was never committed, and record-and-pass compares nothing while reporting
+# success — the same silent-skip shape `assert_enabled` exists to make loud, and it hits every
+# `@golden` in the suite at once (a gitignored `test/golden/`, or a `dir =` pointing at a tmpdir).
+# An explicit `STRICTMODE_RECORD_GOLDEN=1` is still honored: that is someone asking on purpose.
+function _assert_recordable(name::AbstractString, path::AbstractString)
+    isempty(get(ENV, "CI", "")) && return nothing
+    get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1" && return nothing
+    return error(
+        "StrictMode @golden: no golden file for \"$name\" at $path, and CI is set — refusing to " *
+            "record-and-pass, which would compare nothing while reporting success. Commit the " *
+            "golden file (run the suite locally once to record it, then add it to the repo), or " *
+            "set STRICTMODE_RECORD_GOLDEN=1 if re-recording in CI is genuinely what you want."
+    )
+end
+
 function _write_golden(path::String, @nospecialize(x))
     val, tag = _golden_tag(x)
     tag == 0 && error("@golden: unsupported result type $(typeof(x)); supported: Real scalar, AbstractArray{<:Real}, AbstractArray{<:Complex}")
@@ -265,6 +281,7 @@ macro golden(name, expr, kwargs...)
                 )
             else
                 if !isfile(_golden_path) || get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1"
+                    isfile(_golden_path) || StrictMode._assert_recordable(string(_golden_name), _golden_path)
                     mkpath(_golden_dir)
                     StrictMode._write_golden(_golden_path, _golden_result)
                     @info "StrictMode @golden: recorded golden for \"$_golden_name\" at $_golden_path"

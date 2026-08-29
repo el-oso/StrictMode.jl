@@ -4,6 +4,13 @@
 # come from the value-free engine, whose allocation findings are structural guesses — a tool that
 # reports is allowed to be wrong, a tool that gates is not. `StrictModeTest`'s `test_*` drivers gate.
 
+# An advisory pass that errored on one signature, recorded rather than dropped.
+_advisory_error(@nospecialize(f), @nospecialize(types), err) = StrictFinding(
+    _mod_sym(f), _func_name(f), _sig_string(Tuple(types)), :advisory, :info, "", 0,
+    "suggestions could not be computed for this signature: " * sprint(showerror, err),
+    "This is an advisory pass, not a guarantee — the signature is otherwise unaffected."
+)
+
 """
     audit(target = :registered; format = :json, io = stdout,
           guarantees = nothing, sweep = false, require = nothing,
@@ -76,6 +83,10 @@ function audit(
                     static_ownership_suggest && append!(fs, static_ownership_suggestions(f, types))
                 catch err
                     err isa StrictViolation && rethrow()
+                    # Not dropped: the user asked for suggestions over this signature and would
+                    # otherwise get silently fewer than they asked for. `:info`, because a failed
+                    # advisory is not a guarantee violation.
+                    push!(fs, _advisory_error(f, types, err))
                 end
             end
         end
