@@ -658,63 +658,129 @@ runner assigns `Test.TESTSET_PRINT_ENABLE[]`, which became a `ScopedValue` in Ju
 the entire suite before a single item ran), and three Julia 1.13 fixes — two of them silent false
 negatives in `@assert_inlined` and `@assert_no_threadid_state`.
 
-## 8. Revision 8 — distinct names, not shadowing and not auto-escalation
+## 8. Revision 8 — a companion macro in StrictModeTest, not a mode switch
 
-Owner decision, superseding §H.4 and §7 item 1. Both earlier mechanisms answered "which engine does
-this call site use?" with machinery. This answers it with a **name**, and the machinery goes away.
+Owner decision, superseding §H.4 (shadowing macros) and §7 item 1 (auto-escalation). Both earlier
+mechanisms answered "which engine does this call site use?" with machinery. This answers it with the
+macro you wrote, and the machinery goes away.
 
-### The shape
+**Names in `StrictMode` are unchanged.** `@assert_noalloc`, `@assert_typestable`, `@strict` and the
+rest keep their spellings and their meaning: the fast, value-free tier. `StrictModeTest` adds
+COMPANION macros under distinct names:
 
-| macro | package | engine | on failure | registers? |
-| --- | --- | --- | --- | --- |
-| `@noalloc f(x)` | `StrictMode` | typed-IR heuristic | **warns** | yes, at call time |
-| `@test_noalloc f(x)` | `StrictModeTest` | AllocCheck | **throws** | — |
-| `@test_all_noallocs()` | `StrictModeTest` | AllocCheck | throws | reads the registry |
+| macro | package | engine | authority |
+| --- | --- | --- | --- |
+| `@assert_noalloc f(x)` | `StrictMode` | typed-IR heuristic | fast tier |
+| `@test_noalloc f(x)` | `StrictModeTest` | AllocCheck | authoritative |
+| `@test_all_noallocs()` | `StrictModeTest` | AllocCheck | sweeps the registry |
 
-`StrictMode` is the fast development tier and is **warn-only**. `StrictModeTest` is authoritative and
-is the only thing that fails a build. Which you get is visible in the source, not decided by what
-happened to be loaded.
+There is no analysis mode to switch, and no ambient state deciding anything: `StrictMode.@assert_noalloc`
+IS the `:fast` check and `StrictModeTest.@test_noalloc` IS the `:full` check.
+
+### Throw or warn is per GUARANTEE, not per package
+
+A guarantee whose fast check is **exact** still throws. One that **guesses** warns, because a check
+with a measured ~28% false-positive rate must not be able to abort a build (issues #17/#18).
+
+- `:typestable` — return-type concreteness via `Base.return_types` is exact. **Throws.**
+- `:noalloc` / `:noboxing` — the typed-IR scan cannot see what LLVM elides. **Warns.**
+- `:memsafe` — a guard page is an observation, not an inference. **Throws.**
+- Everything else: decide per guarantee on the same test, and record the reason next to it.
+
+The companion `@test_*` macros always throw; they are the authority.
 
 ### What this deletes
 
 - **Auto-escalation** — `backend_available()` as a control-flow mechanism, and the whole class of
   "the tier depends on ambient process state".
-- **The `_be_*` seam** and its stubs. `StrictModeTest` depends on AllocCheck/JET/TrimCheck directly
-  and calls them; nothing has to be filled in from outside.
+- **The `_be_*` seam** and its stubs. `StrictModeTest` depends on AllocCheck/JET/TrimCheck directly.
 - **`BackendUnavailable`**, `_require_backend`, `_is_fatal_sweep_error`. A backend can no longer be
   *absent* at a call site that needs it — the macro that needs it lives in the package that has it.
-  Two of the seven vacuous-green bugs on this branch came from that failure class.
+  Two of this branch's seven vacuous-green bugs came from that failure class.
 - **`:suspect`**, `nsuspect`, `_mkfinding`'s `flagged_status`, `_run_and_report`'s `fail_on_suspect`.
-  The status encoded *how much to trust a verdict*; the package name now carries that, and encoding
-  it twice is redundant.
+  The status encoded how much to trust a verdict; the macro and the guarantee now carry that
+  statically, so a per-finding field is redundant.
 - **`:skip`.** An authoritative checker that cannot answer throws `AnalysisError` rather than
   emitting a finding that reads as "not a failure".
+- **`fail_mode`**, if the per-guarantee rule above replaces it — leaving `checks_enabled` as the only
+  preference. Decide alongside.
 
 Status surface reduces to `:pass` / `:fail` / `:info`. `AnalysisError` is retained: a backend that
-*crashes* is still possible, and must never render as a pass.
+*crashes* is still possible and must never render as a pass.
 
 ### The constraint this design accepts
 
-`@noalloc` registers **when the call runs**, not when it is declared. That is deliberate — a
-declaration-time registration is a cross-package mutation discarded on cached pkgimage load, which
-is exactly why `check_all` is vacuous in a consumer today (§5 "Still open"). Two consequences:
+`@assert_noalloc` registers **when the call runs**, not when it is declared. Deliberate — a
+declaration-time registration is a cross-package mutation discarded on cached pkgimage load, which is
+exactly why `check_all` is vacuous in a consumer today (§5 "Still open"). Two consequences:
 
 1. `@test_all_noallocs` re-checks only what the test suite actually **executed**. Coverage follows
-   execution. Arguably correct — you prove what you run — but it is not "check everything I
-   declared", and it must be documented as such.
-2. It cannot be a macro that expands to static `@test_noalloc` calls: at its expansion time nothing
-   has run and the registry is empty. It expands to a runtime loop.
+   execution — defensible (you prove what you run) but it is not "check everything I declared", and
+   must be documented as such.
+2. It cannot expand to static `@test_noalloc` calls: at its expansion time nothing has run and the
+   registry is empty. It expands to a runtime loop.
 
-Registration must be once-per-signature (not per invocation, which would put a `Dict` insert in a
-hot path) and must happen on **pass as well as fail** — otherwise the authoritative tier only
-re-checks what the heuristic already flagged, which is backwards.
+Registration must be once-per-signature (not per invocation — that would put a `Dict` insert in a hot
+path) and must fire on **pass as well as fail**, or the authoritative tier only re-checks what the
+heuristic already flagged, which is backwards.
 
 ### Cost
 
-This invalidates a substantial part of commits 920dba8..ff1c1d6: auto-escalation, the `:suspect`
-work and its documentation, and parts of the seam. Consumers migrate twice (the preference removal,
-then the macro rename). Taken deliberately: the naming removes an entire category of failure this
-branch has already hit repeatedly, and does so by having less machinery rather than more.
+0.4.0 is a breaking release and consumers upgrade. Since the `StrictMode` spellings are unchanged,
+the migration is the preference removal (`analysis_mode()`, the `analysis` preference,
+`enable_checks!(analysis=)` — 2 call sites across PureBLAS and PureIPM) plus the semantic change that
+guess-based guarantees now warn where they used to throw. The latter is silent — a rename would have
+been caught by the compiler, this will not be — so it belongs in the release notes, not just a
+deprecation warning.
 
-**Not settled here:** whether `@strict_function`'s load-time check survives in this shape, and what
-`fail_mode` still means once `StrictMode` never fails.
+This still invalidates the auto-escalation and `:suspect` work in 920dba8..ff1c1d6.
+
+## 9. Memsafe redesign (independent of §8)
+
+`@assert_memsafe` has no tier involvement — it is value-based, needs no backend, and lives wholly in
+`StrictMode`. Its problem is that a guard-page fault is fatal and uncatchable, and a WRITE fault's
+backtrace is destroyed, so classification cannot come from the fault. Adversarially designed; three
+false passes were confirmed empirically, two of which had been dismissed as theoretical.
+
+**Confirmed by measurement, not argued:**
+
+- **The poison collision is deterministic, not probabilistic.** A store of 8 × `_poison_for(1)`
+  (`0xb4`) one element past the end returns a CLEAN canary; a control store of `99.0` at the same
+  spot is caught. Any buffer whose fill value equals its poison is missed on every run.
+- **Aliasing is broken in both directions.** `f(A, A)` receives two distinct guarded buffers, so a
+  kernel asserting `pointer(a) == pointer(b)` errors under the probe. Today's harness both misses
+  aliasing-dependent overruns and invents divergent behaviour for kernels that require aliasing.
+- **Self-laundering**, previously unidentified: copying a buffer's OWN canary bytes to a shifted
+  offset is invisible, because a constant poison is identical at every position.
+
+**The design:**
+
+1. **Delete `isolate=false`.** Its only failure direction is green-when-red — a clean in-process
+   canary is indistinguishable from "a read overran and disturbed nothing", in exactly the motivating
+   bug class. Its two justifications both die: the saved cost is one ~0.54 s spawn on a deliberate
+   gate call, and the closure argument is dead because `Serialization` round-trips a capturing
+   closure into a fresh child (verified), so the subprocess path can cover closures directly.
+   Keep `:isolate` in `_macro_call`'s allowed tuple purely to REJECT it with a removal message —
+   dropping it silently re-positionals the option into `_callinfo` and misparses.
+2. **Position-dependent poison**: fill canary byte `k` with `base ⊻ k` rather than a constant. Kills
+   the deterministic collision AND self-laundering by arithmetic, at zero cost — a constant-byte
+   store mismatches ≥ 7 of 8 bytes of a `Float64`.
+3. **Extend the canary over `align` slack**, so stores into slack are detected and reported offsets
+   are exact instead of understating by the slack.
+4. **Dedupe aliased arguments by identity** (`IdDict`), so `f(A, A)` receives the same guarded buffer
+   twice and hit messages name every position sharing it.
+5. **Make unguardable arguments loud**: `@assert_memsafe` throws on a `view`/`Adjoint`/non-`Array`
+   `AbstractArray`; `memsafe_report` records them in a new `unguarded` field and `show` prints them,
+   so a partial-coverage clean report cannot render identically to a full-coverage one.
+
+The one-child architecture (canary classifies → flush → guard probe detects) is unchanged and no path
+gains a spawn.
+
+**Knowingly retained false pass:** reads landing in `align` slack are mapped, readable bytes that
+disturb no canary. Opt-in — only reachable with a non-default `align` — and the warning must say so
+in those terms.
+
+**Pre-existing hazard now named:** the child `include`s the source file `which` points at, so if that
+file was edited since `f` was defined in the parent session, the probe checks different code than the
+real call runs. Wrong in either direction, including a false pass. Relevant to a Revise-heavy loop;
+no cheap fix, since a named function cannot be serialized by value.
