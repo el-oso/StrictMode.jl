@@ -40,7 +40,7 @@ end
     # The naive loop is type-stable (concrete Float64 return) yet still allocates — exactly the
     # silent trap @assert_noalloc exists to catch — while the unrolled version is clean.
     @test_throws StrictViolation (@test_noalloc naive(htup))
-    @test (@assert_noalloc unrolled(htup)) == 6.0
+    @test (@test_noalloc unrolled(htup)) == 6.0
 end
 
 @testitem "@unroll rejects a non-statically-known iteration" begin

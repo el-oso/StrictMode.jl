@@ -5,7 +5,15 @@
 # A guarantee the analysis could not evaluate counts as a failure here. A gate that cannot evaluate
 # a method must not pass it.
 
+# A gate over an EMPTY scope proves nothing, and returning green is indistinguishable from having
+# proved everything. Every driver funnels through here so no scope can go quiet: an empty signature
+# list, a module nothing has compiled yet, or an `only`/`exempt` filter that matched nothing all
+# reach this point.
 function _gate(items, kind::Symbol, target::AbstractString)
+    isempty(items) && @warn "StrictModeTest.$kind: nothing to prove for `$target` (0 signatures). " *
+        "This result is green because it checked nothing, not because anything passed. A module " *
+        "sweep needs its kernels exercised first (a concrete specialization must exist), and an " *
+        "`only`/`exempt` filter can exclude everything."
     fs = StrictMode._map_findings(_proof_findings, items)
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs

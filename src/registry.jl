@@ -119,18 +119,15 @@ end
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
 function _registered_findings_in(mod::Module; guarantees = nothing)
-    out = StrictFinding[]
-    for ((f, types), meta) in STRICT_REGISTRY
-        _mod_sym(f) === nameof(mod) || continue
-        _is_exempt(f) && continue                        # cold / @strict_exempt → skip
-        gs = isnothing(guarantees) ? meta.guarantees : guarantees
-        try
-            append!(out, findings(f, types; guarantees = gs))
-        catch err
-            err isa StrictViolation && rethrow()
-        end
-    end
-    return out
+    items = Any[
+        (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
+            for ((f, types), meta) in STRICT_REGISTRY
+            if _mod_sym(f) === nameof(mod) && !_is_exempt(f)   # cold / @strict_exempt → skip
+    ]
+    # Through `_map_findings`, so a signature whose analysis throws becomes a failing finding
+    # naming the error rather than vanishing. This feeds `_auto_check_module` — the `@strict module`
+    # load gate — where a dropped signature is a method that loads clean without being checked.
+    return _map_findings((f, types, gs) -> findings(f, types; guarantees = gs), items)
 end
 
 # Whole-module strict check at load. Uses the value-free engine, which is what makes opting a

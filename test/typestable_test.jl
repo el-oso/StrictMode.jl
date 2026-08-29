@@ -50,7 +50,10 @@ end
     const _BOXD = IdDict{Symbol, Any}()
     boxy_helper() = get!(() -> Int[], _BOXD, :k)::Vector{Int}   # boxes internally; result narrowed
     stable_caller() = length(boxy_helper())::Int                # only a resolved :invoke to the helper
-    @test StrictMode._typestable_fast("stable_caller", stable_caller, ()) === nothing        # :fast passes
+    # `isnothing` alone cannot tell a clean pass from the boxing layer's WARN — that layer returns
+    # `nothing` too, since it reports rather than gating. `@test_logs` with no expected entries
+    # asserts the call was silent, which is what "passes" has to mean here.
+    @test isnothing(@test_logs StrictMode._typestable_fast("stable_caller", stable_caller, ()))
     @test all(f -> f.status === :pass, findings(stable_caller, (); guarantees = (:typestable,)))
     # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
     @test any(f -> f.status === :fail, proof_findings(stable_caller, (); guarantees = (:noboxing,)))

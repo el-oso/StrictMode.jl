@@ -214,7 +214,11 @@ accessor callee, not the top function). `barrier` flags a call reaching a recogn
 allocation barrier (`Base.OncePerProcess`/`OncePerThread`, or a `register_alloc_barrier!`-registered
 function — see the note on `_BASE_BARRIER_TYPES` for why `Base.OncePerTask` is not auto-recognized)
 — recursion stops there, so the barrier's own one-time allocation never contributes to
-`alloc`/`boxing`/`dictlookup`. Location is the method's definition site.
+`alloc`/`boxing`/`dictlookup`. It is a one-sided signal: the callee walk stops once `alloc`,
+`boxing` and `dictlookup` are all set, so a barrier reachable only below that point is not
+recorded, and `barrier == false` alongside those three means "not looked for". Read it only in
+combination with a clean `alloc`/`boxing` result, which is the state where it is exhaustive.
+Location is the method's definition site.
 """
 function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
@@ -370,6 +374,19 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         barrier = true
                     else
                         _mi_dict_lookup(mi) && (dictlookup = true)
+                        # The walk stops once `alloc`, `boxing` and `dictlookup` are all set:
+                        # nothing deeper can change those three, and each further level is a fresh
+                        # `code_typed_by_type` (widening this condition is measurably expensive on
+                        # signal-saturated functions). So `barrier` is ONE-SIDED below a saturated
+                        # frontier: a barrier reachable only there is never recorded, and `barrier
+                        # == false` on a saturated result means "not looked for", not "not there".
+                        # That is safe in one direction only, which is the direction that holds:
+                        # acting on `barrier` means granting an allocation exemption, and every
+                        # such reader first demands a signal set free of `alloc`/`boxing` — which a
+                        # saturated result can never be. A missed barrier can only withhold an
+                        # exemption, never grant one. `abscontainer` is one-sided here too, and
+                        # more so: it is a top-level-only signal, never propagated from a callee
+                        # (widening it to callees and to dict value types over-flags `IdDict`, #17).
                         if depth > 0 && (!alloc || !boxing || !dictlookup)
                             a2, b2, d2, _, br2 = _signals_by_type(mi.specTypes, depth - 1, seen)
                             a2 && (alloc = true)

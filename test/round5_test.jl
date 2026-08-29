@@ -178,24 +178,34 @@ end
 @testitem "register_report is assembly-syntax agnostic (issue #21)" begin
     using StrictMode
     # `code_native` emits Intel syntax (`zmm0`) on some platform/Julia combinations and AT&T
-    # (`%zmm0`) on others. The regex used to require the AT&T `%` sigil, so on an Intel-syntax host
-    # every kernel reported `used = 0` however much vector work it did — a silent zero, which for an
-    # advisory report is worse than an error. Driven through the parsing helper with synthetic
-    # assembly so it does not depend on what this machine's CPU or Julia version actually emits.
-    att = "\tvmulpd\t%zmm1, %zmm2, %zmm3\n\tvaddpd\t%zmm3, %zmm4, %zmm1\n"
-    intel = "\tvmulpd\tzmm1, zmm2, zmm3\n\tvaddpd\tzmm3, zmm4, zmm1\n"
-    regs(s) = Set(m[1] for m in eachmatch(r"\bzmm(\d+)\b", s))
-    @test regs(att) == Set(["1", "2", "3", "4"])
-    @test regs(intel) == Set(["1", "2", "3", "4"])
-    @test regs(att) == regs(intel)
-    # And the live path still returns a well-formed report rather than throwing, whatever this
-    # host emits (a non-AVX-512 target legitimately reports zeros).
+    # (`%zmm0`) on others. A register regex pinned to the AT&T `%` sigil reports `used = 0` on an
+    # Intel-syntax host however much vector work the kernel does — a silent zero, which for an
+    # advisory report is worse than an error. `_zmm_counts` is the parser `register_report` itself
+    # runs; driving it over fixed assembly keeps the check independent of what this host emits.
+    att = "\tvmulpd\t%zmm1, %zmm2, %zmm3\n\tvaddpd\t%zmm3, %zmm4, %zmm1\n\tvmovupd\t%zmm5, 64(%rsp)\n"
+    intel = "\tvmulpd\tzmm1, zmm2, zmm3\n\tvaddpd\tzmm3, zmm4, zmm1\n\tvmovupd\tzmmword ptr [rsp + 64], zmm5\n"
+    @test StrictMode._zmm_counts(att) == (used = 5, total = 32, spills = 1)
+    @test StrictMode._zmm_counts(intel) == (used = 5, total = 32, spills = 1)
+    # No zmm at all: `total = 0` is what marks a report "non-AVX-512" rather than "clean", so a
+    # regex loose enough to match `xmm`/`ymm` would silently turn every SSE kernel into a 0/32 one.
+    @test StrictMode._zmm_counts("\tvaddsd\t%xmm0, %xmm1, %xmm0\n") == (used = 0, total = 0, spills = 0)
+
+    # Live path: the report has to agree with the assembly it was read from. Conditioning on the raw
+    # text rather than on the host CPU keeps the assertion falsifiable where AVX-512 exists and
+    # honest where it doesn't.
     saxpy!(y::Vector{Float64}, a::Float64, x::Vector{Float64}) = (
         @inbounds @simd for i in eachindex(y, x)
             y[i] += a * x[i]
         end; y
     )
-    r = register_report(saxpy!, (Vector{Float64}, Float64, Vector{Float64}))
+    types = (Vector{Float64}, Float64, Vector{Float64})
+    r = register_report(saxpy!, types)
     @test r isa StrictMode.RegisterReport
-    @test r.vec_regs_used >= 0
+    if occursin("zmm", StrictMode._native_asm(saxpy!, types))
+        @test r.vec_regs_used > 0
+        @test r.vec_regs_total == 32
+    else
+        @test r.vec_regs_used == 0
+        @test r.vec_regs_total == 0
+    end
 end

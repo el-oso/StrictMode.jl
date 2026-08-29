@@ -1,7 +1,33 @@
 # Concurrency-safety guarantees — the multi-threading correctness layer.
 #
 # All value-free (`Base.code_typed` IR scans), like `trimsafe`/`scheduling`/`inlining`: no
-# AllocCheck/JET backend needed, works in `:fast` and `:full` alike.
+# AllocCheck/JET backend needed.
+
+"""
+    _UnanalyzableSignature <: Exception
+
+Raised when a scan cannot obtain typed IR for a signature at all. These two guarantees GATE (see
+`_guarantee_gates` in report.jl), so an empty violation list must not be reachable from a scan that
+never ran: "could not check" and "is fine" would then render identically, on the guarantees a user
+trusts most. Returning `_ConcViol[]` here is the vacuous-green shape this package exists to remove.
+"""
+struct _UnanalyzableSignature <: Exception
+    guarantee::Symbol
+    target::String
+    signature::String
+    why::String
+end
+
+_UnanalyzableSignature(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), why::AbstractString) =
+    _UnanalyzableSignature(g, _func_name(f), _sig_string(types), String(why))
+
+function Base.showerror(io::IO, e::_UnanalyzableSignature)
+    print(
+        io, "StrictMode @", e.guarantee, ": could not analyze `", e.target, e.signature,
+        "` — the guarantee is UNKNOWN, not satisfied. ", e.why
+    )
+    return nothing
+end
 #
 # ── `:concurrency_safe` (PRIORITY) ────────────────────────────────────────────────────────────
 # Contract (PureFFT MT Phase 1):
@@ -295,10 +321,15 @@ Powers [`@assert_concurrency_safe`](@ref); see that macro for the guarantee's sc
 function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     cts = try
         Base.code_typed(f, types; optimize = true)
-    catch
-        return _ConcViol[]
+    catch err
+        throw(_UnanalyzableSignature(:concurrency_safe, f, types, sprint(showerror, err)))
     end
-    isempty(cts) && return _ConcViol[]
+    isempty(cts) && throw(
+        _UnanalyzableSignature(
+            :concurrency_safe, f, types,
+            "`Base.code_typed` returned no method instance for this signature"
+        )
+    )
     ci = cts[1].first
     m = try
         which(f, types)
@@ -420,10 +451,15 @@ end
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
         Base.code_typed(f, types; optimize = true)
-    catch
-        return _ConcViol[]
+    catch err
+        throw(_UnanalyzableSignature(:no_threadid_state, f, types, sprint(showerror, err)))
     end
-    isempty(cts) && return _ConcViol[]
+    isempty(cts) && throw(
+        _UnanalyzableSignature(
+            :no_threadid_state, f, types,
+            "`Base.code_typed` returned no method instance for this signature"
+        )
+    )
     ci = cts[1].first
     code = ci.code
     m = try

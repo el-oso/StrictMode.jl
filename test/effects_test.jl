@@ -72,3 +72,41 @@ end
     @test !sig.boxing && !sig.alloc              # not a false positive (was flagged before the fix)
     @test @allocated(f(2)) == 0                  # genuinely zero-alloc
 end
+
+@testitem "the callee walk stops on a saturated signal set, leaving `barrier` one-sided" begin
+    using StrictMode
+    # `barrier` is exhaustive only while the walk is still running: the `:invoke` recursion stops
+    # once alloc, boxing and dictlookup are all set, so a barrier reachable only below that point
+    # is never recorded. Pinned because it is load-bearing for every reader of `barrier` — acting
+    # on it grants an allocation exemption (StrictModeTest's `_checked_allocs` skips AllocCheck),
+    # and each reader first demands `!alloc && !boxing`, a state this one can never reach. Widening
+    # the condition to keep walking for `barrier`'s sake would pay the recursion cost on exactly
+    # the signal-saturated functions the stop exists for, and buy no verdict.
+    _measure_sat() = length(rand(4))
+    const _SAT_ONCE = Base.OncePerProcess{Int}(_measure_sat)
+    @noinline _below(x::Int) = x + _SAT_ONCE()
+
+    # Control: with nothing else flagged the walk reaches `_below` and does see the barrier one
+    # level down. Without this, the assertion at the end would pass for the wrong reason.
+    clean(x::Int) = _below(x)
+    cs = StrictMode._alloc_signals(clean, (Int,))
+    @test cs.barrier
+    @test !cs.alloc && !cs.boxing && !cs.dictlookup
+
+    const _SINK = Ref{Any}(nothing)
+    const _WS = Dict{Symbol, Int}(:a => 1)
+    function saturated(t::Tuple{Int, Float64, Float32})
+        a = rand(4)             # alloc — escaped into a sink so no optimizer elides it
+        _SINK[] = a
+        s = 0.0
+        for i in 1:3            # boxing — runtime index into a heterogeneous tuple
+            s += t[i]
+        end
+        delete!(_WS, :a)        # dictlookup
+        return s + _below(length(a))
+    end
+
+    ss = StrictMode._alloc_signals(saturated, (Tuple{Int, Float64, Float32},))
+    @test ss.alloc && ss.boxing && ss.dictlookup   # the frontier really is saturated ...
+    @test !ss.barrier                              # ... so the walk stopped short of the barrier
+end

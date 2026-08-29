@@ -45,13 +45,30 @@ end
 _guarantee_gates(kind::Symbol) =
     !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trimsafe, :trim_compatible))
 
+# The macro names for a guarantee, which are NOT derivable from its symbol: `:trimsafe` is spelled
+# `@assert_trim_safe`, and only four guarantees have a proving counterpart at all. Interpolating
+# `@$kind`/`@test_$kind` instead sends users to `@no_scalar_loops` and `@test_trimsafe`, neither of
+# which exists.
+function _macro_names(kind::Symbol)
+    kind === :noalloc && return ("@assert_noalloc", "@test_noalloc")
+    kind === :noboxing && return ("@assert_noboxing", "@test_noboxing")
+    kind === :trim_compatible && return ("@assert_trim_compatible", "@test_trim_compatible")
+    kind === :trimsafe && return ("@assert_trim_safe", "@test_trim_compatible")
+    kind === :no_scalar_loops && return ("@assert_no_scalar_loops", nothing)
+    return ("@assert_" * String(kind), nothing)
+end
+
 # Single choke point for every guarantee. `gates = false` reports instead of raising, for a check
 # whose verdict is a structural guess.
 function _fail(kind::Symbol, target, details::AbstractString; gates::Bool = _guarantee_gates(kind))
     v = StrictViolation(kind, target, String(details))
     gates && throw(v)
+    own, proof = _macro_names(kind)
     @warn sprint(showerror, v) *
-        "\n  note:    StrictMode's `@$kind` check is a heuristic, so it reports rather than " *
-        "gating. Add StrictModeTest and use `@test_$kind` for the proof."
+        "\n  note:    StrictMode's `$own` check is a heuristic, so it reports rather than gating. " *
+        (
+        isnothing(proof) ? "This guarantee has no proving counterpart — treat the verdict as a lead, not a fact." :
+            "Add StrictModeTest and use `$proof` for the proof."
+    )
     return nothing
 end

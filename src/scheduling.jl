@@ -630,6 +630,21 @@ struct RegisterReport
     vec_spills::Int      # lines with both "zmm" and "rsp" (zmm saved to stack)
 end
 
+# Count unique zmm registers and stack spills in post-register-allocation assembly. Takes the
+# assembly as a string, so the parse is exercisable against fixed input in both syntaxes.
+#
+# `\bzmm(\d+)\b`, NOT `%zmm…`: `code_native` emits Intel syntax (bare `zmm0`) on some platforms and
+# AT&T (`%zmm0`) on others, and which one you get varies by platform and Julia version. The word
+# boundary matches both, since `%` is a non-word character. Pinning the AT&T sigil made this report
+# a silent zero for every kernel on an Intel-syntax host — 201 `zmm` occurrences in the assembly,
+# `used = 0` (issue #21). `@assert_no_spill` below already avoids this trap by reading LLVM's
+# Spill/Reload comments instead of operand punctuation; this had not caught up.
+function _zmm_counts(s::AbstractString)
+    regs = Set(m[1] for m in eachmatch(r"\bzmm(\d+)\b", s))
+    spills = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
+    return (used = length(regs), total = isempty(regs) ? 0 : 32, spills = spills)
+end
+
 """
     register_report(f, types) -> RegisterReport
 
@@ -645,19 +660,8 @@ hand-written assembly.
 Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros.
 """
 function register_report(@nospecialize(f), @nospecialize(types::Tuple))
-    target = _func_name(f) * _sig_string(types)
-    s = _native_asm(f, types)
-    isempty(s) && return RegisterReport(target, 0, 0, 0)
-    # `\bzmm(\d+)\b`, NOT `%zmm…`: `code_native` emits Intel syntax (bare `zmm0`) on this platform
-    # and AT&T (`%zmm0`) elsewhere, and which one you get varies by platform and Julia version. The
-    # word boundary matches both, since `%` is a non-word character. Pinning the AT&T sigil made this
-    # report a silent zero for every kernel on an Intel-syntax host — 201 `zmm` occurrences in the
-    # assembly, `used = 0` (issue #21). `@assert_no_spill` below already avoids this trap by reading
-    # LLVM's Spill/Reload comments instead of operand punctuation; this had not caught up.
-    zmm_regs = Set(m[1] for m in eachmatch(r"\bzmm(\d+)\b", s))
-    spills = count(l -> occursin("zmm", l) && occursin("rsp", l), split(s, '\n'))
-    total = isempty(zmm_regs) ? 0 : 32
-    return RegisterReport(target, length(zmm_regs), total, spills)
+    c = _zmm_counts(_native_asm(f, types))
+    return RegisterReport(_func_name(f) * _sig_string(types), c.used, c.total, c.spills)
 end
 
 # --- @assert_no_spill: vector-register spill diagnostic as a hard gate --------------------------

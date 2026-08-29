@@ -4,32 +4,6 @@ Small, tracked items. The tier-split design record is `SPLIT-PROPOSAL.md` in thi
 GitHub issues are the source of truth for anything with a number; the notes here record what the
 0.4.0 tier split changed about them, so nobody re-derives it.
 
-## Open — code
-
-- [ ] **`_suggestion` is missing entries for five guarantees.** `src/findings.jl:29`
-  covers `:noboxing`, `:owned`, `:typestable`, `:noalloc`, `:inlined`, `:vectorized`,
-  `:no_scalar_loops`, `:no_spill`, `:trimsafe` and returns `""` otherwise. So
-  `:trim_compatible`, `:concurrency_safe`, `:no_threadid_state`, `:memsafe` and `:mca`
-  findings ship with an empty `suggestion` field. That field is the documented
-  machine-readable fix hint agents act on (see the `audit` docstring and the julia skill's
-  "act on that field directly"), so an empty string is a silent hole in the agent path,
-  not a cosmetic gap.
-  *Fix:* add the five branches. Note `:coverage`, `:inline_suggestion` and
-  `:static_ownership` deliberately build their suggestion inline at the construction site
-  and never route through `_suggestion` — leave those alone.
-
-- [ ] **`barrier` is excluded from the recursion short-circuit.** `src/effects.jl:350`
-  guards the callee walk with `depth > 0 && (!alloc || !boxing || !dictlookup)`. Once all
-  three of those are set, recursion stops — so a barrier reached only *below* an
-  already-saturated signal set is never recorded, and `_alloc_signals(...).barrier` comes
-  back `false`. Consequence is confined to `_checked_allocs` (`src/backend.jl:158`), whose
-  exemption already requires `!sig.alloc && !sig.boxing`; in that state the short-circuit
-  cannot have fired, so **no behaviour change is currently reachable**. It is a latent
-  trap for any future consumer of `barrier` that does not also demand a clean signal set.
-  *Fix:* add `|| !barrier` to the condition, or document the invariant at the field.
-  Note `abscontainer` is omitted from the same condition for the same reason; an attempt to
-  add it is what surfaced the `IdDict` over-flag recorded under #17 below.
-
 ## Open — GitHub issues, and what the 0.4.0 split changed
 
 - [ ] **#17 — `:fast` noalloc false-positives on provably 0-allocation kernels.**
@@ -152,12 +126,95 @@ GitHub issues are the source of truth for anything with a number; the notes here
   positive warns instead of aborting a build. The discriminator is still unsound — the fix is to find
   one SLP output cannot forge.
 
-- [ ] **`register_report`'s regression test is self-referential.** `test/round5_test.jl` re-implements
-  the register regex locally (`regs(s) = ...`) instead of driving `register_report`, and its
-  live-path assertion is `r.vec_regs_used >= 0`, which is vacuously true. A future regression of the
-  real regex would not be caught — the test tests a copy of the code, not the code.
+## Open — from the 0.4 adversarial review (129 agents, 39 findings, all 3-vote verified)
+
+Fixed in the same pass, listed here only so nobody re-derives them: `_fail` named macros that do
+not exist (`@no_scalar_loops`, `@test_trimsafe`); `test_signatures`/`test_compiled` returned green
+on an empty scope with no signal; `concurrency_findings`/`threadid_state_findings` returned `[]` —
+a PASS on a *gating* guarantee — when `code_typed` failed; `_registered_findings_in` swallowed
+per-signature analysis errors, so the `@strict module` load gate silently skipped methods;
+`_cache_key` omitted `_FAST_ALLOC_DEPTH[]`; the load banner claimed no `@assert_*` gates;
+`test/unroll_test.jl` and `test/typestable_test.jl` had lost their power to fail;
+`test/standalone`'s isolation assertion was decorative (verified: it passes without
+`JULIA_LOAD_PATH`, so dropping the CI env var would leave the split-premise gate green).
+
+- [ ] **Negative fixtures do not assert they are still bad.** No test in either suite checks that an
+  intentionally-allocating fixture still allocates before asserting the check flags it. Make one
+  optimizable and every assertion around it stays green. This has already recurred once
+  (`test/unroll_test.jl`). *Fix:* `@test @allocated(fixture(args...)) > 0` beside each such fixture
+  in `test/once_barrier_test.jl`, `test/unroll_test.jl`, `StrictModeTest/test/divergence_test.jl`.
+
+- [ ] **`_guarantee_gates`'s partition is untested.** `src/report.jl` holds a hand-typed tuple;
+  appending one symbol converts a gate to a warning package-wide and no test observes it. Nothing
+  asserts throw-vs-warn at the macro boundary. *Fix:* the new `test/findings_test.jl` item that
+  enumerates `_GUARANTEES` for `_suggestion` is the template.
+
+- [ ] **`assert_enabled()` has one caller in the tree** (`StrictModeTest/src/drivers.jl`). A
+  StrictMode-only consumer running under `CI=1` with `checks_enabled = false` is fully green and
+  nothing invokes the guard that exists to make that loud.
+
+- [ ] **`@golden` passes while comparing nothing when the golden file is absent** (`src/golden.jl`).
+  Record-and-pass is correct on first run, but a CI checkout without `test/golden/` (gitignored, or
+  a `dir=` tmpdir) records every time and never compares. The only signal is an `@info`. `@golden`
+  is also the one guarantee macro not routed through `_gate`.
+
+- [ ] **`audit`'s advisory loops still swallow** (`src/audit.jl`): the `inline_suggest` /
+  `static_ownership_suggest` `catch` drops the item without an `_errored_findings` record — a second
+  copy of the swallow `_map_findings` was fixed for. Advisory-only (`:info`), so lower severity.
+
+- [ ] **`_call_parts` evaluates the function-position expression twice** (`src/macros.jl`). `fe` is
+  spliced into both the executed call and the analyzed `checkfn`, so `@assert_noalloc ws.kernel(x)`
+  or `@test_noalloc make_f()(x)` runs the getfield/factory twice and can analyze a *different*
+  callable than it ran. Pre-existing, not introduced by the split.
+
+- [ ] **`types = (…)` drops keyword args from the proved signature** (`src/macros.jl`): the override
+  takes the `checkfn = fe` branch, bypassing the `Core.kwcall` path, while the executed call still
+  passes the keywords. The proof then covers a signature the call does not have.
+
+- [ ] **Docs pages not updated for 0.4.** `tutorial.md`, `cookbook.md`, `index.md` and `concepts.md`
+  were never touched by the split. Between them they call the deleted `check`, import AllocCheck/JET
+  directly, say checks are "off by default", describe `@explain` as gathering JET + AllocCheck,
+  promise `@strict_function` fails module load on allocation, and describe `@assert_trim_compatible`
+  as escalating with TrimCheck. `README.md` links twice to `docs/rust_gaps`, a page absent from
+  `docs/src/` and from `make.jl`. `src/StrictMode.jl`'s own top-level docstring still describes the
+  deleted `:fast`/`:full` tiers.
+
+- [ ] **Cross-package registry pollution is still unaddressed** (SPLIT-PROPOSAL §10 item 3). The
+  registry key is `(f, types)` with no module, so `test_registered()` re-proves whatever a
+  dependency's executed `@assert_*` calls inserted, under the consumer's gate.
 
 ## Done
+
+- [x] **`_suggestion` was missing ONE entry, not five.** Fixed. `:trim_compatible` is in
+  `_GUARANTEES` and is constructed as a `StrictFinding` in two places, so it genuinely shipped
+  with an empty `suggestion`. The other four the item named — `:concurrency_safe`,
+  `:no_threadid_state`, `:memsafe`, `:mca` — have NO path to a `StrictFinding` at all: they are
+  macro-only and terminate at `_fail`, which builds a `StrictViolation` (a `details::String`,
+  no `suggestion` field). They are also absent from `_GUARANTEES`, so `findings`/`audit` cannot
+  request them. Adding branches for them would have been dead code. If agents should get
+  machine-readable hints for memsafe/mca/concurrency, the real gap is that those guarantees
+  have no findings-pipeline representation — a much larger change than a `_suggestion` branch.
+  The test enumerates `_GUARANTEES` from the code, and pins the anti-vacuity direction too
+  (a non-guarantee symbol must still return `""`).
+
+- [x] **`barrier`'s exclusion from the recursion short-circuit is one-sided, and documented.**
+  Reachability re-established after the split: `barrier` has exactly two readers —
+  `_checked_allocs` (StrictModeTest/src/proofs.jl), which still demands a clean signal set, and
+  an informational label in `@explain`. The stop can only fire once alloc+boxing+dictlookup are
+  all set, and those propagate monotonically upward, so a missed `barrier` implies a saturated
+  top-level result neither reader acts on. The miss is conservative in the only direction that
+  matters: it can WITHHOLD the AllocCheck exemption, never grant one. Documented rather than
+  changed — `|| !barrier` buys no verdict and pays extra `code_typed_by_type` levels on exactly
+  the saturated functions the stop exists for, and it would enlarge the surface of the one
+  thing here that can go vacuously green. Pinned by a test that fails if the condition changes.
+
+- [x] **`register_report`'s regression test drives the real parser.** Fixed. The parse was
+  extracted to `_zmm_counts(::AbstractString)` in src/scheduling.jl (`register_report` had no
+  string seam), and the test runs it over fixed AT&T and Intel assembly fixtures, asserting the
+  whole `(used, total, spills)` tuple. Restoring the issue-#21 regression — `r"%zmm(\d+)\b"` —
+  fails the Intel fixture. The live path is kept but made falsifiable: it branches on a plain
+  `occursin("zmm", ...)` substring check independent of the regex under test, so it is
+  non-vacuous on an AVX-512 host and non-flaky elsewhere.
 
 - [x] **`@assert_memsafe` reported clean on three shapes it never checked.** Fixed. A store
   whose value equals the canary poison was missed on every run (deterministic, not a
@@ -200,3 +257,4 @@ GitHub issues are the source of truth for anything with a number; the notes here
   describe auto-escalation rather than the shadowing macros that were never built, and a new §7
   records all ten divergences with the reason for each. The document is now a decision record, not
   a proposal.
+

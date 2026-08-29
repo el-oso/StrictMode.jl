@@ -11,13 +11,17 @@ const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
 
+# `_FAST_ALLOC_DEPTH[]` is part of the key: it is a user-facing knob, and a deeper walk finds
+# STRICTLY MORE than a shallower one. Omitting it hands back the shallow verdict to a caller who
+# asked to look deeper — staleness that can only ever lose findings, which is the direction that
+# goes quiet. (`_SIGNAL_MEMO` in effects.jl already keys on depth; this is the outer layer.)
 function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     m = try
         which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    return (objectid(m), m.primary_world, types, Tuple(guarantees))
+    return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[])
 end
 
 """

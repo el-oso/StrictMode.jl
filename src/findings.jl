@@ -44,6 +44,7 @@ function _suggestion(guarantee::Symbol)
     guarantee === :no_scalar_loops && return "scalar hot loop (FP or integer) in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels."
     guarantee === :no_spill && return "vector register spill: reduce the live accumulator/tile count (register-block a smaller tile), or split the kernel into multiple passes. See register_report for zmm-saturation diagnostics."
     guarantee === :trimsafe && return "trim-unsafe call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/which/methods). juliac --trim=safe is authoritative."
+    guarantee === :trim_compatible && return "trim-incompatible call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/invokelatest/which/methods). StrictModeTest's @test_trim_compatible runs juliac's own verifier and is authoritative."
     return ""
 end
 

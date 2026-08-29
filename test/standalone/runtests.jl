@@ -9,13 +9,19 @@ using Test
 @testset "StrictMode standalone (no proofs installed)" begin
     @test StrictMode.checks_enabled()
     @test !StrictMode.proofs_loaded()
-    # The proofs must not even be RESOLVABLE here. This needs an isolated LOAD_PATH
-    # (`JULIA_LOAD_PATH="@:@stdlib"`): `--project=X` alone keeps the global `@v#.#` environment on
-    # the path, so `identify_package` finds anything installed there and this suite would then be
-    # testing the developer's machine rather than the repo. CI sets it; so does the CLAUDE.md recipe.
-    @test Base.identify_package("AllocCheck") === nothing
-    @test Base.identify_package("JET") === nothing
-    @test Base.identify_package("StrictModeTest") === nothing
+    # The isolation itself is asserted FIRST, because the three `identify_package` checks below
+    # pass on any machine whose global `@v#.#` environment happens not to have these packages —
+    # which is every clean CI runner. Without this, dropping `JULIA_LOAD_PATH="@:@stdlib"` from the
+    # CI step leaves the whole premise gate green while testing nothing, which is exactly how the
+    # original isolation bug stayed invisible here for two commits.
+    @test !any(p -> occursin(r"^@v#\.#$", p), LOAD_PATH)
+
+    # …and only then: the proofs must not be RESOLVABLE. `--project=X` alone keeps the global
+    # environment on the path, so `identify_package` would find anything installed there and this
+    # suite would be testing the developer's machine rather than the repo.
+    @test isnothing(Base.identify_package("AllocCheck"))
+    @test isnothing(Base.identify_package("JET"))
+    @test isnothing(Base.identify_package("StrictModeTest"))
 
     dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
     A = (1.0, 2.0, 3.0)

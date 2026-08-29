@@ -111,8 +111,10 @@ function _announce_tier()
     printstyled(stderr, "┌ StrictMode: checks ENABLED — reporting tier.\n"; color = :cyan)
     printstyled(
         stderr,
-        "│ @assert_* report and do not gate a build. To gate, add StrictModeTest\n" *
-            "│ and use @test_* / test_signatures / test_compiled / test_registered.\n" *
+        "│ The allocation and trim guarantees REPORT (they guess, so they warn);\n" *
+            "│ the ones that read compiled output still throw. For the allocation\n" *
+            "│ proofs, add StrictModeTest and use @test_* / test_signatures /\n" *
+            "│ test_compiled / test_registered.\n" *
             "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n";
         color = :cyan
     )
