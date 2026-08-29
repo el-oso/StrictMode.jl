@@ -106,7 +106,7 @@ end
 
     # The GKH shape end-to-end: two `::Type{T}`-dispatched hot-path methods (clean) plus a Dict
     # fallback for the rare-type tail (flagged, but advisory — never fails nfailures). Depends on
-    # `check_compiled`'s sweep recognizing a `::Type{T}` argument as a valid dispatch tuple (F37);
+    # the compiled sweep recognizing a `::Type{T}` argument as a valid dispatch tuple (F37);
     # `isconcretetype(Type{Float64}) == false` used to make every such method invisible here.
     module StaticOwnershipDemo
     struct Ws{T} end

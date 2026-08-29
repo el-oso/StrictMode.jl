@@ -49,20 +49,26 @@ GitHub issues are the source of truth for anything with a number; the notes here
   `IdDict` including the concretely-typed rare-type-tail fallback `static_ownership`
   prescribes — the issue-#7 gate that must not exist. It also cost a measured 7.6× on
   fresh scans of signal-saturated functions.
-  The issue's own second suggestion — report these as a distinct lower-confidence category
-  rather than a failure — is the one still standing.
+  *Mitigated, not fixed:* the issue's own second suggestion is implemented — `_guarantee_gates`
+  (report.jl) puts `:noalloc`/`:noboxing` in the reporting set, so a false positive warns instead
+  of aborting a build, and the proof that gates is `StrictModeTest`'s `@test_noalloc`. The
+  false-positive rate itself is unchanged, so `audit` output on a real consumer is still ~28% noise.
 
-- [ ] **#18 — inert preferences / broken consumer precompile.** Half fixed by the split.
-  Part 2 (enabling checks globally breaks PureBLAS's precompile) had two causes: the
-  `:full` tier demanding AllocCheck/JET during the *consumer's own* precompile, which is
-  now impossible since `StrictMode` has no backend at all; and a `:fast` false positive on
-  `trmv!`, which is #17 and still open. So the environment no longer breaks, but a consumer
-  with a #17-shaped kernel still gets a red precompile under `fail_mode = "error"`.
+- [ ] **#18 — inert preferences / broken consumer precompile.** Both parts are addressed;
+  what remains is confirming it on a real consumer.
+  Part 2 (enabling checks globally breaks PureBLAS's precompile) had two causes: the proof
+  tier demanding AllocCheck/JET during the *consumer's own* precompile, which is now
+  impossible since `StrictMode` has no backend at all; and a false positive on `trmv!`, which
+  is #17. A #17-shaped kernel can no longer red a precompile either — `@strict_function`'s
+  allocation layer warns, per `_guarantee_gates`.
   Part 1 (a `[preferences.StrictMode]` block is inert unless StrictMode is a *direct* dep of
-  that environment) is unchanged and still undocumented. Confirmed live on 2026-08-17:
-  `StrictModeTest`'s own suite was silently vacuous for exactly this reason until it got a
-  `test/Project.toml`. The recommended layout now puts StrictMode in `test/Project.toml`
-  directly, which makes the block bind — but nothing warns when it does not.
+  that environment) is sidestepped rather than solved: `checks_enabled` now defaults to `true`,
+  so a test environment needs no block at all and there is nothing to be inert. A block that
+  *disables* checks in a non-direct-dep environment is still silently ignored — but that
+  direction fails safe (checks stay on), and `StrictModeTest.__init__` errors if checks are off
+  where the proofs are expected.
+  *Still to verify on a real consumer:* that `checks_enabled = true` by default does not make
+  PureBLAS/PureIPM unusable through sheer warning volume (#17's ~28%).
 
 - [ ] **#19 / #20 — `@assert_trim_compatible` false FAILs.** Both live in
   `_be_trim_validate`, which moved to `StrictModeTest/src/StrictModeTest.jl` in 0.4.0; the
@@ -112,13 +118,22 @@ GitHub issues are the source of truth for anything with a number; the notes here
   `Project.toml` + `StrictModeTest` in `test/Project.toml` + `@strict_function` in `src/` firing at
   the consumer's own precompile. That is the arrangement the split exists to serve.
 
-- [ ] **`:suspect` is a new public status.** It appears in the JSON findings. Anything matching
-  `status == "fail"` now silently skips fast-tier allocation findings. Documented in
-  `docs/src/agents.md`; the four consumer `strictmode_audit.jl` scripts are OUT OF SCOPE for this
-  repo but will need the same audit.
-
 - [ ] **Register `StrictModeTest`.** Subdirectory package; Registrator supports `subdir=`. Needs a
   decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).
+  **Blocking for 0.4.0**: without it, a consumer upgrading to StrictMode 0.4 has no way to reach
+  the proofs at all, since every gating entry point moved there.
+
+- [ ] **No consumer has been migrated to the 0.4 surface.** PureBLAS alone has 27 `@assert_noalloc`
+  and 85 `@assert_trim_compatible`; under 0.4 every one of them reports where it used to gate, and
+  `check_signatures`/`check_all`/`audit(...; exit_on_fail = true)` no longer exist. The load-time
+  banner is the mechanism that makes the change audible (release notes are not — this branch is
+  seven demonstrations of that), but nothing has been run against a real consumer to check that the
+  banner actually lands and that the migration is mechanical.
+
+- [ ] **§8–§11 has not been adversarially reviewed.** It rewrote code that three earlier passes had
+  cleared: the whole `_be_*` seam deletion, the throw-vs-warn table, the `:suspect`/`:skip` removal,
+  and every driver. Every vacuous-green bug on this branch was found by reading or by an adversarial
+  agent, never by the test suite — so a green suite is not evidence here.
 
 ## Open — deferred from the whole-branch adversarial review
 
@@ -130,10 +145,12 @@ GitHub issues are the source of truth for anything with a number; the notes here
   `acc += z[i] * (a + 2.0im)` loop over `Vector{ComplexF64}` plus a separate `@simd` loop reads as
   "hand-vectorized" and its epilogue gets flagged — the exact thing the commit says must never
   fire. Complex arithmetic + `@simd` is a bread-and-butter shape for this package's own dogfood
-  targets (FFT), and `:no_scalar_loops` fails at `:fail`, not `:suspect`.
+  targets (FFT).
   Not a regression (the shape false-positived before via the integer-phi branch), but the commit's
   soundness argument and its docstring's "e.g. explicit SIMD.jl code" are both wrong.
-  *Fix:* find a discriminator SLP output cannot forge, or downgrade this guarantee to `:suspect`.
+  *Mitigated, not fixed:* `_guarantee_gates` puts `:no_scalar_loops` in the reporting set, so a false
+  positive warns instead of aborting a build. The discriminator is still unsound — the fix is to find
+  one SLP output cannot forge.
 
 - [ ] **`register_report`'s regression test is self-referential.** `test/round5_test.jl` re-implements
   the register regex locally (`regs(s) = ...`) instead of driving `register_report`, and its

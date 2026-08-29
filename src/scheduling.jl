@@ -416,7 +416,7 @@ loop-carried index, and that region isn't LLVM's own bounded remainder/epilogue 
 already vectorized elsewhere.
 
 This is intentionally coarse — it operates on text IR, not a structured IR graph. A loop region
-is any back-edge found by [`_loop_regions`](@ref); a region counts as scalar hot work if it
+is any back-edge found by `_loop_regions`; a region counts as scalar hot work if it
 contains scalar FP arithmetic (`_SCALAR_FP_RE`), or an integer loop-carried index (`phi iN`)
 combined with scalar integer arithmetic (`_SCALAR_INT_RE`). Neither branch requires a
 loop-carried FP accumulator (`phi double`/`phi float`): a region is already proven to be a loop

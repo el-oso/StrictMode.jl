@@ -227,18 +227,20 @@ set_ignore_throw!
 ### One-time-init allocation barriers
 
 `Base.OncePerProcess`/`OncePerThread`-memoized lazy init allocates once, then reads a memoized
-value forever after — `:full` `@assert_noalloc`/`@assert_noboxing` recognize this automatically
-and substitute the (already-correct) `:fast` steady-state heuristic for AllocCheck's all-paths
-proof on that call, rather than reporting the initializer's one-time allocation as a violation.
-`register_alloc_barrier!` extends this to a hand-rolled memoization pattern that doesn't use one
-of those two `Base` types (this includes `Base.OncePerTask`, which is **not** auto-recognized —
-its implementation has no detectable non-inlined callee boundary; wrap it in your own function and
-register that instead). The exemption is logged once per session via `@info`, never silently.
+value forever after. The IR scan recognizes those two `Base` once-guard types automatically and
+stops at them instead of counting the initializer, and `StrictModeTest` honors the same
+recognition: `@test_noalloc` substitutes the (already-correct) steady-state scan for AllocCheck's
+all-paths proof on a call whose only allocation risk is the barrier, rather than reporting the
+initializer's one-time allocation as a violation. That substitution is logged once per session via
+`@info`, never silently, and `StrictModeTest.set_ignore_barrier!(false)` turns it off.
+
+`register_alloc_barrier!` extends the recognition to a hand-rolled memoization pattern that doesn't
+use one of those two `Base` types (this includes `Base.OncePerTask`, which is **not**
+auto-recognized — its implementation has no detectable non-inlined callee boundary; wrap it in your
+own function and register that instead).
 
 ```@docs
 register_alloc_barrier!
-ignore_barrier
-set_ignore_barrier!
 ```
 
 ### Incremental cache

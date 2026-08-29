@@ -1,21 +1,13 @@
 [deps]
-AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
-JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
 [sources]
 StrictMode = {path = ".."}
 
-# Build the docs with guarantees enabled so the live `@example` blocks really run the analysis.
-[preferences.StrictMode]
-checks_enabled = true
-fail_mode = "error"
-
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0.3"
-JET = "0.11.4"
 julia = "1.12"
