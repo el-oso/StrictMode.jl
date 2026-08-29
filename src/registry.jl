@@ -124,6 +124,14 @@ end
 Re-check every entry in the mark-once registry and return all findings. `guarantees = nothing`
 uses each entry's own setting; pass a tuple to override. `fail = :error`/`:warn` raises/logs on
 any failure, `:none` just returns the findings (the default — it is a reporting driver).
+
+!!! warning "Same-process only"
+    The registry is a plain `Dict` populated at *declaration* time. `@strict_function` runs at its
+    own module's precompile, and that cross-package mutation is discarded when the module is loaded
+    from a cached pkgimage — so **a consumer's test process sees an empty registry however many
+    declarations its `src/` carries**, and this driver would then return zero findings and exit 0.
+    It warns loudly in that case rather than reporting a silent green. For a consumer, use
+    [`check_signatures`](@ref) or `audit(MyPkg; sweep = true)`, which enumerate directly.
 """
 function check_all(;
         guarantees = nothing, fail::Symbol = :none,
@@ -133,6 +141,22 @@ function check_all(;
         (f, types, guarantees === nothing ? meta.guarantees : guarantees)
             for ((f, types), meta) in STRICT_REGISTRY if !_is_exempt(f)
     ]
+    if isempty(items)
+        # An empty registry renders exactly like a clean one: zero findings, exit 0. That is the
+        # whole failure mode this package exists to remove, and it is REACHABLE BY DEFAULT in a
+        # consumer, not just when nothing was declared: `@strict_function` registers through a
+        # `register_strict!` Dict insert executed at the ANNOTATED MODULE'S OWN PRECOMPILE, and that
+        # cross-package mutation is discarded when the module is loaded from its cached pkgimage. So
+        # a consumer's test process sees an empty registry no matter how many declarations its
+        # `src/` carries. `check_signatures`/`audit(mod; sweep=true)` are unaffected — they
+        # enumerate directly instead of reading this Dict.
+        @warn "check_all: the registry is EMPTY (0 checks) — this result proves nothing. " *
+            "`@strict_function` registers at its own module's precompile, and that registration " *
+            "does not survive a cached pkgimage load, so a consumer's test process sees no entries " *
+            "even when its `src/` is fully annotated. Use `check_signatures([(f, types), …])` or " *
+            "`audit(MyPkg; sweep = true)`, which enumerate directly. (An empty registry is also " *
+            "legitimate when nothing is declared, or everything is exempt.)"
+    end
     return _run_and_report(_map_findings(items, parallel, mode), :check_all, "registry", fail)
 end
 

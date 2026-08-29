@@ -86,8 +86,26 @@ GitHub issues are the source of truth for anything with a number; the notes here
   is discarded on cached pkgimage load, so `check_all()` in a consumer's test process sees an empty
   registry and reports green. `check_signatures`/`audit` are unaffected (they enumerate directly).
   SPLIT-PROPOSAL §H.3 identified this mechanism and it was never applied to `registry.jl`.
-  *Fix:* marker method definitions (§H.1) rather than a Dict, or document `check_all` as
-  same-process-only.
+  *Done so far:* `check_all` now WARNS loudly on an empty registry and its docstring documents the
+  same-process-only limitation, so the silent green is gone even though the false negative remains.
+  *Design considered and DEFERRED (adversarially reviewed, both critics "sound-with-changes"):*
+  replace the Dict with never-called marker METHODS (`_strict_declared(::typeof(f), ::Type{Tuple{…}},
+  ::Val{guarantees})`), read back via `methods()` and `m.sig` — a method definition is baked into the
+  defining module's pkgimage where a Dict insert is not. Verified cheap: reading `m.sig` costs 0.8 ms
+  where calling 302 markers to fetch a body payload cost 1.54 s.
+  Not taken, because markers are SESSION-GLOBAL AND PERMANENT where the Dict is ephemeral, and two
+  reviewers independently demonstrated that this converts the false negative into worse bugs:
+  (a) **Cross-package false positive.** `check_all` has no module filter and `audit`'s default target
+      is `:registered`. Today a dependency's Dict inserts are discarded on cached load, which is the
+      only reason this is harmless. With markers, every dependency precompiled under the consumer's
+      `checks_enabled = true` emits markers that the consumer's scan recovers — so package A's CI
+      goes red for package B's kernels, analyzed under A's backend, with no way to scope it out.
+  (b) **A NEW silent skip.** Making `@strict_exempt` survive precompilation, while `_is_exempt` stays
+      keyed on a bare `Set{Symbol}` with no module, turns a today-unreachable cross-package name
+      collision into a permanent graph-wide skip. Measured live: `check_compiled(MyPkg)` drops from
+      2 findings to 0 when an unrelated module exempts the name `:setup`.
+  Doing this properly therefore requires module-scoping BOTH the marker scan and the exempt set —
+  a change to a core structure used in four places, not the drop-in the design presents.
 
 - [ ] **No test exercises the real consumer layout.** `test/standalone` proves StrictMode works with
   no backend and `test/` proves the escalated path, but nothing tests `StrictMode` in

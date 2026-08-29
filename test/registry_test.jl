@@ -93,3 +93,20 @@ end
     @test any(f -> f.func == "g" && StrictMode._failed(f), fs)
     @test any(f -> f.func == "f" && f.status === :pass, fs)
 end
+
+@testitem "check_all warns loudly on an empty registry instead of reporting a silent green" begin
+    using StrictMode
+    # The registry is a plain Dict populated at declaration time, and `@strict_function` runs at its
+    # own module's precompile — a cross-package mutation that is DISCARDED on a cached pkgimage
+    # load. So a consumer's test process sees an empty registry however many declarations its src/
+    # carries, and `check_all()` would then return zero findings and exit 0: a green that proves
+    # nothing. That must be audible.
+    old = copy(StrictMode.STRICT_REGISTRY)
+    try
+        empty!(StrictMode.STRICT_REGISTRY)
+        fs = @test_logs (:warn,) match_mode = :any check_all()
+        @test isempty(fs)
+    finally
+        merge!(StrictMode.STRICT_REGISTRY, old)
+    end
+end
