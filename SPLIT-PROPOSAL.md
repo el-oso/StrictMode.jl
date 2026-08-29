@@ -861,3 +861,44 @@ already uses only the return-type half, so the split exists in one place already
    every suite stays green. Release notes are not a mechanism — this branch is seven demonstrations
    of that. Candidate: when `StrictModeTest` is loaded, `@assert_*` emits a once-per-session notice
    that this site is the heuristic and the proof is `@test_*`.
+
+## 11. Revision 10 — the remaining three answers
+
+**`StrictModeTest.__init__` asserts `StrictMode.checks_enabled()`.** Not because the const is
+unfixable — preferences are per active project and StrictMode gets a separate pkgimage per value
+(verified: main env `false`, test env `true`, same source, same moment) — but because a `false`
+reading means every `@assert_*` is a bare call, the registry stays empty, and `test_registered()`
+sweeps nothing and reports success. Issue #18 part 1 makes that reachable: a
+`[preferences.StrictMode]` block is silently inert unless StrictMode is a DIRECT dep of that env.
+
+**An analysis failure inside a gate is a failure.** Follows from §10: StrictModeTest gates, and a
+gate that cannot evaluate a method must not pass it. No `:skip`, no special status. The only detail
+is loop shape — collect all results and throw once at the end, so one crashed method does not leave
+the other 299 unevaluated.
+
+**A loud banner naming the TIER, not the on/off state.** The disarm is not "checks are off", it is
+"checks are on but `@assert_noalloc` is no longer a proof". So:
+
+    ┌ StrictMode: checks ENABLED — fast tier.
+    │ @assert_* REPORT and do not gate. To gate, load StrictModeTest
+    │ and use @test_* / test_signatures / test_compiled.
+
+Silent when disabled. With StrictModeTest loaded the banner states the authoritative variant, so the
+two states are visibly different rather than identical. This is the mechanism for §10's question 4 —
+release notes are not a mechanism, and this branch is seven demonstrations of that.
+
+### Open: should `checks_enabled` default to `true`?
+
+Argument for: a test env would not need a `[preferences.StrictMode]` block at all, which sidesteps
+issue #18 part 1 entirely. **Verified that the alternative does not work** — a DEPENDENCY declaring
+`[preferences.StrictMode] checks_enabled = true` in its own Project.toml has NO effect; only the
+active project's preferences are read (measured, scratch env with StrictModeTest declaring it:
+`checks_enabled = false`). So flipping the default is the only mechanism that removes the block.
+
+Argument against: the default governs downstream strangers. A user of PureBLAS who never heard of
+StrictMode would get checks on — runtime cost on every annotated call site, `@strict_function` work
+at their precompile, and analysis machinery in a `juliac --trim` build. It also contradicts the
+package's headline claim, "enforceable at dev/CI time and free in production".
+
+Unresolved. Note the cost is lower than it was — under §10 StrictMode only reports, so a default-on
+consumer gets warnings and analysis time, not a broken build.
