@@ -787,3 +787,77 @@ in those terms.
 file was edited since `f` was defined in the parent session, the probe checks different code than the
 real call runs. Wrong in either direction, including a false pass. Relevant to a Revise-heavy loop;
 no cheap fix, since a named function cannot be serialized by value.
+
+## 10. Revision 9 — the reporting/gating split, and what it resolves
+
+Owner decisions, resolving §8's first open question. The rule: **StrictMode reports, StrictModeTest
+gates.** Nothing in StrictMode can break a build.
+
+| `StrictMode` — fast, reports | `StrictModeTest` — proof, gates |
+| --- | --- |
+| `@assert_noalloc f(x)` | `@test_noalloc f(x)` |
+| `findings(f, types)` → data, never throws | `test_signatures([(f, types), …])` |
+| `audit(mod; sweep = true)` → discovery | `test_compiled(mod)` |
+| — | `test_registered()` |
+
+`check` does not move — it **dissolves**. `check(f, types; fail)` was `findings(...)` plus a throw;
+the data half is already `findings` and stays, the throwing half becomes `test_signatures`.
+`check_signatures`, `check_all` and `check_compiled` go the same way. Four public functions leave
+StrictMode, `check_signatures` among them — it is a README headline recipe, so this is a larger
+0.4 break than §8's Cost section admits.
+
+`test_signatures` takes SIGNATURES, not values. That is why it exists rather than being covered by
+the macros: `@test_noalloc gemm!(C, A, B)` makes you build the arguments; gating a `10000×10000`
+signature through `test_signatures` costs nothing. `test_registered()` is a plain function, not
+§8's `@test_all_noallocs` — it cannot be a macro, since at expansion time the registry is empty and
+it must loop at runtime.
+
+**`audit` loses `exit_on_fail`.** It is a discovery tool for the dev loop — "show me what looks
+wrong, now" — and its verdicts come from an engine with a measured ~28% false-positive rate on
+allocations (#17). A tool that reports is allowed to be wrong; a tool that gates is not.
+`test_compiled` is the gate.
+
+### Why this resolves the `:suspect` question
+
+`:suspect` existed because a heuristic allocation verdict in a SWEEP had to be both countable (so
+sweeps still gate) and distinguishable (so a 28% false-positive rate could not hard-fail a build).
+Once nothing in StrictMode gates, that tension is gone: a finding's status no longer has to encode
+how much to trust it, because nothing downstream acts on it automatically. A human or an agent reads
+`audit` output and judges. So `:suspect`, `nsuspect`, `flagged_status` and `fail_on_suspect` can all
+go — not by wishing the problem away, but because the thing that made them necessary was removed.
+
+### Correction to §8: `:typestable`'s fast check is NOT exact
+
+§8 classified it as exact and therefore throwing. Refuted empirically — `_typestable_fast` is
+return-type concreteness PLUS a depth-0 IR boxing signal, and the second half is a heuristic:
+
+    warnpath(x::Float64) = (x < 0 && @warn "negative"; sqrt(abs(x)))
+    return type = Float64   depth-0 boxing = true   :typestable fast=fail  full=pass
+
+A guarded `@warn` in a numeric function. Under "exact checks throw" this would abort builds on a
+bread-and-butter shape, and PureIPM has `@assert_typestable solve!(ws)` at top level of `src/verify.jl`
+— which runs at that package's OWN precompile. **Split the layers:** return-type concreteness throws
+(that half is exact for the question it asks), the depth-0 boxing signal warns. `@strict_function`
+already uses only the return-type half, so the split exists in one place already.
+
+### Still open (from the pre-implementation review)
+
+1. **`test_registered()` on an empty or partial registry.** Call-time registration means the sweep
+   covers what executed, and "partial" is the NORMAL state — a filtered test run, a CI shard
+   (PureBLAS's suite is sharded), or sweep-before-exercise all yield a smaller registry with no
+   signal that anything is missing. Also: with `checks_enabled = false` nothing registers at all and
+   the sweep is green. Minimum: `test_registered()` calls `assert_enabled()` and reports its count
+   ("re-proved N signatures") so an implausibly small N is visible.
+2. **Per-item analysis failure in a batch.** Throwing `AnalysisError` leaves the rest of a 300-method
+   sweep unchecked; today's `:skip` is excluded from `_failed`, so a sweep exits 0 when the backend
+   crashed on 50 of 300. Neither pole is right — emit a per-item `:fail` carrying the error text.
+3. **Cross-package registry pollution.** A dependency executing its own `@assert_*` calls during a
+   consumer's test run lands in the same global registry. This is the bug that made us defer the
+   marker design (TODO.md); a runtime registry has the same shape and needs module-scoped keys.
+4. **What tells a consumer their suite silently disarmed.** Consumer suites today load the backend,
+   so `@assert_noalloc` IS an AllocCheck proof that throws; after 0.4 the same spelling is a
+   heuristic that warns. PureBLAS alone has 27 `@assert_noalloc` and 85 `@assert_trim_compatible`.
+   Until each consumer rewrites to the `test_*` surface, no consumer CI runs AllocCheck at all and
+   every suite stays green. Release notes are not a mechanism — this branch is seven demonstrations
+   of that. Candidate: when `StrictModeTest` is loaded, `@assert_*` emits a once-per-session notice
+   that this site is the heuristic and the proof is `@test_*`.
