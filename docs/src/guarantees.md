@@ -657,9 +657,9 @@ just when a real allocation happens to leave the trailing page unmapped. The def
 since that is a fatal, otherwise-uncatchable `SIGSEGV`. Classification of a write is done by a
 **poisoned canary**: the trailing page is filled with a per-argument byte and left writable, so a
 store past the end lands in it and can be read back afterwards with its offset. That is necessary
-because Julia 1.12 turned a guard-page write fault into a fatal signal whose backtrace is destroyed
-(`unknown function (ip: …)`, zero frames), where 1.10/1.11 raised a catchable
-`ReadOnlyMemoryError`. `isolate=false` is a cheaper in-process check that catches out-of-bounds
+because a guard-page write fault is fatal and its backtrace is destroyed (`unknown function
+(ip: …)`, zero frames), so nothing can be recovered from the fault itself.
+`isolate=false` is a cheaper in-process check that catches out-of-bounds
 *writes* and misses *reads* **silently** — a load past the end disturbs no canary, so that mode
 returns a clean report for a read overrun.
 See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array` arguments only, end-of-buffer overruns

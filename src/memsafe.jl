@@ -10,14 +10,16 @@
 # against a trailing `PROT_NONE` guard page, so any read/write one element past the intended bounds
 # faults on every run, and reports it as a StrictMode violation instead of a process kill.
 #
-# Two research findings this design is built on (verified empirically, not assumed):
-#   1. An OOB WRITE against the guard page is catchable IN-PROCESS: Julia's segv handler converts a
-#      write fault on a mapped-but-protected page into a `ReadOnlyMemoryError`; the process survives.
-#   2. An OOB READ is NOT catchable in-process: it is a fatal SIGSEGV (the process dies), but a
-#      *subprocess* that faults is detected deterministically by its parent via `proc.termsignal`,
-#      with the child's own signal report (naming the faulting op) on stderr. This is the only path
-#      that catches the motivating bug's class (a masked *load*), so `isolate=true` (subprocess) is
-#      the default; `isolate=false` (in-process) is the cheaper store-only fallback.
+# Three facts this design is built on (all verified empirically, not assumed):
+#   1. A guard-page fault is FATAL and uncatchable — for a read or a write alike. There is no
+#      in-process way to observe one, so an in-process probe must never touch protected memory.
+#   2. A WRITE fault also destroys the backtrace (`unknown function (ip: …)`, zero frames), while a
+#      READ fault still names the faulting op. Classification therefore cannot come from the fault.
+#   3. A poisoned, WRITABLE page detects an out-of-bounds store without faulting at all, and yields
+#      the byte offset. That is what classifies a write, and what makes an in-process probe possible.
+# Hence: `isolate=true` (subprocess) is the default — a child that faults is detected by its parent
+# via `proc.termsignal`, which is the only way to catch a masked *load*, the motivating bug class.
+# `isolate=false` (in-process, canary only) is the cheaper store-only fallback.
 # A prior design considered shipping the probe to a `Distributed` worker instead of a plain
 # subprocess. Dropped: the guard buffers can't cross a worker boundary anyway (they must be built
 # *inside* the child regardless of transport), so `Distributed` bought nothing here over `run` +
@@ -108,9 +110,9 @@ function _guarded_array(src::Array{T, N}; align::Int = sizeof(T), guard_prot::Ci
     try
         # Poison the guard page BEFORE protecting it. Under `_PROT_NONE` the bytes are unreadable and
         # inert; under `_PROT_READ|_PROT_WRITE` they are the canary an out-of-bounds STORE disturbs
-        # without faulting — which is the only way left to localize a write, since Julia 1.12 turned
-        # a guard-page write fault into a fatal signal whose backtrace is destroyed (`unknown
-        # function (ip: …)`, zero frames), where 1.10/1.11 raised a catchable `ReadOnlyMemoryError`.
+        # without faulting. That is the only way to localize a write: a guard-page write fault is
+        # FATAL and its backtrace is unusable (`unknown function (ip: …)`, zero frames), so nothing
+        # can be recovered from the fault itself. Do not reintroduce a `ReadOnlyMemoryError` catch.
         ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), guard_ptr, Cint(poison), ps)
         _mprotect!(guard_ptr, ps, guard_prot)
     catch
@@ -172,13 +174,14 @@ function _canary_probe(@nospecialize(f), args::Tuple; align::Union{Nothing, Int}
         foreach(h -> _free_guarded!(h[2]), handles)
     end
 end
+
 # --- isolate=false: in-process, catches out-of-bounds WRITES only -------------------------------
 #
-# This used to rely on Julia's segv handler turning a guard-page write fault into a catchable
-# `ReadOnlyMemoryError`. That worked on 1.10/1.11 and became a fatal SIGSEGV in 1.12 — measured on
-# 1.12.7 and 1.13.0-rc3 — which would take the caller's whole process down, including the test
-# runner. The canary reaches the same verdict without faulting at all, so the documented contract
-# ("cheaper, in-process, stores only") is unchanged; only the mechanism is.
+# The canary, not a guard page: an out-of-bounds probe run in the caller's own process must never
+# fault, because a guard-page fault is fatal and would take that process down — including the test
+# runner. Reading the canary back reaches the same verdict for a STORE without touching protected
+# memory. Loads past the end disturb nothing, so this mode cannot see them; that is the documented
+# contract ("cheaper, in-process, stores only"), not a defect of the mechanism.
 function _memsafe_probe_inprocess(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
     hit = _canary_probe(f, args; align)
     hit === nothing && return nothing
