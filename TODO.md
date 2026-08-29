@@ -103,6 +103,31 @@ GitHub issues are the source of truth for anything with a number; the notes here
   decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).
 ## Done
 
+- [x] **#21 — `register_report` always returned 0 registers.** Fixed in `df74181`. The regex
+  required the AT&T `%zmm` sigil; `code_native` emits Intel syntax (bare `zmm0`) on this host, and
+  which you get varies by platform and Julia version. `\bzmm(\d+)\b` matches both. Note
+  `@assert_no_spill` thirty lines below already documented this exact trap — it reads LLVM's
+  Spill/Reload comments precisely because they survive either syntax — and the advisory report had
+  never caught up.
+
+- [x] **#22 — `scalar_fp_loops` false negative AND false positive.** Fixed in `a4fe1ca`. The false
+  negative: the check required an FP `phi` accumulator, but a load-compute-store scalar tail carries
+  only its *index* through a phi. Removing that requirement alone reintroduces the false positive,
+  because LLVM's own vectorizer remainder loop is structurally identical to a hand-written tail. The
+  distinguishing signal is not local to the loop: it is whether the function ALSO contains a
+  hand-vectorized loop (raw `<N x …>` ops without LLVM's `vector.ph`/`middle.block`/`scalar.ph`
+  scaffolding). Verified against the optimized IR for both reproducers, all three directions.
+
+- [x] **#25 — opaque `AssertionError` from a backend failure.** Guarded in `26294ec` via a typed
+  `AnalysisError` naming the call, signature, likely cause and original error. **Leave the issue
+  OPEN:** the filed reproducer did not reproduce on this stack — `Core.Compiler` absorbs a
+  `@generated` generator's exception into an inference failure (return type widens to `Any`) rather
+  than propagating it. What was fixed is a real, separate gap found by reading: `_assert_opt` was the
+  only one of the three `_be_opt_result` call sites with no error handling at all.
+
+- [x] **#23 — suite cannot run on Julia 1.13.** Already fixed on this branch by the ReTestItems →
+  TestItemRunner migration (`274b678`); it is the same `Test.TESTSET_PRINT_ENABLE` ScopedValue break.
+
 - [x] **Reconcile `SPLIT-PROPOSAL.md` with what shipped** — revision 7. §H.4 and §5 rewritten to
   describe auto-escalation rather than the shadowing macros that were never built, and a new §7
   records all ten divergences with the reason for each. The document is now a decision record, not
