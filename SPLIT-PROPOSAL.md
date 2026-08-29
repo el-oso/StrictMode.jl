@@ -657,3 +657,64 @@ declared-but-unloaded check (§5 item 6), the migration from ReTestItems to Test
 runner assigns `Test.TESTSET_PRINT_ENABLE[]`, which became a `ScopedValue` in Julia 1.13 and killed
 the entire suite before a single item ran), and three Julia 1.13 fixes — two of them silent false
 negatives in `@assert_inlined` and `@assert_no_threadid_state`.
+
+## 8. Revision 8 — distinct names, not shadowing and not auto-escalation
+
+Owner decision, superseding §H.4 and §7 item 1. Both earlier mechanisms answered "which engine does
+this call site use?" with machinery. This answers it with a **name**, and the machinery goes away.
+
+### The shape
+
+| macro | package | engine | on failure | registers? |
+| --- | --- | --- | --- | --- |
+| `@noalloc f(x)` | `StrictMode` | typed-IR heuristic | **warns** | yes, at call time |
+| `@test_noalloc f(x)` | `StrictModeTest` | AllocCheck | **throws** | — |
+| `@test_all_noallocs()` | `StrictModeTest` | AllocCheck | throws | reads the registry |
+
+`StrictMode` is the fast development tier and is **warn-only**. `StrictModeTest` is authoritative and
+is the only thing that fails a build. Which you get is visible in the source, not decided by what
+happened to be loaded.
+
+### What this deletes
+
+- **Auto-escalation** — `backend_available()` as a control-flow mechanism, and the whole class of
+  "the tier depends on ambient process state".
+- **The `_be_*` seam** and its stubs. `StrictModeTest` depends on AllocCheck/JET/TrimCheck directly
+  and calls them; nothing has to be filled in from outside.
+- **`BackendUnavailable`**, `_require_backend`, `_is_fatal_sweep_error`. A backend can no longer be
+  *absent* at a call site that needs it — the macro that needs it lives in the package that has it.
+  Two of the seven vacuous-green bugs on this branch came from that failure class.
+- **`:suspect`**, `nsuspect`, `_mkfinding`'s `flagged_status`, `_run_and_report`'s `fail_on_suspect`.
+  The status encoded *how much to trust a verdict*; the package name now carries that, and encoding
+  it twice is redundant.
+- **`:skip`.** An authoritative checker that cannot answer throws `AnalysisError` rather than
+  emitting a finding that reads as "not a failure".
+
+Status surface reduces to `:pass` / `:fail` / `:info`. `AnalysisError` is retained: a backend that
+*crashes* is still possible, and must never render as a pass.
+
+### The constraint this design accepts
+
+`@noalloc` registers **when the call runs**, not when it is declared. That is deliberate — a
+declaration-time registration is a cross-package mutation discarded on cached pkgimage load, which
+is exactly why `check_all` is vacuous in a consumer today (§5 "Still open"). Two consequences:
+
+1. `@test_all_noallocs` re-checks only what the test suite actually **executed**. Coverage follows
+   execution. Arguably correct — you prove what you run — but it is not "check everything I
+   declared", and it must be documented as such.
+2. It cannot be a macro that expands to static `@test_noalloc` calls: at its expansion time nothing
+   has run and the registry is empty. It expands to a runtime loop.
+
+Registration must be once-per-signature (not per invocation, which would put a `Dict` insert in a
+hot path) and must happen on **pass as well as fail** — otherwise the authoritative tier only
+re-checks what the heuristic already flagged, which is backwards.
+
+### Cost
+
+This invalidates a substantial part of commits 920dba8..ff1c1d6: auto-escalation, the `:suspect`
+work and its documentation, and parts of the seam. Consumers migrate twice (the preference removal,
+then the macro rename). Taken deliberately: the naming removes an entire category of failure this
+branch has already hit repeatedly, and does so by having less machinery rather than more.
+
+**Not settled here:** whether `@strict_function`'s load-time check survives in this shape, and what
+`fail_mode` still means once `StrictMode` never fails.
