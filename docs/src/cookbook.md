@@ -41,16 +41,22 @@ nothing for a shipped application.
 @assert_noalloc static = false stream_step!(buf, x)   # measures @allocated after a warmup
 ```
 
-### Trade rigor for speed while iterating
+### Report while iterating, gate in CI
 
-Nothing to configure: `StrictMode` analyzes with the cheap inference-only engine by
-default (sub-ms per method, no backend). Add `StrictModeTest` to the test environment
-when you want the rigorous AllocCheck/JET proof in CI.
+Nothing to configure for the first half: `StrictMode`'s `@assert_*` run a cheap inference-only
+engine (sub-ms per method, no extra dependency) and **report**. Add `StrictModeTest` to the test
+environment and write `@test_*` where you want the AllocCheck/JET proof to **fail the build**:
+
+```julia
+@assert_noalloc kernel!(C, A, B)     # while you iterate — warns
+@test_noalloc    kernel!(C, A, B)    # in CI — throws
+```
 
 ### Diagnose instead of assert
 
-When you want the reason rather than a thrown error, reach for `@explain`. It gathers
-`@code_warntype`, JET, and AllocCheck into one `StrictReport`, and it never throws:
+When you want the reason rather than a verdict, reach for `@explain`. It gathers
+`@code_warntype`, the inferred return type, and the typed-IR signals into one `StrictReport`, and
+it never throws:
 
 ```julia
 @explain component(state, rand(1:3))   # returns a report explaining each verdict
@@ -58,18 +64,24 @@ When you want the reason rather than a thrown error, reach for `@explain`. It ga
 
 ## How each check works (so you can trust the failures)
 
-- **`@assert_noalloc`** asks AllocCheck to *prove* the call cannot allocate. Any reported site —
-  including dynamic dispatch and boxing — fails the guarantee. If static analysis can't run, it
-  falls back to an empirical `@allocated` measurement after a warmup call.
-- **`@assert_noboxing`** runs the same AllocCheck analysis but reports only the *boxing /
-  dynamic-dispatch* subclass (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime
-  calls, `Core.Box`), so legitimate typed allocations pass.
-- **`@assert_typestable`** combines `Test.@inferred` (the *return type* must be concrete) with
-  `JET.@report_opt` (no *internal* instability or runtime dispatch).
+- **`@assert_noalloc`** scans typed IR for allocation sites — including dynamic dispatch and
+  boxing. `static = false` measures `@allocated` after a warmup instead. Both are heuristics, so it
+  **reports**; **`@test_noalloc`** asks AllocCheck to *prove* the call cannot allocate on any path,
+  and throws.
+- **`@assert_noboxing`** flags the *boxing / dynamic-dispatch* subclass from the same scan, so
+  legitimate typed allocations pass. **`@test_noboxing`** classifies AllocCheck's own instances
+  (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime calls, `Core.Box`) — which is
+  where the distinction is actually proved.
+- **`@assert_typestable`** requires a concrete inferred return type (exact, so it throws) and adds
+  an IR signal for internal dispatch behind a concrete return (a heuristic, so it warns).
+  **`@test_typestable`** replaces that second layer with `JET.@report_opt` and throws on it.
 - **`@assert_inlined`** compiles a wrapper around the call and checks its optimized IR for a
-  surviving `:invoke` to the callee — best-effort, since inlining is a heuristic.
-- **`@strict_function`** runs the no-alloc + concrete-return checks against the declared
-  argument types at precompile/load time, so a violation stops the module from loading.
+  surviving `:invoke` to the callee — best-effort, since inlining is a heuristic, but it observes
+  compiled output rather than inferring, so it throws.
+- **`@strict_function`** runs the same checks against the declared argument types at precompile/load
+  time. A non-concrete return stops the module from loading; an allocation verdict only warns there,
+  because the proof is not loadable at a package's own precompile and a guess must not break a build.
+  The declaration is registered either way, so `test_registered()` re-proves it from `test/`.
 
 ## SIMD kernel workflow
 

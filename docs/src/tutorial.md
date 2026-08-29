@@ -98,8 +98,8 @@ throwing — it runs all the checks and explains each verdict:
 @explain dot3_candidate(a, b)
 ```
 
-The report collects `@code_warntype`, JET analysis, and AllocCheck into one place. Use it to
-find the allocation site before trying to fix it.
+The report collects `@code_warntype`, the inferred return type, and the typed-IR allocation and
+dispatch signals into one place. Use it to find the allocation site before trying to fix it.
 
 ## A realistic trap: runtime tuple indexing
 
@@ -154,22 +154,25 @@ See [Avoiding boxing](api.md#avoiding-boxing) in the API reference for `@unroll`
 
 ## CI enforcement
 
-Add a programmatic check to your test suite so CI catches regressions without any call-site
-annotation:
+Add `StrictModeTest` to your **test** environment and gate on an explicit signature list — no
+call-site annotation needed anywhere:
 
 ```julia
-using StrictMode, AllocCheck, JET
+# test/Project.toml:  [deps] StrictMode, StrictModeTest
+using StrictMode, StrictModeTest
 
-# In your test file:
-fs = check(dot3_locked, (NTuple{3,Float64}, NTuple{3,Float64}))
-@test nfailures(fs) == 0
+# In your test file — throws a StrictViolation naming every failure:
+test_signatures([(dot3_locked, (NTuple{3,Float64}, NTuple{3,Float64}))])
 ```
 
-Or sweep everything the module has registered at once:
+Or gate everything the module actually compiled:
 
 ```julia
-fs = audit(MyModule)
-@test nfailures(fs) == 0
+test_compiled(MyModule)
 ```
+
+Note which package each name comes from: the `test_*` drivers run AllocCheck, JET and TrimCheck,
+and they **throw**. `StrictMode`'s own `audit(MyModule)` covers the same scope with the value-free
+scan and only reports — reach for it while you iterate, not as the gate.
 
 See [Automating checks](automating.md) for the full sweep options.

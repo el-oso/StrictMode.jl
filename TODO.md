@@ -180,14 +180,6 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 `test/standalone`'s isolation assertion was decorative (verified: it passes without
 `JULIA_LOAD_PATH`, so dropping the CI env var would leave the split-premise gate green).
 
-- [ ] **Docs pages not updated for 0.4.** `tutorial.md`, `cookbook.md`, `index.md` and `concepts.md`
-  were never touched by the split. Between them they call the deleted `check`, import AllocCheck/JET
-  directly, say checks are "off by default", describe `@explain` as gathering JET + AllocCheck,
-  promise `@strict_function` fails module load on allocation, and describe `@assert_trim_compatible`
-  as escalating with TrimCheck. `README.md` links twice to `docs/rust_gaps`, a page absent from
-  `docs/src/` and from `make.jl`. `src/StrictMode.jl`'s own top-level docstring still describes the
-  deleted `:fast`/`:full` tiers.
-
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding

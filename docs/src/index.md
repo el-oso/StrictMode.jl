@@ -24,9 +24,9 @@ features:
   - title: Ask for the fast path
     details: Say what you want at a call site or a definition — this call should not allocate, this one should stay type-stable — and get an error the moment it doesn't.
   - title: Catch the silent traps
-    details: A thin layer over AllocCheck, JET, and @inferred. The things Julia normally lets slide, like boxing or a hot loop that quietly allocates, become errors you can actually see.
+    details: Two tiers. StrictMode alone reads inferred types and typed IR to report; add StrictModeTest and AllocCheck, JET and TrimCheck prove the same properties and fail your build. The things Julia normally lets slide, like boxing or a hot loop that quietly allocates, become errors you can actually see.
   - title: Zero cost when disabled
-    details: Every check sits behind a Preferences flag, off by default. When it's off the macros vanish into the bare call, so a production build carries none of it.
+    details: Every check sits behind a Preferences flag, on by default so a dev or test environment needs no setup. Turn it off for a shipped application and the macros vanish into the bare call, so the deployment carries none of it.
 ---
 ```
 

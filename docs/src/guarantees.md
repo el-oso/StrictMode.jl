@@ -68,7 +68,8 @@ end
 # ┌ Warning: StrictViolation (@noalloc): guarantee not satisfied
 # │   target:  grow_and_sum(10)
 # │   reason:  allocates / boxes (value-free IR scan) …
-# └   note:    StrictMode's `@noalloc` check is a heuristic, so it reports rather than gating.
+# └   note:    StrictMode's `@assert_noalloc` check is a heuristic, so it reports rather than
+#              gating. Add StrictModeTest and use `@test_noalloc` for the proof.
 ```
 
 **Reported, not thrown** — see [Why `@assert_noalloc` reports instead of
@@ -89,9 +90,10 @@ using StrictMode, StrictModeTest        # test/Project.toml
 A `Base.OncePerProcess`/`OncePerThread`-memoized lazy calibration allocates once, then reads a
 memoized value forever after — but AllocCheck's all-paths proof sees the initializer's one-time
 allocation as statically reachable and would otherwise red a call that's provably alloc-free in
-steady state. `@assert_noalloc`/`@assert_noboxing` recognize the two `Base` once-guard types
-automatically and substitute the (already-correct) `:fast` steady-state heuristic for that one
-call, rather than reporting the cold-path allocation as a violation — logged once per session via
+steady state. The IR scan recognizes the two `Base` once-guard types automatically and stops at
+them, and `@test_noalloc`/`@test_noboxing` honor that: on a call whose ONLY allocation risk is the
+barrier they substitute the (already-correct) steady-state scan for AllocCheck's all-paths proof,
+rather than reporting the cold-path allocation as a violation — logged once per session via
 `@info`, never silently:
 
 ```julia
@@ -211,11 +213,13 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 Every guarantee macro accepts two extra forms, so you can point them straight at a real API instead
 of an internal positional driver.
 
-**Keyword arguments.** A keyword call is guaranteed as written — StrictMode routes it through
-`Core.kwcall`, so inference, AllocCheck and JET all see the keyword sorter's real specialization:
+**Keyword arguments.** A keyword call is checked as written — StrictMode routes it through
+`Core.kwcall`, so inference, AllocCheck and JET all see the keyword sorter's real specialization.
+That holds under a `types = (…)` override too: the override pins the POSITIONAL types and the
+kwcall wrapper is kept, so the analyzed signature stays the one the call actually reaches.
 
 ```julia
-@assert_noalloc    trsm!(B, A; side='L', uplo='L', alpha=1.0)   # public kwarg entry point, proved
+@assert_noalloc    trsm!(B, A; side='L', uplo='L', alpha=1.0)   # public kwarg entry point
 @assert_typestable scale(x; by=2)
 ```
 
@@ -720,10 +724,15 @@ in the cookbook for a practical port workflow.
 
 ## `@explain` — tell me *why*
 
-When an assert fails, you usually want to know why, not just that it did. [`@explain`](@ref)
-gathers `@code_warntype`, JET's `@report_opt`, and AllocCheck into a single [`StrictReport`](@ref),
-and unlike the asserts it never throws. It just returns the report, which the REPL prints for you;
-assign it if you want to poke at the individual fields.
+When a guarantee reports a violation, you usually want to know why, not just that it did.
+[`@explain`](@ref) gathers `@code_warntype`, the inferred return type, and the typed-IR allocation
+and dispatch signals into a single [`StrictReport`](@ref), and unlike the asserts it never throws.
+It just returns the report, which the REPL prints for you; assign it if you want to poke at the
+individual fields.
+
+It runs the value-free engine, so its allocation verdict is the same structural guess
+`@assert_noalloc` makes — for the proved answer, `StrictModeTest`'s `@test_noalloc` /
+`@test_typestable` analyze the same call.
 
 A clean call comes back all green:
 
@@ -744,8 +753,9 @@ component(s, i) = s[i]
 # StrictMode @explain — component(state, rand(1:3))
 #
 #   Return type:    Union{Float64, Int64, String}  ✗ not concrete
-#   Allocations:    ✗ 1 site(s) (AllocCheck):
-#     [1] Allocating runtime call to "jl_get_nth_field_checked" in ./tuple.jl:33 …
+#   Local dispatch: ✗ this function's own IR dispatches dynamically
+#   IR signals:     ✗ boxing / dynamic dispatch
+#                   at ./tuple.jl:33
 #
 #   Verdict:
 #     ✗ @assert_typestable would fail
