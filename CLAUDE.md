@@ -60,7 +60,10 @@ src/
                         structured StrictFinding are untouched, macro-path-only visibility)
   memsafe.jl          — @assert_memsafe, memsafe_report/MemsafeReport, _guarded_array/GuardedBuffer
                         (mmap/mprotect guard-page harness for deterministic OOB read/write detection;
-                        isolate=true runs the probe in a subprocess via Serialization + Base.run)
+                        the probe always runs in a subprocess via Serialization + Base.run — an
+                        in-process probe cannot observe a read overrun. _guarded_args shares one
+                        buffer between aliased argument positions; _unguarded_args names what the
+                        harness could not cover)
   mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
                         throughput/IPC estimate, informational only — never fails without an
                         explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the

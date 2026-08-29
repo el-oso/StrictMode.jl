@@ -77,13 +77,14 @@ explain_trim
 [`@assert_memsafe`](@ref)/`memsafe_report` catch out-of-bounds array reads/writes in unsafe SIMD
 kernels **deterministically** instead of flakily, via a guard-page (electric-fence style) harness:
 `Array` arguments are copied into `mmap`-backed buffers flush against a trailing `PROT_NONE` guard
-page, so an access one element past the intended bounds faults on every run rather than only when
-the next page happens to be unmapped. `isolate=true` (the default) runs the probe in a subprocess
-so a fatal out-of-bounds *read* (an otherwise-uncatchable `SIGSEGV`) is detected via the child's
-exit signal instead of crashing your session — this is the only mode that catches that class;
-`isolate=false` is a cheaper in-process check that only catches out-of-bounds *writes*. Needs no
-extra dependency (`Serialization`, used for subprocess argument marshaling, is a core dep), but is
-Linux/macOS-only and scoped to `Array` arguments — see the docstring for the full scope/limits.
+region, so an access one element past the intended bounds faults on every run rather than only when
+the next page happens to be unmapped. The probe always runs in a subprocess, so a fatal
+out-of-bounds *read* (an otherwise-uncatchable `SIGSEGV`) is detected via the child's exit signal
+instead of crashing your session; a *write* is localized by a poisoned canary read back before the
+child touches the guard pages. Needs no extra dependency (`Serialization`, used for subprocess
+argument marshaling, is a core dep), but is Linux/macOS-only and scoped to `Array` arguments —
+arguments it cannot guard are listed in the report's `unguarded` field, and `@assert_memsafe`
+rejects the ones the caller can materialize. See the docstring for the full scope/limits.
 
 ```@docs
 @assert_memsafe

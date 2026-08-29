@@ -140,13 +140,19 @@ GitHub issues are the source of truth for anything with a number; the notes here
   live-path assertion is `r.vec_regs_used >= 0`, which is vacuously true. A future regression of the
   real regex would not be caught — the test tests a copy of the code, not the code.
 
-- [ ] **Aliased arguments diverge between probe and real call in `@assert_memsafe`.** `f(A, A)`
-  builds two INDEPENDENT guarded copies, so aliasing-dependent behaviour (in-place fast paths, or
-  index values read from the aliased buffer) differs between the probe and the real call, and the
-  verdict can be wrong in either direction. Undocumented; needs at least a scope sentence in
-  `memsafe_report`'s docstring alongside the existing Linux/macOS and `Array`-only caveats.
-
 ## Done
+
+- [x] **`@assert_memsafe` reported clean on three shapes it never checked.** Fixed. A store
+  whose value equals the canary poison was missed on every run (deterministic, not a
+  probabilistic collision) — the fill is now position-dependent, which also closes
+  self-laundering, where a kernel copies its own canary bytes to a shifted offset. `f(A, A)`
+  built two independent buffers, hiding aliasing-dependent overruns and breaking kernels that
+  require the aliasing; positions holding the same array now share one buffer. Stores into
+  `align` slack were invisible and reported offsets understated by the slack; the canary now
+  covers the slack. `isolate=false` is gone: an in-process probe can only use the canary, and
+  a load past the end disturbs no canary, so its clean verdict was indistinguishable from no
+  overrun at all in exactly the motivating case. Arguments the harness cannot guard are named
+  in `MemsafeReport.unguarded` rather than silently skipped.
 
 - [x] **#21 — `register_report` always returned 0 registers.** Fixed in `df74181`. The regex
   required the AT&T `%zmm` sigil; `code_native` emits Intel syntax (bare `zmm0`) on this host, and

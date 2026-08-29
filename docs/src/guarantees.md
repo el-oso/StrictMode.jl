@@ -651,19 +651,27 @@ out-of-bounds access that is invisible to `--check-bounds` by construction, not 
 flag already handles.
 
 Mechanically: `Array` arguments are copied into `mmap`-backed buffers whose data ends flush
-against a trailing `PROT_NONE` guard page, so a one-element overrun faults on *every* run, not
-just when a real allocation happens to leave the trailing page unmapped. The default
-`isolate=true` runs the probe in a subprocess — the only way to catch an out-of-bounds *read*,
-since that is a fatal, otherwise-uncatchable `SIGSEGV`. Classification of a write is done by a
-**poisoned canary**: the trailing page is filled with a per-argument byte and left writable, so a
-store past the end lands in it and can be read back afterwards with its offset. That is necessary
-because a guard-page write fault is fatal and its backtrace is destroyed (`unknown function
-(ip: …)`, zero frames), so nothing can be recovered from the fault itself.
-`isolate=false` is a cheaper in-process check that catches out-of-bounds
-*writes* and misses *reads* **silently** — a load past the end disturbs no canary, so that mode
-returns a clean report for a read overrun.
-See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array` arguments only, end-of-buffer overruns
-only — no interior or underrun detection).
+against a trailing `PROT_NONE` guard region, so a one-element overrun faults on *every* run, not
+just when a real allocation happens to leave the trailing page unmapped. The probe runs in a
+subprocess — the only way to catch an out-of-bounds *read*, since that is a fatal,
+otherwise-uncatchable `SIGSEGV`. Classification of a write is done by a **poisoned canary**: the
+bytes past the data are filled with a per-buffer, position-dependent pattern and read back before
+the child touches the guard pages, so a store past the end is reported with its exact offset. That
+is necessary because a guard-page write fault is fatal and its backtrace is destroyed (`unknown
+function (ip: …)`, zero frames), so nothing can be recovered from the fault itself. Argument
+positions holding the same array share one guarded buffer, so a kernel with an aliasing-dependent
+path sees the aliasing it was called with.
+
+There is no in-process mode: an in-process probe can only use the canary, and a load past the end
+disturbs no canary, so its clean verdict would be indistinguishable from no overrun at all — in
+exactly the case this harness exists for.
+
+See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array` arguments
+only, end-of-buffer overruns only — no interior or underrun detection). Arguments the harness
+cannot guard — a `view`, an `Adjoint`, a struct carrying arrays in its fields — are listed in the
+report's `unguarded` field, so a clean verdict over a partially covered call does not read like a
+clean verdict over a fully covered one; [`@assert_memsafe`](@ref) rejects the ones the caller can
+materialize outright.
 
 ## Promise scope
 

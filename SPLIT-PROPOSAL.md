@@ -738,7 +738,7 @@ deprecation warning.
 
 This still invalidates the auto-escalation and `:suspect` work in 920dba8..ff1c1d6.
 
-## 9. Memsafe redesign (independent of §8)
+## 9. Memsafe redesign (independent of §8) — IMPLEMENTED
 
 `@assert_memsafe` has no tier involvement — it is value-based, needs no backend, and lives wholly in
 `StrictMode`. Its problem is that a guard-page fault is fatal and uncatchable, and a WRITE fault's

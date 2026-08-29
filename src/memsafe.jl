@@ -16,10 +16,13 @@
 #   2. A WRITE fault also destroys the backtrace (`unknown function (ip: …)`, zero frames), while a
 #      READ fault still names the faulting op. Classification therefore cannot come from the fault.
 #   3. A poisoned, WRITABLE page detects an out-of-bounds store without faulting at all, and yields
-#      the byte offset. That is what classifies a write, and what makes an in-process probe possible.
-# Hence: `isolate=true` (subprocess) is the default — a child that faults is detected by its parent
-# via `proc.termsignal`, which is the only way to catch a masked *load*, the motivating bug class.
-# `isolate=false` (in-process, canary only) is the cheaper store-only fallback.
+#      the byte offset. That is what classifies a write.
+#
+# The probe therefore ALWAYS runs in a subprocess: a child that faults is detected by its parent via
+# `proc.termsignal`, and that is the only way to observe a masked *load*, the motivating bug class.
+# There is no in-process mode. An in-process probe can only use the canary, and a load past the end
+# disturbs no canary, so its clean verdict is indistinguishable from "nothing overran" in exactly
+# the case this harness exists for.
 # A prior design considered shipping the probe to a `Distributed` worker instead of a plain
 # subprocess. Dropped: the guard buffers can't cross a worker boundary anyway (they must be built
 # *inside* the child regardless of transport), so `Distributed` bought nothing here over `run` +
@@ -58,33 +61,52 @@ end
 
 _munmap!(ptr::Ptr{Cvoid}, nbytes::Int) = (ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), ptr, nbytes); nothing)
 
+# Size of the trailing guard/canary region. More than one page so that a kernel overrunning by more
+# than a page's worth is still trapped (or canaried) at a known offset rather than landing in
+# unmapped memory, where a store faults instead of being localized and so misreports as a read.
+const _GUARD_PAGES = 4
+
 struct GuardedBuffer
     array::Array
     _base::Ptr{Cvoid}
     _total_bytes::Int
-    _poison::UInt8
+    _canary::Ptr{UInt8}     # first byte past the data: alignment slack, then the guard pages
+    _canary_bytes::Int
+    _poison::UInt8          # base byte; the expected value at offset k is `_poison_byte(base, k)`
+    _readable::Bool         # false once the guard pages are PROT_NONE — the canary cannot be read
 end
 
 _free_guarded!(gb::GuardedBuffer) = _munmap!(gb._base, gb._total_bytes)
 
-# Poison byte for buffer `i`. DISTINCT PER BUFFER, and that is load-bearing rather than tidy: with a
-# single shared value a kernel that copies between two guarded buffers launders it — the overrunning
-# load pulls the poison out of the source's canary and the overrunning store writes that same byte
-# into the destination's, so BOTH canaries read back clean on a kernel with an out-of-bounds read
-# AND an out-of-bounds write. Measured, on `out[i] = a[i]` with a one-element overrun — which is this
-# package's motivating kernel shape, not a corner case. Distinct bytes make the copied value differ
-# from the destination's own poison, so the store is detected.
+# Base poison byte for buffer `i`. DISTINCT PER BUFFER, and that is load-bearing rather than tidy:
+# with a single shared value a kernel that copies between two guarded buffers launders it — the
+# overrunning load pulls the poison out of the source's canary and the overrunning store writes that
+# same byte into the destination's, so BOTH canaries read back clean on a kernel with an
+# out-of-bounds read AND an out-of-bounds write. Measured, on `out[i] = a[i]` with a one-element
+# overrun — this package's motivating kernel shape, not a corner case. Distinct bytes make the
+# copied value differ from the destination's own poison, so the store is detected.
 _poison_for(i::Integer) = UInt8(0xa5 ⊻ (UInt8(i % 251) * 0x11))
+
+# Expected canary byte at offset `k` past the end of the data. POSITION-DEPENDENT, for two reasons a
+# constant fill cannot cover:
+#   - A buffer filled with its own poison value hides an overrunning store of that value entirely; a
+#     constant-byte store now mismatches at least 7 of the 8 bytes of a `Float64`-wide store.
+#   - A kernel that copies a buffer's own canary bytes to a shifted offset ("self-laundering") is
+#     invisible when every position holds the same byte.
+# The 251 modulus (prime, and coprime with every power-of-two element size) means a shift by any
+# plausible element-multiple changes the expected byte.
+_poison_byte(base::UInt8, k::Integer) = base ⊻ UInt8(k % 251)
 
 """
     _guarded_array(src::Array; align = sizeof(eltype(src))) -> GuardedBuffer
 
-Copy `src` into a fresh `mmap`-backed buffer whose data ends **flush** against a trailing
-`PROT_NONE` guard page: any read or write one element past `src`'s last valid byte faults
-deterministically. The default `align = sizeof(eltype(src))` always evenly divides the data's
-total byte length, so the default placement is simultaneously flush *and* naturally aligned — no
-tradeoff. Requesting a wider `align` (e.g. for a kernel that assumes SIMD-width alignment) trades
-away up to `align - 1` bytes of end-of-buffer detection precision to get it (warned once).
+Copy `src` into a fresh `mmap`-backed buffer whose data is followed immediately by a poisoned
+canary and then a trailing `PROT_NONE` guard region: any read or write past `src`'s last valid
+byte faults deterministically. The default `align = sizeof(eltype(src))` always evenly divides the
+data's total byte length, so the default placement puts the guard pages flush against the data.
+Requesting a wider `align` (e.g. for a kernel that assumes SIMD-width alignment) inserts up to
+`align - 1` bytes of slack before the guard pages; that slack is part of the poisoned canary, so a
+STORE into it is still detected at its exact offset, but a READ of it cannot fault (warned once).
 
 Only catches overruns past the **end of the allocation** — an interior overread (e.g. a masked
 load reading past a valid sub-row but still inside the same buffer) is invisible to this harness.
@@ -95,79 +117,110 @@ function _guarded_array(src::Array{T, N}; align::Int = sizeof(T), guard_prot::Ci
     n = length(src)
     databytes = n * sizeof(T)
     ps = _pagesize()
-    slack = databytes == 0 ? 0 : (align - databytes % align) % align
+    slack = iszero(databytes) ? 0 : (align - databytes % align) % align
     if slack > 0
         @warn "StrictMode @assert_memsafe: align=$align does not evenly divide this buffer's " *
-            "$databytes-byte length — $slack byte(s) of end-of-buffer detection precision traded " *
-            "away for alignment. Use align=sizeof(eltype(src)) (the default) for exact flush." maxlog = 3
+            "$databytes-byte length — $slack byte(s) of slack sit between the data and the guard " *
+            "pages. A store into that slack is still reported at its exact offset (the canary " *
+            "covers it), but a read of it cannot fault. Use align=sizeof(eltype(src)) (the " *
+            "default) for a flush guard." maxlog = 3
     end
     padded_bytes = databytes + slack
     data_pages = cld(max(padded_bytes, 1), ps)
     data_region_bytes = data_pages * ps
-    total_bytes = data_region_bytes + ps
+    guard_bytes = _GUARD_PAGES * ps
+    total_bytes = data_region_bytes + guard_bytes
     base = _mmap_anon(total_bytes)
     guard_ptr = base + data_region_bytes
+    data_start = guard_ptr - padded_bytes
+    canary_ptr = Ptr{UInt8}(data_start + databytes)   # the slack, then the guard pages
+    canary_bytes = slack + guard_bytes
     try
-        # Poison the guard page BEFORE protecting it. Under `_PROT_NONE` the bytes are unreadable and
-        # inert; under `_PROT_READ|_PROT_WRITE` they are the canary an out-of-bounds STORE disturbs
-        # without faulting. That is the only way to localize a write: a guard-page write fault is
-        # FATAL and its backtrace is unusable (`unknown function (ip: …)`, zero frames), so nothing
-        # can be recovered from the fault itself. Do not reintroduce a `ReadOnlyMemoryError` catch.
-        ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), guard_ptr, Cint(poison), ps)
-        _mprotect!(guard_ptr, ps, guard_prot)
+        # Poison the canary BEFORE protecting the guard pages. Under `_PROT_NONE` the guard bytes
+        # are unreadable and inert; under `_PROT_READ|_PROT_WRITE` the whole canary is what an
+        # out-of-bounds STORE disturbs without faulting. That is the only way to localize a write: a
+        # guard-page write fault is FATAL and its backtrace is unusable (`unknown function (ip: …)`,
+        # zero frames), so nothing can be recovered from the fault itself. Do not reintroduce a
+        # `ReadOnlyMemoryError` catch.
+        for k in 0:(canary_bytes - 1)
+            unsafe_store!(canary_ptr, _poison_byte(poison, k), k + 1)
+        end
+        _mprotect!(guard_ptr, guard_bytes, guard_prot)
     catch
         _munmap!(base, total_bytes)
         rethrow()
     end
-    data_start = guard_ptr - padded_bytes   # flush against the guard once `slack` is accounted for
     arr = unsafe_wrap(Array, Ptr{T}(data_start), size(src); own = false)
     copyto!(arr, src)
-    return GuardedBuffer(arr, base, total_bytes, poison)
+    readable = !iszero(guard_prot & _PROT_READ)
+    return GuardedBuffer(arr, base, total_bytes, canary_ptr, canary_bytes, poison, readable)
 end
 
 # --- the canary classifier: detects an out-of-bounds STORE without faulting --------------------
 #
-# Leave the trailing page readable AND writable, pre-filled with a per-buffer poison byte. A store
-# past the end then lands in the canary instead of trapping, so it can be observed after the fact —
-# with the byte offset and the argument it belongs to. That is the replacement for the backtrace
-# Julia 1.12+ destroys on a guard-page write fault.
+# Leave the trailing region readable AND writable, pre-filled with a per-buffer, position-dependent
+# poison byte. A store past the end then lands in the canary instead of trapping, so it can be
+# observed after the fact — with the byte offset and the argument it belongs to. That is the
+# replacement for the backtrace Julia 1.12+ destroys on a guard-page write fault.
 #
 # Reads past the end are invisible to this probe by construction (a load disturbs nothing); the
-# PROT_NONE guard page is what detects those. The two are complementary, not redundant.
+# PROT_NONE guard region is what detects those. The two are complementary, not redundant.
 
-# Byte offset of the first disturbed canary byte, or `nothing` if the page is untouched.
+# Byte offset (past the end of the data) of the first disturbed canary byte, or `nothing` if the
+# canary is untouched.
 function _canary_dirty(gb::GuardedBuffer)
-    ps = _pagesize()
-    p = Ptr{UInt8}(gb._base + gb._total_bytes - ps)
-    i = findfirst(k -> unsafe_load(p, k) != gb._poison, 1:ps)
-    return i === nothing ? nothing : i - 1
+    gb._readable || error("StrictMode @assert_memsafe: internal error — the canary of a PROT_NONE-guarded buffer cannot be read.")
+    for k in 0:(gb._canary_bytes - 1)
+        unsafe_load(gb._canary, k + 1) == _poison_byte(gb._poison, k) || return k
+    end
+    return nothing
+end
+
+# Guarded stand-ins for every `Array` argument, plus the handles needed to inspect and free them.
+#
+# Argument positions holding the SAME array share ONE guarded buffer, by object identity. Building
+# an independent copy per position would hand `f(A, A)` two distinct pointers, which both hides
+# aliasing-dependent overruns and breaks kernels that require the aliasing they were called with.
+# Each handle carries every position its buffer stands in for, so a hit names all of them.
+function _guarded_args(args::Tuple; align::Union{Nothing, Int}, guard_prot::Cint = _PROT_NONE)
+    probe_args = Any[]
+    handles = Tuple{Vector{Int}, GuardedBuffer}[]
+    seen = IdDict{Any, Int}()
+    for (i, a) in enumerate(args)
+        if a isa Array
+            j = get(seen, a, 0)
+            if iszero(j)
+                gb = _guarded_array(
+                    a; align = something(align, sizeof(eltype(a))),
+                    guard_prot, poison = _poison_for(length(handles) + 1)
+                )
+                push!(handles, ([i], gb))
+                seen[a] = length(handles)
+                push!(probe_args, gb.array)
+            else
+                push!(handles[j][1], i)
+                push!(probe_args, handles[j][2].array)
+            end
+        else
+            push!(probe_args, a)
+        end
+    end
+    return (probe_args, handles)
 end
 
 # Run `f` with every Array argument backed by a writable, poisoned canary. Returns `nothing` when
 # nothing stored past any end, or a description naming the argument, its type and the byte offset.
 function _canary_probe(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
-    probe_args = Any[]
-    handles = Tuple{Int, GuardedBuffer}[]
-    rw = _PROT_READ | _PROT_WRITE
-    for (i, a) in enumerate(args)
-        if a isa Array
-            gb = _guarded_array(
-                a; align = something(align, sizeof(eltype(a))),
-                guard_prot = rw, poison = _poison_for(i)
-            )
-            push!(probe_args, gb.array)
-            push!(handles, (i, gb))
-        else
-            push!(probe_args, a)
-        end
-    end
+    probe_args, handles = _guarded_args(args; align, guard_prot = _PROT_READ | _PROT_WRITE)
     try
         f(probe_args...)
         hits = String[]
-        for (i, gb) in handles
+        for (positions, gb) in handles
             off = _canary_dirty(gb)
-            off === nothing && continue
-            push!(hits, "argument $i::$(typeof(gb.array)) at +$off byte(s) past its end")
+            isnothing(off) && continue
+            where = length(positions) == 1 ? "argument $(only(positions))" :
+                "arguments " * join(positions, ", ") * " (one shared buffer)"
+            push!(hits, "$where::$(typeof(gb.array)) at +$off byte(s) past its end")
         end
         return isempty(hits) ? nothing : join(hits, "; ")
     finally
@@ -175,21 +228,57 @@ function _canary_probe(@nospecialize(f), args::Tuple; align::Union{Nothing, Int}
     end
 end
 
-# --- isolate=false: in-process, catches out-of-bounds WRITES only -------------------------------
+# --- arguments this harness cannot guard ---------------------------------------------------------
 #
-# The canary, not a guard page: an out-of-bounds probe run in the caller's own process must never
-# fault, because a guard-page fault is fatal and would take that process down — including the test
-# runner. Reading the canary back reaches the same verdict for a STORE without touching protected
-# memory. Loads past the end disturb nothing, so this mode cannot see them; that is the documented
-# contract ("cheaper, in-process, stores only"), not a defect of the mechanism.
-function _memsafe_probe_inprocess(@nospecialize(f), args::Tuple; align::Union{Nothing, Int})
-    hit = _canary_probe(f, args; align)
-    hit === nothing && return nothing
-    return "out-of-bounds WRITE detected: $hit. isolate=false only catches stores, not loads — " *
-        "use the default isolate=true to also catch out-of-bounds reads."
+# A clean verdict over a partially guarded call must not render like a clean verdict over a fully
+# guarded one, so every argument the harness cannot place behind a guard page is named.
+#
+# Two classes, treated differently because their fixes differ. A `view`/`Adjoint`/other non-`Array`
+# `AbstractArray` has no relocatable backing store to rebuild, and the caller can materialize it
+# (`collect`) to get coverage — so `@assert_memsafe` rejects it outright. A struct that carries
+# arrays in its fields hides them from the argument list, and there is nothing the caller can
+# restructure at the call site — so that one is reported, not rejected.
+
+# Could a value of type `T` hold an array in (or below) its fields? A field typed abstractly enough
+# to hold one counts: the answer must never understate coverage that was not achieved.
+function _carries_array(@nospecialize(T::Type), depth::Int = 2)
+    depth < 0 && return false
+    isconcretetype(T) || return false
+    for FT in fieldtypes(T)
+        (FT <: AbstractArray || AbstractArray <: FT) && return true
+        FT === T && continue                     # self-referential field: nothing new below it
+        _carries_array(FT, depth - 1) && return true
+    end
+    return false
 end
 
-# --- isolate=true: subprocess probe, catches OOB READS and WRITES -------------------------------
+# `(position, class, description)` per unguardable argument; `class` is `:abstractarray` or `:struct`.
+function _unguarded_args(args::Tuple)
+    out = Tuple{Int, Symbol, String}[]
+    for (i, a) in enumerate(args)
+        a isa Array && continue
+        if a isa AbstractArray
+            push!(
+                out, (
+                    i, :abstractarray,
+                    "argument $i::$(typeof(a)) is an AbstractArray that is not an Array — it has no " *
+                        "relocatable backing store, so it runs unguarded",
+                )
+            )
+        elseif _carries_array(typeof(a))
+            push!(
+                out, (
+                    i, :struct,
+                    "argument $i::$(typeof(a)) carries array(s) in its fields — those buffers are not " *
+                        "arguments, so they run unguarded",
+                )
+            )
+        end
+    end
+    return out
+end
+
+# --- the subprocess probe: catches OOB READS and WRITES ------------------------------------------
 #
 # The guard buffers can't cross a process boundary (a raw mmap pointer is meaningless in another
 # address space), so they're built INSIDE the child from the plain deserialized argument values —
@@ -216,9 +305,9 @@ function _signal_name(sig::Integer)
 end
 
 function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_path::AbstractString, using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int})
-    mod_stmt = using_module === nothing ? "include($(repr(kernel_file)))" : "using $(using_module)"
-    lookup_mod = using_module === nothing ? "Main" : string(using_module)
-    align_kw = align === nothing ? "" : "; align=$align"   # an Int repr is safe to splice verbatim
+    mod_stmt = isnothing(using_module) ? "include($(repr(kernel_file)))" : "using $(using_module)"
+    lookup_mod = isnothing(using_module) ? "Main" : string(using_module)
+    align_arg = isnothing(align) ? "nothing" : string(align)   # an Int repr is safe to splice verbatim
     # Plain (global) top-level bindings, not `local` — a top-level `local` in a multi-statement
     # script only scopes to its own statement, so it doesn't survive to the next line. Harmless
     # here: this is a throwaway one-shot process that exits right after.
@@ -245,10 +334,10 @@ function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_
     $mod_stmt
     __args = deserialize($(repr(args_path)))
     __f = getfield($lookup_mod, $(repr(fname)))
-    __hit = StrictMode._canary_probe(__f, __args; align=$(align === nothing ? "nothing" : align))
-    println(stdout, __hit === nothing ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * __hit)
+    __hit = StrictMode._canary_probe(__f, __args; align=$align_arg)
+    println(stdout, isnothing(__hit) ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * __hit)
     flush(stdout)
-    __guarded = map(__a -> __a isa Array ? StrictMode._guarded_array(__a$(align_kw)).array : __a, __args)
+    __guarded, __handles = StrictMode._guarded_args(__args; align=$align_arg)
     __f(__guarded...)
     print(stdout, "STRICTMODE_MEMSAFE_OK")
     flush(stdout)
@@ -272,8 +361,7 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
         (kernel_file === nothing || !isfile(kernel_file)) && error(
             "StrictMode @assert_memsafe: `$fname`'s source file ($(m.file)) could not be found on " *
                 "disk (a closure, an anonymous function, or a REPL/`eval`'d-from-string definition?) " *
-                "— isolate=true needs a named function reachable in a fresh process. Pass " *
-                "`isolate=false` (in-process, catches out-of-bounds stores only), or move the " *
+                "— the guarded probe needs a named function reachable in a fresh process. Move the " *
                 "definition to a file and pass `using_module = TheDefiningPackage`."
         )
     else
@@ -328,113 +416,157 @@ end
 
 # --- public API -----------------------------------------------------------------------------------
 
+const _ISOLATE_REMOVED = "StrictMode @assert_memsafe: the `isolate` option was removed — the probe " *
+    "always runs in a subprocess. An in-process probe can only use the canary, and a load past the " *
+    "end disturbs no canary, so its clean verdict was indistinguishable from no overrun at all in " *
+    "exactly the case this harness exists for. Drop `isolate=`."
+
 """
     MemsafeReport
 
-The result of [`memsafe_report`](@ref): `target` (the checked signature, as a string), `isolate`
-(whether the probe ran in a subprocess), and `violation` (`nothing` if clean, else a description
-of the out-of-bounds access detected — naming the faulting op when `isolate=true` caught it).
+The result of [`memsafe_report`](@ref): `target` (the checked signature, as a string), `violation`
+(`nothing` if clean, else a description of the out-of-bounds access detected — naming the faulting
+op for a read), and `unguarded` (one line per argument the harness could not place behind a guard
+page). A clean `violation` with a non-empty `unguarded` means part of the call was never covered.
 """
 struct MemsafeReport
     target::String
-    isolate::Bool
     violation::Union{Nothing, String}
+    unguarded::Vector{String}
 end
 
 function Base.show(io::IO, r::MemsafeReport)
     printstyled(io, "MemsafeReport"; bold = true)
-    print(io, ": ", r.target, " (isolate=", r.isolate, ")\n")
-    if r.violation === nothing
+    print(io, ": ", r.target, "\n")
+    if isnothing(r.violation)
         printstyled(io, "  clean"; color = :green)
         print(io, ": no out-of-bounds access detected.")
     else
         printstyled(io, "  VIOLATION"; color = :red, bold = true)
         print(io, ": ", r.violation)
     end
+    for u in r.unguarded
+        print(io, "\n")
+        printstyled(io, "  UNGUARDED"; color = :yellow, bold = true)
+        print(io, ": ", u)
+    end
     return nothing
 end
 
 """
-    memsafe_report(f, args...; isolate = true, align = nothing, using_module = nothing) -> MemsafeReport
+    memsafe_report(f, args...; align = nothing, using_module = nothing) -> MemsafeReport
 
 Run `f(args...)` once against guard-page-backed copies of every `Array` argument and report
 whether an out-of-bounds access was detected. Non-execution guarantees elsewhere in StrictMode
 (`check`/`findings`) are value-free by design; this one needs real argument values to build the
 guarded buffers, so it stays a `@golden`-style value-based function/macro pair instead.
 
-- `isolate = true` (default): the probe runs in a **subprocess**, so a fatal out-of-bounds READ
-  (a SIGSEGV) is caught via the child's exit signal rather than crashing your session. This is the
-  only mode that catches the motivating bug class (a masked SIMD load reading past a tile).
-- `isolate = false`: the probe runs **in-process** — cheaper, but only catches out-of-bounds
-  WRITES, and it misses out-of-bounds READS **silently**. A load past the end reads the canary's
-  poison bytes and disturbs nothing, so this mode returns a CLEAN report for a read overrun (and the
-  kernel computes on poison garbage). Use the default `isolate = true` if reads matter — it is the
-  only mode that catches them.
-- `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
-  — the default (the element's own size) is always exact-flush, no tradeoff.
-- `using_module`: for `isolate=true` when `f`'s defining file isn't self-contained (relies on its
-  package's `using`/context) — the subprocess does `using \$using_module` and looks `f` up there,
-  instead of raw-`include`-ing the source file.
+The probe always runs in a **subprocess**: a fatal out-of-bounds READ (a SIGSEGV) is then observed
+through the child's exit signal instead of killing your session, and that read is the motivating
+bug class. An out-of-bounds WRITE is localized by a poisoned canary the child reads back before it
+touches the guard pages, since a write fault's own backtrace is destroyed.
 
-**Scope**: only `Array` arguments are guarded; every other argument passes through unguarded. Only
-catches overruns past the *end* of an allocation (no leading guard, no interior-overread
-detection). Linux/macOS only (needs `mmap`/`mprotect` + POSIX signal delivery). The fatal signal
-for a guard-page fault is platform-dependent — SIGSEGV on Linux, SIGBUS on macOS — both are reported
-identically as a memsafe violation.
+- `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
+  — the default (the element's own size) places the guard pages flush against the data.
+- `using_module`: for when `f`'s defining file isn't self-contained (relies on its package's
+  `using`/context) — the subprocess does `using \$using_module` and looks `f` up there, instead of
+  raw-`include`-ing the source file.
+
+**Scope**: only `Array` arguments are guarded. Arguments that cannot be guarded — a `view`, an
+`Adjoint`, any other non-`Array` `AbstractArray`, or a struct carrying arrays in its fields — are
+listed in `unguarded`; the call still runs, but those buffers are not covered. Only catches
+overruns past the *end* of an allocation (no leading guard, no interior-overread detection).
+Positions holding the same array share one guarded buffer, so aliasing is preserved. Linux/macOS
+only (needs `mmap`/`mprotect` + POSIX signal delivery). The fatal signal for a guard-page fault is
+platform-dependent — SIGSEGV on Linux, SIGBUS on macOS — both are reported identically as a memsafe
+violation.
+
+The subprocess loads `f` from its defining source file, so under a Revise-style edit loop it checks
+what is on disk, not what this session compiled. If the file changed since `f` was defined here, the
+verdict describes different code — in either direction, a clean report included. Reload before
+trusting a probe after an edit.
 
 ```julia
 r = memsafe_report(masked_load_kernel!, C, A, B)
-r.violation === nothing || error(r.violation)
+isnothing(r.violation) || error(r.violation)
 ```
 """
 function memsafe_report(
         @nospecialize(f), args...;
-        isolate::Bool = true, align::Union{Nothing, Int} = nothing, using_module::Union{Nothing, Symbol} = nothing
+        align::Union{Nothing, Int} = nothing, using_module::Union{Nothing, Symbol} = nothing,
+        isolate = nothing
     )
+    isnothing(isolate) || throw(ArgumentError(_ISOLATE_REMOVED))
     Sys.islinux() || Sys.isapple() || error(
         "StrictMode @assert_memsafe: only Linux/macOS are supported (needs mmap/mprotect + POSIX " *
             "signal delivery); got Sys.KERNEL = $(Sys.KERNEL)."
     )
     target = _func_name(f) * _sig_string(map(typeof, args))
-    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module, align) :
-        _memsafe_probe_inprocess(f, args; align)
-    return MemsafeReport(target, isolate, violation)
+    violation = _memsafe_probe_subprocess(f, args; using_module, align)
+    return MemsafeReport(target, violation, [d for (_, _, d) in _unguarded_args(args)])
 end
 
-function _assert_memsafe(target, @nospecialize(f), args::Tuple; isolate::Bool, align, using_module)
-    violation = isolate ? _memsafe_probe_subprocess(f, args; using_module, align) :
-        _memsafe_probe_inprocess(f, args; align)
-    violation === nothing || _fail(:memsafe, target, violation)
+function _assert_memsafe(target, @nospecialize(f), args::Tuple; align, using_module)
+    # A `view`/`Adjoint` is rejected rather than reported: the caller can materialize it and get
+    # real coverage, and a gate that silently checks less than it names is the failure this
+    # harness exists to remove. A struct's array fields have no such fix at the call site, so
+    # those are named and the check proceeds over what it can cover.
+    unguarded = _unguarded_args(args)
+    rejected = [d for (_, class, d) in unguarded if class === :abstractarray]
+    isempty(rejected) || throw(
+        ArgumentError(
+            "@assert_memsafe cannot guard every argument of `$target`, so a clean verdict would " *
+                "cover less than it claims:\n  " * join(rejected, "\n  ") *
+                "\nPass a materialized `Array` (e.g. `collect(v)`) instead, or use " *
+                "`memsafe_report`, which reports the gap in its `unguarded` field rather than " *
+                "refusing the call."
+        )
+    )
+    for (_, class, d) in unguarded
+        class === :struct && @warn "StrictMode @assert_memsafe: $d. The guarantee covers only the " *
+            "`Array` arguments of `$target`." maxlog = 3
+    end
+    violation = _memsafe_probe_subprocess(f, args; using_module, align)
+    isnothing(violation) || _fail(:memsafe, target, violation)
     return nothing
 end
 
 """
     @assert_memsafe f(args...)
-    @assert_memsafe isolate=false f(args...)
     @assert_memsafe using_module=MyPackage f(args...)
     @assert_memsafe align=64 f(args...)
 
 Fail if `f(args...)` performs an **out-of-bounds array access** — a `PROT_NONE`-guard-page harness
 (electric-fence style), the deterministic-detection sibling of [`@assert_noalloc`](@ref) for memory
-safety rather than allocation. See [`memsafe_report`](@ref) for the full semantics of `isolate`,
-`align`, and `using_module`, and its scope/platform limitations.
+safety rather than allocation. See [`memsafe_report`](@ref) for the full semantics of `align` and
+`using_module`, and its scope/platform limitations.
 
-The probe runs on guard-page-backed **copies** of every `Array` argument; the real call then runs
-once more, on the original arguments, so `f`'s return value and any argument mutation are exactly
-as if you had called it plainly. Each argument expression is evaluated once; `f` itself runs
-twice (probe, then real) — precedented by [`@assert_noalloc`](@ref)'s warm-up-then-measure pattern.
-Disabled builds expand to the bare call, with no probe run at all.
+The probe runs in a subprocess, on guard-page-backed **copies** of every `Array` argument; the real
+call then runs once more, in this process, on the original arguments, so `f`'s return value and any
+argument mutation are exactly as if you had called it plainly. Each argument expression is
+evaluated once; `f` itself runs twice (probe, then real) — precedented by
+[`@assert_noalloc`](@ref)'s warm-up-then-measure pattern. Disabled builds expand to the bare call,
+with no probe run at all.
+
+An argument that cannot be guarded and that the caller *can* fix — a `view`, an `Adjoint`, any
+other non-`Array` `AbstractArray` — is rejected, because a passing guarantee must not cover less
+than it names; pass `collect(v)`, or use [`memsafe_report`](@ref), which reports the gap instead of
+refusing. A struct carrying arrays in its fields has no call-site fix, so it is warned about and
+the check proceeds over the `Array` arguments.
 
 **Keyword-argument calls are not yet supported** — call `f` positionally.
 
 ```julia
 @assert_memsafe masked_load_kernel!(C, A, B)               # throws if it reads past a tile's end
-@assert_memsafe isolate=false fills_only!(buf, x)           # cheaper store-only check
+@assert_memsafe align=64 aligned_kernel!(buf, x)            # kernel assumes a 64-byte-aligned start
 @assert_memsafe using_module=PureBLAS gemm_tile!(C, A, B)   # kernel's file needs its package context
 ```
 """
 macro assert_memsafe(args...)
+    # `:isolate` stays in the allowed set only so it can be rejected here: dropping it would make
+    # `isolate=false` parse as a positional argument and misreport as "needs a call expression".
     pos, opts = _macro_call(args, (:isolate, :align, :using_module))
+    haskey(opts, :isolate) && throw(ArgumentError(_ISOLATE_REMOVED))
     isempty(pos) && throw(ArgumentError("@assert_memsafe needs a call expression"))
     call = pos[1]
     fexpr, argexprs, kwexprs = _callinfo(call)
@@ -448,7 +580,6 @@ macro assert_memsafe(args...)
     fe = esc(fexpr)
     argsyms = [gensym(:arg) for _ in eachindex(argexprs)]
     binds = Any[:($s = $(esc(e))) for (s, e) in zip(argsyms, argexprs)]
-    isolate_expr = haskey(opts, :isolate) ? esc(opts[:isolate]) : true
     align_expr = haskey(opts, :align) ? esc(opts[:align]) : nothing
     if haskey(opts, :using_module) && !(opts[:using_module] isa Symbol)
         throw(
@@ -466,7 +597,7 @@ macro assert_memsafe(args...)
         local _f = $fe
         $(_assert_memsafe)(
             $target, _f, ($(argsyms...),);
-            isolate = $isolate_expr, align = $align_expr, using_module = $using_module_expr
+            align = $align_expr, using_module = $using_module_expr
         )
         _f($(argsyms...))
     end
