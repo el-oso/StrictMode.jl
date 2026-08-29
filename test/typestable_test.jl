@@ -83,3 +83,32 @@ end
     # Pinning Type{Float64} restores concreteness.
     @test (@assert_typestable g(Float64) types = (Type{Float64},)) isa Vector{Float64}
 end
+
+@testitem "@assert_typestable :full path names the check when the backend itself fails (issue #25)" begin
+    using StrictMode
+    # A backend failure — most commonly JET's `report_opt` expanding a runtime-dead `@generated`
+    # branch whose generator throws — must surface as `StrictMode.AnalysisError`, naming the
+    # checked call and signature, rather than as the bare exception raised inside the backend.
+    #
+    # On this Julia version, Core.Compiler absorbs a `@generated` generator's exception during
+    # ordinary type inference into an inference failure (the callee's return type widens to `Any`)
+    # instead of propagating it, so a real generator failure can't be driven through JET to exercise
+    # this path directly. Add a method to the backend seam scoped to a private test function
+    # instead: it produces the exact `_be_opt_result` failure `_assert_opt` (typestability.jl) must
+    # turn into a located diagnostic.
+    mystery_kernel_25(x::Int) = x + 1
+    StrictMode._be_opt_result(::typeof(mystery_kernel_25), types) =
+        throw(AssertionError("AVX-512 only"))
+
+    err = try
+        StrictMode.@assert_typestable mystery_kernel_25(1)
+        nothing
+    catch e
+        e
+    end
+    @test err isa StrictMode.AnalysisError
+    msg = sprint(showerror, err)
+    @test occursin("mystery_kernel_25(1)", msg)          # names the checked call
+    @test occursin("AssertionError: AVX-512 only", msg)  # preserves the original error
+    @test occursin("@generated", msg)                    # points at the likely cause and the fix
+end

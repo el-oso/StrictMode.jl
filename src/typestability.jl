@@ -31,10 +31,12 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
-# Internal-instability check via JET (`:full`). Requires the analysis backend.
+# Internal-instability check via JET (`:full`). Requires the analysis backend. `_safe_opt_result`
+# (backend.jl) turns a backend failure into a located `AnalysisError` rather than a bare exception
+# from inside JET (see its docstring — the common cause is a runtime-dead `@generated` branch).
 function _assert_opt(target, @nospecialize(f), @nospecialize(types::Tuple))
     _require_backend()
-    r = _be_opt_result(f, types)
+    r = _safe_opt_result(target, f, types)
     isempty(_be_opt_reports(r)) || _fail(:typestable, target, sprint(show, r))
     return nothing
 end

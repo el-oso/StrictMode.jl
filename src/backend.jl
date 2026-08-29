@@ -52,6 +52,48 @@ function _be_is_boxing end      # (alloc_instance) -> Bool  (boxing / dynamic-di
 function _be_opt_result end     # (f, types) -> JET optimization-analysis result
 function _be_opt_reports end    # (result)   -> the result's reports
 
+"""
+    AnalysisError <: Exception
+
+Thrown when a `:full`-tier backend call (JET's `report_opt`, in practice) fails outright while
+compiling `(f, types)`, instead of returning a report. The usual cause: full inference visits every
+branch of a method regardless of which one is reachable at runtime for a given call, so a
+runtime-dead branch that reaches a `@generated` function whose generator throws (an `@assert` at
+generation time, rather than a guarded `return :(throw(...))`) fails analysis even though the
+function itself runs fine. Carries the checked target, the analyzed signature, and the original
+error, so the failure names what StrictMode was analyzing instead of surfacing as a bare exception
+raised from inside the backend.
+"""
+struct AnalysisError <: Exception
+    target::String
+    signature::String
+    original::Any
+end
+
+function Base.showerror(io::IO, e::AnalysisError)
+    print(
+        io,
+        "StrictMode: the `:full` analysis backend failed while compiling `", e.target,
+        "` (signature ", e.signature, "). Full inference visits every branch of a method regardless ",
+        "of runtime reachability, so a runtime-dead branch that reaches a `@generated` function whose ",
+        "generator throws (e.g. `@assert` at generation time) fails analysis here even though the call ",
+        "runs fine. Fix the generator to always succeed: guard it and return a throw expression instead ",
+        "of asserting — `cond || return :(throw(AssertionError(\"...\")))`. Original error: "
+    )
+    showerror(io, e.original)
+    return nothing
+end
+
+# Wraps `_be_opt_result` so a backend failure (see `AnalysisError`) names the check target and
+# signature instead of propagating raw from inside JET.
+function _safe_opt_result(target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple))
+    try
+        return _be_opt_result(f, types)
+    catch err
+        throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
+    end
+end
+
 # Trim backend — an *independent* weak dependency (separate from AllocCheck/JET): `TrimCheck` drives
 # juliac's real `verify_typeinf_trim` verifier. The `:full` `trim_compatible` guarantee uses it; `:fast`
 # (and the fallback when TrimCheck is absent) uses the TypeContracts static scan in `trimsafe.jl`.
