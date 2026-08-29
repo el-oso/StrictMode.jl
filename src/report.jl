@@ -1,7 +1,7 @@
 """
     StrictViolation(kind, target, details) <: Exception
 
-Thrown (in `:error` [`fail_mode`](@ref)) when a StrictMode guarantee fails.
+Thrown when a StrictMode guarantee fails.
 
 - `kind::Symbol` — which guarantee (`:noalloc`, `:typestable`, `:strict_function`, ...).
 - `target` — the call/definition the guarantee was attached to (an `Expr` or string).
@@ -24,13 +24,7 @@ function Base.showerror(io::IO, e::StrictViolation)
     return nothing
 end
 
-# Single choke point for every guarantee. Honors the compile-time `fail_mode`.
+# Single choke point for every guarantee.
 function _fail(kind::Symbol, target, details::AbstractString)
-    v = StrictViolation(kind, target, String(details))
-    if FAIL_MODE === :warn
-        @warn sprint(showerror, v)
-        return nothing
-    else
-        throw(v)
-    end
+    throw(StrictViolation(kind, target, String(details)))
 end

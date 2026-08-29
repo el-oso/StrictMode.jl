@@ -23,53 +23,49 @@ StrictMode with the checks off needs neither package. If you want the live feedb
 
 ## Enable the checks
 
-Every guarantee sits behind a compile-time setting, off by default. With it off, a production
-build pays nothing: the macros expand to the bare call and there's nothing left to run.
+Every guarantee sits behind a compile-time setting, **on by default**. A dev or test environment
+therefore needs no setup at all: depend on StrictMode and the guarantees run. That default is
+deliberate — a preference you have to remember to add is a preference that goes missing, and with
+checks off every `@assert_*` is a no-op, so a suite full of them passes vacuously.
 
-The recommended way to enable checks for a package's dev and CI runs is to add a section to
-`Project.toml` (or a `LocalPreferences.toml` next to it). This gets committed alongside the code
-so every contributor and CI run picks it up automatically:
+A shipped application turns them off. Add a section to the deployed project's `Project.toml` (or a
+`LocalPreferences.toml` next to it):
 
 ```toml
 [preferences.StrictMode]
-checks_enabled = true
-fail_mode = "error"
+checks_enabled = false
 ```
 
-Then run your tests in a **fresh Julia process** — the setting is read when Julia compiles the
-package, not while a session is already running.
+With it off, the macros expand to the bare call and there's nothing left to run.
 
-To catch the preference silently going missing (with checks off, every `@assert_*` is a no-op
-and your strictmode tests pass vacuously), start those tests with [`assert_enabled`](@ref): it
-returns `checks_enabled()` locally but **errors under CI** when checks are disabled.
+Either way, run in a **fresh Julia process** after changing the setting — it is read when Julia
+compiles the package, not while a session is already running.
 
-For interactive use during development, `enable_checks!()` writes the setting for you:
+To catch the setting having been turned off where it matters, start your strict tests with
+[`assert_enabled`](@ref): it returns `checks_enabled()` locally but **errors under CI** when checks
+are disabled.
+
+For interactive use, `disable_checks!()`/`enable_checks!()` write the setting for you:
 
 ```julia
 using StrictMode
 
-StrictMode.enable_checks!()    # writes the setting; restart Julia to apply
-# ... develop with guarantees active ...
-StrictMode.disable_checks!()   # back to the production default
+StrictMode.disable_checks!()   # writes the setting; restart Julia to apply
+# ... run without the guarantees ...
+StrictMode.enable_checks!()    # back on
 ```
 
 !!! note "Why does a restart matter?"
     StrictMode's checks compile away to nothing when disabled, so the setting must be fixed before
-    Julia compiles the package. Calling `enable_checks!()` and then asserting in the same process
-    quietly checks nothing — the existing compiled image is already baked. Restart Julia (or start
+    Julia compiles the package. Calling `disable_checks!()` and then asserting in the same process
+    still runs every check — the existing compiled image is already baked. Restart Julia (or start
     a fresh process for your tests) after changing the setting.
-
-You can choose whether a violation throws or just warns:
-
-```julia
-StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of throwing
-```
 
 Check the current state at any time:
 
 ```@example gs
 using StrictMode
-StrictMode.checks_enabled(), StrictMode.fail_mode()
+StrictMode.checks_enabled()
 ```
 
 (These docs are built with the checks enabled, so every live example below is really running the

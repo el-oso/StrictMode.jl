@@ -1,18 +1,26 @@
-# Compile-time gating. The two `const`s below are baked at precompile from Preferences;
-# Preferences.jl tracks them, so flipping a preference forces a recompile of StrictMode and
-# every module that uses its macros — exactly the CI/dev-vs-production switch we want.
+# Compile-time gating. `CHECKS_ENABLED` is baked at precompile from Preferences; Preferences.jl
+# tracks it, so flipping the preference forces a recompile of StrictMode and every module that uses
+# its macros — exactly the dev/CI-vs-production switch we want. Preferences are read from the ACTIVE
+# project only, so a package and its `test/` environment can disagree and each gets its own pkgimage.
 
 """
     checks_enabled() -> Bool
 
-Whether StrictMode guarantee checks are active in this build. Controlled by the
-`checks_enabled` preference (default `false`). When `false`, every guarantee macro expands to
-the **bare** call/definition — zero runtime cost.
+Whether StrictMode guarantee checks are active in this build. Controlled by the `checks_enabled`
+preference, which defaults to **`true`**: a test environment needs no `[preferences.StrictMode]`
+block to get checks, which is what makes them hard to disarm by accident. When `false`, every
+guarantee macro expands to the **bare** call/definition — zero runtime cost — and that is the
+setting a production deployment wants.
 
-Toggle with [`enable_checks!`](@ref) / [`disable_checks!`](@ref) (triggers recompilation).
+Turn it off for a shipped application with [`disable_checks!`](@ref), or by adding
+
+    [preferences.StrictMode]
+    checks_enabled = false
+
+to the deployed project's `Project.toml`. Both trigger recompilation, so restart to apply.
 """
 checks_enabled() = CHECKS_ENABLED
-const CHECKS_ENABLED = @load_preference("checks_enabled", false)::Bool
+const CHECKS_ENABLED = @load_preference("checks_enabled", true)::Bool
 
 """
     assert_enabled() -> Bool
@@ -69,10 +77,11 @@ function _assert_enabled(enabled::Bool, ci::Bool, backend_declared_but_unloaded:
     if !enabled
         ci && error(
             "StrictMode checks are DISABLED in this build, but CI is set — refusing to skip " *
-                "silently (a green run with checks off proves nothing). Enable them by adding\n" *
-                "    [preferences.StrictMode]\n    checks_enabled = true\n    fail_mode = \"error\"\n" *
-                "to the test environment's Project.toml (or run `StrictMode.enable_checks!()` and " *
-                "restart). For the `:full` proofs, add `StrictModeTest` to that environment."
+                "silently (a green run with checks off proves nothing). Checks are on by default, " *
+                "so something turned them off: remove `checks_enabled = false` from this " *
+                "environment's `[preferences.StrictMode]` block (or its LocalPreferences.toml), or " *
+                "run `StrictMode.enable_checks!()` and restart. For the proofs, add " *
+                "`StrictModeTest` to that environment."
         )
         return false
     end
@@ -88,38 +97,28 @@ function _assert_enabled(enabled::Bool, ci::Bool, backend_declared_but_unloaded:
 end
 
 """
-    fail_mode() -> Symbol
+    enable_checks!()
 
-How a failed guarantee is reported: `:error` (default — throw [`StrictViolation`](@ref),
-Rust-like) or `:warn` (emit `@warn` and continue). Controlled by the `fail_mode` preference.
+Turn StrictMode's guarantee checks back on for the active project, undoing a
+[`disable_checks!`](@ref). This writes a `LocalPreferences.toml` entry and triggers recompilation,
+so restart the session (or re-`using`) before the change takes effect. Checks are on by default, so
+this is only needed where something turned them off.
+
+StrictMode analyzes with a value-free engine (`Base.return_types` concreteness plus a typed-IR
+scan) and needs no analysis backend. The proofs — AllocCheck's static no-allocation proof, JET's
+`@report_opt`, and TrimCheck's `juliac --trim=safe` verifier — live in the companion
+`StrictModeTest` package, which you add to the test environment.
 """
-fail_mode() = FAIL_MODE
-const FAIL_MODE = Symbol(@load_preference("fail_mode", "error"))::Symbol
-
-"""
-    enable_checks!(; fail_mode = "error")
-
-Turn StrictMode's guarantee checks on for the active project, and set the failure mode (`:error`
-or `:warn`) while you're at it. This writes a `LocalPreferences.toml` entry and triggers
-recompilation, so restart the session (or re-`using`) before the change takes effect.
-
-StrictMode analyzes with the value-free `:fast` engine (`Base.return_types` concreteness plus a
-typed-IR scan) and needs no analysis backend. The rigorous `:full` proofs — AllocCheck's static
-no-allocation proof and JET's `@report_opt` — live in the companion `StrictModeTest` package,
-which you add to the test environment; there is no preference to switch between them.
-"""
-function enable_checks!(; fail_mode::Union{Symbol, AbstractString} = "error")
-    fm = String(fail_mode)
-    fm in ("error", "warn") || throw(ArgumentError("fail_mode must be :error or :warn, got $fail_mode"))
-    @set_preferences!("checks_enabled" => true, "fail_mode" => fm)
+function enable_checks!()
+    @set_preferences!("checks_enabled" => true)
     if CHECKS_ENABLED
-        @info "StrictMode checks ENABLED (fail_mode = :$fm)."
+        @info "StrictMode checks ENABLED."
     else
-        @warn "StrictMode checks will be ENABLED (fail_mode = :$fm) — but the " *
-            "gate is compile-time, so THIS session is unaffected (`checks_enabled()` stays false " *
-            "and every `@assert_*` is still a no-op). Restart Julia to apply. To commit the " *
-            "setting, add `[preferences.StrictMode]` with `checks_enabled = true` to the project's " *
-            "`Project.toml` (or a `LocalPreferences.toml`), then run in a fresh process."
+        @warn "StrictMode checks will be ENABLED — but the gate is compile-time, so THIS session " *
+            "is unaffected (`checks_enabled()` stays false and every `@assert_*` is still a " *
+            "no-op). Restart Julia to apply. To commit the setting, remove `checks_enabled = " *
+            "false` from the project's `[preferences.StrictMode]` block (or its " *
+            "`LocalPreferences.toml`), then run in a fresh process."
     end
     return nothing
 end
@@ -127,9 +126,10 @@ end
 """
     disable_checks!()
 
-Turn StrictMode guarantee checks off for the active project (the production default). Writes a
-`LocalPreferences.toml` entry and **triggers recompilation**; restart the session to apply.
-After this, every guarantee macro compiles away to the bare call.
+Turn StrictMode guarantee checks off for the active project — what a shipped application wants.
+Writes a `LocalPreferences.toml` entry and **triggers recompilation**; restart the session to
+apply. After this, every guarantee macro compiles away to the bare call and StrictMode costs
+nothing at runtime.
 """
 function disable_checks!()
     @set_preferences!("checks_enabled" => false)

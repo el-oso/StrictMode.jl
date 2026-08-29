@@ -59,13 +59,14 @@ construction, so there a `:suspect` verdict warns instead of breaking your build
 ## Zero cost when disabled
 
 Every check sits behind a [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl)
-compile-time flag, and by default that flag is off. With it off, every guarantee macro expands to
-the bare call, so production builds pay nothing. Turn the checks on in CI or while developing:
+compile-time flag, on by default so a dev or test environment needs no setup. Turn it off for a
+shipped application and every guarantee macro expands to the bare call, so the deployment pays
+nothing:
 
 ```julia
 using StrictMode
-StrictMode.enable_checks!()       # writes LocalPreferences.toml; restart Julia to apply
-StrictMode.disable_checks!()      # back to the production default
+StrictMode.disable_checks!()      # writes LocalPreferences.toml; restart Julia to apply
+StrictMode.enable_checks!()       # back on
 ```
 
 ```julia

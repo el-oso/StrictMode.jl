@@ -1,8 +1,8 @@
 # StrictMode cookbook: trap → macro
 
 A quick lookup table from the usual Julia performance traps to the StrictMode guarantee that
-catches each one. Turn the checks on first with `StrictMode.enable_checks!()`; in production they
-compile away to nothing.
+catches each one. Checks are on by default; `StrictMode.disable_checks!()` compiles them away to
+nothing for a shipped application.
 
 | Performance trap | Symptom | Catch it with |
 |---|---|---|
@@ -39,12 +39,6 @@ compile away to nothing.
 
 ```julia
 @assert_noalloc static = false stream_step!(buf, x)   # measures @allocated after a warmup
-```
-
-### Choose error vs. warn
-
-```julia
-StrictMode.enable_checks!(fail_mode = "warn")   # log violations instead of throwing
 ```
 
 ### Trade rigor for speed while iterating

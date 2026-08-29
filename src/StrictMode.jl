@@ -8,8 +8,9 @@ guarantees**.
 Philosophy: *make correct-and-fast the default; make falling off the fast path a loud error.*
 
 All checks are gated behind a [`Preferences`](https://github.com/JuliaPackaging/Preferences.jl)
-compile-time flag (`checks_enabled`, default `false`), so production builds pay **nothing** —
-the macros expand to the bare call. Enable them in CI/dev with [`enable_checks!`](@ref).
+compile-time flag (`checks_enabled`, default `true`), so a dev or test environment is checked
+without any setup. A shipped application turns them off with [`disable_checks!`](@ref); the macros
+then expand to the bare call and pay **nothing**.
 
 ## v0.1 public API
 - [`@assert_noalloc`](@ref) — fail if a call allocates (static via AllocCheck, runtime fallback).
@@ -47,7 +48,7 @@ export inline_suggestions
 export static_ownership_suggestions
 export divergence_report, StrictDivergence
 export clear_cache!, cache_stats
-export enable_checks!, disable_checks!, checks_enabled, assert_enabled, fail_mode, backend_available
+export enable_checks!, disable_checks!, checks_enabled, assert_enabled, backend_available
 export BackendUnavailable, AnalysisError
 export register_alloc_barrier!, ignore_barrier, set_ignore_barrier!
 

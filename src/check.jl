@@ -235,7 +235,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
 end
 
 """
-    check(f, types; guarantees = (:typestable, :noalloc), fail = fail_mode()) -> Vector{StrictFinding}
+    check(f, types; guarantees = (:typestable, :noalloc), fail = :error) -> Vector{StrictFinding}
 
 Check the guarantees for `f`'s concrete signature `types` and return the findings. It's an
 ordinary function call rather than a macro, so it never parses syntax and can't collide with
@@ -252,7 +252,7 @@ check(boxy, (Tuple{Int,Float64,Float32},); guarantees=(:noboxing,))   # throws S
 """
 function check(
         @nospecialize(f), @nospecialize(types::Tuple);
-        guarantees = (:typestable, :noalloc), fail::Symbol = fail_mode(), mode::Symbol = :fast,
+        guarantees = (:typestable, :noalloc), fail::Symbol = :error, mode::Symbol = :fast,
     )
     fs = findings(f, types; guarantees, mode)
     failed = filter(_failed, fs)

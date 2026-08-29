@@ -204,16 +204,15 @@ StrictViolation
 
 ## Configuration
 
-Checks are gated behind a compile-time setting. Toggling it writes `LocalPreferences.toml` and
-takes effect on the next Julia start. See [Getting Started](getting_started.md) for the recommended
-`Project.toml` pattern.
+Checks are gated behind a compile-time setting, on by default. Toggling it writes
+`LocalPreferences.toml` and takes effect on the next Julia start. See
+[Getting Started](getting_started.md) for the `Project.toml` pattern a shipped application wants.
 
 ```@docs
 enable_checks!
 disable_checks!
 checks_enabled
 assert_enabled
-fail_mode
 backend_available
 StrictMode.trimcheck_available
 mca_available

@@ -8,6 +8,3 @@ StrictMode = {path = "../.."}
 [compat]
 julia = "1.12"
 
-[preferences.StrictMode]
-checks_enabled = true
-fail_mode = "error"

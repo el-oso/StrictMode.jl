@@ -176,8 +176,6 @@ function check_signatures(pairs; guarantees = (:typestable, :noalloc), fail::Sym
     return _run_and_report(_map_findings(items, _default_parallel(mode), mode), :check_signatures, "signatures", fail)
 end
 
-# Automatic-at-load hook emitted by `@strict module`. Gated on CHECKS_ENABLED so production pays
-# nothing; honors fail_mode.
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
 function _registered_findings_in(mod::Module; guarantees = nothing, fast::Bool = false, mode::Symbol = :fast)
@@ -203,7 +201,7 @@ end
 # rigorous `:full` proof is run explicitly via `audit`/`check_all` in CI.
 function _auto_check_module(mod::Module)
     CHECKS_ENABLED || return nothing
-    _run_and_report(_registered_findings_in(mod; fast = true), :strict_module, string(nameof(mod)), FAIL_MODE)
+    _run_and_report(_registered_findings_in(mod; fast = true), :strict_module, string(nameof(mod)), :error)
     return nothing
 end
 

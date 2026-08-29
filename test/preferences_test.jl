@@ -1,7 +1,6 @@
 @testitem "checks are enabled in the test environment" begin
     using StrictMode
     @test StrictMode.checks_enabled() === true
-    @test StrictMode.fail_mode() === :error
 end
 
 @testitem "assert_enabled: errors under CI when disabled, skippable locally" begin

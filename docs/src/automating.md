@@ -66,9 +66,8 @@ and verifies one definition at a time.
 ### Auto-check at load
 
 When a strict-marked module loads and checks are enabled, StrictMode runs its checks on its own and
-reports according to [`fail_mode`](@ref): `:error` stops the module from loading, `:warn` just logs.
-This is the "checks happen as you compile" behavior. It's gated on `checks_enabled`, so a production
-build pays nothing, and the analyzers are already warmed.
+a violation stops the module from loading. This is the "checks happen as you compile" behavior. It's
+gated on `checks_enabled`, so a production build pays nothing, and the analyzers are already warmed.
 
 ### Re-check on demand
 
@@ -116,8 +115,7 @@ after each edit, the strict registry is re-checked and any violations print stra
 It's the closest thing to a compiler looking over your shoulder as you type.
 
 ```julia
-using Revise, StrictMode, AllocCheck, JET   # Revise = live loop; AllocCheck+JET = the analysis backend
-StrictMode.enable_checks!()    # then restart
+using Revise, StrictMode, StrictModeTest   # Revise = live loop; StrictModeTest = the proofs
 # … using MyPkg, which marks its kernels strict …
 StrictMode.watch()             # start the loop
 # edit a kernel so it boxes, save:
