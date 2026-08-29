@@ -117,6 +117,26 @@ GitHub issues are the source of truth for anything with a number; the notes here
   Not urgent: nothing consumes 0.4 yet. It becomes load-bearing the moment one does, since every
   gating entry point lives there.
 
+- [ ] **A global Stop hook runs `audit` in every consumer repo, and 0.4 breaks all five of them.**
+  `~/.claude/hooks/strictmode-stop.sh` (registered in `~/.claude/settings.json`) runs a
+  project's `strictmode_audit.jl` at the end of every agent turn and BLOCKS the stop on a
+  non-zero exit. It is a no-op for this repo (no audit script at any of its four conventional
+  paths), which is why it never fires here. Every consumer script uses API 0.4 deleted:
+    - `StrictMode.backend_available()` — BlazingPorts, PureFFT, PureIPM, PureSparse
+    - `StrictMode.check(f, types; mode = :full)` — PureOSQP
+    - `exit(nfailures(audit(PureIPM; format = :json, mode = :fast)))` — PureIPM
+  Each throws `UndefVarError`/`MethodError` on load, so the hook reports "audit FAILED" with
+  an unrelated error and blocks every turn in that repo. Loud, not silent — but it stops work.
+  **URGENCY: this is NOT gated on registration.** `BlazingPorts.jl` sources StrictMode from
+  `rev = "master"`, so merging this branch to master breaks it on the next resolve.
+  `PureFFT.jl` pins `rev = "v0.3.3"`; the other three come from the registry and are pinned
+  to 0.3.10 until 0.4 is registered.
+  *Migration per script:* `backend_available()` → `proofs_loaded()`; `check(…; mode = :full)`
+  → `StrictModeTest.test_signatures`; `exit(nfailures(audit(…)))` → `test_compiled(MyPkg)`,
+  since `audit` deliberately no longer gates or sets an exit status.
+  Note the hook's own anti-vacuity guard (it refuses to stamp a run whose output says
+  `checks are disabled`) still matches the new checks-off CI banner, so that half is fine.
+
 - [ ] **No consumer has been migrated to the 0.4 surface.** PureBLAS alone has 27 `@assert_noalloc`
   and 85 `@assert_trim_compatible`; under 0.4 every one of them reports where it used to gate, and
   `check_signatures`/`check_all`/`audit(...; exit_on_fail = true)` no longer exist. The load-time
