@@ -273,3 +273,41 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
   a proposal.
 
 
+
+- [ ] **MEASURED: the split's assumption about WHERE `@assert_*` lives is wrong, and it changes the
+  size of the 0.4 disarm.** SPLIT-PROPOSAL §8–§11 reasons throughout as though `@assert_*` is a
+  `src/` annotation — checked at the annotated module's own precompile, where the proof is
+  unreachable by construction, so warning is the only sane behaviour. Surveyed across the eight
+  consumer packages on this machine, the guarantees 0.4 moved to reporting break down as:
+
+  | location | disarmed call sites |
+  |---|---|
+  | `test/` | **149** |
+  | `benchmark/` | 55 |
+  | `src/` | 21 |
+
+  Two thirds sit in test suites, where gating is the entire point — and 5 of 6 of those test
+  environments run `analysis = "full"` (or the 0.3 `:full` default) with 1–3 of
+  AllocCheck/JET/TrimCheck/StrictModeTest as deps. So TODAY those `@assert_noalloc` calls ARE
+  AllocCheck's all-paths proof and they throw; those `@assert_trim_compatible` calls ARE juliac's
+  verifier and they throw. Under 0.4 all of them become the value-free scan and warn.
+
+  Ecosystem totals: 229 call sites stop gating outright (`@assert_noalloc` 122,
+  `@assert_trim_compatible` 91, `@assert_trim_safe` 8, `@assert_noboxing` 5,
+  `@assert_no_scalar_loops` 3) and 85 more lose their noalloc component (`@kernel` 70, `@strict` 15).
+  The single largest block is PureBLAS's 90 `@assert_trim_compatible`, which today run juliac's own
+  verifier. (PureIPM is the one exception — its test env is already `analysis = "fast"` with no
+  backend deps, which is consistent with #17 having been measured there.)
+
+  §8's Cost section already named the hazard — "a rename would have been caught by the compiler,
+  this will not be" — and accepted it on the assumption that the affected surface was small. It is
+  not: it is ~314 sites, ~70% of all guarantee usage.
+
+  *Options, needs a decision:*
+  (a) migrate — mechanical `@assert_X` → `@test_X` in `test/` across six repos;
+  (b) revisit the shadowing design rejected in §H.4 (StrictModeTest re-exports `@assert_*` as the
+      proving macros) — this survey is new evidence that was not available when it was rejected;
+  (c) make the disarm compiler-enforced: when `StrictModeTest` is loaded, the five reporting
+      `@assert_*` macros ERROR naming their `@test_*` replacement, instead of quietly scanning.
+      Buys back exactly the compiler enforcement §8 wished for, keeps macro-name-is-engine, and
+      answers §10's open question 4 far more strongly than the load banner does.
