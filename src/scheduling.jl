@@ -376,9 +376,15 @@ const _LOOP_RE = r"\bphi (?:double|float)\b"
 const _SCALAR_INT_RE = r"\b(?:add|sub|mul|and|or|xor|shl|lshr|ashr) i(?:8|16|32|64)\b"
 const _LOOP_INT_RE = r"\bphi i(?:8|16|32|64)\b"
 
-# Vector op in the text IR (any `<N x …>` value). Used to decide, per-loop, whether a given loop
+# Vector op in the text IR (any `<N x …>` value). Read per-loop to decide whether a given loop
 # vectorized — see `_loop_regions` / `scalar_fp_loops`.
 const _VEC_RE = r"<\d+ x "
+
+# Block names LLVM's own loop vectorizer inserts around any loop it vectorizes, whether the
+# source loop carries `@simd` or is plain scalar code. A scalar region built from these blocks is
+# the vectorizer's own remainder/epilogue, bounded to under one vector-width's worth of
+# iterations — not evidence of source code the optimizer failed to vectorize.
+const _VECTORIZER_SCAFFOLD_RE = r"\b(?:vector\.ph|vector\.body|middle\.block|scalar\.ph|min\.iters\.check|bc\.resume\.val)\b"
 
 # Split the optimized text IR into loop regions. A loop is a back-edge: a `br … label %X` whose target
 # label `X` is defined *at or before* the branch line. The region is the IR text from the loop header
@@ -404,18 +410,31 @@ end
 """
     scalar_fp_loops(f, types::Tuple) -> Bool
 
-**Best-effort** detection: returns `true` if `f`'s optimized LLVM IR shows a loop (back-edge
-branch tagged with `!llvm.loop`) alongside scalar (non-`<N x>` vector) floating-point
-arithmetic on `double`/`float`, AND the function did not vectorize as a whole.
+**Best-effort** detection: returns `true` if `f`'s optimized LLVM IR contains a loop region
+(a back-edge branch) with scalar (non-`<N x>` vector) FP or integer arithmetic on its
+loop-carried index, and that region isn't LLVM's own bounded remainder/epilogue of a loop it
+already vectorized elsewhere.
 
-This is intentionally coarse — it operates on text IR, not a structured IR graph. The loop
-indicator is the presence of a `phi double`/`phi float` node (a loop-carried FP accumulator);
-this is more portable than `!llvm.loop` metadata, which LLVM emits inconsistently across
-optimization levels. A false-negative is possible when the optimizer eliminates all loop-carried
-FP variables (e.g. pure store loops, full unrolls with no accumulator). Use it as a triage
-signal: a `true` result means "look here for a vectorization opportunity"; a `false` result does
-not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for per-kernel vectorization
-enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
+This is intentionally coarse — it operates on text IR, not a structured IR graph. A loop region
+is any back-edge found by [`_loop_regions`](@ref); a region counts as scalar hot work if it
+contains scalar FP arithmetic (`_SCALAR_FP_RE`), or an integer loop-carried index (`phi iN`)
+combined with scalar integer arithmetic (`_SCALAR_INT_RE`). Neither branch requires a
+loop-carried FP accumulator (`phi double`/`phi float`): a region is already proven to be a loop
+by construction (it was found via a back-edge), and a plain load/compute/store loop with no
+reduction has no such accumulator — its FP values are freshly loaded each iteration.
+
+LLVM's own auto-vectorizer wraps every loop it vectorizes — `@simd`-annotated or not — in a
+recognizable scaffold (`vector.ph`/`vector.body`/`middle.block`/`scalar.ph`/`min.iters.check`/
+`bc.resume.val`); the `scalar.ph`-rooted remainder handles at most one vector-width's worth of
+leftover iterations and is not a sign of unvectorized source code, so a scalar region built from
+that scaffold is excluded — UNLESS the function also contains a genuinely hand-vectorized loop
+(vector ops with none of that scaffolding, e.g. explicit `SIMD.jl` code). In that case the
+function's numeric intent was already fully vectorized by hand, so a second, separate scalar
+loop is real glue work even if LLVM partially rescued it with its own vectorization attempt.
+
+Use it as a triage signal: a `true` result means "look here for a vectorization opportunity"; a
+`false` result does not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for
+per-kernel vectorization enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
 """
 function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
     s = _llvm_ir(f, types)
@@ -430,12 +449,18 @@ function scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool
         return (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
             (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
     end
+    # A hand-vectorized loop (vector ops, none of LLVM's own scaffolding) means the author
+    # already vectorized this function's numeric work — any separate scalar loop is glue.
+    hand_vectorized = any(regions) do r
+        occursin(_VEC_RE, r) && !occursin(_VECTORIZER_SCAFFOLD_RE, r)
+    end
     for r in regions
         occursin(_VEC_RE, r) && continue   # this loop vectorized → fine
-        if (occursin(_LOOP_RE, r) && occursin(_SCALAR_FP_RE, r)) ||
-                (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
-            return true
-        end
+        is_scalar_hot = occursin(_SCALAR_FP_RE, r) ||
+            (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
+        is_scalar_hot || continue
+        occursin(_VECTORIZER_SCAFFOLD_RE, r) && !hand_vectorized && continue
+        return true
     end
     return false
 end

@@ -53,3 +53,69 @@
     end
     @test_throws StrictViolation check(scalar_sum, (Vector{Float64}, Int); guarantees = (:no_scalar_loops,), fail = :error)
 end
+
+@testitem "F20 scalar loop scan — hand-written tail vs. LLVM epilogue (issue #22)" tags = [:f20] begin
+    using StrictMode
+    using SIMD: Vec, vload, vstore
+
+    # A hand-vectorized SIMD.jl main loop followed by a hand-written *scalar* cleanup loop for
+    # the n % 8 remainder — the defect this check exists to catch: the scalar tail runs at
+    # native speed for at most 7 elements, but nothing stops it from running unbounded scalar
+    # work if the width assumption is wrong elsewhere.
+    @noinline function body_plus_scalar_tail!(p::Ptr{Float64}, n::Int, a::Float64)
+        V = Vec{8, Float64}
+        i = 0
+        while i + 8 <= n
+            vstore(muladd(vload(V, p + i * 8), V(a), vload(V, p + i * 8)), p + i * 8)
+            i += 8
+        end
+        while i < n
+            unsafe_store!(p, muladd(a, unsafe_load(p, i + 1), unsafe_load(p, i + 1)), i + 1)
+            i += 1
+        end
+        nothing
+    end
+
+    # Same kernel, but the remainder is a masked SIMD store instead of a scalar loop — the fix
+    # for the case above. No scalar loop should be reported.
+    @noinline function body_plus_masked_tail!(p::Ptr{Float64}, n::Int, a::Float64)
+        V = Vec{8, Float64}
+        i = 0
+        while i + 8 <= n
+            vstore(muladd(vload(V, p + i * 8), V(a), vload(V, p + i * 8)), p + i * 8)
+            i += 8
+        end
+        if i < n
+            m = Vec((1, 2, 3, 4, 5, 6, 7, 8)) <= (n - i)
+            vstore(muladd(vload(V, p + i * 8, m), V(a), vload(V, p + i * 8, m)), p + i * 8, m)
+        end
+        nothing
+    end
+
+    # A plain `@simd` loop with no hand-vectorized code anywhere in the function. LLVM's own
+    # vectorizer wraps it in a scalar remainder loop (bounded to under one vector width); that
+    # remainder is not a defect and firing on it would make `true` carry no information, since
+    # essentially every `@simd` loop gets one.
+    @noinline function vector_kernel!(y::Vector{Float64}, a::Float64)
+        @inbounds @simd for i in eachindex(y)
+            y[i] = muladd(a, y[i], 1.0)
+        end
+        nothing
+    end
+
+    p = Base.unsafe_convert(Ptr{Float64}, Libc.malloc(64 * sizeof(Float64)))
+    body_plus_scalar_tail!(p, 64, 2.0)
+    body_plus_masked_tail!(p, 64, 2.0)
+    Libc.free(p)
+    vector_kernel!(zeros(64), 2.0)
+
+    # False negative (issue #22): a hand-written scalar tail alongside a hand-vectorized main
+    # loop must now be flagged, even though the function also contains vector ops.
+    @test scalar_fp_loops(body_plus_scalar_tail!, (Ptr{Float64}, Int, Float64)) == true
+
+    # The masked-tail fix must not be flagged.
+    @test scalar_fp_loops(body_plus_masked_tail!, (Ptr{Float64}, Int, Float64)) == false
+
+    # False positive (issue #22): LLVM's own `@simd` scalar epilogue must not be flagged.
+    @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) == false
+end
