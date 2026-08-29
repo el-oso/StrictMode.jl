@@ -104,11 +104,6 @@ GitHub issues are the source of truth for anything with a number; the notes here
   seven demonstrations of that), but nothing has been run against a real consumer to check that the
   banner actually lands and that the migration is mechanical.
 
-- [ ] **§8–§11 has not been adversarially reviewed.** It rewrote code that three earlier passes had
-  cleared: the whole `_be_*` seam deletion, the throw-vs-warn table, the `:suspect`/`:skip` removal,
-  and every driver. Every vacuous-green bug on this branch was found by reading or by an adversarial
-  agent, never by the test suite — so a green suite is not evidence here.
-
 ## Open — deferred from the whole-branch adversarial review
 
 - [ ] **`scalar_fp_loops`'s "hand-vectorized" discriminator is unsound (issue #22 follow-up).**
@@ -185,6 +180,15 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 
 ## Done
 
+- [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding
+  put to three refuters. Eight live vacuous greens came out of it and are fixed (see the
+  commit and the section above). Two caveats on the review itself, so its result is not
+  over-trusted: 39 of 39 findings survived verification, which for refuters told to default to
+  `refuted = true` means the verify stage was not discriminating — the load-bearing claims were
+  re-checked by hand before being acted on. And the single worst finding (`concurrency.jl`
+  passing a GATING guarantee on a signature it could not analyze) came from the completeness
+  critic, not from any of the eight lenses: no lens had been pointed at that file.
+
 - [x] **`_suggestion` was missing ONE entry, not five.** Fixed. `:trim_compatible` is in
   `_GUARANTEES` and is constructed as a `StrictFinding` in two places, so it genuinely shipped
   with an empty `suggestion`. The other four the item named — `:concurrency_safe`,
@@ -258,3 +262,12 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
   records all ten divergences with the reason for each. The document is now a decision record, not
   a proposal.
 
+
+- [ ] **No release notes for the 0.4 break.** SPLIT-PROPOSAL §8 flags the migration cost as
+  *silent*: the `StrictMode` spellings are unchanged, so a consumer's `@assert_noalloc` compiles and
+  runs exactly as before and merely stops gating. A rename would have been caught by the compiler;
+  this will not be. The load banner is the in-process mechanism, but there is no CHANGELOG, no
+  release note, and no migration table (`check` → `findings`/`test_signatures`, `check_all` →
+  `test_registered`, `check_compiled` → `test_compiled`, `audit(...; exit_on_fail)` → `test_*`,
+  `:suspect`/`nsuspect` → gone, `mode=`/`fail_mode` → gone, `divergence_report` → StrictModeTest).
+  Registering 0.4.0 without one ships a silent behaviour change to every consumer.
