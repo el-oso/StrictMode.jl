@@ -2,6 +2,7 @@
 # that gates on them. These tests cover exactly that: the primitives StrictMode itself cannot test,
 # because StrictMode does not depend on those packages at all.
 using StrictModeTest
+using TrimCheck
 using StrictMode
 using Test
 
@@ -199,4 +200,53 @@ end
     absc(1)
     @test StrictMode._failed(only(StrictMode.findings(absc, (Int,); guarantees = (:noboxing,))))
     @test only(proof_findings(absc, (Int,); guarantees = (:noboxing,))).status === :pass
+end
+
+@testset "issue #20: juliac WARNINGS are not trim failures" begin
+    # `TrimVerificationErrors.errors` is a `Vector{Pair{Bool, Any}}` whose Bool is `warn`, and
+    # juliac's own gate fails only on the non-warning entries. Counting warnings as failures reds
+    # signatures juliac itself would build. A warnings-only raise cannot be provoked deterministically
+    # from a real signature, so the classifier is driven directly.
+    # Capture a REAL raise first and reuse its `parents`, so the fixtures differ from the genuine
+    # article only in the field under test.
+    reflecty20(x::Int) = length(Base.return_types(sin, (Float64,)))
+    reflecty20(1)
+    realerr = try
+        TrimCheck.hook_verify_typeinf_trim() do
+            C = TrimCheck.Compiler
+            C.typeinf_ext_toplevel(
+                Any[Core.svec(Int, Tuple{typeof(reflecty20), Int})], [Base.get_world_counter()], C.TRIM_SAFE
+            )
+        end
+        nothing
+    catch e
+        e
+    end
+    @test realerr isa TrimCheck.TrimVerificationErrors
+    @test any(p -> !first(p), realerr.errors)          # it really is an ERROR set, not warnings
+    mk(pairs) = TrimCheck.TrimVerificationErrors(pairs, realerr.parents)
+
+    # Warnings only → PASS, with a note rather than silence.
+    passed, findings = @test_logs (:info,) match_mode = :any StrictModeTest._trim_verdict(
+        mk(Pair{Bool, Any}[true => "a warning", true => "another warning"])
+    )
+    @test passed
+    @test isempty(findings)
+
+    # A single real error among warnings → FAIL. The anti-vacuity half: without it, a classifier
+    # that always returned `passed` would satisfy the assertion above.
+    p2, f2 = StrictModeTest._trim_verdict(
+        mk(Pair{Bool, Any}[true => "a warning", false => "a real error"])
+    )
+    @test !p2
+    @test !isempty(f2)
+
+    # No entries at all is not a failure either.
+    @test first(StrictModeTest._trim_verdict(mk(Pair{Bool, Any}[])))
+
+    # …and the real end-to-end path still fails on genuine reflection, so the filter did not
+    # accidentally let everything through.
+    ok, why = StrictModeTest._trim_validate(reflecty20, (Int,))
+    @test !ok
+    @test !isempty(why)
 end

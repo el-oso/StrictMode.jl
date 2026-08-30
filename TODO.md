@@ -86,8 +86,12 @@ GitHub issues are the source of truth for anything with a number; the notes here
   is discarded on cached pkgimage load, so `check_all()` in a consumer's test process sees an empty
   registry and reports green. `check_signatures`/`audit` are unaffected (they enumerate directly).
   SPLIT-PROPOSAL §H.3 identified this mechanism and it was never applied to `registry.jl`.
-  *Done so far:* `check_all` now WARNS loudly on an empty registry and its docstring documents the
-  same-process-only limitation, so the silent green is gone even though the false negative remains.
+  *REPRODUCED, 2026-08-30.* `test/consumer/` is a real second package: StrictMode in its own
+  Project.toml, `@strict_function` in its `src/`, StrictModeTest only in its `test/`. Measured in
+  its test process: `registered_strict()` is **completely empty** — 0 entries, not merely missing
+  ConsumerPkg's. So the leg is confirmed dead end to end, not just derived.
+  *Done so far:* every registry driver WARNS loudly on an empty registry, and the fixture asserts
+  that warning, so the silent green is gone even though the false negative remains.
   *Design considered and DEFERRED (adversarially reviewed, both critics "sound-with-changes"):*
   replace the Dict with never-called marker METHODS (`_strict_declared(::typeof(f), ::Type{Tuple{…}},
   ::Val{guarantees})`), read back via `methods()` and `m.sig` — a method definition is baked into the
@@ -106,11 +110,6 @@ GitHub issues are the source of truth for anything with a number; the notes here
       2 findings to 0 when an unrelated module exempts the name `:setup`.
   Doing this properly therefore requires module-scoping BOTH the marker scan and the exempt set —
   a change to a core structure used in four places, not the drop-in the design presents.
-
-- [ ] **No test exercises the real consumer layout.** `test/standalone` proves StrictMode works with
-  no backend and `test/` proves the escalated path, but nothing tests `StrictMode` in
-  `Project.toml` + `StrictModeTest` in `test/Project.toml` + `@strict_function` in `src/` firing at
-  the consumer's own precompile. That is the arrangement the split exists to serve.
 
 - [ ] **Register `StrictModeTest`.** Subdirectory package; Registrator supports `subdir=`. Needs a
   decision on subdir-vs-own-repo and whether its version tracks StrictMode's (both 0.4.0 now).

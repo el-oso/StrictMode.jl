@@ -1,0 +1,12 @@
+[deps]
+ConsumerPkg = "b2c4d6e8-1a3b-5c7d-9e0f-1a2b3c4d5e6f"
+StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
+StrictModeTest = "a64655d1-1e86-453c-b761-1219f9f51c2b"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+StrictMode = {path = "../../../.."}
+StrictModeTest = {path = "../../../../StrictModeTest"}
+
+[compat]
+julia = "1.12"

@@ -1,0 +1,12 @@
+name = "ConsumerPkg"
+uuid = "b2c4d6e8-1a3b-5c7d-9e0f-1a2b3c4d5e6f"
+version = "0.1.0"
+
+[deps]
+StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
+
+[sources]
+StrictMode = {path = "../../.."}
+
+[compat]
+julia = "1.12"

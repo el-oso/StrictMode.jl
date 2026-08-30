@@ -179,34 +179,61 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
         end
         return (true, String[])
     catch err
-        if err isa TrimCheck.TrimVerificationErrors
-            # Route the raw verifier output through TypeContracts' `TrimDiagnostics` — the same parser
-            # `explain_trim` uses — for deduplicated, source-mapped sites (statement + user frame),
-            # instead of hand-filtering the raw dump.
-            raw = try
-                sprint(show, err)
-            catch
-                ""
-            end
-            tf = TypeContracts.explain_trim_failure(raw)
-            if !tf.recognized || isempty(tf.sites)
-                return (false, ["juliac --trim=safe rejected this signature (verifier output not recognized)"])
-            end
-            findings = String[]
-            for s in tf.sites
-                # frames are innermost-first ⇒ the outermost frame is the user-relevant call site.
-                loc = isempty(s.frames) ? "" :
-                    "  [" * basename(last(s.frames).file) * ":" * string(last(s.frames).line) * "]"
-                push!(findings, s.statement * loc)
-            end
-            if length(findings) > 8
-                extra = length(findings) - 8
-                findings = vcat(findings[1:8], ["… (+$extra more call site(s))"])
-            end
-            return (false, findings)
-        end
+        err isa TrimCheck.TrimVerificationErrors && return _trim_verdict(err)
         rethrow(err)
     end
+end
+
+"""
+    _trim_verdict(err::TrimVerificationErrors) -> (passed::Bool, findings::Vector{String})
+
+Classify what the verifier raised. `err.errors` is a `Vector{Pair{Bool, Any}}` whose `Bool` is
+`warn`, and **juliac's own gate fails only on the non-warning entries** — so treating every entry as
+a failure reds signatures juliac itself would build (issue #20). A raise carrying nothing but
+warnings is a PASS here.
+
+Split out from `_trim_validate` so the classification can be tested against hand-built
+`TrimVerificationErrors` values — provoking a warnings-only raise from a real signature is not
+something a test can arrange deterministically.
+"""
+function _trim_verdict(err)
+    real = filter(p -> !first(p), err.errors)
+    nwarn = length(err.errors) - length(real)
+    if isempty(real)
+        nwarn > 0 && @info "StrictModeTest: juliac's trim verifier raised $nwarn warning(s) for this " *
+            "signature and no errors — juliac's own gate accepts that, so this is a PASS." maxlog = 3
+        return (true, String[])
+    end
+    # Route the verifier output through TypeContracts' `TrimDiagnostics` — the same parser
+    # `explain_trim` uses — for deduplicated, source-mapped sites (statement + user frame), instead
+    # of hand-filtering the raw dump. Re-wrap so only the real errors reach the parser; otherwise a
+    # warning's call site would be reported as a failing one.
+    errs = try
+        TrimCheck.TrimVerificationErrors(real, err.parents)
+    catch
+        err                                   # constructor shape changed: fall back to the whole set
+    end
+    raw = try
+        sprint(show, errs)
+    catch
+        ""
+    end
+    tf = TypeContracts.explain_trim_failure(raw)
+    if !tf.recognized || isempty(tf.sites)
+        return (false, ["juliac --trim=safe rejected this signature ($(length(real)) error(s); verifier output not recognized)"])
+    end
+    findings = String[]
+    for s in tf.sites
+        # frames are innermost-first ⇒ the outermost frame is the user-relevant call site.
+        loc = isempty(s.frames) ? "" :
+            "  [" * basename(last(s.frames).file) * ":" * string(last(s.frames).line) * "]"
+        push!(findings, s.statement * loc)
+    end
+    if length(findings) > 8
+        extra = length(findings) - 8
+        findings = vcat(findings[1:8], ["… (+$extra more call site(s))"])
+    end
+    return (false, findings)
 end
 
 # ── the proof engine ─────────────────────────────────────────────────────────────────────────────

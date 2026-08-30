@@ -19,3 +19,7 @@ Manifest.toml
 .DS_Store
 Manifest-v*.toml
 StrictModeTest/Manifest.toml
+
+# The consumer-layout fixture resolves against the repo by path; its manifests are per-machine.
+test/consumer/**/Manifest.toml
+test/consumer/**/Manifest-v*.toml
