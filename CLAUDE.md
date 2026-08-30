@@ -17,7 +17,7 @@ you wrote** — decided at expansion by name, with no ambient state and nothing 
 ## Key architecture
 
 ```
-src/
+StrictMode/src/
   StrictMode.jl       — module root, exports, top-level docstring
   macros.jl           — @strict (composite guarantee), @kernel (SIMD shorthand)
   preferences.jl      — checks_enabled/enable_checks!/disable_checks!/proofs_loaded, _gate (the
@@ -79,13 +79,13 @@ src/
                         whole-function false-loop-carried-dependency trap), _resolve_mcpu (llvm-mca's
                         CLI hard-fails on an unrecognized -mcpu, unlike Julia's own codegen path, so
                         this validates against `-mcpu=help` and falls back to "generic")
-ext/
+StrictMode/ext/
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
   StrictModeCpuIdExt.jl     — CPU-specific _CACHE_BYTES override (weak dep, `using CpuId`)
   StrictModeReviseExt.jl    — cache invalidation on code change
   StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,
                               ~680MiB — never a test/CI default, see test/mca_test.jl's live-path guard)
-StrictModeTest/       — the PROOF tier, a SEPARATE package (subdir), test-environment only
+StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder, test-environment only
   src/StrictModeTest.jl — module root; AllocCheck/JET/TrimCheck as HARD deps. __init__ REFUSES to
                         load unless StrictMode.checks_enabled() (otherwise every @assert_* is a
                         bare call, nothing registers, and test_registered() sweeps an empty
@@ -102,7 +102,7 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package (subdir), test-envi
                         which is why it lives here)
   test/               — its own suite: the proof primitives StrictMode cannot test, because
                         StrictMode does not depend on those packages at all
-test/
+StrictMode/test/
   runtests.jl         — TestItemRunner @run_package_tests; `using StrictModeTest` supplies the proofs
   Project.toml        — no [preferences.StrictMode] block: checks_enabled defaults to true, and this
                         env exercises that default
@@ -116,7 +116,7 @@ test/
 ```
 
 This table is a map, not a promise — when adding/moving a top-level definition, update the entry for
-the file you touched rather than trusting this list; it has drifted before (verify with `ls src/`).
+the file you touched rather than trusting this list; it has drifted before (verify with `ls StrictMode/src/`).
 
 ## Running tests
 
@@ -126,7 +126,7 @@ generate different code: five vectorization-shape tests only fail under forced b
 is how they stayed invisible in CI. `+release` selects 1.12 when 1.13 is the juliaup default.
 
 ```bash
-julia +release --project=. -e 'import Pkg; Pkg.test()'
+julia +release --project=StrictMode -e 'import Pkg; Pkg.test()'
 ```
 
 The test `Project.toml` depends on `StrictModeTest`, which supplies the AllocCheck/JET/TrimCheck
@@ -147,8 +147,8 @@ JULIAUP_CHANNEL=release jl -e 'using StrictMode, StrictModeTest, TestItemRunner;
 The proof-free premise has its own environment; run it whenever you touch a guarantee's engine:
 
 ```bash
-julia --project=test/standalone -e 'import Pkg; Pkg.instantiate()'
-JULIA_LOAD_PATH="@:@stdlib" julia --project=test/standalone test/standalone/runtests.jl
+julia --project=StrictMode/test/standalone -e 'import Pkg; Pkg.instantiate()'
+JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMode/test/standalone/runtests.jl
 ```
 
 ## Key invariants
