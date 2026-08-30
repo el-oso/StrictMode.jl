@@ -44,11 +44,15 @@ jobs:
       # proofs installed. Every item in test/ runs with StrictModeTest loaded, so none of them can
       # catch a guarantee that has re-acquired a hard AllocCheck/JET/TrimCheck dependency — which
       # would break StrictMode as a plain [deps] entry in a consumer's Project.toml.
+      - name: StrictMode standalone — instantiate
+        run: julia --project=StrictMode/test/standalone -e 'import Pkg; Pkg.instantiate()'
+      # `JULIA_LOAD_PATH` is a step env rather than a shell prefix: Windows runs `run:` under
+      # PowerShell, which has no `VAR=value command` form. Its separator is platform-specific too —
+      # `;` on Windows, `:` everywhere else — so the value is chosen per runner, not hardcoded.
       - name: StrictMode standalone (no proofs installed)
-        run: |
-          julia --project=StrictMode/test/standalone -e 'import Pkg; Pkg.instantiate()'
-          JULIA_LOAD_PATH="@:@stdlib" \
-          julia --project=StrictMode/test/standalone StrictMode/test/standalone/runtests.jl
+        env:
+          JULIA_LOAD_PATH: ${{ runner.os == 'Windows' && '@;@stdlib' || '@:@stdlib' }}
+        run: julia --project=StrictMode/test/standalone StrictMode/test/standalone/runtests.jl
       # StrictModeTest's own suite: the proof primitives (allocation classification, ignore_throw,
       # the JET and TrimCheck drivers) and the @test_* / test_* gating surface. StrictMode cannot test
       # these: it does not depend on AllocCheck, JET, or TrimCheck at all.

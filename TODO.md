@@ -60,6 +60,13 @@ GitHub issues are the source of truth for anything with a number; the notes here
   else has already flagged. Eagerly it doubled the sweep (45.0s vs 21.7s for 120 signatures); lazily
   it costs 28.0s. Kept rather than reverted because it does fix the reported reproducer, but nobody
   should expect it to move a real consumer's numbers.
+  *CONFIRMED DEAD ON 1.13, 2026-08-30.* The caveat below is no longer hypothetical: on the CI matrix's
+  `~1.13.0-rc1` job, `_all_news_nonescaping(Tuple{typeof(mkvec), Int})` returns `false` and the issue's
+  own reproducer is flagged again. The fallback behaved as designed — it degraded to over-flagging
+  rather than quietly passing — and the `@test` that pins the analysis is what surfaced it, which is
+  the only reason a silent internal move became visible. That job is `continue-on-error`, so this
+  does not gate; it does mean the #17 mitigation is 1.12-only until the internal is located on 1.13.
+
   *Caveat:* `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability
   guarantee. Every failure falls back to "assume it escapes" (the previous behaviour), so a Julia
   release that moves it degrades the rate rather than breaking the guarantee — but the fallback is
