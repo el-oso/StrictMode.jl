@@ -1,0 +1,54 @@
+name: TagBot
+
+on:
+  issue_comment:
+    types:
+      - created
+  workflow_dispatch:
+    inputs:
+      lookback:
+        default: "3"
+
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  deployments: read
+  discussions: read
+  issues: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  security-events: read
+  statuses: read
+
+jobs:
+  TagBot:
+    if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
+    runs-on: ubuntu-latest
+    steps:
+      # Both packages live in subfolders, so each needs its own step.
+      #
+      # `ssh:` is set but the DOCUMENTER_KEY secret does not exist yet, so TagBot pushes tags with
+      # GITHUB_TOKEN. GitHub does not start workflows for anything that token pushes, so a new tag
+      # will NOT trigger Documentation.yml's `tags: ['*']` build — run that workflow by hand after a
+      # release, or add a deploy key here and the trigger starts working with no further change.
+      - name: Tag StrictMode
+        uses: JuliaRegistries/TagBot@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ssh: ${{ secrets.DOCUMENTER_KEY }}
+          subdir: StrictMode
+          # The v0.3.x tags predate the move into a subfolder and carry no prefix; keeping
+          # NO_PREFIX continues that series, so `rev = "v0.3.3"`-style pins stay meaningful.
+          tag_prefix: NO_PREFIX
+
+      - name: Tag StrictModeTest
+        uses: JuliaRegistries/TagBot@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ssh: ${{ secrets.DOCUMENTER_KEY }}
+          subdir: StrictModeTest
+          # No prefix override: this one takes TagBot's automatic `StrictModeTest-v{VERSION}`, so it
+          # cannot collide with StrictMode's unprefixed tag at the same version.
