@@ -83,8 +83,10 @@ GitHub issues are the source of truth for anything with a number; the notes here
   *disables* checks in a non-direct-dep environment is still silently ignored — but that
   direction fails safe (checks stay on), and `StrictModeTest.__init__` errors if checks are off
   where the proofs are expected.
-  *Still to verify on a real consumer:* that `checks_enabled = true` by default does not make
-  PureBLAS/PureIPM unusable through sheer warning volume (#17's ~28%).
+  *MEASURED, 2026-08-30.* A from-scratch precompile of PureBLAS + PureIPM under `checks_enabled =
+  true` emits **24 warnings** and completes. That is a readable one-time volume, not a wall, so the
+  default is usable. Note the reason it is this low is partly that `_guarantee_gates` demotes the
+  allocation layer to a warning; the underlying scan still over-flags at the 8.1% recorded under #17.
 
 - [ ] **#19 / #20 — `@assert_trim_compatible` false FAILs.** Both live in
   `_be_trim_validate`, which moved to `StrictModeTest/src/StrictModeTest.jl` in 0.4.0; the
@@ -107,9 +109,21 @@ GitHub issues are the source of truth for anything with a number; the notes here
   for exactly this reason; the real fix is the same isolation, which needs the verification moved
   to a subprocess (the shape `@assert_memsafe` already uses).
 
-- [ ] **#13, #14, #15, #16** — verify whether these are actually closed by the code that now
-  exists (`trimsafe.jl`'s heuristic caveat, `register_alloc_barrier!`, `memsafe.jl`,
-  `no_spill`/`mca.jl`) and close them if so. Not audited.
+- [x] **#13, #14, #15, #16 — AUDITED 2026-08-30; all four are addressed, closing comments drafted.**
+  - **#13** — not fixed as the issue proposes, and should not be: its own repro shows the trivial
+    four-`Val` case trips neither check, so an arg-shape rule would fire on code that trims fine.
+    The issue's second suggestion shipped instead — a heuristic PASS logs `_TRIM_HEURISTIC_CAVEAT`
+    naming the uncovered class. The mode split that made the discrepancy silent is also gone: the
+    macro name now picks the engine.
+  - **#14** — both proposed options shipped. `OncePerProcess`/`OncePerThread` auto-recognized,
+    `register_alloc_barrier!` for hand-rolled equivalents, `StrictModeTest.set_ignore_barrier!`
+    controlling whether the proof honors them.
+  - **#15** — shipped, and the issue's acceptance sentence is a test: the masked-load shape
+    reproduces the OOB read while `@assert_typestable` and `@assert_noalloc` both pass on it.
+  - **#16** — both tiers shipped as sequenced. Tier 1 `@assert_no_spill` gates; Tier 2 `@assert_mca`
+    is informational unless `max_rthroughput=`/`min_ipc=` is supplied, behind the `LLVM_full_jll`
+    weak dep.
+  Drafts written and awaiting approval before posting (GitHub is social media — no unapproved text).
 
 
 ## Open — added by the 0.4.0 split itself
@@ -161,6 +175,15 @@ GitHub issues are the source of truth for anything with a number; the notes here
   an unrelated error and blocks every turn in that repo. Loud, not silent — but it stops work.
   **URGENCY: this is NOT gated on registration.** `BlazingPorts.jl` sources StrictMode from
   `rev = "master"`, so merging this branch to master breaks it on the next resolve.
+  **But the migration IS gated on it, which makes the two claims a sequencing constraint rather
+  than a contradiction.** Each migrated script needs `StrictModeTest` in a `Project.toml`, and
+  that is not resolvable from any of these repos until StrictModeTest is registered (or each repo
+  takes a `rev`/`subdir` pin). A local `Pkg.develop` makes it work on this machine and commits
+  nothing usable. So: do not merge this branch to master before StrictModeTest is resolvable —
+  merging first is what breaks BlazingPorts, and there is no migration that can land ahead of it.
+  All five scripts confirmed present at the hook's conventional paths, 2026-08-30:
+  BlazingPorts `bench/` (110 lines), PureFFT `bench/` (71), PureIPM `benchmark/audit/` (64),
+  PureSparse `benchmark/audit/` (135), PureOSQP `bench/` (191).
   `PureFFT.jl` pins `rev = "v0.3.3"`; the other three come from the registry and are pinned
   to 0.3.10 until 0.4 is registered.
   **Migration trap, PureSparse specifically:** its script's ONLY verdict mechanism is
@@ -196,9 +219,29 @@ GitHub issues are the source of truth for anything with a number; the notes here
   targets (FFT).
   Not a regression (the shape false-positived before via the integer-phi branch), but the commit's
   soundness argument and its docstring's "e.g. explicit SIMD.jl code" are both wrong.
-  *Mitigated, not fixed:* `_guarantee_gates` puts `:no_scalar_loops` in the reporting set, so a false
-  positive warns instead of aborting a build. The discriminator is still unsound — the fix is to find
-  one SLP output cannot forge.
+  *CONFIRMED by direct measurement, 2026-08-30, and TWO candidate fixes are dead.* The predicted
+  shape reproduces: a function with `acc += z[i] * (a + 2.0im)` over `Vector{ComplexF64}` plus a
+  separate `@simd` loop returns `true`. Its four loop regions are the unroller's main body and
+  epilogue for the complex loop (vector ops, no scaffold in the region — so they read as
+  "hand-vectorized"), the `@simd` loop's `vector.body`, and that loop's `scalar.ph`-rooted
+  remainder, which is what gets flagged.
+  - **Dead: a vector-typed loop-carried phi (`phi <N x …>`) outside the scaffold.** The premise was
+    that only a loop transformation can create one. Measured wrong — the complex loop's SLP/unrolled
+    regions carry `phi <2 x double>` with no scaffold, identically to hand-written SIMD.jl code.
+  - **Dead: judging the scaffold whole-function instead of per region.** Structurally the better
+    reading (`vector.ph` is the preheader and `middle.block` the exit, so neither is inside the
+    back-edge region the check tests), and it does fix the false positive. But it regresses issue
+    #22's own false-negative reproducer: LLVM vectorizes `body_plus_scalar_tail!`'s hand-written
+    scalar tail, so scaffold appears somewhere in that function too, and the whole-function rule then
+    reads it as "no hand vectorization" and skips the tail. Trading the false positive for a false
+    negative on the reported case is not a fix.
+  A note for whoever picks this up: the two reproducers may not both be satisfiable as stated.
+  `body_plus_scalar_tail!` wants `true` because its *source* has a scalar tail, but LLVM vectorizes
+  that tail, and the commit's own principle — the vectorizer's bounded remainder carries no
+  information — argues the compiled output is fine. This check reads compiled output, so the two
+  test expectations may be in tension rather than the discriminator merely being weak.
+  *Mitigated meanwhile:* `_guarantee_gates` puts `:no_scalar_loops` in the reporting set, so a false
+  positive warns instead of aborting a build.
 
 ## Open — from the 0.4 adversarial review (129 agents, 39 findings, all 3-vote verified)
 
