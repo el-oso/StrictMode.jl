@@ -7,33 +7,33 @@
         # --- exact match (ulps=0 default) ---
         # Record
         x = [1.0, 2.0, 3.0]
-        r1 = @golden "vec_exact" copy(x) dir = tmpdir
+        r1 = @golden "vec_exact" copy(x) dir = tmpdir record = true
         @test r1 == x
         @test isfile(joinpath(tmpdir, "vec_exact.golden"))
 
         # Compare (same value) → passes
-        r2 = @golden "vec_exact" copy(x) dir = tmpdir
+        r2 = @golden "vec_exact" copy(x) dir = tmpdir record = true
         @test r2 == x
 
         # --- scalar Float64 record + compare ---
-        s1 = @golden "scalar" 42.0 dir = tmpdir
+        s1 = @golden "scalar" 42.0 dir = tmpdir record = true
         @test s1 === 42.0
-        s2 = @golden "scalar" 42.0 dir = tmpdir
+        s2 = @golden "scalar" 42.0 dir = tmpdir record = true
         @test s2 === 42.0
 
         # --- 1-ULP perturbation: fails with ulps=0, passes with ulps=1 ---
         v = [1.0]
-        @golden "ulp_test" v dir = tmpdir   # record
+        @golden "ulp_test" v dir = tmpdir record = true   # record
         v1 = nextfloat(1.0)               # 1 ULP away
         perturbed = [v1]
 
-        @test_throws StrictViolation @golden "ulp_test" perturbed dir = tmpdir         # ulps=0 → fail
-        @test (@golden "ulp_test" perturbed dir = tmpdir ulps = 1) == perturbed          # ulps=1 → pass
+        @test_throws StrictViolation @golden "ulp_test" perturbed dir = tmpdir record = true         # ulps=0 → fail
+        @test (@golden "ulp_test" perturbed dir = tmpdir ulps = 1 record = true) == perturbed          # ulps=1 → pass
 
         # --- shape/type mismatch errors clearly ---
         long_vec = [1.0, 2.0, 3.0, 4.0]
         err = try
-            @golden "vec_exact" long_vec dir = tmpdir   # different length than recorded [1,2,3]
+            @golden "vec_exact" long_vec dir = tmpdir record = true   # different length than recorded [1,2,3]
             nothing
         catch e
             e
@@ -43,20 +43,20 @@
 
         # --- Float32 array ---
         y32 = Float32[1.0, 2.0]
-        @golden "f32" y32 dir = tmpdir
-        r32 = @golden "f32" Float32[1.0, 2.0] dir = tmpdir
+        @golden "f32" y32 dir = tmpdir record = true
+        r32 = @golden "f32" Float32[1.0, 2.0] dir = tmpdir record = true
         @test r32 isa Vector{Float32}
         @test r32 == y32
 
         # --- ComplexF64 array ---
         z = ComplexF64[1.0 + 2.0im, 3.0 + 4.0im]
-        @golden "complex" z dir = tmpdir
-        rc = @golden "complex" copy(z) dir = tmpdir
+        @golden "complex" z dir = tmpdir record = true
+        rc = @golden "complex" copy(z) dir = tmpdir record = true
         @test rc == z
 
         # --- unsupported type throws clearly ---
         err2 = try
-            @golden "str" "hello" dir = tmpdir
+            @golden "str" "hello" dir = tmpdir record = true
             nothing
         catch e
             e
@@ -70,7 +70,7 @@
             ENV["STRICTMODE_RECORD_GOLDEN"] = "1"
             # Re-record with a different value overwrites; subsequent compare must match
             new_x = [10.0, 20.0, 30.0]
-            @golden "vec_exact" new_x dir = tmpdir   # re-records
+            @golden "vec_exact" new_x dir = tmpdir record = true   # re-records
         finally
             if isempty(orig_env)
                 delete!(ENV, "STRICTMODE_RECORD_GOLDEN")
@@ -79,7 +79,7 @@
             end
         end
         # Now the golden matches the new value
-        r3 = @golden "vec_exact" [10.0, 20.0, 30.0] dir = tmpdir
+        r3 = @golden "vec_exact" [10.0, 20.0, 30.0] dir = tmpdir record = true
         @test r3 == [10.0, 20.0, 30.0]
     end
 end

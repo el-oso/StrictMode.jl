@@ -297,6 +297,9 @@ end
 # Signal numbers are OS-specific: SIGBUS is 7 on Linux but 10 on Darwin/macOS (SIGSEGV is 11 on
 # both). A guard-page boundary fault raises SIGSEGV on Linux but SIGBUS on macOS for the same
 # out-of-bounds access — both indicate the same fault class this harness is designed to catch.
+# Julia renders a memory fault it caught itself as one of these; a raw signal death has no such text.
+const _MEMFAULT_RE = r"ReadOnlyMemoryError|SegmentationFault"
+
 function _signal_name(sig::Integer)
     sig == 11 && return "SIGSEGV"
     bus = Sys.isapple() ? 10 : 7
@@ -326,9 +329,10 @@ function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_
     # present in the captured stdout. That is what makes a single spawn sufficient; classifying in a
     # second child would double the cost of the clean path, which is the common one.
     #
-    # No `try`/`catch` around step 2: nothing is catchable there any more, and a genuine exception
-    # from `f` must propagate so the parent reports an unrelated script error rather than a
-    # memory-safety verdict.
+    # No `try`/`catch` around step 2: a genuine exception from `f` must propagate so the parent
+    # reports an unrelated script error rather than a memory-safety verdict. The guard-page hit
+    # itself may arrive either as a fatal signal or as a catchable `ReadOnlyMemoryError` depending
+    # on the host; the parent distinguishes both from an unrelated error, so neither is caught here.
     return """
     using StrictMode, Serialization
     $mod_stmt
@@ -381,18 +385,27 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
         # The canary line is printed and flushed BEFORE the guard probe, so it is present whether or
         # not the child then died on the guard page.
         canary = match(r"STRICTMODE_CANARY_DIRTY (.*)", out_s)
-        if proc.termsignal != 0
-            signame = _signal_name(proc.termsignal)
+        # A guard-page hit does not always arrive as a signal. Julia's own fault handler can turn an
+        # access to protected memory into a CATCHABLE `ReadOnlyMemoryError`, and the child then dies
+        # with exit code 1 and an ordinary backtrace instead of a `termsignal`. Both deliveries are
+        # the same event, and the harness must count both: treating the exception form as an
+        # unrelated script error reports a real detection as a broken probe. The write kernel takes
+        # the exception path on some Linux and macOS hosts and the signal path on others.
+        by_signal = proc.termsignal != 0
+        by_exception = !by_signal && proc.exitcode != 0 && occursin(_MEMFAULT_RE, err_s)
+        if by_signal || by_exception
+            how = by_signal ? "killed by $(_signal_name(proc.termsignal))" :
+                "stopped by a memory-access exception"
             if canary !== nothing
                 # A store past the end. Report the canary's own localization: on Julia 1.12+ the
                 # write fault's backtrace is destroyed (`unknown function (ip: …)`, zero frames), so
                 # the child's signal report carries nothing usable and the canary is all there is.
                 return "out-of-bounds WRITE detected: $(canary.captures[1]). (The guarded probe " *
-                    "subprocess was then killed by $signame; a write fault's own backtrace is not " *
+                    "subprocess was then $how; a write fault's own backtrace is not " *
                     "usable, so the offset above comes from a writable poisoned canary.)"
             end
-            return "out-of-bounds READ detected — the guarded probe subprocess was killed by " *
-                "$signame and nothing was stored past any argument's end. Child's own signal " *
+            return "out-of-bounds READ detected — the guarded probe subprocess was $how " *
+                "and nothing was stored past any argument's end. Child's own fault " *
                 "report (names the faulting op):\n" * _indent(err_s)
         elseif proc.exitcode != 0
             error(

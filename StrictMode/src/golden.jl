@@ -38,8 +38,12 @@ end
 # on disk there means it was never committed, and record-and-pass compares nothing while reporting
 # success — the same silent-skip shape `assert_enabled` exists to make loud, and it hits every
 # `@golden` in the suite at once (a gitignored `test/golden/`, or a `dir =` pointing at a tmpdir).
-# An explicit `STRICTMODE_RECORD_GOLDEN=1` is still honored: that is someone asking on purpose.
-function _assert_recordable(name::AbstractString, path::AbstractString)
+# An explicit `STRICTMODE_RECORD_GOLDEN=1` is still honored: that is someone asking on purpose, as is
+# a call-site `record = true`, which says recording is the behavior under test rather than a missing
+# commit. `STRICTMODE_RECORD_GOLDEN=1` cannot serve that case: it forces re-recording on EVERY
+# `@golden`, so a record-then-compare test would stop comparing and pass while checking nothing.
+function _assert_recordable(name::AbstractString, path::AbstractString; deliberate::Bool = false)
+    deliberate && return nothing
     isempty(get(ENV, "CI", "")) && return nothing
     get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1" && return nothing
     return error(
@@ -237,8 +241,9 @@ macro golden(name, expr, kwargs...)
     ulps_val = 0
     dir_expr = nothing
     validator_expr = nothing
+    record_expr = false
     for kw in kwargs
-        Meta.isexpr(kw, :(=), 2) || throw(ArgumentError("@golden: unexpected argument $kw; expected `ulps=N`, `dir=<path>`, or `validator=f`"))
+        Meta.isexpr(kw, :(=), 2) || throw(ArgumentError("@golden: unexpected argument $kw; expected `ulps=N`, `dir=<path>`, `validator=f`, or `record=true`"))
         k, v = kw.args
         if k === :ulps
             ulps_val = v  # may be a literal or expression
@@ -246,8 +251,10 @@ macro golden(name, expr, kwargs...)
             dir_expr = v
         elseif k === :validator
             validator_expr = v
+        elseif k === :record
+            record_expr = v
         else
-            throw(ArgumentError("@golden: unknown keyword `$k`; expected `ulps`, `dir`, or `validator`"))
+            throw(ArgumentError("@golden: unknown keyword `$k`; expected `ulps`, `dir`, `validator`, or `record`"))
         end
     end
 
@@ -262,6 +269,7 @@ macro golden(name, expr, kwargs...)
     expr_esc = esc(expr)
     ulps_esc = esc(ulps_val)
     validator_esc = esc(validator_expr === nothing ? :nothing : validator_expr)
+    record_esc = esc(record_expr)
 
     return quote
         let _golden_name = $(name_esc),
@@ -281,7 +289,7 @@ macro golden(name, expr, kwargs...)
                 )
             else
                 if !isfile(_golden_path) || get(ENV, "STRICTMODE_RECORD_GOLDEN", "") == "1"
-                    isfile(_golden_path) || StrictMode._assert_recordable(string(_golden_name), _golden_path)
+                    isfile(_golden_path) || StrictMode._assert_recordable(string(_golden_name), _golden_path; deliberate = $(record_esc))
                     mkpath(_golden_dir)
                     StrictMode._write_golden(_golden_path, _golden_result)
                     @info "StrictMode @golden: recorded golden for \"$_golden_name\" at $_golden_path"
