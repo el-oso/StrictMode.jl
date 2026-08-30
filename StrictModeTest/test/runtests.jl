@@ -289,3 +289,55 @@ end
         StrictModeTest.set_juliac_patches!(old)
     end
 end
+
+# The union-split rule (StrictMode issue #13) is a heuristic that claims to agree with juliac's
+# verifier on a class the dispatch rule cannot see. Only this package can check that claim, since
+# only this package has TrimCheck.
+@testset "issue #13: the union-split rule agrees with juliac's verifier" begin
+    @noinline function opaque(::Val{A}, ::Val{B}, ::Val{C}, ::Val{D}, x::Vector{Float64}) where {A, B, C, D}
+        s = 0.0
+        for i in eachindex(x)
+            s = muladd(s, A ? 1.0000001 : 1.0000002, B ? x[i] : -x[i])
+            C && (s += 1.0)
+            D && (s -= 1.0)
+        end
+        return s
+    end
+    trivial(::Val, ::Val, ::Val, ::Val) = 0
+    vv(b::Bool) = b ? Val(true) : Val(false)
+
+    # The `Union{Nothing,Int}` idiom reaches the same arithmetic as three `Val`s.
+    @noinline function consume(a::Union{Nothing, Int}, b::Union{Nothing, Int}, c::Union{Nothing, Int}, x::Vector{Float64})
+        s = 0.0
+        for i in eachindex(x)
+            s = muladd(s, 1.0000001, x[i])
+            a === nothing || (s += a)
+            b === nothing || (s -= b)
+            c === nothing || (s *= 1.0 + c)
+        end
+        return s
+    end
+    maybe(v::Int, on::Bool) = on ? v : nothing
+    three_isbits(x::Vector{Float64}, p::Bool, q::Bool, r::Bool) = consume(maybe(1, p), maybe(2, q), maybe(3, r), x)
+    two_isbits(x::Vector{Float64}, p::Bool, q::Bool) = consume(maybe(1, p), maybe(2, q), nothing, x)
+
+    four_trivial(a::Bool, b::Bool, c::Bool, d::Bool) = trivial(vv(a), vv(b), vv(c), vv(d))
+    two(x::Vector{Float64}, a::Bool, b::Bool) = opaque(vv(a), vv(b), Val(true), Val(false), x)
+    three(x::Vector{Float64}, a::Bool, b::Bool, c::Bool) = opaque(vv(a), vv(b), vv(c), Val(false), x)
+    four(x::Vector{Float64}, a::Bool, b::Bool, c::Bool, d::Bool) = opaque(vv(a), vv(b), vv(c), vv(d), x)
+
+    cases = (
+        ("four_trivial", four_trivial, (Bool, Bool, Bool, Bool)),
+        ("two", two, (Vector{Float64}, Bool, Bool)),
+        ("three", three, (Vector{Float64}, Bool, Bool, Bool)),
+        ("four", four, (Vector{Float64}, Bool, Bool, Bool, Bool)),
+        ("two_isbits", two_isbits, (Vector{Float64}, Bool, Bool)),
+        ("three_isbits", three_isbits, (Vector{Float64}, Bool, Bool, Bool)),
+    )
+    for (name, f, tt) in cases
+        @testset "$name" begin
+            verifier_passed, _ = StrictModeTest._trim_validate(f, tt)
+            @test StrictMode._trim_report(f, tt).passed == verifier_passed
+        end
+    end
+end

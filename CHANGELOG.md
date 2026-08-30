@@ -125,3 +125,16 @@ where the proof was available).
   `juliac-trim-base.jl` stubs `Base.CoreLogging.current_logger_for_env`, which silences every
   `@warn` and `@info` for the rest of the session — including the entire StrictMode reporting tier.
   Turn it on only in a process that does nothing but trim verification.
+
+### Trim scan: calls that union-split past the limit (issue #13)
+
+The static scan gained a third rule. `TypeContracts.trim_report` finds dynamic dispatch by asking
+whether a call's *result* infers to `Any`; a call left unresolved because its arguments union-split
+past `max_union_splitting` infers a perfectly concrete result and was invisible to it, while juliac's
+verifier rejects it. `@assert_trim_safe` / `@assert_trim_compatible` now report it, naming the callee
+and the specialization count.
+
+No callee size or opacity threshold is involved: a callee small enough to inline leaves no call
+behind, and a product within the limit is split before optimization ends, so both safe cases are
+excluded by the IR itself. Verified against juliac's verifier on seven shapes, including three
+`Union{Nothing,Int}` arguments at one call site — which the verifier genuinely rejects.

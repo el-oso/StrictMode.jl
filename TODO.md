@@ -109,12 +109,22 @@ GitHub issues are the source of truth for anything with a number; the notes here
   for exactly this reason; the real fix is the same isolation, which needs the verification moved
   to a subprocess (the shape `@assert_memsafe` already uses).
 
-- [x] **#13, #14, #15, #16 — AUDITED 2026-08-30; all four are addressed, closing comments drafted.**
-  - **#13** — not fixed as the issue proposes, and should not be: its own repro shows the trivial
-    four-`Val` case trips neither check, so an arg-shape rule would fire on code that trims fine.
-    The issue's second suggestion shipped instead — a heuristic PASS logs `_TRIM_HEURISTIC_CAVEAT`
-    naming the uncovered class. The mode split that made the discrepancy silent is also gone: the
-    macro name now picks the engine.
+- [x] **#13, #14, #15, #16 — AUDITED 2026-08-30; all four are addressed.**
+  - **#13 — FIXED, and the issue's stated objection is measured wrong.** The issue argues no
+    heuristic is possible because a scan flagging small-`Union`-heavy call sites "would
+    false-positive on exactly the callees that are fine". The IR says otherwise: a callee small
+    enough to inline leaves no call behind at all, so the trivial four-`Val` repro produces no
+    signal without needing to be excluded. `_union_split_findings` (trimsafe.jl) reports a call that
+    SURVIVES optimization with union-typed arguments whose cardinality product exceeds inference's
+    `max_union_splitting`. That is the mechanism, not a tuned threshold, and it explains the third
+    data point the PureBLAS fix records — "the real gemm gets away with 2" — exactly: 2^2 = 4 is at
+    the limit, 2^3 = 8 is over it.
+    Agrees with juliac's verifier on all seven shapes tested, including the isbits-union idiom that
+    looked like the false-positive risk: three `Union{Nothing,Int}` arguments at one call site, and
+    the same shape built from `findfirst` returns, are BOTH genuinely rejected by the verifier.
+    Swept 150 compiled PureBLAS + PureIPM specializations: the rule fired on 0, so no false
+    positives — though the corpus contains no instance of the class either (PureBLAS's resolver
+    chain removed the one it had), so that leg is weak evidence on its own.
   - **#14** — both proposed options shipped. `OncePerProcess`/`OncePerThread` auto-recognized,
     `register_alloc_barrier!` for hand-rolled equivalents, `StrictModeTest.set_ignore_barrier!`
     controlling whether the proof honors them.

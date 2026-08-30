@@ -1,34 +1,88 @@
 # Trim-safety guarantee, powered by TypeContracts (already a core dep — no backend needed).
 #
 # PROACTIVE: `@assert_trim_safe` and the `:trimsafe` guarantee scan a method's typed IR for what
-# `juliac --trim=safe` rejects — dynamic dispatch (a call whose result infers to `Any`) and
+# `juliac --trim=safe` rejects — dynamic dispatch (a call whose result infers to `Any`), a call left
+# unresolved by exceeding the union-split limit (`_union_split_findings`), and
 # reflection (`return_types`/`invokelatest`/`which`/`methods`) — via `TypeContracts.trim_report`.
 # Value-free and dependency-free.
 #
 # REACTIVE: `explain_trim` translates raw `juliac --trim` verifier output into a source-mapped
 # explanation (via `TypeContracts.explain_trim_failure`).
 
-_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) = TypeContracts.trim_report(f, Tuple{types...})
+_base_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) = TypeContracts.trim_report(f, Tuple{types...})
 
-# issue #13: the static heuristic (`TypeContracts.trim_report`) misses a real trim-incompatibility
-# class that TrimCheck's authoritative `verify_typeinf_trim` catches — N simultaneous
-# runtime `Union{Val,...}`-shaped arguments whose 2^N specialization count can exceed juliac's
-# reachability/union-split limit. A trivial, small callee does NOT trip this (the trimmer resolves
-# every instance when the callee is simple); it only shows up with a large/opaque callee where the
-# union propagates past what inference can collapse — so a per-call-site static scan cannot
-# reliably discriminate the safe case from the dangerous one (flagging heuristically would
-# false-positive on exactly the callees the issue's own repro proves are fine). No warn-tier
-# heuristic is added for that reason; instead, a PASS reached only via the static scan (not the
-# authoritative verifier) gets a one-time session note that this class isn't covered — a fast
-# dev-loop check that never reaches TrimCheck would otherwise get no signal at all
-# for it. `status`/`reason` on the structured `StrictFinding` are deliberately left untouched (a
-# heuristic PASS stays `:pass` with an empty reason, matching every other guarantee and the
-# existing back-compat contract) — this is macro-path-only visibility, not a findings/check API
-# change.
+# The union-split rule (issue #13). `TypeContracts.trim_report` finds dynamic dispatch by asking
+# whether a call's RESULT infers to `Any`; this class infers a perfectly concrete result and is
+# still rejected, so that rule structurally cannot see it.
+#
+# juliac materializes a call's specializations only while the product of its arguments' union
+# cardinalities stays within inference's `max_union_splitting`. Past that the call is left
+# unresolved, and `verify_typeinf_trim` rejects it from the ccallable root. The signal is therefore
+# a call that SURVIVES optimization with union-typed arguments whose product exceeds the limit. It
+# agrees with the verifier on the shapes that bracket the boundary:
+#
+#   sink(::Val,::Val,::Val,::Val) = 0, four runtime Vals   verifier PASS   no call survives (inlined)
+#   two runtime Vals into a large callee                   verifier PASS   no call survives (2^2 = 4)
+#   three runtime Vals into a large callee                 verifier FAIL   :call, product 8
+#   four runtime Vals into a large callee                  verifier FAIL   :call, product 16
+#
+# The two passing cases produce no signal on their own — a callee small enough to inline leaves no
+# call to resolve, and a product within the limit is split by inference before optimization ends.
+# So no callee size or opacity threshold is needed: the IR has already applied both.
+# A resolved `:invoke` is excluded because it names one MethodInstance — there is nothing left to
+# materialize.
+function _union_split_findings(@nospecialize(f), @nospecialize(types::Tuple))
+    out = String[]
+    limit = Core.Compiler.InferenceParams().max_union_splitting
+    sig = Base.signature_type(f, Tuple{types...})
+    ci = try
+        first(code_typed(f, Tuple{types...}; optimize = true))[1]
+    catch
+        return out                      # unanalyzable here is the caller's problem to report
+    end
+    for st in ci.code
+        Meta.isexpr(st, :call) || continue
+        callee = _static_callee(ci, st.args[1])
+        # Builtins and intrinsics take `Any` without dispatching, so they never union-split.
+        (callee isa Core.Builtin || callee isa Core.IntrinsicFunction) && continue
+        product = 1
+        nunion = 0
+        for a in st.args[2:end]
+            T = _stmt_arg_type(ci, sig, a)
+            T isa Union || continue
+            nunion += 1
+            product *= length(Base.uniontypes(T))
+        end
+        product > limit || continue
+        name = callee === nothing ? "call" : string(callee)
+        push!(
+            out,
+            "unresolved call to `$name` with $nunion union-typed argument(s): $product " *
+                "specializations exceeds max_union_splitting ($limit), so juliac cannot " *
+                "materialize them and the call stays unresolved"
+        )
+    end
+    return out
+end
+
+function _trim_report(@nospecialize(f), @nospecialize(types::Tuple))
+    r = _base_trim_report(f, types)
+    extra = _union_split_findings(f, types)
+    isempty(extra) && return r
+    return TypeContracts.TrimReport(r.entry, vcat(r.findings, extra), false)
+end
+
+# `_union_split_findings` covers the class the base scan misses, but the scan as a whole is still
+# not the verifier: it models neither juliac.s wider reachability analysis nor the Base patches
+# juliac applies before trim inference. A PASS reached only through it therefore gets a one-time
+# session note, so a fast dev loop that never runs TrimCheck is not left reading a bare green.
+# `status`/`reason` on the structured `StrictFinding` are deliberately left untouched (a heuristic
+# PASS stays `:pass` with an empty reason, matching every other guarantee and the existing
+# back-compat contract) — this is macro-path-only visibility, not a findings/check API change.
 const _TRIM_HEURISTIC_CAVEAT = "StrictMode: this trim-safety PASS is from the static heuristic scan only " *
-    "(TypeContracts.trim_report), not juliac's authoritative verifier — it does not cover " *
-    "reachability-limit union-splits (N simultaneous small-Union arguments whose 2^N specialization " *
-    "count can exceed juliac's split limit on a large/opaque callee). Verify with " *
+    "(TypeContracts.trim_report plus StrictMode's union-split rule), not juliac's authoritative " *
+    "verifier — it models neither juliac's full reachability analysis nor the Base patches juliac " *
+    "applies before trim inference. Verify with " *
     "`StrictModeTest.@test_trim_compatible` (or a real `juliac --trim=safe` build) before relying " *
     "on this pass alone."
 
@@ -54,8 +108,9 @@ that want to say "static scan" explicitly.
 
 Report if `f(args...)` looks incompatible with `juliac --trim=safe` by a value-free
 `TypeContracts.trim_report` scan of the typed IR: dynamic dispatch (a call whose result infers to
-`Any`) or reflection (`return_types`, `invokelatest`, `which`, `methods`). It never runs the
-verifier, so it needs no `TrimCheck` dependency.
+`Any`), reflection (`return_types`, `invokelatest`, `which`, `methods`), or a surviving call whose
+arguments union-split past `max_union_splitting`. It never runs the verifier, so it needs no
+`TrimCheck` dependency.
 
 **This reports; it does not gate** — the scan does not model juliac's reachability limit, so a PASS
 is incomplete and a FAIL is a guess about the same territory. `StrictModeTest`'s
@@ -63,15 +118,19 @@ is incomplete and a FAIL is a guess about the same territory. `StrictModeTest`'s
 of [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call. The
 reactive counterpart, for a real build failure, is [`explain_trim`](@ref).
 
-!!! note "known gap: reachability-limit union-splits"
-    This static scan does **not** catch every trim-incompatibility juliac's real verifier does — in
-    particular, N simultaneous runtime `Union{Val,…}`-shaped arguments whose 2ᴺ specialization count
-    can exceed juliac's reachability/union-split limit when the callee is large/opaque enough that
-    inference can't collapse it (a trivial callee resolves fine and does *not* trip this). A scan
-    that flagged every small-`Union`-heavy call site would false-positive on exactly the callees that
-    are fine, so no heuristic is added for it — a PASS from this macro logs a one-time session note
-    that this class isn't covered. Use `StrictModeTest.@test_trim_compatible` before relying on a
-    green pass here for a `juliac --trim` build.
+!!! note "union-split call sites"
+    A third rule covers the class the dispatch rule structurally cannot see: a call that survives
+    optimization with union-typed arguments whose specialization product exceeds inference's
+    `max_union_splitting`. juliac cannot materialize those, so the call stays unresolved and the
+    verifier rejects it — while the caller still infers a concrete return type, which is why the
+    "result infers to `Any`" rule misses it. A callee small enough to inline leaves no call behind,
+    and a product within the limit is split before optimization ends, so neither needs a size or
+    opacity threshold to be excluded.
+
+!!! note "a PASS here is still not the verifier"
+    This scan models neither juliac's full reachability analysis nor the Base patches juliac applies
+    before trim inference, so a PASS logs a one-time session note saying so. Use
+    `StrictModeTest.@test_trim_compatible` before relying on a green pass for a `juliac --trim` build.
 """
 macro assert_trim_safe(args...)
     pos, opts = _macro_call(args, (:types,))
@@ -102,9 +161,10 @@ end
 """
     @assert_trim_compatible f(args...)
 
-Report if `f(args...)` looks incompatible with `juliac --trim=safe`: TypeContracts' static IR scan
-for dynamic dispatch (a call whose result infers to `Any`) and reflection
-(`return_types`/`invokelatest`/`which`/`methods`). Cheap, value-free, and needs no extra dependency.
+Report if `f(args...)` looks incompatible with `juliac --trim=safe`: a static IR scan for dynamic
+dispatch (a call whose result infers to `Any`), reflection
+(`return_types`/`invokelatest`/`which`/`methods`), and calls left unresolved by exceeding the
+union-split limit. Cheap, value-free, and needs no extra dependency.
 
 **This reports; it does not gate.** The scan does not model juliac's reachability limit, so a PASS
 is incomplete and a FAIL is a guess about the same territory. The authoritative check is
@@ -115,11 +175,10 @@ verifier over this exact signature and does gate. Advisory either way — *not* 
 Each argument is evaluated once; disabled builds expand to the bare call. The reactive counterpart,
 for a real build failure, is [`explain_trim`](@ref).
 
-!!! note "known gap: reachability-limit union-splits"
-    A PASS here does not cover N-simultaneous-small-`Union`-argument call sites that can exceed
-    juliac's reachability limit on a large/opaque callee (see [`@assert_trim_safe`](@ref) for why no
-    heuristic is added for it), and it logs a one-time session note saying so.
-    `StrictModeTest.@test_trim_compatible` does catch this class.
+!!! note "a PASS here is still not the verifier"
+    The scan models neither juliac's full reachability analysis nor the Base patches juliac applies
+    before trim inference, so a PASS logs a one-time session note saying so.
+    `StrictModeTest.@test_trim_compatible` runs the real verifier.
 """
 macro assert_trim_compatible(args...)
     pos, opts = _macro_call(args, (:types,))
