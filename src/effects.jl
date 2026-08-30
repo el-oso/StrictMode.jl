@@ -246,10 +246,9 @@ end
 
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
 #
-# The dominant false positive of this scan: typed IR still contains the
-# `Vector{Float64}(undef, n)` that LLVM later removes because the array never escapes, so a call
-# measuring 0 bytes is reported as allocating (19 of 68 on one real consumer, every one 0 B).
-# `has_no_escape` on the `:new` statement separates the two — MEASURED on the shapes that matter:
+# Typed IR still contains the `Vector{Float64}(undef, n)` that LLVM later removes because the array
+# never escapes, so a call measuring 0 bytes is reported as allocating. `has_no_escape` on the `:new`
+# statement separates the two — MEASURED on the shapes that matter:
 #
 #   length(Vector{Float64}(undef, n))          0 B      no_escape = true    (the false positive)
 #   v = …; SINK[] = v                        112 B      no_escape = false
@@ -262,6 +261,12 @@ end
 # positive — it cannot introduce a false negative, which is the direction that would matter for an
 # allocation guarantee. (`[n, n+1]`, which measures 0 B, still reports `false` and stays flagged:
 # the over-flag is narrowed, not eliminated.)
+#
+# The reach is narrow, and worth knowing before pointing anyone at it: over 120 compiled PureBLAS +
+# PureIPM specializations, 63 frames contain a non-isbits `:new` and this proves the set fully
+# non-escaping in NONE of them. It separates small self-contained kernels, not the interprocedural
+# shapes library code is made of. That is why `_scan_ci` calls it on demand rather than per frame —
+# eagerly it doubles a sweep.
 #
 # `Core.Compiler.EscapeAnalysis` is a compiler internal with no stability guarantee across Julia
 # versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behaviour
@@ -386,7 +391,11 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     barrier = false                   # a call reached a recognized one-time-init allocation barrier
     # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
-    newsdead = _all_news_nonescaping(sig)   # every `:new` here provably non-escaping ⇒ LLVM elides it
+    # Computed on demand: the analysis costs about as much as the whole rest of the scan, and it can
+    # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
+    # Corpus-measured (PureBLAS + PureIPM, 120 specializations): 57 frames reach no such statement.
+    escmemo = Ref{Union{Nothing, Bool}}(nothing)
+    newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
@@ -412,7 +421,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             # 2 false negatives, net 1 new false positive on `Base.CodeUnits{UInt8,String}`-style
             # non-escaping stdlib wrappers (no escape analysis here to tell those apart) — an
             # acceptable tradeoff since over-flagging is the safe direction for an alloc guarantee.
-            (nt isa Type && !Base.isbitstype(nt)) && !newsdead && (alloc = true)
+            (!alloc && nt isa Type && !Base.isbitstype(nt) && !newsdead()) && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
             # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
             # with an abstract recorded result (mutating helpers with an unused return are typed
@@ -464,7 +473,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
-                (dead[i] || newsdead) || (alloc = true)
+                (alloc || dead[i] || newsdead()) || (alloc = true)
             elseif _nonconcrete(T) && !_static_getfield(callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee

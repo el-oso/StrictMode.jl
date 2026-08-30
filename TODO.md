@@ -35,9 +35,31 @@ GitHub issues are the source of truth for anything with a number; the notes here
       negatives, one residual false positive** (`[n, n+1]`, still flagged, still the safe
       direction). Cost: ~0.69 ms cold per signature, 0.08 ms warm; memoized and cleared with the
       findings cache.
-  *Still owed:* a corpus re-measurement. The 19/68 figure came from a 68-signature PureIPM sweep
-  and the ~569-specialization corpus study; neither has been re-run against this, so the new rate is
-  unknown — 11 hand-built shapes plus a 649-assertion suite is not the same evidence.
+  *CORPUS RE-MEASURED, 2026-08-30 — and the escape-analysis fix is INERT on real code.* 120 compiled
+  PureBLAS + PureIPM specializations, AllocCheck as the oracle, A/B by redefining
+  `_all_news_nonescaping` to return `false` (the pre-fix behaviour):
+
+  | | findings | false | rate |
+  |---|---|---|---|
+  | escape analysis OFF | 74 | 6 | 8.1% |
+  | escape analysis ON  | 74 | 6 | 8.1% |
+
+  Zero findings removed. The diagnostic says why: **63 of the 120 frames contain a non-isbits
+  `:new`, and escape analysis proves the set fully non-escaping in 0 of them.** It fires on small
+  self-contained kernels — the issue's own reproducer among them, which is why it stays — and not
+  on the interprocedural shapes real library code is made of.
+
+  Two further corrections to the text above, both from the same run:
+  - The baseline false-positive rate on this corpus is **8.1%, not ~28%**. The 19/68 figure is from a
+    different sweep and should not be quoted as the general rate.
+  - The dangerous direction is the other one: the scan **misses 23** signatures AllocCheck flags
+    (recall 68/91 = 75%), unchanged by the fix. That is by design after the split — the scan reports,
+    `@test_noalloc` proves — but it is the number that matters for anyone tempted to gate on `:fast`.
+
+  The analysis is now computed **on demand**, at the first non-isbits `:new`/`memorynew` that nothing
+  else has already flagged. Eagerly it doubled the sweep (45.0s vs 21.7s for 120 signatures); lazily
+  it costs 28.0s. Kept rather than reverted because it does fix the reported reproducer, but nobody
+  should expect it to move a real consumer's numbers.
   *Caveat:* `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability
   guarantee. Every failure falls back to "assume it escapes" (the previous behaviour), so a Julia
   release that moves it degrades the rate rather than breaking the guarantee — but the fallback is
