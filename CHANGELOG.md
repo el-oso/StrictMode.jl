@@ -110,3 +110,18 @@ packages measured here gate a block of their **`src/`** on `analysis_mode()` / `
 which stops the package precompiling at all. `migration_report` scans `src/` and `ext/` for deleted
 names (fatal anywhere) and `test/`, `benchmark/`, `bench/` for the reporting macros (only a problem
 where the proof was available).
+
+### Trim verification: juliac's warnings, and its Base patches
+
+- **Warnings are no longer failures (issue #20).** `TrimVerificationErrors.errors` is a
+  `Vector{Pair{Bool, Any}}` whose `Bool` is `warn`, and juliac's own gate fails only on the
+  non-warning entries. `@test_trim_compatible` now splits them: a raise carrying nothing but
+  warnings is a PASS, and only the real errors reach the site parser, so a warning's call site is
+  no longer reported as a failing one.
+- **`set_juliac_patches!` (default `false`).** juliac includes `juliac-trim-base.jl` and
+  `juliac-trim-stdlib.jl` before trim inference, and without them the verifier rejects code juliac
+  builds clean — issue #19, where a ≥4-argument string interpolation on a reachable throw path is
+  despecialized to `Vararg{Any}`. Enabling this applies them. It defaults **off** because
+  `juliac-trim-base.jl` stubs `Base.CoreLogging.current_logger_for_env`, which silences every
+  `@warn` and `@info` for the rest of the session — including the entire StrictMode reporting tier.
+  Turn it on only in a process that does nothing but trim verification.

@@ -70,9 +70,20 @@ GitHub issues are the source of truth for anything with a number; the notes here
   #20 has a concrete, parse-free fix: `TrimVerificationErrors.errors` holds `warn::Bool =>
   desc` pairs, and juliac's own gate fails only on `warn == false`. Filter or relabel the
   warnings to match.
-  #19 is the deeper one — the verifier is invoked without juliac's Base patches, so it
-  checks a different program than juliac compiles. Surfaced on 1.13, which is now a CI
-  matrix entry, so this will keep showing up.
+  #20 is FIXED: `_trim_verdict` splits `TrimVerificationErrors.errors` on its `warn` flag, so a
+  raise carrying only warnings is a PASS, matching juliac's own gate.
+  #19 is the deeper one, and the obvious fix is MEASURED WRONG. juliac includes
+  `juliac-trim-base.jl` / `juliac-trim-stdlib.jl` before trim inference, and applying them is what
+  makes the verifier check the program juliac actually compiles — but `juliac-trim-base.jl` stubs
+  `Base.CoreLogging.current_logger_for_env`, so applying it IN-PROCESS silences every `@warn` and
+  `@info` for the rest of the session. That is the whole of StrictMode's reporting tier going
+  quiet: every `@assert_noalloc` would find its violations and say nothing. Observed directly —
+  two `@test_logs` assertions in StrictModeTest's suite went empty the moment the patches were
+  applied by default.
+  Shipped as `set_juliac_patches!`, defaulting OFF, for a process that does nothing but trim
+  verification. TrimCheck's own `validate_function` runs `init_validation` on a Distributed worker
+  for exactly this reason; the real fix is the same isolation, which needs the verification moved
+  to a subprocess (the shape `@assert_memsafe` already uses).
 
 - [ ] **#13, #14, #15, #16** — verify whether these are actually closed by the code that now
   exists (`trimsafe.jl`'s heuristic caveat, `register_alloc_barrier!`, `memsafe.jl`,

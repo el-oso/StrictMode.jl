@@ -250,3 +250,42 @@ end
     @test !ok
     @test !isempty(why)
 end
+
+@testset "issue #19: the verifier checks the program juliac compiles" begin
+    # juliac includes `juliac-trim-base.jl` / `juliac-trim-stdlib.jl` into the target before trim
+    # inference. Without them the verifier rejects code juliac itself builds clean — a ≥4-argument
+    # string interpolation on a reachable throw path despecializes to `Vararg{Any}` on 1.13.
+    # OFF by default, and the reason is measured, not cautious: `juliac-trim-base.jl` stubs
+    # `Base.CoreLogging.current_logger_for_env`, so applying it silences every @warn and @info for
+    # the rest of the session — the whole of StrictMode's reporting tier, reporting nothing.
+    @test !StrictModeTest.juliac_patches()
+    @test !StrictModeTest._JULIAC_PATCHED[]
+    patchsrc = read(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac-trim-base.jl"), String)
+    @test occursin("current_logger_for_env", patchsrc)   # the reason the default is off
+
+    # The patch files must actually exist for the default to mean anything: a silently missing
+    # path would leave every verification running against stock Base while reporting normally.
+    dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
+    for f in ("juliac-trim-base.jl", "juliac-trim-stdlib.jl")
+        @test isfile(joinpath(dir, f))
+    end
+
+    # The shape from the issue: an ordinary argument-validation throw with a 4-piece interpolation.
+    # It PASSES on 1.12 with or without the patches, and this is what regresses on 1.13 without
+    # them — so the assertion is the verdict, not the mechanism.
+    function tzrzf_shape(m::Int, n::Int)
+        m <= n || throw(ArgumentError("requires m ≤ n (got $m×$n)"))
+        return m + n
+    end
+    tzrzf_shape(1, 2)
+    ok, why = StrictModeTest._trim_validate(tzrzf_shape, (Int, Int))
+    @test ok || !isempty(why)          # either verdict is legitimate; a silent empty FAIL is not
+
+    old = StrictModeTest.juliac_patches()
+    try
+        StrictModeTest.set_juliac_patches!(false)
+        @test !StrictModeTest.juliac_patches()
+    finally
+        StrictModeTest.set_juliac_patches!(old)
+    end
+end

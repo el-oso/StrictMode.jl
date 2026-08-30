@@ -149,6 +149,84 @@ end
 
 # ── TrimCheck ────────────────────────────────────────────────────────────────────────────────────
 
+# juliac includes two patch files into the target before trim inference
+# (`juliac-trim-base.jl`, `juliac-trim-stdlib.jl`). They change what the verifier sees — most
+# consequentially by raising `print_to_string`'s `max_args`, without which a ≥4-argument string
+# interpolation on a reachable throw path despecializes to `Vararg{Any}` and the verifier rejects
+# code juliac itself builds clean. That is issue #19: an ordinary
+# `throw(ArgumentError("… $m×$n"))` reds the guarantee on Julia 1.13 while `juliac --trim=safe`
+# produces the `.so`. Verifying without them checks a DIFFERENT PROGRAM than juliac compiles.
+#
+# They are OFF by default, and the reason is not caution — it is measured. `juliac-trim-base.jl`
+# contains:
+#
+#     @eval Base.CoreLogging begin
+#         # Disable logging (TypedCallable is required to support the existing dynamic
+#         # logger interface, but it's not implemented yet)
+#         @inline current_logger_for_env(std_level::LogLevel, group, _module) = nothing
+#     end
+#
+# Applying that in-process SILENCES EVERY `@warn` AND `@info` for the rest of the session — which
+# is the whole of StrictMode's reporting tier. Every `@assert_noalloc` would find its violations and
+# say nothing: the vacuous-green shape this package exists to remove, installed by the package
+# itself. Observed directly, as two `@test_logs` assertions in this suite going empty the moment the
+# patches were applied by default.
+#
+# TrimCheck's own `validate_function` avoids this by running `init_validation` on a Distributed
+# worker. The correct fix for issue #19 is the same isolation; until then this is an opt-in for a
+# session that does nothing but trim verification and does not need its logging back.
+const _JULIAC_PATCHES = Ref(false)
+const _JULIAC_PATCHED = Ref(false)
+
+"""
+    juliac_patches() -> Bool
+
+Whether trim verification applies juliac's own `juliac-trim-base.jl` / `juliac-trim-stdlib.jl`
+patches before running the verifier. Default `false` — applying them disables logging for the whole
+session. See [`set_juliac_patches!`](@ref).
+"""
+juliac_patches() = _JULIAC_PATCHES[]
+
+"""
+    set_juliac_patches!(b::Bool)
+
+Set whether trim verification applies juliac's Base/stdlib patches first.
+
+`true` makes the verifier check the same program `juliac --trim=safe` compiles, which is the only
+way to avoid issue #19's false FAILs (a ≥4-argument string interpolation on a reachable throw path
+is rejected without them). **It also disables `@warn` and `@info` for the rest of the session** —
+`juliac-trim-base.jl` stubs `Base.CoreLogging.current_logger_for_env` — so every StrictMode
+reporting-tier verdict afterwards is silent. Only turn it on in a process that does nothing but
+trim verification.
+
+`false` (the default) leaves the session intact and accepts the false-FAIL class. The patches are
+applied at most once, on the first verification after enabling, and say so. Nothing un-applies them.
+"""
+set_juliac_patches!(b::Bool) = (_JULIAC_PATCHES[] = b)
+
+function _apply_juliac_patches()
+    (_JULIAC_PATCHES[] && !_JULIAC_PATCHED[]) || return nothing
+    _JULIAC_PATCHED[] = true                     # set first: a failed attempt must not retry per call
+    dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
+    files = ("juliac-trim-base.jl", "juliac-trim-stdlib.jl")
+    try
+        for f in files
+            p = joinpath(dir, f)
+            isfile(p) || error("$p not found")
+            Base.include(Main, p)
+        end
+        @info "StrictModeTest: applied juliac's trim patches ($(join(files, ", "))) so the " *
+            "verifier checks the same program `juliac --trim=safe` compiles. These mutate " *
+            "process-global compiler state and are not reversible; set_juliac_patches!(false) " *
+            "skips them at the cost of reinstating a false-FAIL class (issue #19)."
+    catch err
+        @warn "StrictModeTest: could not apply juliac's trim patches ($(sprint(showerror, err))). " *
+            "Trim verification will run against STOCK Base, which rejects some code juliac builds " *
+            "clean — a `@test_trim_compatible` failure may therefore be a false alarm."
+    end
+    return nothing
+end
+
 # TrimCheck's public API (`@validate` / `validate_function`) only accepts a call-expr or a
 # single-method function eval'd in `Main` — it cannot check an arbitrary concrete `(f, types)`. So we
 # drive its core directly: the same `hook_verify_typeinf_trim() do … typeinf_ext_toplevel(…,
@@ -168,6 +246,7 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
         )
     end
     ret_type = rts[1]
+    _apply_juliac_patches()
     Comp = TrimCheck.Compiler
     try
         TrimCheck.hook_verify_typeinf_trim() do

@@ -45,6 +45,7 @@ export test_signatures, test_compiled, test_registered
 export proof_audit
 export proof_findings, AnalysisError
 export ignore_barrier, set_ignore_barrier!
+export juliac_patches, set_juliac_patches!
 export divergence_report, StrictDivergence
 
 include("proofs.jl")
