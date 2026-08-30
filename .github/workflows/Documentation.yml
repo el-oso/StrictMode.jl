@@ -41,6 +41,12 @@ jobs:
           node-version: "20"
       - name: Build and deploy docs
         uses: julia-actions/julia-docdeploy@v1
+        with:
+          # The action's install step is `Pkg.develop(PackageSpec(path=pwd()))`, and the repository
+          # root is not a package — both packages live in subfolders. Nothing is lost by skipping it:
+          # `docs/Project.toml` already carries `[sources] StrictMode = {path = "../StrictMode"}`, so
+          # the instantiate step that follows resolves the package being documented.
+          install-package: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JULIA_DEBUG: "Documenter"
