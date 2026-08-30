@@ -99,3 +99,14 @@ the findings cache.
 `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability guarantee, so
 any failure inside it falls back to "assume it escapes" — the previous behaviour. A Julia release
 that moves it degrades the false-positive rate rather than weakening the guarantee.
+
+### `migration_report` also flags deleted API
+
+Beyond the macros that stopped gating, 0.4 **deleted** names some consumers call directly:
+`analysis_mode`, `backend_available`, `trimcheck_available`, `check_all`, `check_signatures`,
+`check_compiled`, `nsuspect`, `fail_mode`, `BackendUnavailable`, and the `exit_on_fail` keyword.
+Those are a `UndefVarError` at load, not a silent downgrade — and three of the eight consumer
+packages measured here gate a block of their **`src/`** on `analysis_mode()` / `backend_available()`,
+which stops the package precompiling at all. `migration_report` scans `src/` and `ext/` for deleted
+names (fatal anywhere) and `test/`, `benchmark/`, `bench/` for the reporting macros (only a problem
+where the proof was available).

@@ -143,3 +143,29 @@ end
     @test migration_report(clean; io = b2) == 0
     @test occursin("nothing to change", String(take!(b2)))
 end
+
+@testitem "migration_report flags DELETED api anywhere, including src/" begin
+    using StrictMode
+    # A macro in `src/` is correct and must stay unreported; a DELETED NAME there is fatal — the
+    # package will not even load — so that half scans every directory. Three of the consumer
+    # packages on this machine gate a block of `src/` on `analysis_mode()`/`backend_available()`.
+    root = mktempdir()
+    mkpath(joinpath(root, "src")); mkpath(joinpath(root, "test"))
+    write(
+        joinpath(root, "src", "P.jl"), """
+        if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
+            @assert_noalloc hot(x)
+        end
+        """
+    )
+    write(joinpath(root, "test", "runtests.jl"), "fs = check_signatures([(f, (Int,))])\n")
+    buf = IOBuffer()
+    n = migration_report(root; io = buf)
+    out = String(take!(buf))
+
+    @test occursin("will not load", out)
+    @test occursin("analysis_mode", out) && occursin("backend_available", out)
+    @test occursin("check_signatures", out) && occursin("test_signatures", out)
+    @test !occursin("@assert_noalloc", out)   # a src/ macro is correct, not a finding
+    @test n == 3                              # 2 deleted names in src/, 1 in test/
+end
