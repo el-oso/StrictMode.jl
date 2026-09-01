@@ -19,3 +19,34 @@
         StrictMode._CACHE_BYTES[] = saved
     end
 end
+
+# Regression: `CpuId.cachesize()` does not only RETURN a degenerate tuple — on a host with no cache
+# leaves it THROWS, and the extension's `__init__` used to let that escape. Interactively that is
+# just "extension failed to load"; during PRECOMPILATION it is fatal and aborts the whole package,
+# so StrictMode+CpuId dependents (PureBLAS) were uninstallable on Apple Silicon. Reported 2026-09-01
+# against 0.3.10 / CpuId 0.3.1 / Julia 1.12.7 on an M4 Pro.
+#
+# This cannot be reached through a REAL `cachesize()` on x86 CI — the throw only happens on non-x86,
+# where CpuId's `cpuid` is an all-zeros stub. Hence `_init_cache_bytes` takes the probe as a function
+# so the throwing case can be injected here, on any architecture.
+@testitem "CpuId cache ingest survives a THROWING probe (aarch64 / Apple Silicon)" begin
+    using StrictMode
+    saved = StrictMode._CACHE_BYTES[]
+    try
+        # exactly what CpuId does on aarch64: _throw_unsupported_leaf(0x00000004)
+        @test StrictMode._init_cache_bytes(() -> error("This CPU does not provide information on cpuid leaf 0x00000004.")) == false
+        @test StrictMode._CACHE_BYTES[] == saved       # defaults kept, nothing bricked
+
+        # other throw flavours a stub/VM could produce
+        @test StrictMode._init_cache_bytes(() -> throw(BoundsError((), 3))) == false
+        @test StrictMode._init_cache_bytes(() -> throw(ArgumentError("no leaf"))) == false
+        @test StrictMode._CACHE_BYTES[] == saved
+
+        # the non-throwing paths still behave: degenerate declines, valid applies
+        @test StrictMode._init_cache_bytes(() -> ()) == false
+        @test StrictMode._init_cache_bytes(() -> (49_152, 1_310_720, 268_435_456)) == true
+        @test StrictMode._CACHE_BYTES[] == (l1 = 49_152, l2 = 1_310_720, l3 = 268_435_456)
+    finally
+        StrictMode._CACHE_BYTES[] = saved
+    end
+end

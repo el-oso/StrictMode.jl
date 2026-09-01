@@ -225,6 +225,26 @@ function _set_cache_bytes!(cs)
     return true
 end
 
+# The extension's whole `__init__` body, lifted here so it is TESTABLE ON ANY ARCH.
+#
+# `cachesize()` does not only return `()` on CPUs CpuId cannot describe — on a host with no cache
+# leaves at all it THROWS (`_throw_unsupported_leaf`), because CpuId's non-x86 `cpuid` is an
+# all-zeros stub. That is every aarch64 host. An exception out of an extension `__init__` is fatal
+# during precompilation, so it made StrictMode+CpuId dependents uninstallable on Apple Silicon.
+#
+# Taking the probe as a FUNCTION rather than calling `cachesize()` inline is the point: a throwing
+# probe can then be injected from a test running on x86 CI, which otherwise cannot reach this path at
+# all (a real `cachesize()` only throws on non-x86 hardware). Returns whether the sizes were applied.
+function _init_cache_bytes(probe)
+    return try
+        _set_cache_bytes!(probe())
+    catch err
+        @debug "StrictMode: cache-size probe unavailable on this CPU (expected on any non-x86 \
+                host); keeping the defaults." exception = (err, catch_backtrace())
+        false
+    end
+end
+
 # LLVM inserts fast-math flags (`fast`, `nnan`, `ninf`, `nsz`, `arcp`, `contract`, `afn`,
 # `reassoc`) between a floating-point opcode/call and its result type whenever
 # `@fastmath`/`@simd`-style reassociation is proven safe — e.g. `fmul contract <8 x double>`,
