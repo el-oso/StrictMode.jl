@@ -324,8 +324,57 @@ is caught immediately rather than at the next profiling session:
 # ERROR: StrictViolation (@strict_function): return type is not concrete …
 ```
 
-Signatures with abstract argument types or varargs can't be pinned down statically. Those emit a
-one-time warning and fall back to call-site [`@strict`](@ref) checks instead.
+### When the declaration names no concrete types
+
+A generic declaration cannot be checked as written. Inference has nothing to work with:
+
+```@example guide
+pick(t::Tuple, i::Int) = t[i]
+Base.return_types(pick, Tuple{Tuple, Int})
+```
+
+`Any` — so verifying the declared signature directly would fail every generic function ever written.
+That is why such a definition is skipped with a warning rather than checked. The same function is
+perfectly answerable once you fix the tuple type, and the answer differs per instantiation:
+
+```@example guide
+[Base.return_types(pick, Tuple{T, Int}) for T in
+    (NTuple{3, Float64}, Tuple{Int, Float64}, Tuple{Float64, String})]
+```
+
+Two ways to get an answer anyway, differing in who names the instantiations and when the verdict
+forms.
+
+**Name them yourself, still at load** — `signatures = [...]` verifies each listed instantiation
+exactly as a concrete declaration is verified, so a violation still stops the module loading:
+
+```julia
+sigs = [(NTuple{3,Float64}, Int), (Tuple{Float64,String}, Int)]
+@strict_function signatures = sigs pick(t::Tuple, i::Int) = t[i]
+# the second entry infers Union{Float64,String}, so the module fails to load
+```
+
+**Or check whatever callers create** — [`@strict_stable`](@ref) moves the body into a hidden inner
+function and has the public one infer its return type. That inference is a compile-time constant, so
+a stable specialization compiles to exactly the code the unannotated definition would, and an
+unstable one throws as it is compiled:
+
+```@example guide
+@strict_stable spick(t::Tuple, i::Int) = t[i]
+spick((1.0, 2.0, 3.0), 2)      # stable: no check survives in the compiled code
+```
+
+```julia
+spick((1.0, "a"), 2)           # Union{Float64,String}
+# ERROR: StrictViolation (@typestable): return type is not concrete for this specialization …
+```
+
+The trade is real and worth stating: `@strict_stable` forms its verdict per specialization rather
+than once at load, and inference is not stable under an open world — a definition that loaded clean
+can begin to throw after unrelated code changes what inference can prove. Reach for `signatures`
+when the contract is a fixed set of types you own; reach for `@strict_stable` for an entry point
+whose callers pick the types. Only type stability travels this way: allocation and vectorization are
+read from compiled output.
 
 ## Interfaces + performance with TypeContracts
 

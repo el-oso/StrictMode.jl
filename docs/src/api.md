@@ -116,8 +116,15 @@ assert on them in future runs. See the [SIMD kernel workflow](cookbook.md) in th
 
 ## Definition-level guarantees
 
+Two macros answer "does this definition hold its contract?", and they differ in *when* the answer
+is formed. [`@strict_function`](@ref) decides at the enclosing module's load, against the declared
+argument types — so a violation stops the module loading. [`@strict_stable`](@ref) decides per
+specialization, as each is compiled, which reaches instantiations a declaration cannot name at the
+cost of failing later than load.
+
 ```@docs
 @strict_function
+@strict_stable
 @strict_exempt
 ```
 

@@ -15,17 +15,25 @@ makedocs(;
         repo = "github.com/el-oso/StrictMode.jl",
         sidebar_drawer = true
     ),
+    # Grouped rather than flat: ten top-level entries overflowed the navbar. Only the two entry
+    # points a first-time reader needs stay at the top level; the rest nest one level down.
     pages = [
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
-        "Key Concepts" => "concepts.md",
-        "Tutorial" => "tutorial.md",
-        "Guarantees" => "guarantees.md",
-        "Performance diagnostics" => "performance_diagnostics.md",
-        "Automating checks" => "automating.md",
-        "Agentic feedback" => "agents.md",
-        "Cookbook" => "cookbook.md",
-        "API Reference" => "api.md",
+        "Learn" => [
+            "Key Concepts" => "concepts.md",
+            "Tutorial" => "tutorial.md",
+            "Cookbook" => "cookbook.md",
+        ],
+        "Reference" => [
+            "Guarantees" => "guarantees.md",
+            "API Reference" => "api.md",
+        ],
+        "In practice" => [
+            "Automating checks" => "automating.md",
+            "Performance diagnostics" => "performance_diagnostics.md",
+            "Agentic feedback" => "agents.md",
+        ],
     ],
     checkdocs = :exports,
     warnonly = [:missing_docs],
