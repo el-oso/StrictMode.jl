@@ -125,7 +125,7 @@ Dogfooding a pure-Julia Cholesky against [faer](https://github.com/sarah-quinone
 boundary concrete: naive, hand-tiled, and `@turbo` versions of the same trailing-update kernel *all*
 passed the same asserts, yet spanned roughly **0.24×–0.47×** of faer, because no per-call assert can
 see cache and register blocking, leading-dimension conflicts, or microkernel scheduling. That
-sufficiency layer still needs human roofline reasoning. [`kernel_report`](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps)
+sufficiency layer still needs human roofline reasoning. [`kernel_report`](https://el-oso.github.io/StrictMode.jl/dev/performance_diagnostics)
 is the first diagnostic aimed at it — it reads arithmetic intensity from the IR, so a green-but-slow
 kernel shows up as memory-bound — and it's meant to *complement* the guardrails, not replace them.
 
@@ -145,7 +145,7 @@ you:
 
 ## Interfaces + performance, together
 
-Pair a [TypeContracts.jl](https://github.com/el-oso/TypeContracts) interface with StrictMode's
+Pair a [TypeContracts.jl](https://github.com/el-oso/TypeContracts.jl) interface with StrictMode's
 performance guarantees. `@contract` checks that the right methods are there; StrictMode checks that
 they're fast.
 
@@ -254,7 +254,7 @@ See the [documentation](https://el-oso.github.io/StrictMode.jl/dev/) and
 `docs/src/cookbook.md` for the trap → macro mapping.
 
 ### Status
-Working through the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/rust_gaps):
+Working through the [three gaps with Rust](https://el-oso.github.io/StrictMode.jl/dev/concepts):
 the time tax (a cheap value-free triage over all properties, plus an incremental cache), staying
 opt-in (`@strict module` checks everything automatically, and `@strict_exempt` opts cold code out),
 and scheduling visibility (`@assert_vectorized`, `@assert_effects`, and Cthulhu's `descend`). It all
@@ -264,7 +264,14 @@ sits on an ergonomics layer (`findings`, `audit`, `watch`) over the guarantee se
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/el-oso/StrictMode.jl")
+Pkg.add("StrictMode")
+```
+
+The proofs that gate a build live in a companion package, added to your **test** environment:
+
+```julia
+# test/Project.toml:  [deps] StrictMode, StrictModeTest
+Pkg.add("StrictModeTest")
 ```
 
 ## License

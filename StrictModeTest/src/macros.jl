@@ -44,7 +44,7 @@ This is the authoritative counterpart to [`StrictMode.@assert_noalloc`](@ref), w
 and only reports. A violation here throws a `StrictMode.StrictViolation`, so it is what a test suite
 or a CI gate should use. Each argument is evaluated once and the macro returns the call's value.
 
-Allocations on never-taken throw branches are ignored by default — see [`set_ignore_throw!`](@ref) —
+Allocations on never-taken throw branches are ignored by default — see [`StrictMode.set_ignore_throw!`](@ref) —
 as is a call whose only allocation is a recognized one-time-init barrier
 (see [`set_ignore_barrier!`](@ref)).
 

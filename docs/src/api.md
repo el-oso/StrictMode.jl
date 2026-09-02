@@ -177,11 +177,57 @@ verifier — and **gates**: a violation throws a [`StrictViolation`](@ref). Add 
 | — | `proof_audit(mod)` — proved, as data, formatted |
 | — | `test_registered()` |
 
-It also carries `ignore_barrier` /
-`set_ignore_barrier!` (whether a recognized one-time-init barrier is exempt from AllocCheck's
-all-paths proof), and `divergence_report` / `StrictDivergence`, which run both engines on one
+```@meta
+CurrentModule = StrictModeTest
+```
+
+### Proving macros
+
+```@docs
+@test_noalloc
+@test_noboxing
+@test_typestable
+@test_trim_compatible
+@test_strict
+@test_kernel
+```
+
+### Gating drivers
+
+```@docs
+test_signatures
+test_compiled
+test_registered
+```
+
+### Proofs as data
+
+```@docs
+proof_findings
+proof_audit
+AnalysisError
+```
+
+### Barriers, juliac patches, and engine divergence
+
+`ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier is exempt
+from AllocCheck's all-paths proof. `divergence_report` / `StrictDivergence` run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
 *categories*, and versions only — that you can send to the maintainers to fix the scan.
+
+```@docs
+ignore_barrier
+set_ignore_barrier!
+juliac_patches
+set_juliac_patches!
+divergence_report
+StrictDivergence
+save_divergence
+```
+
+```@meta
+CurrentModule = StrictMode
+```
 
 ## TypeContracts integration
 

@@ -1,12 +1,14 @@
 using Documenter
 using DocumenterVitepress
 using StrictMode
-# `StrictModeTest` is deliberately absent: every live `@example` block here uses StrictMode's own
-# value-free engine, which is what a reader gets from a plain `[deps] StrictMode`. The `@test_*`
-# surface is shown as non-executed `julia` blocks.
+using StrictModeTest
+# Both packages are documented here, since both are registered. The live `@example` blocks still
+# use StrictMode's own value-free engine — that is what a reader gets from a plain `[deps]
+# StrictMode` — and the `@test_*` surface stays in non-executed `julia` blocks, so nothing in these
+# pages depends on the proof tier running.
 
 makedocs(;
-    modules = [StrictMode],
+    modules = [StrictMode, StrictModeTest],
     sitename = "StrictMode.jl",
     authors = "el_oso",
     format = DocumenterVitepress.MarkdownVitepress(
