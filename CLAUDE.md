@@ -37,7 +37,12 @@ StrictMode/src/
                         spill_report/SpillReport, descend, _CACHE_BYTES
   static_ownership.jl — static_ownership_suggestions (module-sweep GKH-ownership advisory)
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
-  strict_function.jl  — @strict_function (load-time enforcement), @strict_exempt
+  strict_function.jl  — @strict_function (load-time enforcement; `signatures = [...]` verifies
+                        concrete instantiations a generic declaration cannot name, since such a
+                        declaration infers to `Any`), @strict_stable (per-specialization instead:
+                        body moves to a hidden `#f#inner`, the wrapper infers its return type via
+                        promote_op so a stable specialization folds the branch away entirely),
+                        @strict_exempt
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
                         StrictMode performance guarantees)
   registry.jl         — @strict_function registry, register_strict!, watch/unwatch, _demangle
