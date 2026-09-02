@@ -15,8 +15,13 @@ const STRICT_CONTRACTS = Set{Any}()
 
 """
     @strict_contract AbstractIface begin
+        method(::Self, x::T)::R => "what this method is for"
+        :optional
+        extra(::Self)::R
+    end
+
+    @strict_contract AbstractIface "what the interface is" begin
         method(::Self, x::T)::R
-        ...
     end
 
 Declare `AbstractIface` as a TypeContracts interface (through `TypeContracts.@contract`) and record
@@ -24,14 +29,33 @@ that it carries StrictMode performance guarantees too. Verify implementations wi
 [`@verify_strict`](@ref), which checks both the method surface and that those methods are
 type-stable and allocation-free.
 
-The body uses the same syntax as `TypeContracts.@contract` (`::Self`, `:optional`, and so on).
+The body uses the same syntax as `TypeContracts.@contract` (`::Self`, `:optional`, per-method
+`=> "description"`, and so on), and — as the second form shows — an interface description may be
+given as a string literal between the type and the block. Both fold into the type's `?`-visible
+documentation and into `TypeContracts.describe`.
 """
 macro strict_contract(T, block)
+    return _strict_contract(__source__, T, nothing, block)
+end
+
+# `@contract` has had a 3-argument form (type, description, block) for as long as the 2-argument one,
+# but this wrapper only ever forwarded 2, so `@strict_contract Iface "desc" begin … end` failed with a
+# MethodError on the macro itself. Per-method `=> "doc"` and `:optional` were never affected — they
+# live INSIDE the block, which is forwarded verbatim — so the gap was exactly the interface-level
+# description, i.e. the one piece of contract documentation that is not attached to a method.
+macro strict_contract(T, desc, block)
+    desc isa String ||
+        error("@strict_contract: interface description must be a string literal, got: $desc")
+    return _strict_contract(__source__, T, desc, block)
+end
+
+function _strict_contract(src, T, desc, block)
     # Plain block (no `quote`) so the forwarded `@contract` macrocall expands with its own
     # escaping intact — a wrapping `quote` would add a hygiene layer that corrupts it.
+    args = isnothing(desc) ? (T, block) : (T, desc, block)
     contract_call = Expr(
         :macrocall,
-        GlobalRef(TypeContracts, Symbol("@contract")), __source__, T, block
+        GlobalRef(TypeContracts, Symbol("@contract")), src, args...
     )
     register = Expr(:call, push!, STRICT_CONTRACTS, esc(T))
     # `esc` the forwarded macrocall so our expansion layer supplies the escape level the nested

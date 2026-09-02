@@ -63,6 +63,10 @@ distinguishes `@inline` from `@noinline`; `@strict`, `@explain`, `check`, `check
 | F33 | `kernel_report` intensity model is **blind to shuffle/permute ops** — a `pshufb`-dominated (shuffle/lookup) SIMD kernel is mischaracterized by its incidental arithmetic | ✅ fixed | `KernelReport` gains a `shuffle_ops` field (counts `shufflevector` + `@llvm.x86.*.pshuf/perm/palignr`); `_kr_bound` returns `:shuffle` when shuffles dominate at low intensity (`shuffle_ops≥2 && ≥fp_ops && eff<2.0`, guarding compute kernels); `show` prints `→ shuffle/port-bound: … WIDER vectors or FEWER shuffles — cache blocking does not apply` + a shuffle-op count line. Verified: the byte-ops/UTF-8 `pshufb` kernels now read `:shuffle` (was `:balanced`); an FMA kernel stays put. `kernel_report` counts FP and integer **arithmetic** ops + memory ops, but **not** `vpshufb`/`vpermd`/shuffle intrinsics — the actual work of the encoding/validation/transcoding kernel class. Repro (BlazingPorts `Utf8._check_special`, a UTF-8 validator = 3 `pshufb` nibble lookups + 5 bitwise ops, 2026-06-27): report says `FP intensity 0.0`, `integer ops:mem = 5:3 → "balanced: some data reuse; more register/cache blocking may help"` — but the 3 `pshufb` (the bottleneck) are uncounted, the "3 memory ops" are phantom (const-table materialization, no real traffic), and "cache blocking" is irrelevant for a **shuffle-port-bound** kernel. The conjectured "data-movement SIMD" blind spot. *Suggested fix:* add a **shuffle/permute op count** axis (scan IR for `shufflevector`/`@llvm.x86.*.pshuf*`/`*.perm*`) and a `:shuffle-bound` verdict; this is a large + growing kernel class (UTF-8 validate, base64, hex — see the BlazingPorts byte-ops cluster). (Minor: also reported "2 pointer params" on a `Vec`-only function — spurious.) |
 | F32 | `@assert_no_scalar_loops` (the F20 fix) was blind to a scalar loop that **coexists** with vectorized code in the same function | ✅ fixed | `scalar_fp_loops` short-circuited on `_vectorized(f, types) && return false` (`src/scheduling.jl`), so **any** function containing a `<N x …>` op was declared scalar-loop-free even with a real scalar hot loop present. Repro (JSON.jl stage-1 SIMD POC, `BlazingPorts` campaign 2026-06-27): kernel `_string_scan_simd` lowers to a SIMD main loop (4× `<64 x i8>`) **and** a scalar tail loop (`load i8` + `phi i64`, back-edge `L32→L40` in `code_llvm`) — yet `@assert_no_scalar_loops` **passed**. **Fix:** new `_loop_regions(ir)` splits the text IR into loop regions (back-edge = `br … label %X` with `X` defined at/before the branch); `scalar_fp_loops` now scans **per-loop** — a loop region with scalar FP/int hot ops but no `<N x …>` of its own is flagged, even if a *different* loop in the same function vectorized. Existing F20/F22 cases preserved (`scalar_sum`/`first_gt` → true, `vec_scale!` → false — no false positive on explicit-SIMD-no-remainder loops); the JSON kernel's tail now correctly flags. Refines F20. |
 | F38 | Cleanup + audit pass (readability, dead code, rule enforcement): (1) `kernel_report`'s vector-op regexes didn't account for LLVM fast-math flags (`fmul contract <8 x double>`), silently undercounting `fp_ops`/`mem_ops` for any `@simd`/`@fastmath` kernel; (2) fast-math itself was invisible — a kernel relying on FP reassociation/NaN-Inf assumptions looked identical to a strict-IEEE one; (3) `_DICT_ACCESSORS` (the `:owned` GKH-violation scan) missed `delete!`/`getkey`; (4) the `:new`-allocation rule (`mutable \|\| Array \|\| Memory \|\| Box`) missed escaping non-isbits *immutables* (`Some{Any}(x)`) — real PureFFT false negatives; (5) dead code (`golden.jl`'s unused `_GOLDEN_REAL`/`_GOLDEN_SUPPORTED`/`_TAG_SCALAR_F32`, an unused `@has_preference` import); (6) `@assert_owned`'s depth default baked `_FAST_ALLOC_DEPTH[]` at compile time instead of reading it live; (7) three copies of the same `names(mod)`-sweep loop (`check_compiled`, `static_ownership_suggestions(mod)`, `inline_suggestions(mod)`) had started to drift | ✅ fixed | (1)(2) `_FMF`/`_FMF1` fast-math-flag regex fragments; new `KernelReport.fastmath_ops` field + red `⚠` warning in `show` when nonzero — user-visible, not silently folded into `fp_ops`. (3) `:delete!, :getkey` added to `_DICT_ACCESSORS`. (4) `:new` rule broadened to `!Base.isbitstype(nt)` — corpus-measured (PureFFT+BlazingPorts, 569 specializations): fixed 2 false negatives (`apply_rfft!`/`pfft!`), net 1 new false positive on non-escaping stdlib wrappers (`Base.CodeUnits{UInt8,String}` — no escape analysis to tell it apart from a real escaping allocation); accepted as a documented tradeoff since over-flagging is the safe direction. (5) deleted (tag byte `6` for `_TAG_SCALAR_F64` kept as-is — persisted file format, not renumbered). (6) `_FAST_ALLOC_DEPTH[]` read live via an unescaped hygienic expression in the macro, and in the function default. (7) `_module_specializations(f!, mod; only, exempt)` in `registry.jl` — the one place that walks `mod`'s compiled specializations, called from all three sites. Also: `KernelReport` converted to `Base.@kwdef`; `_build_finding`/`_findings_fast`'s five identical mode-independent branches (`:owned`/`:inlined`/`:vectorized`/`:no_scalar_loops`/`:trimsafe`) merged into `_mode_independent_finding`; shared macro-call plumbing moved from `preferences.jl` to `macros.jl`; guarantee-macro boilerplate extracted into `_guarantee_expr`. Full suite green (374/374); regression tests in `test/round5_test.jl`, `test/owned_test.jl`, `test/noalloc_test.jl`, `test/typestable_test.jl`, `test/effects_test.jl`. |
+| F39 | **a non-isbits union PHI boxes even when the union fully splits** — `:fast` can't see it (the box leaves no `:new` in optimized IR, only a typed `PhiNode`, and `_scan_ci` never inspects PhiNodes), JET can't see it (union splitting is not dynamic dispatch), and AllocCheck sees it only at the signature that boxes | 🔴 open | PureBLAS `_trsm_right!`: one local assigned 3 types; **0 B with `Matrix`, 64 B/call with `SubArray`**, under a contract declaring allocation-free. Proposal: a `unionphi` signal in `_scan_ci` wired into `:typestable` (NOT `:noalloc`). GitHub #27 |
+| F40 | **`@verify_strict` verifies exactly the calls you enumerate** — coverage is the argument list someone thought to write, and a member exercised on a path it cannot reach is a vacuous check that reads as a pass | 🔴 open | Same bug: all 4 verified `trsm!` calls used `side='L'` (→ `_trsm_left!`), so the buggy `_trsm_right!` was **never executed**; and `side='R'` with a `Matrix` is also 0 B, so fixing the side alone wouldn't have caught it. Two independent gaps had to align. Proposal: types-only argument VARIANTS (no execution, no valid values needed) |
+| F41 | `@strict_contract` silently dropped the 3-argument `(type, description, block)` form that `TypeContracts.@contract` has always had | ✅ fixed 0.3.12 | `@strict_contract Iface "desc" begin … end` → `MethodError` on the macro itself. Per-method `=> "doc"` and `:optional` were never affected (they ride inside the block), which is why the feature looked half-present. 3-arg method + shared `_strict_contract` helper + regression testitem |
+| F42 | **placement rule**: a check with NO runtime component belongs in the consumer's `test/`, not in StrictMode — there is nothing for `_gate`/`checks_enabled()` to gate, and a StrictMode release lands on the critical path of the consumer's bug fix | 📋 note | Derived from designing a borrow checker for PureBLAS workspace aliasing and concluding it should NOT live here. Also records the general hazard that produced two defects in one week: **declared configuration that silently no-ops** |
 
 (Also shipped from a side suggestion: a `:trimsafe` guarantee / `@assert_trim_safe` + `explain_trim`,
 via `TypeContracts.trim_report` / `explain_trim_failure`, commit `362b791`.)
@@ -855,3 +859,151 @@ verdict change), and the top-level body comes from `code_typed(f, types)` with `
 reserved for callee `MethodInstance`s. End-to-end fast median **24 ms → 4.9 ms** (vs 2.9 ms before
 F35, 296 ms full): the accuracy win costs ~2 ms of direct-callee scanning, not 21 ms. Lesson: on
 big types, `hash` is the enemy — key identity, not structure (types are interned).
+
+---
+
+# F39–F42 — from the PureBLAS.jl contract campaign (2026-09-01/02)
+
+Source: bringing PureBLAS's LAPACK surface under `@strict_contract` (4 → 44 members). Fourteen
+routines were found breaking the `!` = allocation-free promise, plus two wrong-answer aliasing bugs
+and one latent out-of-bounds write. The four findings below are the ones about **StrictMode**, not
+about PureBLAS. Full write-ups: `kb/findings/gkh-borrow-design.md`,
+`kb/findings/workspace-self-alias-two-bugs.md`, `kb/findings/checks-that-answer-the-wrong-question.md`.
+
+## F39 — a non-isbits union PHI boxes even when the union fully splits
+
+**The bug that got through.** `PureBLAS._trsm_right!` assigned one local three types (the caller's
+`A`, and two workspace views), making the slot union-typed. `trsm!` is a `@strict_contract` member
+declared type-stable AND allocation-free, and `@verify_strict` asserts it. It still shipped:
+
+| argument | allocation |
+|---|---|
+| `Matrix` | 0 B |
+| `SubArray` | **64 B/call** |
+
+**"Union split ⇒ zero cost" is the wrong model, and that is the load-bearing correction.** A repro of
+the same shape fully union-splits — Pi nodes, concrete `:invoke`s, consumer inlined — and *still*
+allocates. The cost is not dispatch, it is the **union value representation**: a non-isbits union phi
+is a tagged pointer, so any member that normally lives unboxed must be heap-boxed to flow through it.
+
+- **isbits** members ride the unboxed payload — `Union{Int,Matrix}` with an `Int` flowing: 0 B.
+- **mutable** members are already pointers — `Union{Matrix,Vector}`: 0 B. *(Why `Matrix` was free.)*
+- **immutable structs holding heap refs must box** — `SubArray`, `Adjoint`, `Transpose`,
+  `Tuple{String,Int}`. *(Why `SubArray` cost 64 B.)*
+
+So the harmful/benign discriminator is a **representation** test, not `_splittable_union`'s
+member-count test (`src/effects.jl:28`). Confirmed separately that
+`Core.Compiler.InferenceParams().max_union_splitting == 4` matches that ≤4 heuristic — member count
+was never the gap.
+
+**Why each layer was blind.**
+
+- `:fast` — the box leaves no `:new` and no alloc `foreigncall` in optimized IR. Its only trace is a
+  `PhiNode` typed `Union{SubArray{…}, Matrix{Float64}}`, and `_scan_ci` (`src/effects.jl:299`) never
+  inspects `PhiNode`s, so `_alloc_signals` returns `boxing=false` at *both* signatures.
+- **JET can never catch this class** — union splitting is not dynamic dispatch; `report_opt` is silent
+  at both signatures.
+- **AllocCheck was right but unasked** — 0 sites at the `Matrix` signature (LLVM genuinely elides that
+  box, so past `:full` passes were *true* passes for the signatures checked), 1 site at the `SubArray`
+  signature. The `:full` gap was purely argument coverage.
+- `@assert_typestable` works from `Base.return_types` — the return type is concrete; the instability
+  is in a LOCAL.
+
+**Proposal (code and full rationale in GitHub issue #27).** A `unionphi` signal in `_scan_ci`, wired
+into `:typestable` in BOTH modes — including `_build_finding`'s `:full` branch (`src/check.jl:72`),
+since `:full` currently trusts return-type + JET and JET is proven blind here.
+
+```julia
+_box_on_entry(@nospecialize m) = !(m isa DataType) ? true :
+    (Base.allocatedinline(m) && !Base.isbitstype(m) && !Base.issingletontype(m))
+
+elseif st isa Core.PhiNode
+    if !dead[i]
+        T = ci.ssavaluetypes[i]
+        if T isa Union && !Base.isbitsunion(T) && any(_box_on_entry, Base.uniontypes(T))
+            unionphi = true
+        end
+    end
+```
+
+Two properties make `:typestable` the right home rather than `:noalloc`: the signal is
+**signature-independent** (the union comes from branch structure, so a prototype flags it at the
+`Matrix` signature too — it does not depend on anyone thinking to test `SubArray`), and the claim
+"this local is union-typed with a box-on-entry member" is true at every signature while "it allocates"
+is not (LLVM elides it for `Matrix`). Folding it into `:noalloc` would flag provably-0 B kernels and
+recreate #17.
+
+**Do NOT build**: a new guarantee macro (the class *is* a type instability, and contracts already
+declare `:typestable`); an unoptimized-IR `slottypes` sweep (strictly noisier — SROA legitimately
+erases benign union locals that a source-pattern scan would flag).
+
+**Coverage lever with zero new code**: `check_compiled(mod; guarantees=(:typestable,))`
+(`src/registry.jl:295`) visits every compiled specialization's own body, so with the signal in place
+it finds this without any call enumeration. Worth noting PureBLAS uses **none** of the non-enumerated
+surfaces — `@strict_function`, `check_all`, `check_compiled`, `audit`, `inline_suggestions`,
+`static_ownership_suggestions` are 0 uses each.
+
+## F40 — `@verify_strict` verifies exactly the calls you enumerate
+
+The same bug, from the other side. All four verified `trsm!` calls used `side='L'`, which routes to
+`_trsm_left!`. **The buggy function was never executed.** And fixing that alone would not have been
+enough: `side='R'` with a `Matrix` is *also* 0 B, so catching it needed `side='R'` **and** a
+`SubArray`. Two independent coverage gaps had to align, which is precisely why it survived a contract
+that genuinely was being checked.
+
+The general shape — **a check whose scope is narrower than its claim reads as a pass** — recurred four
+times in two days on this project, in different disguises (see the kb finding). It is not a StrictMode
+defect as such, but StrictMode is where the affordance could live.
+
+**Proposal: types-only argument variants.** Every StrictMode check is computed from `(f, types)`, so a
+variant needs **no execution and no semantically valid values** — only a transformed type tuple:
+
+```julia
+@verify_strict SIMDBackend begin
+    trsm!(bk, Bt, At; side='L', uplo='L', transA='N', diag='N', alpha=1.0) strided=(Bt, At)
+end
+```
+
+`strided=(Bt, At)` expands to one extra `check(checkfn, vtypes)` with those entries replaced by
+`typeof(view(x, axes(x)...))`. Opt-in per call: one extra inference + AllocCheck compile in `:full`,
+milliseconds in `:fast`. Ranked below F39 because with the `unionphi` signal this class is caught
+without variants; variants cover the broader "generic fallback selected only for wrapper types"
+family. PureBLAS has since added the manual equivalent (SubArray assertions over a LARGER parent, so
+`lda != nrows` — the shape its owned-workspace accessors actually produce).
+
+## F41 — `@strict_contract` dropped `@contract`'s 3-argument form  ✅ fixed in 0.3.12
+
+`macro strict_contract(T, block)` was 2-arg only, so `@strict_contract Iface "description" begin … end`
+failed with a `MethodError` on the macro itself, even though `TypeContracts.@contract` has both the
+2-arg and 3-arg `(type, description, block)` forms.
+
+The gap was exactly the **interface-level** description. Per-method `=> "doc"` and `:optional` were
+never affected — they live inside the block, forwarded verbatim — which is why the feature looked
+half-present rather than missing, and why it went unnoticed. Fixed by adding the 3-arg method routed
+through a shared `_strict_contract` helper, keeping the string-literal check so a non-literal
+description gives a clear error rather than a confusing macro `MethodError`. Regression testitem covers
+all four cases.
+
+## F42 — placement rule, and the "declared config that silently no-ops" hazard
+
+Designing a borrow checker for PureBLAS's workspace aliasing produced a rule worth keeping:
+
+> **A check with no runtime component belongs in the consumer's `test/`. A check that must be gated at
+> runtime belongs in StrictMode.**
+
+The borrow checker lost to a static lint on **coverage, not cost**: the second aliasing bug sits behind
+an AVX2-only predicate, so a runtime ledger on an AVX-512 dev box would watch a branch it can never
+execute. And since the lint ships no runtime code, there is nothing for `_gate`/`checks_enabled()` to
+gate — putting it in StrictMode would only place a package release on the critical path of a
+data-corruption fix.
+
+**The hazard worth generalising.** That lint declared callback edges to model closures the name-level
+graph cannot see, and its header claimed this "puts the callbacks in the graph instead of leaving them
+as an untracked hole". It did not: the callbacks are anonymous-function *assignments*, which the
+scanner never recorded as definitions, so the declared edges resolved to nothing and were **silently
+dropped**. A configuration entry that quietly does nothing is indistinguishable from one that works.
+
+The fix that generalises: **a declared entry that fails to resolve must be an ERROR, not a no-op.**
+Anywhere StrictMode takes a user-supplied name — `only=`, `exempt=`, `register_alloc_barrier!`,
+`register_strict!` — the same question applies: what happens when the name matches nothing? If the
+answer is "nothing happens", the feature can be inert for its whole existence while reading as active.
