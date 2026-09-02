@@ -38,7 +38,7 @@ export @assert_no_spill, spill_report, SpillReport
 export @assert_memsafe, memsafe_report, MemsafeReport
 export @assert_mca, mca_report, McaReport, mca_available
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
-export @strict, @kernel, @strict_function, @strict_exempt
+export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export @golden

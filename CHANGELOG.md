@@ -22,9 +22,10 @@ used to throw, so a real regression in any of those will no longer fail your bui
 `@assert_no_threadid_state`) still throws.
 
 Why: those five infer something they cannot see. The allocation scan reads typed IR, where an
-allocation LLVM will later elide is still present — measured ~28% false positives on a real
-consumer, every one of them 0 bytes. A check that guesses must not be able to abort a build. The
-ones that still throw *observe* compiled output rather than inferring about it.
+allocation LLVM will later elide is still present — measured 8.1% false positives over 120 compiled
+PureBLAS and PureIPM specializations, every one of them 0 bytes. A check that guesses must not be
+able to abort a build. The ones that still throw *observe* compiled output rather than inferring
+about it.
 
 ### To keep gating
 
@@ -85,16 +86,20 @@ If you match on the JSON `status` field, `"suspect"` no longer appears — match
 ### Fewer false allocation reports (issue #17)
 
 The allocation scan reads typed IR, where an allocation LLVM will later remove is still present, so
-a call measuring 0 bytes could be reported as allocating — 19 of 68 findings on one real consumer,
-every one of them 0 B. `Core.Compiler.EscapeAnalysis` on the same signature now gates both the
-`:new` and the `Core.memorynew` rules: `length(Vector{Float64}(undef, n))`, the issue's own
-reproducer, comes back clean.
+a call measuring 0 bytes could be reported as allocating. `Core.Compiler.EscapeAnalysis` on the same
+signature now gates both the `:new` and the `Core.memorynew` rules, and
+`length(Vector{Float64}(undef, n))` — the issue's own reproducer — comes back clean. Over eleven
+hand-built shapes it produces **zero false negatives**: everything that really allocates is still
+flagged.
 
-Measured over eleven shapes — escaping, runtime-size, 100k-element, `IOBuffer`, `Dict`,
-`push!`-grown, bare `Memory`, and two clean controls — this produces **zero false negatives**: every
-shape that really allocates is still flagged. One residual over-flag remains (`[n, n+1]`), which is
-the safe direction. Cost is ~0.7 ms cold per signature and ~0.08 ms warm, memoized and cleared with
-the findings cache.
+Set expectations honestly, though: on a corpus of 120 compiled PureBLAS and PureIPM specializations
+this removed **zero** findings, leaving the false-positive rate at 8.1% either way. 63 of those
+frames contain a non-isbits `:new` and the analysis proves the set fully non-escaping in none of
+them — it separates small self-contained kernels, not the interprocedural shapes library code is
+made of. It is therefore computed on demand, at the first non-isbits `:new` that nothing else has
+already flagged; eagerly it doubled a sweep (45.0s vs 21.7s over that corpus), lazily it costs 28.0s.
+The number that matters more for anyone tempted to gate on this scan is the other direction: it
+misses 23 of the 91 signatures AllocCheck flags, a recall of 75%.
 
 `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability guarantee, so
 any failure inside it falls back to "assume it escapes" — the previous behaviour. A Julia release
@@ -138,3 +143,34 @@ No callee size or opacity threshold is involved: a callee small enough to inline
 behind, and a product within the limit is split before optimization ends, so both safe cases are
 excluded by the IR itself. Verified against juliac's verifier on seven shapes, including three
 `Union{Nothing,Int}` arguments at one call site — which the verifier genuinely rejects.
+
+### Two ways to check a definition that names no concrete types
+
+A generic declaration cannot be checked as written: `return_types(pick, Tuple{Tuple,Int})` is `Any`,
+so verifying it directly would fail every generic function in Julia. `@strict_function` therefore
+skipped such definitions entirely, warning and moving on — which left the most common shape in a
+library with no guarantee at all. Two additions close that, answering different questions.
+
+- **`@strict_function signatures = [...]`** verifies the same contract against concrete
+  instantiations you name, at module load, exactly as a concrete declaration is verified:
+
+  ```julia
+  sigs = [(NTuple{3,Float64}, Int), (Tuple{Float64,String}, Int)]
+  @strict_function signatures = sigs pick(t::Tuple, i::Int) = t[i]
+  # the second entry infers Union{Float64,String}, so the module fails to load
+  ```
+
+  Supplying it also silences the abstract-declaration warning, since it answers what that warning
+  asks. The definition is untouched.
+
+- **`@strict_stable`** instead checks every specialization callers actually create, and costs
+  nothing for the ones that hold. The body moves into a hidden inner function and the public one
+  infers its return type; that inference is a compile-time constant, so a stable specialization
+  compiles to the same LLVM as the unannotated definition and still inlines into its caller, while
+  an unstable one throws as it is compiled.
+
+Reach for the first when the contract is a fixed set of signatures and you want the module to fail
+to load. Reach for the second for an entry point whose callers pick the types — accepting that the
+verdict then forms per specialization rather than at load, and that inference is not stable under an
+open world, so a definition that loaded clean can begin to throw. Only type stability can be
+delivered this way; allocation and vectorization are read from compiled output.
