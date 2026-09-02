@@ -86,6 +86,12 @@ in the future. With `using Revise`, `StrictMode.watch()` re-checks as you edit.
 - [API reference](https://el-oso.github.io/StrictMode.jl/dev/api) — every macro and function, including
   [the proof tier](https://el-oso.github.io/StrictMode.jl/dev/api#The-proof-tier-StrictModeTest)
 
+## Development
+
+StrictMode is developed with the assistance of [Claude Code](https://claude.com/claude-code).
+Generated code is reviewed before it lands, and the design decisions, the measurements behind them,
+and the released behaviour are the maintainer's own.
+
 ## License
 
 MIT.

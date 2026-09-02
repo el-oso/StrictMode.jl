@@ -62,6 +62,12 @@ sweep would pass by checking nothing at all.
 - [Guarantees](https://el-oso.github.io/StrictMode.jl/dev/guarantees) — what each check means
 - [Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) — sweeps and CI
 
+## Development
+
+StrictModeTest is developed with the assistance of [Claude Code](https://claude.com/claude-code).
+Generated code is reviewed before it lands, and the design decisions, the measurements behind them,
+and the released behaviour are the maintainer's own.
+
 ## License
 
 MIT.
