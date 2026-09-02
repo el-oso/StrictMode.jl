@@ -126,7 +126,11 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
     # instability — only a direct dynamic `:call` is. So typestable uses depth-0 (this-level) boxing;
     # noalloc/noboxing keep the full-depth signal (a callee's runtime alloc/dispatch IS a real cost).
     # Matches JET's optimization analysis (it flags dynamic dispatch, not resolved invokes).
-    local_boxing = (:typestable in guarantees) ? _alloc_signals(f, types; depth = 0).boxing : false
+    local_sig = (:typestable in guarantees) ? _alloc_signals(f, types; depth = 0) : nothing
+    local_boxing = isnothing(local_sig) ? false : local_sig.boxing
+    # F39: a union-typed local with a member that must be boxed to flow through it. Signature-
+    # independent, because the union comes from branch structure rather than from the argument types.
+    local_unionphi = isnothing(local_sig) ? false : local_sig.unionphi
     out = StrictFinding[]
     for g in guarantees
         shared = _compiled_output_finding(g, f, types, md, fn, sg)
@@ -137,9 +141,11 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch; the IR boxing signal catches
             # that shape, so this checks both.
-            fail = badret || local_boxing
+            fail = badret || local_boxing || local_unionphi
             reason = badret ? "return type is not concrete (inference)" :
-                "internal dynamic dispatch (concrete return; IR heuristic)"
+                local_boxing ? "internal dynamic dispatch (concrete return; IR heuristic)" :
+                "a union-typed local carries a member that must be boxed to flow through it " *
+                "(concrete return; IR heuristic)"
             push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0))
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)

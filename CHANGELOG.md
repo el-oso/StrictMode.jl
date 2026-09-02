@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.1
+
+### `CpuId.cachesize()` throws on aarch64 (Apple Silicon)
+
+It has two failure modes and the extension handled one. It RETURNS `()` on x86 parts CpuId cannot
+parse, which `_set_cache_bytes!` already guarded — but it THROWS on a host with no cache leaves at
+all, because CpuId's non-x86 `cpuid` is an all-zeros stub, so `hasleaf` is false for both
+`0x00000004` and `0x8000001d`. That is every aarch64 host. An exception escaping an extension
+`__init__` is fatal during precompilation, so any package depending on both StrictMode and CpuId was
+uninstallable on Apple Silicon.
+
+Handling moved to `StrictMode._init_cache_bytes(probe)`, which takes the probe as a function so x86
+CI can inject a throwing one — a real `cachesize()` only throws on hardware no runner here has.
+
+Note for 0.3 consumers: this fix is on the 0.4 line only. A package pinning `StrictMode = "0.3.10"`
+resolves `[0.3.10, 0.4.0)` and will not see it until it moves to 0.4.
+
+### `@strict_contract` accepts an interface description
+
+It forwarded only two arguments to `TypeContracts.@contract`, so the 3-argument
+`(type, description, block)` form failed with a `MethodError` on the macro itself. Per-method
+`=> "doc"` and `:optional` ride inside the block and were never affected, which is why the feature
+looked half-present rather than missing.
+
+### A union-typed local that boxes is now reported (F39)
+
+A non-isbits union phi is a tagged pointer, so a member that normally lives unboxed must be
+heap-boxed to flow through it. The box leaves no `:new` and no allocating `foreigncall` in optimized
+IR — its only trace is the phi's own type — so the scan was blind to it, JET is blind to it
+structurally (union splitting is not dynamic dispatch), and AllocCheck sees it only at whichever
+signature happens to box.
+
+Member count is not the discriminator; representation is. isbits members ride the unboxed payload and
+mutable members are already pointers, but an immutable struct holding heap references — `SubArray`,
+`Adjoint`, `Transpose` — is boxed on the way in.
+
+The signal rides `:typestable`, not `:noalloc`, and that is deliberate. "This local is union-typed
+with a box-on-entry member" is a property of the code as written; "it allocates" is LLVM's call and
+moves with inlining — the same fixture measures 16 B/call across a module boundary and 0 B once it
+inlines. Folding it into an allocation verdict would red kernels LLVM made free, which is issue #17
+again.
+
+Measured on 600 compiled stdlib specializations: it fires on **2** (0.3%), both genuine —
+`LinearAlgebra.wrap` builds a `Union{Adjoint, Transpose, Symmetric, Hermitian, Matrix}`, where the
+four immutable wrappers box and the `Matrix` does not.
+
 ## 0.4.0 — the tier split
 
 **Read this before upgrading.** The breaking change is *silent*: every `StrictMode` macro keeps its

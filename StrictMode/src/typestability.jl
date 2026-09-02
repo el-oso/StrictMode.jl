@@ -29,9 +29,26 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     # question it asks, so it gates. This one is an IR signal: a guarded `@warn` inside an
     # otherwise-clean numeric function reads as depth-0 boxing while JET's optimization analysis
     # passes it, and that shape must not be able to abort a build.
-    if _alloc_signals(f, types; depth = 0).boxing
+    sig = _alloc_signals(f, types; depth = 0)
+    if sig.boxing
         _fail(
             :typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)";
+            gates = false
+        )
+    end
+    # F39. A union-typed local whose members do not all ride unboxed is a type instability the
+    # return type cannot show — the return stays concrete while a value is boxed to flow through the
+    # phi. It reports rather than gates for the same reason the line above does: it is an IR signal.
+    #
+    # It belongs here and NOT in `:noalloc`. The claim "this local is union-typed with a
+    # box-on-entry member" holds at every signature, because the union comes from branch structure;
+    # "it allocates" does not, since LLVM elides the box for members that are already pointers. Wiring
+    # it into an allocation verdict would red provably-0 B kernels, which is issue #17 all over again.
+    if sig.unionphi
+        _fail(
+            :typestable, target,
+            "a union-typed local carries a member that must be boxed to flow through it — the " *
+                "return type is concrete, but a value is heap-boxed on the way into that union";
             gates = false
         )
     end

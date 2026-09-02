@@ -232,7 +232,8 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     seen = Base.IdSet{Any}()
     push!(seen, sig)
-    alloc, boxing, dictlookup, abscontainer, barrier = isempty(cts) ? (false, false, false, nothing, false) :
+    alloc, boxing, dictlookup, abscontainer, barrier, unionphi =
+        isempty(cts) ? (false, false, false, nothing, false, false) :
         _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
@@ -241,7 +242,7 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     end
     file = m === nothing ? "" : string(m.file)
     line = m === nothing ? 0 : Int(m.line)
-    return (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
+    return (; alloc, boxing, dictlookup, abscontainer, barrier, unionphi, file, line)
 end
 
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
@@ -357,11 +358,11 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, false, nothing, false)
+    sig in seen && return (false, false, false, nothing, false, false)
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -370,7 +371,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -378,11 +379,18 @@ function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.Id
     cts = try
         Base.code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, false, nothing, false)
+        return (false, false, false, nothing, false, false)
     end
-    isempty(cts) && return (false, false, false, nothing, false)
+    isempty(cts) && return (false, false, false, nothing, false, false)
     return _scan_ci(first(cts)[1], sig, depth, seen)
 end
+
+# Would a value of this type have to be boxed to flow through a union-typed slot? An isbits type
+# rides the union's inline payload and a mutable one is already a pointer; what costs is an
+# immutable struct that is not inline-allocatable as a bare value — it gets a heap box on entry.
+# Anything that is not a concrete `DataType` is assumed to box, which is the safe direction.
+_box_on_entry(@nospecialize m) = !(m isa DataType) ? true :
+    (Base.allocatedinline(m) && !Base.isbitstype(m) && !Base.issingletontype(m))
 
 function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     alloc = false
@@ -390,6 +398,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     barrier = false                   # a call reached a recognized one-time-init allocation barrier
+    unionphi = false                  # a union-typed phi whose members do not all ride unboxed (F39)
     # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
     # Computed on demand: the analysis costs about as much as the whole rest of the scan, and it can
     # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
@@ -410,6 +419,24 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             # method survives in optimized IR), so the method-name rules below never see it. This is
             # the exact PureBLAS `_symm_scr` shape — detect the primitive directly.
             occursin("eqtable", tgt) && (dictlookup = true)
+        elseif st isa Core.PhiNode
+            # F39. A non-isbits union phi is a TAGGED POINTER, so a member that normally lives
+            # unboxed has to be heap-boxed to flow through it. That box leaves no `:new` and no
+            # allocating `foreigncall` behind — its only trace in optimized IR is the phi's own type —
+            # so every other rule here is blind to it, and so is JET, because union splitting is not
+            # dynamic dispatch. Measured on `PureBLAS._trsm_right!`: 0 B through a `Matrix`, 64 B per
+            # call through a `SubArray`, under a contract declaring the method allocation-free.
+            #
+            # Member count is NOT the discriminator — a union that splits perfectly still boxes.
+            # Representation is: isbits members ride the unboxed payload, mutable members are already
+            # pointers, and an immutable struct holding heap references (`SubArray`, `Adjoint`,
+            # `Tuple{String,Int}`) must be boxed on the way in.
+            if !dead[i]
+                local PT = ci.ssavaluetypes[i]
+                if PT isa Union && !Base.isbitsunion(PT) && any(_box_on_entry, Base.uniontypes(PT))
+                    unionphi = true
+                end
+            end
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
             nt = st.args[1]
@@ -455,11 +482,12 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # more so: it is a top-level-only signal, never propagated from a callee
                         # (widening it to callees and to dict value types over-flags `IdDict`, #17).
                         if depth > 0 && (!alloc || !boxing || !dictlookup)
-                            a2, b2, d2, _, br2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            a2, b2, d2, _, br2, up2 = _signals_by_type(mi.specTypes, depth - 1, seen)
                             a2 && (alloc = true)
                             b2 && (boxing = true)
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
+                            up2 && (unionphi = true)
                         end
                     end
                 end
@@ -497,7 +525,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         end
     end
-    return (alloc, boxing, dictlookup, abscontainer, barrier)
+    return (alloc, boxing, dictlookup, abscontainer, barrier, unionphi)
 end
 
 # --- Base.infer_effects layer (cheap; basis for @assert_effects in Phase 3) -------------------
