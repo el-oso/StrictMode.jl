@@ -220,3 +220,16 @@ to load. Reach for the second for an entry point whose callers pick the types â€
 verdict then forms per specialization rather than at load, and that inference is not stable under an
 open world, so a definition that loaded clean can begin to throw. Only type stability can be
 delivered this way; allocation and vectorization are read from compiled output.
+
+### `@test_typestable` sees the union-phi box too (issue #27)
+
+0.4.1 taught StrictMode's scan to flag a union-typed local carrying a member that must be boxed to
+flow through it. The proof did not learn it at the same time, which left the reporting tier stricter
+than the gating one: `@assert_typestable` reported the class and `@test_typestable` waved it through,
+because it checked the return type and then asked JET â€” and union splitting is not dynamic dispatch,
+so JET is silent on it at every signature.
+
+`StrictModeTest` now consults the same signal after its own two layers pass. Both packages move to
+0.4.1 together, and StrictModeTest's `[compat]` on StrictMode is pinned to `"0.4.1"` rather than
+`"0.4"`: it reaches into StrictMode internals, so a loose bound would let a version pair resolve
+that was never tested together.

@@ -404,8 +404,18 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
         return StrictMode._mkfinding(md, fn, sg, :typestable, true, "return type $rt is not concrete (inference)", "", 0)
     end
     reports = _opt_reports(target, f, types)
-    return StrictMode._mkfinding(
-        md, fn, sg, :typestable, !isempty(reports),
+    isempty(reports) || return StrictMode._mkfinding(
+        md, fn, sg, :typestable, true,
         "internal instability / runtime dispatch ($(length(reports)) JET report(s))", "", 0
+    )
+    # F39. JET cannot see this class at all: a union-typed local that boxes a member on the way in is
+    # not dynamic dispatch, so `@report_opt` is silent at every signature. Without this the proof
+    # would be WEAKER than the scan it is supposed to settle — `@assert_typestable` catches it and
+    # `@test_typestable` would wave it through.
+    unionphi = StrictMode._alloc_signals(f, types; depth = 0).unionphi
+    return StrictMode._mkfinding(
+        md, fn, sg, :typestable, unionphi,
+        "a union-typed local carries a member that must be boxed to flow through it " *
+            "(concrete return, and invisible to JET)", "", 0
     )
 end

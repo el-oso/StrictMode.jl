@@ -158,6 +158,13 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## Key invariants
 
+- **`StrictMode` and `StrictModeTest` ship in lockstep.** StrictModeTest reaches into ~20 StrictMode
+  internals (`_alloc_signals`, `_compiled_output_finding`, `_mkfinding`, `_call_parts`, `_gate`, …),
+  so their versions move together and StrictModeTest's `[compat]` names the exact StrictMode minor
+  it was built against, not the loose `"0.4"`. A signal added to the scan must also be wired into the
+  matching proof, or the reporting tier ends up STRICTER than the gating one — which is what happened
+  when `unionphi` (F39) landed in `_typestable_fast` and JET could not see it.
+
 - **No Python**. No PythonCall/PyCall, no pip deps.
 - **No new main-Project.toml deps** for test-only packages — those go in `test/Project.toml`.
 - `_gate(checked, fallback)` in `preferences.jl` is the zero-cost expansion switch — every macro routes through it. The `checks_enabled` preference is a compile-time const baked at precompile; changing it requires a restart.

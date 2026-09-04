@@ -78,6 +78,7 @@ function _scan_signals(@nospecialize(f), @nospecialize(types::Tuple))
     labels = String[]
     s.alloc && push!(labels, "scan:alloc")
     s.boxing && push!(labels, "scan:boxing")
+    s.unionphi && push!(labels, "scan:unionphi")
     return labels
 end
 
