@@ -125,8 +125,13 @@ Load [Revise](https://github.com/timholy/Revise.jl) next to StrictMode and you g
 after each edit, the strict registry is re-checked and any violations print straight to the REPL.
 It's the closest thing to a compiler looking over your shoulder as you type.
 
+This is StrictMode on its own — `watch` runs the value-free scan and nothing else. It is a REPL loop
+in your package's own environment, where `StrictModeTest` is not a dependency and the proofs are
+not available; adding it would change nothing here anyway. Iterate against the scan, and let the
+test suite prove it.
+
 ```julia
-using Revise, StrictMode, StrictModeTest   # Revise = live loop; StrictModeTest = the proofs
+using Revise, StrictMode
 # … using MyPkg, which marks its kernels strict …
 StrictMode.watch()             # start the loop
 # edit a kernel so it boxes, save:
