@@ -77,8 +77,11 @@ GitHub issues are the source of truth for anything with a number; the notes here
   the suite and asserting itself as correct. The fixture now escapes its allocation, and the
   `@allocated(...) > 0` guard added alongside is what catches that class.
 
-- [ ] **#18 — inert preferences / broken consumer precompile.** Both parts are addressed;
-  what remains is confirming it on a real consumer.
+- [x] **#18 — inert preferences / broken consumer precompile.** CLOSED. Part 2 is fixed and
+  measured on a real consumer (see the 2026-08-30 note below). Part 1 is sidestepped rather than
+  solved, and that was accepted: a `[preferences.StrictMode]` block that *disables* checks in an
+  environment where StrictMode is not a direct dependency is still silently ignored. It fails in
+  the safe direction — checks stay on — and making that loud was considered and declined.
   Part 2 (enabling checks globally breaks PureBLAS's precompile) had two causes: the proof
   tier demanding AllocCheck/JET during the *consumer's own* precompile, which is now
   impossible since `StrictMode` has no backend at all; and a false positive on `trmv!`, which
@@ -111,10 +114,20 @@ GitHub issues are the source of truth for anything with a number; the notes here
   quiet: every `@assert_noalloc` would find its violations and say nothing. Observed directly —
   two `@test_logs` assertions in StrictModeTest's suite went empty the moment the patches were
   applied by default.
-  Shipped as `set_juliac_patches!`, defaulting OFF, for a process that does nothing but trim
-  verification. TrimCheck's own `validate_function` runs `init_validation` on a Distributed worker
-  for exactly this reason; the real fix is the same isolation, which needs the verification moved
-  to a subprocess (the shape `@assert_memsafe` already uses).
+  FIXED by isolation: `set_juliac_patches!(true)` now runs the patched verification in a child
+  process and reads back only the verdict, so the caller keeps its logging. TrimCheck's own
+  `validate_function` runs `init_validation` on a Distributed worker for the same reason. The child
+  reports whether the patches actually applied, and a verdict reached without them is refused
+  rather than returned — juliac ships no patch files on some builds (1.13.0-rc4), and a silent
+  fallback there would relabel a stock-Base verdict as a patched one.
+
+  Still OFF by default: the child costs a Julia start and a package load per verification.
+  Everything that can go wrong (a closure, a `@testitem` fixture the child cannot load, a spawn
+  failure, missing patch files) degrades to unpatched in-process verification with a warning
+  carrying the child's own stderr — never to a FAIL.
+
+  What remains, and it caps the payoff: on a Julia shipping no juliac patch files there is nothing
+  to isolate, so verification stays stock-Base and the false-FAIL class is still present there.
 
 - [x] **#13, #14, #15, #16 — AUDITED 2026-08-30; all four are addressed.**
   - **#13 — FIXED, and the issue's stated objection is measured wrong.** The issue argues no

@@ -162,3 +162,57 @@ end
         end
     end
 end
+
+@testitem "issue #19: patched trim verification does not silence the caller" begin
+    using StrictMode, StrictModeTest
+    old = StrictModeTest.juliac_patches()
+    try
+        StrictModeTest.set_juliac_patches!(true)
+
+        # A Base function is reachable in a fresh child, so this really takes the subprocess path.
+        # `nothing` means it declined to answer — the child failed, or ran without the patches.
+        r = StrictModeTest._trim_validate_subprocess(abs, Any[Int])
+        if isnothing(r)
+            # Declining is legitimate only when there is nothing to isolate — juliac ships no patch
+            # files on some builds (1.13.0-rc4). Any other cause is a real failure, so the child's
+            # own stderr goes into the message rather than leaving a bare `false`.
+            patch = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac-trim-base.jl")
+            @test !isfile(patch) ||
+                error(
+                "subprocess declined although $patch exists; child stderr:\n" *
+                    StrictModeTest._TRIM_CHILD_STDERR[]
+            )
+        else
+            @test r == (true, String[])
+        end
+
+        # The point of the whole change: applying juliac's patches stubs
+        # `Base.CoreLogging.current_logger_for_env`, so whichever process applies them stops
+        # emitting `@warn`/`@info`. That process must not be this one.
+        @test_logs (:warn, "still logging") @warn "still logging"
+        @test !isnothing(Base.CoreLogging.current_logger_for_env(Base.CoreLogging.Warn, "", Main))
+
+        # A function the child cannot resolve falls back to stock Base in-process — with a warning,
+        # never a FAIL, since "could not verify the way juliac does" is not "trim-unsafe".
+        local_only(x::Int) = x + 1
+        local_only(1)
+        passed, _ = @test_logs (:warn,) match_mode = :any StrictModeTest._trim_validate(local_only, (Int,))
+        @test passed
+    finally
+        StrictModeTest.set_juliac_patches!(old)
+    end
+end
+
+@testitem "issue #19: _apply_juliac_patches reports whether it applied" begin
+    using StrictModeTest
+    old = StrictModeTest.juliac_patches()
+    patched = StrictModeTest._JULIAC_PATCHED[]
+    try
+        # Off: nothing to apply, and it says so rather than claiming success.
+        StrictModeTest.set_juliac_patches!(false)
+        @test StrictModeTest._apply_juliac_patches() === false
+    finally
+        StrictModeTest.set_juliac_patches!(old)
+        StrictModeTest._JULIAC_PATCHED[] = patched
+    end
+end

@@ -97,6 +97,30 @@ one memo entry.
 It runs the same scan as `@assert_trim_compatible` under an older name. It warns once per session
 and will be removed.
 
+### Patched trim verification runs in a subprocess (#19)
+
+Applying juliac's `juliac-trim-base.jl` is what makes the verifier check the program juliac
+actually compiles, and it is the only way to avoid the false FAILs #19 reports — a ≥4-argument
+string interpolation on a reachable throw path is rejected without it. But that file stubs
+`Base.CoreLogging.current_logger_for_env`, so whichever process applies it stops emitting `@warn`
+and `@info` for good: the whole of StrictMode's reporting tier, silent. Observed directly — two
+`@test_logs` assertions went empty the moment the patches were applied by default.
+
+`set_juliac_patches!(true)` now runs the patched verification in a child process and reads back
+only the verdict, so the caller keeps its logging. This is the isolation TrimCheck's own
+`validate_function` gets from a Distributed worker, and the shape `@assert_memsafe` already uses.
+
+The child reports whether the patches were actually applied, and a verdict reached without them is
+refused rather than returned. juliac ships no patch files on some builds (1.13.0-rc4), and a silent
+fallback there would relabel a stock-Base verdict as a patched one — reinstating exactly the
+false-FAIL class this path exists to remove.
+
+Every failure degrades to unpatched in-process verification with a warning naming the cause, never
+to a FAIL: "could not verify the way juliac does" is not "trim-unsafe". A closure or a fixture
+defined inside a `@testitem` cannot be resolved in a fresh process, so those take that path.
+
+Still off by default — the child costs a Julia start and a package load per verification.
+
 ## 0.4.0 — the tier split
 
 **Read this before upgrading.** The breaking change is *silent*: every `StrictMode` macro keeps its

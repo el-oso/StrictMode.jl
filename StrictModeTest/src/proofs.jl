@@ -194,18 +194,27 @@ Set whether trim verification applies juliac's Base/stdlib patches first.
 
 `true` makes the verifier check the same program `juliac --trim=safe` compiles, which is the only
 way to avoid issue #19's false FAILs (a ≥4-argument string interpolation on a reachable throw path
-is rejected without them). **It also disables `@warn` and `@info` for the rest of the session** —
-`juliac-trim-base.jl` stubs `Base.CoreLogging.current_logger_for_env` — so every StrictMode
-reporting-tier verdict afterwards is silent. Only turn it on in a process that does nothing but
-trim verification.
+is rejected without them). The patched verification runs in a **subprocess**, so the caller's
+session keeps its logging: `juliac-trim-base.jl` stubs `Base.CoreLogging.current_logger_for_env`,
+which silences every `@warn` and `@info` in whatever process applies it, and that process is now a
+throwaway child.
 
-`false` (the default) leaves the session intact and accepts the false-FAIL class. The patches are
-applied at most once, on the first verification after enabling, and say so. Nothing un-applies them.
+The child costs a Julia start and a package load per verification, which is why this is off by
+default rather than always on. A signature whose function cannot be reached in a fresh process —
+a closure, or something defined in a module the child cannot load — falls back to unpatched
+in-process verification with a warning naming the reason.
+
+`false` (the default) verifies against stock Base in this process and accepts the false-FAIL class.
 """
 set_juliac_patches!(b::Bool) = (_JULIAC_PATCHES[] = b)
 
+# Returns whether the patches are actually in effect. The subprocess path reports this back, so a
+# verdict reached against STOCK Base is never presented as a patched one — the patch files are
+# absent on some Julia builds (1.13.0-rc4 ships none), and a silent fallback there would relabel
+# exactly the false FAILs issue #19 is about.
 function _apply_juliac_patches()
-    (_JULIAC_PATCHES[] && !_JULIAC_PATCHED[]) || return nothing
+    _JULIAC_PATCHES[] || return false
+    _JULIAC_PATCHED[] && return true             # already applied in this process
     _JULIAC_PATCHED[] = true                     # set first: a failed attempt must not retry per call
     dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
     files = ("juliac-trim-base.jl", "juliac-trim-stdlib.jl")
@@ -223,8 +232,9 @@ function _apply_juliac_patches()
         @warn "StrictModeTest: could not apply juliac's trim patches ($(sprint(showerror, err))). " *
             "Trim verification will run against STOCK Base, which rejects some code juliac builds " *
             "clean — a `@test_trim_compatible` failure may therefore be a false alarm."
+        return false
     end
-    return nothing
+    return true
 end
 
 # TrimCheck's public API (`@validate` / `validate_function`) only accepts a call-expr or a
@@ -249,8 +259,94 @@ function _typeinf_toplevel(Comp, methods::Vector{Any}, worlds::Vector{UInt})
     end
 end
 
+# --- issue #19: verify against juliac's patched Base without poisoning this session --------------
+# Applying `juliac-trim-base.jl` is what makes the verifier check the program juliac actually
+# compiles, but it stubs `Base.CoreLogging.current_logger_for_env`, so the process that applies it
+# stops emitting `@warn`/`@info` — the whole of StrictMode's reporting tier, silent. The isolation
+# is the fix: run the patched verification in a child and read back only the verdict. TrimCheck's
+# own `validate_function` runs `init_validation` on a Distributed worker for the same reason.
+#
+# `f` and the argument types travel by `Serialization`, which records a function by module and name
+# — so the child resolves them only if it can load the defining module. A closure, or a fixture
+# defined inside a `@testitem`, cannot survive that, which is why every failure path here falls back
+# to unpatched in-process verification rather than erroring: an unavailable subprocess must degrade
+# to the old answer, never to a FAIL.
+const _TRIM_CHILD_STDERR = Ref("")
+
+function _trim_subprocess_script(in_path::String, out_path::String, modname::Union{Nothing, Symbol})
+    load = isnothing(modname) ? "" : """
+        try
+            @eval using $modname
+        catch
+        end
+        """
+    # Only `StrictModeTest` is loaded by name. `Serialization` is reached through it rather than
+    # with a `using` of its own: under `Pkg.test()` the child runs in the temporary test
+    # environment, where Serialization is a dependency of this package but not a direct dependency
+    # of that environment — so `using Serialization` there is an ArgumentError.
+    return """
+    using StrictModeTest
+    $load
+    __f, __types = StrictModeTest.deserialize($(repr(in_path)))
+    StrictModeTest.set_juliac_patches!(true)
+    __patched = StrictModeTest._apply_juliac_patches()
+    __passed, __findings = StrictModeTest._trim_validate_here(__f, __types)
+    StrictModeTest.serialize($(repr(out_path)), (__patched, __passed, __findings))
+    """
+end
+
+function _trim_validate_subprocess(@nospecialize(f), argtypes::Vector)
+    in_path, in_io = mktemp()
+    out_path, _ = mktemp()
+    try
+        serialize(in_io, (f, argtypes))
+        close(in_io)
+        m = parentmodule(f)
+        modname = (m === Main || m === Base || m === Core) ? nothing : nameof(m)
+        script = _trim_subprocess_script(in_path, out_path, modname)
+        cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`
+        # The child's stderr is kept, not discarded: when it fails, that text is the only account of
+        # why, and a silent decline here reads identically to "juliac ships no patches on this
+        # build" — two very different situations for whoever is reading the fallback warning.
+        err = IOBuffer()
+        ok = success(pipeline(ignorestatus(cmd); stdout = devnull, stderr = err))
+        if !ok
+            _TRIM_CHILD_STDERR[] = String(take!(err))
+            return nothing
+        end
+        r = open(deserialize, out_path)
+        r isa Tuple{Bool, Bool, Vector{String}} || return nothing
+        patched, passed, findings = r
+        # The child ran, but without the patches — juliac ships none on some builds (1.13.0-rc4).
+        # That verdict came from stock Base, so it carries the false-FAIL class this whole path
+        # exists to remove, and must not be returned as though it did not.
+        patched || return nothing
+        return (passed, findings)
+    catch
+        return nothing
+    finally
+        rm(in_path; force = true)
+        rm(out_path; force = true)
+    end
+end
+
 function _trim_validate(@nospecialize(f), @nospecialize(types))
     argtypes = (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
+    if _JULIAC_PATCHES[]
+        r = _trim_validate_subprocess(f, argtypes)
+        isnothing(r) || return r
+        @warn "StrictModeTest: could not run the patched trim verification in a subprocess for " *
+            "`$(nameof(f))` (a closure, a function the child cannot load, or a build shipping no " *
+            "juliac patches). Falling back to STOCK Base in this process, which rejects some code " *
+            "juliac builds clean — a failure here may be a false alarm (issue #19)." *
+            (isempty(_TRIM_CHILD_STDERR[]) ? "" : "\n  child stderr: " * first(_TRIM_CHILD_STDERR[], 500)) maxlog = 3
+    end
+    return _trim_validate_here(f, argtypes)
+end
+
+# The verification itself, in whatever process calls it. The child runs this with the patches
+# applied; the parent runs it against stock Base.
+function _trim_validate_here(@nospecialize(f), argtypes::Vector)
     rts = Base.return_types(f, Tuple{argtypes...})
     if length(rts) != 1
         return (
@@ -261,7 +357,6 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
         )
     end
     ret_type = rts[1]
-    _apply_juliac_patches()
     Comp = TrimCheck.Compiler
     try
         TrimCheck.hook_verify_typeinf_trim() do

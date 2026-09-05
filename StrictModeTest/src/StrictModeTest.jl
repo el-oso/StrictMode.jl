@@ -38,6 +38,7 @@ using JET
 using TrimCheck
 using TypeContracts   # its TrimDiagnostics parses the trim verifier's output
 using PrecompileTools: @setup_workload, @compile_workload
+using Serialization: serialize, deserialize   # issue #19: patched trim verification runs in a child
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible
 export @test_strict, @test_kernel
