@@ -58,7 +58,7 @@ your package.
          while you iterate                   in your tests
 ```
 
-Two macros, different use. One lightweight for interactive develop one rigorous for testing.
+Two macros, two uses: one light enough to keep on while you edit, one strict enough to fail a test.
 
 ```julia
 @assert_noalloc kernel!(C, A, B)     # StrictMode: the scan — warns
