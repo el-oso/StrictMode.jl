@@ -37,6 +37,25 @@ allocate inside a hot loop — and it won't say a word. Each of these stays invi
 hunting for it with a profiler. StrictMode lets you ask for those properties out loud: declare what
 you expect, and hear about it right away when something breaks the promise.
 
+## Two packages
+
+This is the first thing to know, because it decides which macro you write.
+
+**[StrictMode](guarantees.md)** goes in your `Project.toml`. It analyzes with a value-free engine
+built on Base's own inference, needs no analysis backend, and **reports** — its `@assert_*` macros
+warn where they are guessing, so nothing here can break your build.
+
+**[StrictModeTest](proof_tier.md)** goes in your `test/Project.toml`. It brings AllocCheck, JET and
+TrimCheck, and **gates** — its `@test_*` macros and `test_*` drivers throw, so a violation fails
+CI. Your users never install those backends just to use your package.
+
+Which one runs is decided by the macro you wrote, when it expands. There is no mode to switch.
+
+```julia
+@assert_noalloc kernel!(C, A, B)     # StrictMode: the scan — warns
+@test_noalloc   kernel!(C, A, B)     # StrictModeTest: AllocCheck's proof — throws
+```
+
 > StrictMode grew out of a JuliaCon 2024 talk, *"Why do we need a stricter Julia mode?"* The traps
 > that motivated it turned up while tuning a SIMD FFT, where indexing a tuple with a runtime value
 > quietly boxed and cost a measured **135× slowdown** — the kind of thing you only ever find by
@@ -45,8 +64,8 @@ you expect, and hear about it right away when something breaks the promise.
 ```julia
 using StrictMode
 
-@assert_noalloc    sum(rand(100))         # fails if the call allocates
-@assert_typestable muladd(2.0, 3.0, 1.0)  # fails on type instability
+@assert_noalloc    sum(rand(100))         # warns if the call looks like it allocates
+@assert_typestable muladd(2.0, 3.0, 1.0)  # throws on an inconcrete return type
 @strict            dot(u, v)              # all per-call guarantees at once
 ```
 

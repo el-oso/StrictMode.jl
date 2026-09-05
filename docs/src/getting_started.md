@@ -100,10 +100,35 @@ weighted(a, b) = 0.5a + 0.5b
 y = @strict weighted(2.0, 4.0)
 ```
 
+## The other half: proving it
+
+Everything above **reports**. `@assert_noalloc` reads typed IR, where an allocation LLVM later
+deletes is still visible, so it can only tell you something looks wrong — and a check that guesses
+must not be able to break your build.
+
+When you want the same property to actually fail CI, reach for the macro from `StrictModeTest`. It
+is the same question asked of AllocCheck instead, and it throws:
+
+```julia
+using StrictMode, StrictModeTest
+
+@assert_noalloc square_sum((1.0, 2.0, 3.0))   # warns — the scan's opinion
+@test_noalloc   square_sum((1.0, 2.0, 3.0))   # throws — AllocCheck's proof, over every path
+```
+
+This pairing is the thing to carry away from this page. Which engine runs is decided by **the macro
+you wrote**, when it expands — there is no mode to switch, no environment variable, and nothing
+ambient choosing for you. `@assert_*` while you iterate, `@test_*` in the test suite, and
+[`proofs_loaded()`](@ref) if you ever need to ask which tier a session is in.
+
+See [StrictModeTest](proof_tier.md) for the whole proving surface.
+
 ## When a guarantee fails
 
-When a guarantee doesn't hold, you get a [`StrictViolation`](@ref) (in the default `:error` mode)
-that names the call and explains what went wrong. Indexing a heterogeneous tuple with a runtime
+When a guarantee doesn't hold you get a [`StrictViolation`](@ref) naming the call and explaining
+what went wrong — for the guarantees that gate. There is no mode to set: whether a given guarantee
+throws or warns is fixed per guarantee, and the ones that infer rather than observe only warn (see
+[Guarantees](guarantees.md)). Indexing a heterogeneous tuple with a runtime
 value is a good example: it produces a `Union` return type and boxes behind your back. Here that
 silence becomes an error:
 
