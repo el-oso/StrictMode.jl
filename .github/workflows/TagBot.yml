@@ -10,7 +10,7 @@ on:
         default: "3"
 
 permissions:
-  actions: read
+  actions: write          # dispatch the docs build for a tag TagBot just created
   checks: read
   contents: write
   deployments: read
@@ -28,17 +28,13 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
     runs-on: ubuntu-latest
     steps:
-      # Both packages live in subfolders, so each needs its own step.
-      #
-      # `ssh:` is set but the DOCUMENTER_KEY secret does not exist yet, so TagBot pushes tags with
-      # GITHUB_TOKEN. GitHub does not start workflows for anything that token pushes, so a new tag
-      # will NOT trigger Documentation.yml's `tags: ['*']` build — run that workflow by hand after a
-      # release, or add a deploy key here and the trigger starts working with no further change.
+      # Both packages live in subfolders, so each needs its own step. `ssh:` is left unset: tags are
+      # pushed with GITHUB_TOKEN, and the docs build is dispatched explicitly below rather than
+      # relying on that push to trigger it.
       - name: Tag StrictMode
         uses: JuliaRegistries/TagBot@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ssh: ${{ secrets.DOCUMENTER_KEY }}
           subdir: StrictMode
           # The v0.3.x tags predate the move into a subfolder and carry no prefix; keeping
           # NO_PREFIX continues that series, so `rev = "v0.3.3"`-style pins stay meaningful.
@@ -48,7 +44,35 @@ jobs:
         uses: JuliaRegistries/TagBot@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ssh: ${{ secrets.DOCUMENTER_KEY }}
           subdir: StrictModeTest
           # No prefix override: this one takes TagBot's automatic `StrictModeTest-v{VERSION}`, so it
           # cannot collide with StrictMode's unprefixed tag at the same version.
+
+      # A tag pushed with GITHUB_TOKEN does not start a workflow — GitHub suppresses that to prevent
+      # recursion — so Documentation.yml never sees the release and the published site stays on
+      # whatever version was last tagged by hand. `workflow_dispatch` is the documented exception to
+      # that rule and always creates a run, so ask for the build explicitly.
+      #
+      # Only StrictMode's unprefixed tags are dispatched: Documenter reads the version from the ref,
+      # and `StrictModeTest-v0.4.0` is not a version it can parse. Both packages are documented on
+      # the one site, so StrictMode's tag is the one that should publish it.
+      #
+      # Redeploying a version already published is harmless — it writes the same folder again — so
+      # this does not try to detect whether the tag was created by THIS run.
+
+      # Checkout is only for reading the tag list; the TagBot steps above need no working copy.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Publish docs for the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(git tag --list 'v*' --sort=-creatordate | head -n 1)
+          if [ -z "$tag" ]; then
+            echo "No v* tag found; nothing to publish."
+            exit 0
+          fi
+          echo "Dispatching Documentation.yml for $tag"
+          gh workflow run Documentation.yml --ref "$tag" --repo "$GITHUB_REPOSITORY"
