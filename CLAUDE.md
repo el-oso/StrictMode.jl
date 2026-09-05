@@ -105,8 +105,11 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         and raises ONCE, so one unanalyzable method leaves the rest evaluated
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
                         which is why it lives here)
-  test/               — its own suite: the proof primitives StrictMode cannot test, because
-                        StrictMode does not depend on those packages at all
+  test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is
+                        the runner, fixtures.jl the shared @testmodule, then one file per concern
+                        (proofs/macros/drivers/trim/typestable/divergence). Covers the proof
+                        primitives StrictMode cannot test, because StrictMode does not depend on
+                        those packages at all
 StrictMode/test/
   runtests.jl         — TestItemRunner @run_package_tests; `using StrictModeTest` supplies the proofs
   Project.toml        — no [preferences.StrictMode] block: checks_enabled defaults to true, and this

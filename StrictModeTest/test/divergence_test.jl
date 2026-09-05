@@ -1,4 +1,5 @@
-@testset "divergence_report — flags scan-vs-proof disagreement, IP-free" begin
+@testitem "divergence_report — flags scan-vs-proof disagreement, IP-free" begin
+    using StrictMode, StrictModeTest
 
     # Internal dynamic dispatch through an abstract eltype, but with a concrete (`Float64`) return,
     # buried two non-inlined hops below the entry point — deeper than `_FAST_ALLOC_DEPTH[]` (2)
@@ -72,7 +73,8 @@
     end
 end
 
-@testset "divergence is about FLAGGED-ness, not the status symbol" begin
+@testitem "divergence is about FLAGGED-ness, not the status symbol" begin
+    using StrictMode, StrictModeTest
     # Regression guard: this map must be built from `_failed`, the one predicate that decides what
     # counts. A hand-written status comparison here recorded findings as "the scan did not flag", so
     # a call BOTH engines flag reported as a divergence — the exact inverse of what
