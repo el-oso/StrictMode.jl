@@ -1,8 +1,8 @@
 # StrictModeTest — the proofs
 
 `StrictMode` reads inferred types and typed IR. It needs no other package, which is what makes it
-safe to depend on from `src` — and why it **reports**: typed IR still shows allocations LLVM later
-deletes, so it can only say something looks wrong.
+safe to depend on from `src` — and why its allocation verdicts **report**: typed IR still shows
+allocations LLVM later deletes, so there they can only say something looks wrong.
 
 `StrictModeTest` is the other half. It goes in your **test** environment, brings AllocCheck, JET and
 TrimCheck, and **throws** — a violation fails the build. Keeping them apart means your users never
@@ -40,7 +40,7 @@ CurrentModule = StrictModeTest
 StrictModeTest.StrictModeTest
 ```
 
-### Proving macros
+## Proving macros
 
 ```@docs
 @test_noalloc

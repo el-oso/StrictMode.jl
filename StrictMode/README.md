@@ -21,10 +21,11 @@ using StrictMode
 
 @assert_noalloc    sum(rand(100))
 @assert_typestable muladd(2.0, 3.0, 1.0)
-@strict            dot(u, v)             # every per-call guarantee at once; returns the value
+@strict            dot(u, v)             # type-stable, owned scratch, allocation-free
 ```
 
-A definition can carry its contract too, and then a violation stops the module loading:
+A definition can carry its contract too, and then a type-stability violation stops the module
+loading:
 
 ```julia
 @strict_function dot3(a::NTuple{3,Float64}, b::NTuple{3,Float64}) =
@@ -44,10 +45,10 @@ StrictMode only helps with the language-level things you need to take into accou
 ## So, what does it do?
 
 StrictMode analyzes with some fast heuristics built on Base's own inference, so it needs no analysis
-backend and nothing here can break your build. Its allocation verdicts read typed IR, where an
-allocation LLVM later removes is still visible, so they report. These heuristics are not perfect:
-when they are unsure there is a problem they only emit a warning, and when they are sure they throw
-an error.
+backend. Its allocation verdicts read typed IR, where an allocation LLVM later removes is still
+visible, so those warn rather than fail your build. Which checks warn and which throw is fixed per
+guarantee, not judged case by case: the allocation and trim checks warn, and the ones that read the
+compiled output — type stability, `@assert_owned`, `@assert_vectorized` and the rest — throw.
 
 The real proofs live in **[StrictModeTest](../StrictModeTest)**, which you add to your test
 environment. It uses heavier backends like AllocCheck, JET and TrimCheck.
@@ -84,13 +85,13 @@ in the future. With `using Revise`, `StrictMode.watch()` re-checks as you edit.
 - [Cookbook](https://el-oso.github.io/StrictMode.jl/dev/cookbook) — the trap → macro mapping
 - [Automating checks](https://el-oso.github.io/StrictMode.jl/dev/automating) — `audit`, `watch`, module sweeps
 - [API reference](https://el-oso.github.io/StrictMode.jl/dev/api) — every macro and function, including
-  [the proof tier](https://el-oso.github.io/StrictMode.jl/dev/api#The-proof-tier-StrictModeTest)
+  [the proof tier](https://el-oso.github.io/StrictMode.jl/dev/proof_tier)
 
 ## Development
 
 StrictMode is developed with the assistance of [Claude Code](https://claude.com/claude-code).
 Generated code is reviewed before it lands, and the design decisions, the measurements behind them,
-and the released behaviour are the maintainer's own.
+and the released behavior are the maintainer's own.
 
 ## License
 

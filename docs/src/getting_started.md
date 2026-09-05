@@ -7,8 +7,9 @@ using Pkg
 Pkg.add("StrictMode")
 ```
 
-`StrictMode` reads inferred types and typed IR. It needs no other package, is fast enough to run at
-load time, and it **reports** — it warns, it never breaks your build.
+`StrictMode` reads inferred types and typed IR. It needs no other package and is fast enough to run
+at load time. Where it is **guessing** — the allocation and trim checks — it warns instead of
+failing your build. Where it reads the compiled output and knows, it throws.
 
 The proofs are heavy, so they live in a second package you add to your test environment only:
 [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl),
@@ -98,8 +99,9 @@ y = @strict weighted(2.0, 4.0)
 
 ## The other half: proving it
 
-Everything above **reports**. `@assert_noalloc` reads typed IR, which still shows allocations LLVM
-later deletes — so it can only say something looks wrong, and a guess must not break your build.
+The allocation check above **reports**. `@assert_noalloc` reads typed IR, which still shows
+allocations LLVM later deletes — so it can only say something looks wrong, and a guess must not
+break your build.
 
 To make the same property fail CI, use the `StrictModeTest` macro. Same question, asked of
 AllocCheck, and it throws:
@@ -144,7 +146,7 @@ component(s, i) = s[i]
 @assert_typestable component(state, rand(1:3))
 # ERROR: StrictViolation (@typestable): guarantee not satisfied
 #   target:  component(state, rand(1:3))
-#   reason:  return type is not concretely inferrable: ... Union{Int64, Float64, String}
+#   reason:  return type is not concrete or isbits-union (inference): Union{Float64, Int64, String}
 ```
 
 ## Zero cost when disabled
@@ -159,19 +161,16 @@ nothing to pay for:
 
 ## What the checks cost when enabled
 
-JET and AllocCheck are heavyweight, so it's worth knowing where the time actually goes:
+`StrictMode` has no analysis backend and no warmup step. It reads Base's own inference and nothing
+else, so it costs about what any small package costs to load. With checks off the macros are bare
+calls, so a shipped application pays nothing at all.
 
-- With checks off, in production: nothing at all. The macros are bare calls and the analyzers are
-  never compiled in, so precompiling StrictMode stays quick (around 3 s here).
-- With checks on, in dev or CI: a warmup step built into StrictMode runs once when the package is
-  first compiled (10–20 s during install). After that the first `@explain` or `@strict` in a
-  session takes about 0.1 s, and a warm check on a small kernel runs in single-digit to tens of
-  milliseconds.
+`StrictModeTest` is where the heavy machinery is: it warms JET and AllocCheck at its own precompile.
+That is why it belongs in `test/` and not in your `Project.toml`.
 
-The shape of it is: you pay once at precompile, not on every call, and an edit-and-rerun loop with
-Revise keeps the image warm between edits. The warm cost does grow with the size of the call graph,
-so these checks are happiest pointed at small hot kernels, which is exactly where the silent traps
-live anyway.
+The per-check cost is in the table below. It grows with the size of the call graph, so these checks
+are happiest pointed at small hot kernels — which is where the silent traps live anyway. With
+Revise, an edit-and-rerun loop keeps the image warm between edits.
 
 ### The two analysis engines
 
@@ -185,7 +184,8 @@ preference to set and no ambient state to read — the macro name selects the en
 
 `StrictMode`'s engine is a quick triage over all the properties at once, type stability as well as
 allocation and boxing, built entirely on Base's own inference. Because of that it needs no
-AllocCheck or JET and runs roughly 10× cheaper per method than the proof (see `bench/timetax.jl`).
+AllocCheck or JET and runs roughly 10× cheaper per method than the proof
+(see `StrictMode/bench/timetax.jl`).
 It catches the usual suspects, like explicit heap allocation, boxing, dynamic dispatch, and
 non-concrete returns. Being a scan of typed IR it can miss or over-flag something that AllocCheck's
 LLVM-level proof would get exactly right — which is exactly why it reports rather than gating. The

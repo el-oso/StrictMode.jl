@@ -14,7 +14,7 @@ nothing for a shipped application.
 | **Boxing, but buffers are fine** (must not box, may allocate scratch space) | runtime dispatch / `jl_get_nth_field_checked` only | `@assert_noboxing` (allows typed allocations) |
 | **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc` |
 | **A call that should inline but doesn't** (cost-model misfire, `@noinline`) | call overhead, lost cross-call optimization | `@assert_inlined` (best-effort) |
-| **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (combines the per-call guarantees) |
+| **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (type stability, owned scratch, allocation-freedom) |
 | **A `@generated`/SIMD kernel that must vectorize and stay on the fast path** | silent ~100× regression from boxing, or vectorization silently disabled — easy to miss during exploration | `@kernel` (bundles `@assert_noalloc` + `@assert_vectorized` + `@assert_typestable`; makes the boxing check reflexive) |
 | **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (return type checked at load; allocation re-proved by `test_registered()`) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
@@ -37,7 +37,8 @@ fail CI, write the `@test_*` macro of the same name from
 ```julia
 @strict_function axpy(a::Float64, x::NTuple{4,Float64}, y::NTuple{4,Float64}) =
     a .* x .+ y
-# A later edit that makes this allocate or go unstable now breaks module load — not a profiler run.
+# A later edit that makes this return a non-concrete type now breaks module load; one that makes
+# it allocate warns here and fails under test_registered().
 ```
 
 ### Empirical fallback when static analysis can't prove it
@@ -143,15 +144,15 @@ StrictMode provides [`@golden`](@ref) for this pattern. Record mode writes a typ
 compare mode does exact or ULP-tolerant comparison and throws `StrictViolation` on mismatch:
 
 ```julia
-@golden norm_check my_norm(x)            # exact comparison (deterministic kernel)
-@golden dot_check my_dot(a, b) ulps=2    # tolerance-aware (SIMD reduction)
+@golden "norm_check" my_norm(x)            # exact comparison (deterministic kernel)
+@golden "dot_check" my_dot(a, b) ulps=2    # tolerance-aware (SIMD reduction)
 ```
 
 For problems with multiple valid outputs (e.g. "any shortest round-trip decimal"), pass a
 `validator=` predicate instead of a golden file:
 
 ```julia
-@golden ryu_check ryu_format(x) validator = s -> parse(Float64, s) === x
+@golden "ryu_check" ryu_format(x) validator = s -> parse(Float64, s) === x
 ```
 
 ### Guarantee the kernel, smoke-test the entry
@@ -217,3 +218,71 @@ end
 ```
 
 If the spread exceeds 2×, the "typical case" number may not represent production load.
+
+## `@unroll` — force the fast path
+
+```@setup cookbook
+using StrictMode
+```
+
+The assert macros tell you after the fact that you boxed. [`@unroll`](@ref) keeps it from
+happening in the first place. When a loop's trip count is known at macro time, it unrolls the loop
+completely and swaps the loop variable for a literal on each pass, so `t[i]` becomes
+`t[1]; t[2]; …`. A heterogeneous tuple then gets indexed type-stably, with no boxing. Unlike the
+asserts it isn't gated behind the checks flag; the unrolling always happens.
+
+This is the trap that started the whole project. The naive loop is type-stable, returning a
+concrete `Float64`, and it still allocates, because the runtime tuple index boxes. It's the exact
+thing `@assert_noalloc` is there to catch:
+
+```@example cookbook
+htup = (1, 2.0, 3.0f0)
+
+function naive(t)
+    acc = 0.0
+    for i in 1:3
+        acc += t[i]          # runtime index over a heterogeneous tuple → boxes
+    end
+    return acc
+end
+
+function unrolled(t)
+    acc = 0.0
+    @unroll for i in 1:3
+        acc += t[i]          # → acc += t[1]; t[2]; t[3]   (literal, no boxing)
+    end
+    return acc
+end
+
+(naive(htup), unrolled(htup), @allocated(naive(htup)), @allocated(unrolled(htup)))
+```
+
+Both give the same answer, but only the naive loop allocates, so the guarantee passes for the
+unrolled version and not the other:
+
+```@example cookbook
+@assert_noalloc unrolled(htup)
+```
+
+```julia
+@assert_noalloc naive(htup)
+# ┌ Warning: StrictViolation (@noalloc): guarantee not satisfied
+# │   reason:  allocates / boxes (value-free IR scan)
+#   (@test_noalloc names the site: Allocating runtime call to "jl_get_nth_field_checked")
+```
+
+When the size lives only in a type, you can lift it into the type domain with [`staticval`](@ref)
+and splice the literal into `@unroll` from a `@generated` method:
+
+```julia
+@generated function tuple_sum(t::Tuple)
+    N = length(t.parameters)
+    quote
+        acc = zero(promote_type(t.parameters...))
+        @unroll for i in 1:$N        # $N is a literal inside the generated body
+            acc += t[i]
+        end
+        acc
+    end
+end
+```

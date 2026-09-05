@@ -2,7 +2,7 @@
 # boundary may read the payload. This is the Julia form of the Linux kernel's `__user` pointer
 # annotation (`include/linux/compiler_types.h`): `Untrusted{T}` is the distinct type that
 # `address_space(__user)` creates, the `getproperty` override is `noderef`, `unsafe_trust` is the
-# `__force` cast, and the scan below is the checker that reports where the cast appears outside a
+# `__force` cast, and the scan below is the checker that finds the cast used outside a
 # boundary.
 #
 # Dispatch does most of the work with no checker at all: `Untrusted{Vector{UInt8}}` matches no
@@ -28,7 +28,7 @@ of quietly succeeding, and `u.x` throws. The one deliberate way out is [`unsafe_
 Wrapping is free: `Untrusted{T}` has the same layout as `T` and allocates nothing. Wrapping twice
 returns the same value, so an edge that wraps defensively costs nothing.
 
-[`@assert_trusted`](@ref) reports any function outside a boundary that reads the payload.
+[`@assert_trusted`](@ref) fails on any function outside a boundary that reads the payload.
 
 ```julia
 function parse_header(u::Untrusted{Vector{UInt8}})
@@ -58,7 +58,7 @@ Return the wrapped payload, unvalidated.
 This is the one deliberate way out of [`Untrusted`](@ref), and it is `unsafe_` for the usual
 reason: nothing has checked the value. Call it inside a function registered with
 [`trust_boundary!`](@ref) — that is where [`@assert_trusted`](@ref) permits it. Anywhere else, the
-check reports the call site.
+check fails on the call site.
 """
 @noinline unsafe_trust(u::Untrusted) = getfield(u, :x)
 
@@ -142,7 +142,7 @@ Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f`
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
 The read is any call to `getfield`, `getproperty`, or [`unsafe_trust`](@ref) on an argument
-inference types as `<:Untrusted`. Registering `f` with [`trust_boundary!`](@ref) permits all of
+that inference types as `<:Untrusted`. Registering `f` with [`trust_boundary!`](@ref) permits all of
 them in that one method.
 
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized

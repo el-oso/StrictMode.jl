@@ -4,10 +4,10 @@
 # 0-alloc, no runtime lookup. See `staticval`/`@unroll` (idioms.jl) for the dispatch-form fix.
 #
 # Deliberately advisory, never a hard failure — see GitHub issue #7 for the full rationale: unlike
-# `:noalloc` (AllocCheck) or `:trimsafe` (juliac --trim), "should this be static ownership" has no
-# sound backend, and the pattern's own sanctioned fallback (a Dict for the rare-type tail) would
-# trip a hard gate on the very form it prescribes. Findings are status `:info`, exactly like
-# `inline_suggestions` — never counted by `nfailures`.
+# `:noalloc` (which StrictModeTest can prove) or `:trim_compatible`, "should this be static
+# ownership" has no sound backend, and the pattern's own sanctioned fallback (a Dict for the
+# rare-type tail) would trip a hard gate on the very form it prescribes. Findings are status
+# `:info`, exactly like `inline_suggestions` — never counted by `nfailures`.
 #
 # Detection scans **unoptimized** typed IR (`code_typed(...; optimize=false)`), not the optimized
 # form the rest of `effects.jl` uses: a `Type{T}`-keyed lookup on a concrete, statically-known `T`
@@ -150,8 +150,7 @@ backend): a legitimately dynamic dict (a config table, a value-keyed memo cache,
 sanctioned rare-type fallback) will pass through unflagged by design elsewhere in this scan, but a
 false positive here costs a glance, not a broken build.
 
-No backend required (Base inference only), so this runs in `:fast` mode too — unlike
-`:noalloc`/`:typestable`, it isn't mode-sensitive.
+No backend required (Base inference only), so this needs nothing beyond StrictMode itself.
 
 ```julia
 static_ownership_suggestions(my_accessor, (Type{Float64},))

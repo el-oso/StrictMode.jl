@@ -54,7 +54,7 @@ Clean, correct, fast. Now ask StrictMode to verify the fast-path properties:
 @strict dot3(a, b)
 ```
 
-All three guarantees pass (type-stable, allocation-free). Good.
+All three guarantees pass (type-stable, owned scratch, allocation-free). Good.
 
 ## Lock it in
 
@@ -113,10 +113,11 @@ load, the allocation half in the test suite.
 ## Diagnosing a failure
 
 When a guarantee fails on more complex code, `@explain` gives the full picture without
-throwing — it runs all the checks and explains each verdict:
+throwing — it gathers the type-stability and allocation signals and explains what
+`@assert_typestable` and `@assert_noalloc` would conclude:
 
 ```julia
-@explain dot3_candidate(a, b)
+@explain dot3_locked(a, b)
 ```
 
 The report collects `@code_warntype`, the inferred return type, and the typed-IR allocation and
@@ -151,7 +152,8 @@ end
 
 mixed = (1, 2.0, 3.0f0)   # Tuple{Int64, Float64, Float32}
 @strict weighted_sum((1.0, 0.5, 0.25), mixed)
-# ERROR: StrictViolation — type instability / boxing
+# ┌ Warning: StrictViolation (@typestable): internal dynamic dispatch (concrete return; IR heuristic)
+# ┌ Warning: StrictViolation (@noalloc): allocates / boxes (value-free IR scan)
 ```
 
 `@explain weighted_sum((1.0, 0.5, 0.25), mixed)` will point at `values[i]` as the source.
@@ -170,7 +172,7 @@ end
 @strict weighted_sum((1.0, 0.5, 0.25), mixed)   # passes
 ```
 
-See [Avoiding boxing](api.md#avoiding-boxing) in the API reference for `@unroll` and
+See [`@unroll` — force the fast path](cookbook.md) in the Cookbook for `@unroll` and
 `staticval`.
 
 ## CI enforcement

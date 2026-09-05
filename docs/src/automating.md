@@ -73,7 +73,8 @@ and verifies one definition at a time.
 ### Auto-check at load
 
 When a strict-marked module loads and checks are enabled, StrictMode runs its checks on its own and
-a violation stops the module from loading. This is the "checks happen as you compile" behavior. It's
+a non-concrete return type stops the module from loading. This is the "checks happen as you
+compile" behavior. It's
 gated on `checks_enabled`, so a production build pays nothing, and the analyzers are already warmed.
 
 ### Re-check on demand

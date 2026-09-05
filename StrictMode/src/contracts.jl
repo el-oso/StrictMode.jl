@@ -27,7 +27,7 @@ const STRICT_CONTRACTS = Set{Any}()
 Declare `AbstractIface` as a TypeContracts interface (through `TypeContracts.@contract`) and record
 that it carries StrictMode performance guarantees too. Verify implementations with
 [`@verify_strict`](@ref), which checks both the method surface and that those methods are
-type-stable and allocation-free.
+type-stable (throws) and, as warnings, owned-scratch-clean and allocation-free.
 
 The body uses the same syntax as `TypeContracts.@contract` (`::Self`, `:optional`, per-method
 `=> "description"`, and so on), and — as the second form shows — an interface description may be
@@ -71,7 +71,8 @@ end
 
 Verify that type `T` implements its [`@strict_contract`](@ref) interface (through
 `TypeContracts.@verify`), and that each representative call you list satisfies StrictMode's per-call
-guarantees ([`@strict`](@ref), so type-stable and non-allocating). The calls run against the
+guarantees ([`@strict`](@ref): type stability throws, owned scratch and allocation warn). The calls
+run against the
 instances and values you bind in the surrounding scope.
 
 The interface check always runs. The per-call performance checks gate themselves on the

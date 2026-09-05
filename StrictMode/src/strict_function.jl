@@ -93,9 +93,10 @@ end
     @strict_function f(x::T, ...) = ...
 
 Define `f` and, when checks are enabled, verify its contract at precompile time against the
-declared argument types. The return type must be concrete and the body must not allocate, with
-runtime dispatch and boxing counting as allocations. Break the contract and the enclosing module
-won't load, rather than being discovered at the next profiling session.
+declared argument types. A non-concrete return type stops the enclosing module loading. An
+allocation only WARNS here: this runs at the annotated package's own precompile, where the proof
+is not loadable, so a structural guess must not stop a consumer installing — `test_registered()`
+re-proves the same signature from `test/` and does fail.
 
 Only concrete signatures are verified this way. A declaration whose argument types are abstract
 infers to `Any` and so cannot be checked directly — list the instantiations that matter with

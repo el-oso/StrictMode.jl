@@ -65,7 +65,7 @@ the non-inlined callees to help). See also [`kernel_report`](@ref) for *why-not-
 diagnostics when a loop vectorizes but is still slow.
 
 ```julia
-@inbounds @simd_dot(a, b)          # vectorizes → ok
+@assert_vectorized simd_dot(a, b)   # ok: emits <N x double>
 @assert_vectorized branchy(a)      # throws: a data-dependent branch blocked vectorization
 ```
 """
@@ -510,7 +510,7 @@ FP ops — so a `false` result does not guarantee every loop vectorized. Disable
 to the bare call.
 
 ```julia
-@assert_no_scalar_loops apply_T!(Y, T, W)   # throws if TᵀW is a scalar triple-loop
+@assert_no_scalar_loops apply_T!(Y, T, W)   # warns if TᵀW is a scalar triple-loop
 ```
 """
 macro assert_no_scalar_loops(args...)
@@ -668,7 +668,7 @@ end
 """
     register_report(f, types) -> RegisterReport
 
-Read the native assembly for `f` specialised on `types` and count zmm vector register usage
+Read the native assembly for `f` specialized on `types` and count zmm vector register usage
 and stack spills. Complements [`kernel_report`](@ref): where `kernel_report` works from LLVM IR
 (pre-register-allocation), `register_report` reads post-allocation `code_native`, so it captures
 whether the kernel is register-saturated (all 32 zmm in use) and how many spills occurred.
@@ -711,7 +711,7 @@ end
 """
     spill_report(f, types) -> SpillReport
 
-Read the native assembly for `f` specialised on `types` and count vector-register spill/reload
+Read the native assembly for `f` specialized on `types` and count vector-register spill/reload
 events (LLVM's `# ... Spill`/`# ... Reload` annotations on a line naming an xmm/ymm/zmm register).
 A nonzero count means the kernel needs more live vector registers than the target ISA provides —
 the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/

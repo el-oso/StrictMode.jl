@@ -28,7 +28,7 @@ Pkg.add("StrictModeTest")    # the proofs, in your test/ environment
 
 StrictMode is developed with the assistance of [Claude Code](https://claude.com/claude-code).
 Generated code is reviewed before it lands, and the design decisions, the measurements behind them,
-and the released behaviour are the maintainer's own.
+and the released behavior are the maintainer's own.
 
 ## License
 

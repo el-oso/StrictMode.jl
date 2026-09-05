@@ -231,3 +231,47 @@ warn once per session; use the names above.
 
 When a real `juliac --trim` run fails, [`explain_trim`](@ref) translates the verifier output into
 source-mapped hints with per-site suggestions.
+
+## `@explain` — tell me *why*
+
+```@setup diagnostics
+using StrictMode
+```
+
+When a guarantee reports a violation, you usually want to know why, not just that it did.
+[`@explain`](@ref) gathers `@code_warntype`, the inferred return type, and the typed-IR allocation
+and dispatch signals into a single [`StrictReport`](@ref), and unlike the asserts it never throws.
+It just returns the report, which the REPL prints for you; assign it if you want to poke at the
+individual fields.
+
+It runs the value-free engine, so its allocation verdict is the same structural guess
+`@assert_noalloc` makes — for the proved answer, `StrictModeTest`'s `@test_noalloc` /
+`@test_typestable` analyze the same call.
+
+A clean call comes back all green:
+
+```@example diagnostics
+clean(a, b) = 0.5a + 0.5b
+
+@explain clean(2.0, 4.0)
+```
+
+And the runtime tuple-index trap gets pulled apart: the non-concrete return type, the boxing
+allocation site, the `@code_warntype` body, and a verdict for each guarantee:
+
+```julia
+state = (1, 2.0, "three")
+component(s, i) = s[i]
+
+@explain component(state, rand(1:3))
+# StrictMode @explain — component(state, rand(1:3))
+#
+#   Return type:    Union{Float64, Int64, String}  ✗ not concrete
+#   Local dispatch: ✗ this function's own IR dispatches dynamically
+#   IR signals:     ✗ boxing / dynamic dispatch
+#                   at ./tuple.jl:33
+#
+#   Verdict:
+#     ✗ @assert_typestable would fail
+#     ✗ @assert_noalloc would fail
+```

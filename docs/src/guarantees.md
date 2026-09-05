@@ -1,10 +1,14 @@
 # Guarantees
 
 Each guarantee pins a *necessary* property of a hot kernel — allocation-free, type-stable,
-vectorized — and fails loudly the moment an edit breaks it. Once an assert is in place it fences
+vectorized — and tells you the moment an edit breaks it. Once an assert is in place it fences
 every future edit: refactor freely and get told the instant something crosses the line. They keep
-you on the fast path; they don't promise you've found the *fastest* path. For diagnostics that
-address the gap between "passing" and "fast," see [Performance diagnostics](performance_diagnostics.md).
+you on the fast path; they don't promise you've found the *fastest* path.
+
+This page is the guarantees themselves. Two neighbors cover what surrounds them: `@explain` and
+the rest of the tools for the gap between "passing" and "fast" are in
+[Performance diagnostics](performance_diagnostics.md), and the techniques for fixing what a
+guarantee flags — `@unroll` among them — are in the [Cookbook](cookbook.md).
 
 ## Key concepts
 
@@ -23,8 +27,9 @@ If these terms are unfamiliar, a quick definition before diving in:
   Happens when the compiler can't pin down the type of a receiver, and adds a function-table lookup
   to every call.
 
-Allocation-free code avoids all three. Type-stable code avoids instability (and usually boxing
-too). The macros below enforce each property separately so you can be precise about what you need.
+Allocation-free code avoids boxing and dispatch. Type-stable code avoids instability (and
+usually boxing too). The macros below enforce each property separately so you can be precise about
+what you need.
 See [Key Concepts](concepts.md) for worked examples of each.
 
 Every example here is live. The docs are built with checks enabled, so the analysis runs as the
@@ -143,8 +148,8 @@ test_registered()                    # …or re-prove everything that was declar
 ```
 
 Guarantees whose check *observes* compiled output rather than inferring about it — `:typestable`'s
-return-type layer, `:memsafe`, `:vectorized`, `:no_spill`, `:inlined`, `:owned` — throw from
-StrictMode directly. The ones that guess (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
+return-type layer, `:memsafe`, `:vectorized`, `:no_spill`, `:inlined`, `:owned`, `:trusted` —
+throw from StrictMode directly. The ones that guess (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
 `:trimsafe`/`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and the
 union-typed local) report.
 
@@ -243,7 +248,7 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 @assert_typestable component(state, rand(1:3))
 # ERROR: StrictViolation (@typestable): guarantee not satisfied
 #   target:  component(state, rand(1:3))
-#   reason:  return type is not concretely inferrable: …
+#   reason:  return type is not concrete or isbits-union (inference): Union{Float64, Int64, String}
 ```
 
 ## Keyword calls and explicit signatures
@@ -270,7 +275,7 @@ type widens to non-concrete. Supply the real specialization explicitly:
 tmp(::Type{T}, n) where {T} = Vector{T}(undef, n)
 
 @assert_typestable tmp(Float64, 4)
-# ERROR: StrictViolation (@typestable): return type is not concrete: Vector  (DataType widened `T`)
+# ERROR: StrictViolation (@typestable): return type is not concrete or isbits-union (inference): Vector
 
 @assert_typestable tmp(Float64, 4) types=(Type{Float64}, Int)   # ok: real call-site specialization
 ```
@@ -325,24 +330,35 @@ reflecty(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection →
 # │   Base.indexed_iterate(…)::Any  [myfile.jl:NN]; … (+N more call site(s))
 ```
 
-As an engine guarantee it is `:trim_compatible` (with `:trimsafe` the static subset):
+As an engine guarantee it is `:trim_compatible` (`:trimsafe` is the deprecated spelling of the
+same scan):
 
 ```julia
 findings(reflecty, (Int,); guarantees = (:trim_compatible,))     # report
 test_signatures([(reflecty, (Int,))]; guarantees = (:trim_compatible,))   # prove (StrictModeTest)
 ```
 
-## `@strict` — every per-call guarantee at once
+## `@strict` — the guarantees a hot path wants, together
 
-[`@strict`](@ref) checks type stability first, since that's usually what's behind a surprise
-allocation, and then allocation-freedom. It returns the call's value, so you can drop it in around
-an expression you already have:
+[`@strict`](@ref) checks three things in order: type stability first, since that's usually what's
+behind a surprise allocation; then owned scratch; then allocation-freedom. It returns the call's
+value, so you can drop it in around an expression you already have:
 
 ```@example guide
 saxpy(a, x, y) = a .* x .+ y
 
 result = @strict saxpy(2.0, (1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 ```
+
+Only the type-stability check throws. The other two warn: the owned-scratch rule flags *any*
+runtime dictionary accessor, which is right when you name it yourself and too broad applied to
+every call site, and the allocation check is a heuristic scan. Use [`@assert_owned`](@ref) for a
+hard gate on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of
+allocation-freedom.
+
+`@assert_noboxing` is not part of it. Its rule is a strict subset of `@assert_noalloc`'s — every
+violation it finds, the allocation check already reports — so including both would say the same
+thing twice.
 
 ## `@strict_function` — verify a definition at load time
 
@@ -355,15 +371,19 @@ at precompile or module-load time. A clean one loads like any other:
 scaled(2.0, (1.0, 2.0, 3.0))
 ```
 
-If some later edit makes it allocate or go unstable, the module won't load at all — the violation
-is caught immediately rather than at the next profiling session:
+A later edit that makes the return type non-concrete stops the module loading. An allocation only
+**warns** here: this runs at your own package's precompile, where the proof is not loadable, and a
+guess must not stop a consumer installing. `test_registered()` re-proves the same signature from
+`test/`, and that one fails.
 
 ```julia
-@strict_function leaky(n::Int) = sum(collect(1:n))   # collect allocates
-# ERROR: StrictViolation (@strict_function): call provably allocates …
-
 @strict_function maybe(x::Int) = x > 0 ? x : 1.0     # Union{Int,Float64} return
 # ERROR: StrictViolation (@strict_function): return type is not concrete …
+
+@strict_function leaky(n::Int) = sum(collect(1:n))   # collect allocates
+# ┌ Warning: @strict_function leaky(Int64): allocates / boxes (value-free IR scan — a structural
+# │ guess, not a proof; add StrictModeTest to your test environment and call test_registered()
+# └ to resolve it)
 ```
 
 ### When the declaration names no concrete types
@@ -443,7 +463,7 @@ xs = [1.5, 2.5, 3.5]
 end
 ```
 
-An implementation that has the right methods but allocates is turned down:
+An implementation that has the right methods but allocates is reported:
 
 ```julia
 struct SlowMetric end
@@ -452,70 +472,7 @@ score(::SlowMetric, xs::AbstractVector{<:Real}) = sum(collect(xs))   # allocates
 @verify_strict SlowMetric begin
     score(SlowMetric(), [1.0, 2.0, 3.0])
 end
-# ERROR: StrictViolation (@noalloc): guarantee not satisfied …
-```
-
-## `@unroll` — force the fast path
-
-The assert macros tell you after the fact that you boxed. [`@unroll`](@ref) keeps it from
-happening in the first place. When a loop's trip count is known at macro time, it unrolls the loop
-completely and swaps the loop variable for a literal on each pass, so `t[i]` becomes
-`t[1]; t[2]; …`. A heterogeneous tuple then gets indexed type-stably, with no boxing. Unlike the
-asserts it isn't gated behind the checks flag; the unrolling always happens.
-
-This is the trap that started the whole project. The naive loop is type-stable, returning a
-concrete `Float64`, and it still allocates, because the runtime tuple index boxes. It's the exact
-thing `@assert_noalloc` is there to catch:
-
-```@example guide
-htup = (1, 2.0, 3.0f0)
-
-function naive(t)
-    acc = 0.0
-    for i in 1:3
-        acc += t[i]          # runtime index over a heterogeneous tuple → boxes
-    end
-    return acc
-end
-
-function unrolled(t)
-    acc = 0.0
-    @unroll for i in 1:3
-        acc += t[i]          # → acc += t[1]; t[2]; t[3]   (literal, no boxing)
-    end
-    return acc
-end
-
-(naive(htup), unrolled(htup), @allocated(naive(htup)), @allocated(unrolled(htup)))
-```
-
-Both give the same answer, but only the naive loop allocates, so the guarantee passes for the
-unrolled version and not the other:
-
-```@example guide
-@assert_noalloc unrolled(htup)
-```
-
-```julia
-@assert_noalloc naive(htup)
-# ERROR: StrictViolation (@noalloc): call provably allocates …
-#   [2] Allocating runtime call to "jl_get_nth_field_checked" in ./tuple.jl:33
-```
-
-When the size lives only in a type, you can lift it into the type domain with [`staticval`](@ref)
-and splice the literal into `@unroll` from a `@generated` method:
-
-```julia
-@generated function tuple_sum(t::Tuple)
-    N = length(t.parameters)
-    quote
-        acc = zero(promote_type(t.parameters...))
-        @unroll for i in 1:$N        # $N is a literal inside the generated body
-            acc += t[i]
-        end
-        acc
-    end
-end
+# ┌ Warning: StrictViolation (@noalloc): guarantee not satisfied …
 ```
 
 ## Static ownership — one method per type, not a lookup table
@@ -553,7 +510,7 @@ Julia cannot skip the dict probe: the type is an ordinary value at runtime, and 
 contents are not knowable while compiling. Base works the method way — `one(::Type{T})` was never
 going to be a dict.
 
-The name comes from the Linux-kernel principle that *data has a clear static owner, reached through
+The idea comes from the Linux-kernel principle that *data has a clear static owner, reached through
 that owner — never a global registry*. In real code the owned value is usually a workspace:
 
 ```julia
@@ -604,7 +561,8 @@ identified as hot and want a permanent regression guard on. Reach for
 yet know where the pattern shows up and want a package-wide pass that can't break anything while
 you look — the same relationship [`inline_suggestions`](@ref) has to `@assert_inlined`.
 
-**Why `@assert_owned` isn't swept in by default.** Keep it scoped to calls you assert by hand;
+**Why `@assert_owned` isn't swept in by default.** `@strict f(x)` does run it on the call you
+named, but as a warning. Keep the *throwing* form scoped to calls you assert by hand;
 don't add it to `register_strict!`'s guarantee list or a `@strict module`'s default set. The
 pattern's own sanctioned escape hatch — a `Dict` fallback for a rare-type tail that doesn't earn
 its own `const` — is *also* a runtime dict lookup, and a broad sweep would flag (and, since
@@ -782,14 +740,83 @@ report's `unguarded` field, so a clean verdict over a partially covered call doe
 clean verdict over a fully covered one; [`@assert_memsafe`](@ref) rejects the ones the caller can
 materialize outright.
 
+## `@assert_trusted` — check data from outside before using it
+
+Data from a socket, a file, `ARGS`, or a device has not been checked by anyone yet. The bug this
+prevents is a length field read *from* that data and then used as an index.
+
+Wrap it where it arrives, in [`Untrusted`](@ref):
+
+```julia
+frame = Untrusted(read(sock, n))
+```
+
+That changes its type, so nothing written for `Vector{UInt8}` accepts it. `sum(frame)` and
+`frame[1]` are `MethodError`s; `frame.x` throws. You can pass it around, and that is all. Wrapping
+costs nothing — same layout as the payload, no allocation — and the type is still there in a
+shipped build.
+
+One function opens it, and its name says so:
+
+```julia
+function parse_header(u::Untrusted{Vector{UInt8}})
+    b = unsafe_trust(u)                          # the one way through
+    length(b) >= 4 || throw(ArgumentError("short header"))
+    n = Int(b[1]) | Int(b[2]) << 8
+    n <= length(b) - 2 || throw(ArgumentError("length field exceeds buffer"))
+    return Header(n, copy(@view b[3:2+n]))       # copy: the caller still owns that buffer
+end
+trust_boundary!(parse_header)                    # this function is allowed to do that
+```
+
+[`@assert_trusted`](@ref) then fails on any *other* function that reads a payload:
+
+```julia
+peek(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
+
+@assert_trusted peek(frame)
+# ERROR: StrictViolation (@trusted): guarantee not satisfied
+#   reason:  reads an `Untrusted` payload outside a trust boundary (unsafe_trust) — 1 site(s)
+```
+
+One wrapper, one door, one place to get it right:
+
+```text
+   read(sock, n)          parse_header              the rest of your code
+        │                       │                            │
+  ┌─────┴──────┐      ┌─────────┴──────────┐       ┌─────────┴─────────┐
+  │  Untrusted │ ───▶ │ unsafe_trust, then │ ────▶ │   plain values    │
+  │  {Vector}  │      │  check, then copy  │       │  safe to index    │
+  └────────────┘      └────────────────────┘       └───────────────────┘
+   nothing works        the one function            everything works
+   on it out here       allowed to open it
+```
+
+Two limits, both real.
+
+**The type does most of the work on its own.** An `Untrusted{T}` matches no method written for `T`,
+in a shipped build as much as in tests. The check is only there for the deliberate way out:
+`unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
+that.
+
+**Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header` really
+checks what it read, or that it copied instead of handing back the caller's buffer. Both matter,
+and both are on you.
+
+The idea is the Linux kernel's `__user` annotation: a pointer from userspace gets its own type,
+`copy_from_user` is the crossing that checks and copies, and `__force` is the one cast around it.
+The kernel's marker disappears unless a separate checker is run, which is why it so often isn't.
+`Untrusted` is a real type, so it holds either way.
+
 ## Promise scope
 
 StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**
 (where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), **register pressure**
 (via [`@assert_no_spill`](@ref)), **static-binary (`juliac --trim`) compatibility** (via
-[`@assert_trim_compatible`](@ref)), and, deterministically rather than flakily, **out-of-bounds
-array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is explicitly out
-of scope: **bit-reproducibility**.
+[`@assert_trim_compatible`](@ref)), **owned scratch** (via [`@assert_owned`](@ref)), **validated
+foreign data** (via [`@assert_trusted`](@ref)), and, deterministically rather than flakily,
+**out-of-bounds array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is
+explicitly out of scope: **bit-reproducibility**.
 
 SIMD reduction order is LLVM-codegen-defined. The lane-combine order for a vector reduction —
 for example, how four `<4 x double>` lanes are collapsed to a scalar — is chosen by the compiler
@@ -801,43 +828,3 @@ If you are testing numerical correctness against a reference, use tolerance-awar
 SIMD reductions. Exact matching remains valid for deterministic operations (non-reduction
 arithmetic, memory copies, index computations). See also [the golden-harness methodology](cookbook.md)
 in the cookbook for a practical port workflow.
-
-## `@explain` — tell me *why*
-
-When a guarantee reports a violation, you usually want to know why, not just that it did.
-[`@explain`](@ref) gathers `@code_warntype`, the inferred return type, and the typed-IR allocation
-and dispatch signals into a single [`StrictReport`](@ref), and unlike the asserts it never throws.
-It just returns the report, which the REPL prints for you; assign it if you want to poke at the
-individual fields.
-
-It runs the value-free engine, so its allocation verdict is the same structural guess
-`@assert_noalloc` makes — for the proved answer, `StrictModeTest`'s `@test_noalloc` /
-`@test_typestable` analyze the same call.
-
-A clean call comes back all green:
-
-```@example guide
-clean(a, b) = 0.5a + 0.5b
-
-@explain clean(2.0, 4.0)
-```
-
-And the runtime tuple-index trap gets pulled apart: the non-concrete return type, the boxing
-allocation site, the `@code_warntype` body, and a verdict for each guarantee:
-
-```julia
-state = (1, 2.0, "three")
-component(s, i) = s[i]
-
-@explain component(state, rand(1:3))
-# StrictMode @explain — component(state, rand(1:3))
-#
-#   Return type:    Union{Float64, Int64, String}  ✗ not concrete
-#   Local dispatch: ✗ this function's own IR dispatches dynamically
-#   IR signals:     ✗ boxing / dynamic dispatch
-#                   at ./tuple.jl:33
-#
-#   Verdict:
-#     ✗ @assert_typestable would fail
-#     ✗ @assert_noalloc would fail
-```

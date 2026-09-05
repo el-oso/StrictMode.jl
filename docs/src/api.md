@@ -102,8 +102,8 @@ MemsafeReport
 Wrapping is free (same layout as `x`, nothing allocated) and it changes the *type*, so no method
 written for the payload matches it: an accidental use raises a `MethodError` rather than quietly
 succeeding, and it does so in a shipped build too, because the type is never checked away. The one
-way to the value is [`unsafe_trust`](@ref), and [`@assert_trusted`](@ref) reports every function
-that calls it outside a validating boundary registered with [`trust_boundary!`](@ref).
+way to the value is [`unsafe_trust`](@ref), and [`@assert_trusted`](@ref) fails on every function
+that reads a payload outside a validating boundary registered with [`trust_boundary!`](@ref).
 
 This is the Linux kernel's `__user` pointer annotation, in Julia. There the type records that a
 pointer came from userspace, `__force` is the one cast that crosses the line, and an external
@@ -120,11 +120,12 @@ trust_boundary!
 
 ## Concurrency safety
 
-`@assert_concurrency_safe` proves a function treats its plan/workspace argument as read-only (no
-write of, or through, it) — the precondition for sharing one plan object safely across concurrent
-tasks. `@assert_no_threadid_state` fails on mutable state indexed by `Threads.threadid()`, the
-task-migration hazard (a task can move threads mid-run, stranding state keyed on the thread it
-started on). `pool_balance_report` is the companion diagnostic for thread-pool balance questions.
+`@assert_concurrency_safe` checks that a function treats its plan/workspace argument as read-only
+(no write of, or through, it) — the precondition for sharing one plan object safely across
+concurrent tasks. `@assert_no_threadid_state` fails on mutable state indexed by
+`Threads.threadid()`, the task-migration hazard: a task can move threads mid-run, stranding state
+keyed on the thread it started on. `pool_balance_report` is the companion diagnostic for
+thread-pool balance questions.
 
 ```@docs
 @assert_concurrency_safe
@@ -145,7 +146,8 @@ assert on them in future runs. See the [SIMD kernel workflow](cookbook.md) in th
 
 Two macros answer "does this definition hold its contract?", and they differ in *when* the answer
 is formed. [`@strict_function`](@ref) decides at the enclosing module's load, against the declared
-argument types — so a violation stops the module loading. [`@strict_stable`](@ref) decides per
+argument types — so a non-concrete return type stops the module loading (an allocation verdict only
+warns there). [`@strict_stable`](@ref) decides per
 specialization, as each is compiled, which reaches instantiations a declaration cannot name at the
 cost of failing later than load.
 

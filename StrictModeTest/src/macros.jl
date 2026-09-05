@@ -112,8 +112,8 @@ end
     @test_strict f(args...)
 
 Fail unless `f(args...)` is both type stable and allocation-free — the proving counterpart of
-[`StrictMode.@strict`](@ref), which bundles the same two guarantees but only reports the allocation
-half.
+[`StrictMode.@strict`](@ref) for type stability and allocation-freedom; the owned-scratch check
+@strict also runs has no proving counterpart.
 
 ```julia
 @test_strict kernel!(C, A, B)

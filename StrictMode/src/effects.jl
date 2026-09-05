@@ -344,7 +344,7 @@ end
 # eagerly it doubles a sweep.
 #
 # `Core.Compiler.EscapeAnalysis` is a compiler internal with no stability guarantee across Julia
-# versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behaviour
+# versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behavior
 # without this. A missing analysis must never quiet a guarantee.
 const _ESCAPE_MEMO = IdDict{Any, Bool}()
 const _ESCAPE_MEMO_LOCK = ReentrantLock()

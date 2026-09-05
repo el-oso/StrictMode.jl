@@ -249,7 +249,7 @@ Arguments are evaluated once, and the macro returns the call's value. Disabled b
 bare call.
 
 ```julia
-@kernel vscale!(dst, src)       # vectorized + allocation-free + type-stable, or it throws
+@kernel vscale!(dst, src)       # type-stable + vectorized (throw), allocation-free (warns)
 x = @kernel dot_kernel(a, b)   # use the result while still guaranteeing the fast path
 ```
 
@@ -263,7 +263,7 @@ x = @kernel dot_kernel(a, b)   # use the result while still guaranteeing the fas
 Keyword-argument calls and a `types = (…)` signature override are supported (see
 [`@assert_typestable`](@ref)).
 
-See also [`@strict`](@ref) for the subset without the vectorization check.
+See also [`@strict`](@ref), which swaps the vectorization check for the owned-scratch check.
 """
 macro kernel(args...)
     pos, opts = _macro_call(args, (:types,))

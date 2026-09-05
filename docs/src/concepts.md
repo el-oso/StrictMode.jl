@@ -320,11 +320,13 @@ These four issues cascade. A single root cause can trigger all of them:
 4. The loop carries an opaque value → **no SIMD**
 
 Fixing the root cause (often the type instability) eliminates all four. `@explain` shows which layer
-is the actual source, and `@strict` / `@kernel` check all four at once.
+is the actual source. `@strict` covers the first three — instability, boxing and dispatch all show
+up in its type-stability and allocation checks — and `@kernel` adds the vectorization check.
 
 A note on what "check" means here, since it decides how much a green run is worth. The `@assert_*`
-macros on this page come from `StrictMode`, which analyzes without running anything and therefore
-**reports**: the allocation and boxing verdicts read typed IR, where an allocation LLVM later
-deletes is still visible, so they warn rather than fail your build. The matching `@test_*` macros
+macros on this page come from `StrictMode`, which analyzes without running anything. Its allocation
+and boxing verdicts read typed IR, where an allocation LLVM later deletes is still visible, so those
+**warn** rather than fail your build; the type-stability and vectorization checks read what the
+compiler actually produced, so they **throw**. The matching `@test_*` macros
 from [`StrictModeTest`](proof_tier.md) put the same questions to AllocCheck and JET and **throw**.
 Use the first while you work and the second in your test suite.

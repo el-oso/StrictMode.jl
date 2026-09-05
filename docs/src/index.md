@@ -40,9 +40,9 @@ those properties out loud, and hear about it the moment one breaks.
 
 Know this first — it decides which macro you write.
 
-**[StrictMode](guarantees.md)** goes in your `Project.toml`. It reads inferred types and typed IR,
-needs no other package, and **reports**: it warns where it is guessing, so nothing here breaks your
-build.
+**[StrictMode](guarantees.md)** goes in your `Project.toml`. It reads inferred types and typed IR
+and needs no other package. Where it is **guessing** — the allocation and trim checks — it warns
+instead of failing your build; where it reads the compiled output, it throws.
 
 **[StrictModeTest](proof_tier.md)** goes in your `test/Project.toml`. It brings AllocCheck, JET and
 TrimCheck, and **gates**: a violation fails CI. Your users never install those backends just to use
