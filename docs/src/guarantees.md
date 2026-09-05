@@ -518,98 +518,76 @@ and splice the literal into `@unroll` from a `@generated` method:
 end
 ```
 
-## GKH ownership — static dispatch over runtime registries
+## GKH ownership — one method per type, not a lookup table
 
-Give each type a `const` value reached by dispatch, instead of looking it up in a dict at runtime.
-The name comes from the Linux-kernel principle that *data has a clear static owner, reached through
-that owner — never a global registry*.
-
-Both forms look identical at the call site (`_ws(Float64)`). They resolve through completely
-different machinery:
-
-```text
-  _ws(Float64)                       _ws(Float64)
-       │                                  │
-  ┌────┴─────────────┐              ┌─────┴──────────────┐
-  │  METHOD TABLE    │              │  IdDict at runtime │
-  │  one applicable  │              │  hash the key      │
-  │  method, body is │              │  probe the table   │
-  │  a const read    │              │  compare, return   │
-  └────┬─────────────┘              └─────┬──────────────┘
-       │ compile time                     │ every single call
-       ↓                                  ↓
-   nothing left:                     a probe, a branch,
-   the call is gone                  a result typed Any
-```
-
-The dispatch form const-folds because there is exactly one applicable method and its body is a
-`const` read — by runtime the call has disappeared. The dict form cannot fold: `T` is a value at
-runtime and a mutable dict's contents are not knowable at compile time.
+When each type needs its own value — a workspace, a unit, a scratch buffer — write one method per
+type instead of keying a dict by the type:
 
 ```julia
-# GKH ownership: each type owns a const value, reached by compile-time dispatch.
-const _WS_F64 = Workspace{Float64}()
-const _WS_F32 = Workspace{Float32}()
-_ws(::Type{Float64}) = _WS_F64      # bare dispatch, const-folds — no lookup at all
-_ws(::Type{Float32}) = _WS_F32
-```
-
-versus the anti-pattern it replaces:
-
-```julia
-const _WS = IdDict{Type, Any}()
-_ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)   # runtime lookup on every call
-```
-
-The smallest possible instance of the pattern, with no domain complexity at all — dispatching on a
-type instead of keying a dict by it:
-
-```julia
-# anti-pattern
+# lookup table: a probe on every call
 const UNITS = Dict{Type, Any}(Int => 1, Float64 => 1.0)
-unit(::Type{T}) where {T} = UNITS[T]        # hash+eq probe every call, returns Any
+unit(::Type{T}) where {T} = UNITS[T]
 
-# GKH ownership
-unit(::Type{Int})     = 1                   # method table entry, const-folds
+# GKH ownership: one method per type
+unit(::Type{Int})     = 1
 unit(::Type{Float64}) = 1.0
 ```
 
+Both are called the same way, `unit(Float64)`. What differs is **when the answer is found**:
 
-(Base's own `one(::Type{T})` works exactly this way — it was never going to be a dict.)
-**What problem it solves.** A type/symbol-keyed `Dict`/`IdDict` lookup is often non-allocating on
-the warm hit (measured: 0 bytes) — and when its result is narrowed, by a type assert or a
-concretely-typed dict, `@assert_typestable`, `@assert_noalloc` and `@assert_noboxing` all pass on
-it. Nothing else in this package would tell you it's there. (The bare form above is *not* narrowed:
-`UNITS[T]` on an `IdDict{Type,Any}` infers to `Any`, so it fails all three on the return type alone
-— narrow it with `::T` and the guarantees go quiet while the probe remains.) But it
-still costs a real hash/eq-table probe on every call (measured ~130 ns) — for a hot inner-loop
-accessor, that's dozens of FLOPs worth of latency spent fetching a pointer that could have cost
-zero. Because it's latency, not allocation or instability, only a benchmark or a structural IR
-lint exposes it — and it hides even from IR inspection when `T` is a static parameter, since the
-optimizer folds `get!` down to raw `jl_eqtable_*` foreigncalls, erasing the recognizable pattern
-from *optimized* IR. (That's why `static_ownership_suggestions` scans *unoptimized* typed IR —
-the runtime cost is real, but the source-level pattern is gone by the time optimized IR would show
-it.)
+```text
+  unit(Float64)                      unit(Float64)
+  one method per type                dict keyed by type
+       │                                  │
+  ┌────┴──────────────┐             ┌─────┴──────────────┐
+  │ COMPILE TIME      │             │ EVERY CALL         │
+  │ Julia picks the   │             │ hash the type      │
+  │ method, inlines   │             │ probe the table    │
+  │ the constant      │             │ return, typed Any  │
+  └────┬──────────────┘             └─────┬──────────────┘
+       ↓                                  ↓
+  the call is gone                   ~130 ns, every time
+```
 
-**Why it matters for `juliac --trim` and non-allocating code.** `juliac --trim` builds a static
-binary by proving every reachable call resolves to a concrete method at compile time, then
-discarding everything it can't prove that about. A dispatch-based accessor is trivially provable:
-for a concrete call there is exactly one callee, its body is a `const`, and the whole thing inlines
-away — nothing dynamic is left to trim. A `Dict` lookup keyed by a `Type` value is resolved by
-*value*, at *runtime*: the trimmer can prove which `get!` *method* runs, but never what comes out
-of the table, because that association lives in mutable heap memory, not the type system or the
-method table. That's exactly the runtime indirection a static build cannot swallow. The same
-asymmetry shows up for allocation: the dict's first-miss allocation makes an all-paths allocation
-proof see a statically-reachable allocation forever, even though steady state is alloc-free; the
-`const`-owner form allocates once at module load, so the hot path is provably allocation-free with
-no barriers or exemptions needed.
+Julia cannot skip the dict probe: the type is an ordinary value at runtime, and a mutable dict's
+contents are not knowable while compiling. Base works the method way — `one(::Type{T})` was never
+going to be a dict.
 
-This is also why StrictMode treats GKH-ownership violations as a *judgment call* rather than a
-provable property the way "does this allocate" is: a `Dict` is sometimes exactly the right tool (a
-config table parsed once, a genuinely open-ended value-keyed memo cache) — and the pattern's own
-sanctioned escape hatch, a `Dict` fallback for a rare-type tail (Example 2 below), is *also* a
-runtime dict lookup. A hard gate swept over a whole package would break the build on the very
-fallback the idiom recommends.
+The name comes from the Linux-kernel principle that *data has a clear static owner, reached through
+that owner — never a global registry*. In real code the owned value is usually a workspace:
+
+```julia
+const _WS_F64 = Workspace{Float64}()
+const _WS_F32 = Workspace{Float32}()
+_ws(::Type{Float64}) = _WS_F64
+_ws(::Type{Float32}) = _WS_F32
+
+# the anti-pattern it replaces
+const _WS = IdDict{Type, Any}()
+_ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)
+```
+**Why no other check catches it.** A warm dict hit allocates nothing (measured: 0 bytes). Narrow
+its result — a type assert, or a concretely-typed dict — and `@assert_typestable`,
+`@assert_noalloc` and `@assert_noboxing` all pass. The cost is pure latency, about **130 ns** per
+call, so only a benchmark or a structural lint finds it.
+
+It hides from IR inspection too. When `T` is a static parameter the optimizer folds `get!` into raw
+`jl_eqtable_*` foreigncalls, so the recognizable pattern is gone from optimized IR — which is why
+[`static_ownership_suggestions`](@ref) reads **unoptimized** typed IR instead.
+
+**Why `juliac --trim` needs it.** A static build keeps only calls it can resolve to a concrete
+method while compiling. One method per type resolves trivially — one callee, a `const` body,
+inlined away. A dict lookup does not: the trimmer can see which `get!` runs, but never what comes
+out of the table, because that association lives in mutable memory rather than in the type system.
+
+Allocation splits the same way. The dict allocates on first miss, so an all-paths proof sees a
+reachable allocation forever, even though steady state is clean. The `const` owner allocates once
+at module load, leaving the hot path provably allocation-free with no exemptions.
+
+**Why it is advice, not a proof.** A `Dict` is sometimes the right tool — a config table parsed
+once, an open-ended memo cache. The idiom's own escape hatch is a `Dict` fallback for a rare-type
+tail (Example 2 below), which is itself a runtime lookup. Swept over a whole package, a hard gate
+would break the build on the fallback the idiom recommends.
 
 **Two tools, for two different jobs.** StrictMode gives you a precise tool and a broad one, and
 they don't overlap in scope (different guarantee names, no shared registry entry):
