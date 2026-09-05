@@ -140,7 +140,8 @@ test_registered()                    # …or re-prove everything that was declar
 Guarantees whose check *observes* compiled output rather than inferring about it — `:typestable`'s
 return-type layer, `:memsafe`, `:vectorized`, `:no_spill`, `:inlined`, `:owned` — throw from
 StrictMode directly. The ones that guess (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
-`:trimsafe`/`:trim_compatible`, and `:typestable`'s IR boxing signal) report.
+`:trimsafe`/`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and the
+union-typed local) report.
 
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 

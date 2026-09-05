@@ -222,7 +222,7 @@ Julia's ahead-of-time compiler (`juliac --trim=safe`) rejects dynamic dispatch a
 reflection. StrictMode can flag incompatible patterns before a slow `juliac` build reveals them:
 
 ```julia
-@assert_trim_safe my_kernel(a, b)   # fails if the compiled body would be rejected by --trim
+@assert_trim_safe my_kernel(a, b)   # warns if the compiled body looks like --trim would reject it
 audit(MyPkg; sweep = true, guarantees = (:typestable, :noalloc, :trimsafe))
 ```
 

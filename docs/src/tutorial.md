@@ -12,10 +12,11 @@ confuse an `int` with a `std::string`. But the compiler won't tell you if a func
 unexpectedly allocates on the heap, fails to devirtualize a virtual call, or produces scalar
 code where you expected SIMD. You find those out from a profiler, after the fact.
 
-`@strict_function` fills that gap: it checks "no heap allocation, concrete return type" at
-precompile time, so a violation stops the module from loading rather than showing up in a
-profiler three days later. It's closer to a compile-time performance sanitizer than to a type
-declaration.
+`@strict_function` fills that gap: it checks "concrete return type, no heap allocation" against the
+declared argument types at precompile time, rather than leaving both to a profiler three days later.
+It is closer to a compile-time performance sanitizer than to a type declaration. The return type is
+settled there and then — a violation stops the module loading — while the allocation half warns and
+is proved from your test suite, for reasons the regression section below makes concrete.
 
 The failures you'll see in this tutorial — boxing and type instability — are equivalent to Java
 autoboxing (`int` silently promoted to `Integer`) or a missed devirtualization in C++. The
@@ -65,29 +66,49 @@ precompile time against the declared types — use `@strict_function`:
     a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
 ```
 
-This definition loads cleanly. If the body violates the guarantee, the enclosing module fails
-to load — before any tests run and before anything else uses the function.
+This definition loads cleanly. A later edit that makes the return type inconcrete stops the enclosing
+module loading — before any tests run, and before anything else uses the function:
+
+```julia
+@strict_function widened(x::Int) = x > 0 ? x : 1.0
+# ERROR: StrictViolation (@strict_function): return type is not concrete for (Int64): Union{Float64, Int64}
+```
 
 ## Simulating a regression
 
 Three months later, someone refactors `dot3_locked` for readability:
 
 ```julia
-# Proposed change: use a loop + collect for "clarity"
+# Proposed change: a generator, for "clarity"
 @strict_function dot3_locked(a::NTuple{3,Float64}, b::NTuple{3,Float64}) =
     sum(a[i]*b[i] for i in 1:3)
 ```
 
-The generator expression `a[i]*b[i] for i in 1:3` allocates a temporary. If you load this
-definition with checks enabled, you get:
+The generator allocates a temporary. Loading this **warns** rather than failing:
 
 ```
-ERROR: StrictViolation (@noalloc): guarantee not satisfied
-  target:  dot3_locked(NTuple{3,Float64}, NTuple{3,Float64})
-  reason:  allocates (1 site(s))
+┌ Warning: @strict_function dot3_locked(NTuple{3,Float64}, NTuple{3,Float64}): allocates / boxes
+│ (value-free IR scan — a structural guess, not a proof; add StrictModeTest to your test
+│ environment and call test_registered() to resolve it)
 ```
 
-Caught at load time instead of at the next profiling session.
+That is deliberate, and it is worth understanding before you rely on this macro. The check runs at
+your package's own precompile, where the proof cannot be loaded — AllocCheck lives in
+`StrictModeTest`, a test-environment dependency. What is left is a scan of typed IR, which still
+sees allocations LLVM later deletes, so it guesses. A guess must not be able to stop a package
+installing.
+
+The declaration is registered either way, which is what makes the warning actionable. From your test
+suite, where the proof *is* available, one call re-proves every `@strict_function` in the package
+and throws on this one:
+
+```julia
+using StrictMode, StrictModeTest
+test_registered()      # re-proves each declaration against AllocCheck and JET
+```
+
+So the regression is caught at load as a warning and in CI as a failure — the type-stability half at
+load, the allocation half in the test suite.
 
 ## Diagnosing a failure
 
