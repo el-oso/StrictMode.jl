@@ -22,34 +22,43 @@ hero:
 
 features:
   - title: Ask for the fast path
-    details: Say what you want at a call site or a definition — this call should not allocate, this one should stay type-stable — and get an error the moment it doesn't.
+    details: Say what you want at a call site or a definition — this call must not allocate, this one must stay type-stable — and hear about it the moment it does not hold.
   - title: Catch the silent traps
-    details: Two tiers. StrictMode alone reads inferred types and typed IR to report; add StrictModeTest and AllocCheck, JET and TrimCheck prove the same properties and fail your build. The things Julia normally lets slide, like boxing or a hot loop that quietly allocates, become errors you can actually see.
+    details: Two packages. StrictMode reads inferred types and typed IR, and warns. Add StrictModeTest and AllocCheck, JET and TrimCheck prove the same properties and fail your build. Boxing and quietly allocating loops stop being invisible.
   - title: Zero cost when disabled
-    details: Every check sits behind a Preferences flag, on by default so a dev or test environment needs no setup. Turn it off for a shipped application and the macros vanish into the bare call, so the deployment carries none of it.
+    details: Checks sit behind a Preferences flag, on by default so dev and test need no setup. Turn it off for a shipped application and each macro compiles to the bare call.
 ---
 ```
 
 ## Why
 
-Julia will happily let your code box a value, miss an inline, drift into a type instability, or
-allocate inside a hot loop — and it won't say a word. Each of these stays invisible until you go
-hunting for it with a profiler. StrictMode lets you ask for those properties out loud: declare what
-you expect, and hear about it right away when something breaks the promise.
+Julia will let your code box a value, miss an inline, drift into a type instability, or allocate in
+a hot loop — without saying a word. You find out with a profiler, later. StrictMode lets you ask for
+those properties out loud, and hear about it the moment one breaks.
 
 ## Two packages
 
-This is the first thing to know, because it decides which macro you write.
+Know this first — it decides which macro you write.
 
-**[StrictMode](guarantees.md)** goes in your `Project.toml`. It analyzes with a value-free engine
-built on Base's own inference, needs no analysis backend, and **reports** — its `@assert_*` macros
-warn where they are guessing, so nothing here can break your build.
+**[StrictMode](guarantees.md)** goes in your `Project.toml`. It reads inferred types and typed IR,
+needs no other package, and **reports**: it warns where it is guessing, so nothing here breaks your
+build.
 
 **[StrictModeTest](proof_tier.md)** goes in your `test/Project.toml`. It brings AllocCheck, JET and
-TrimCheck, and **gates** — its `@test_*` macros and `test_*` drivers throw, so a violation fails
-CI. Your users never install those backends just to use your package.
+TrimCheck, and **gates**: a violation fails CI. Your users never install those backends just to use
+your package.
 
-Which one runs is decided by the macro you wrote, when it expands. There is no mode to switch.
+```text
+         write @assert_noalloc          write @test_noalloc
+                  │                             │
+              StrictMode                  StrictModeTest
+           reads typed IR                asks AllocCheck
+                  ↓                             ↓
+              warns  ⚠                       throws  ✗
+         while you iterate                   in your tests
+```
+
+The macro you write picks the side. There is no mode to switch.
 
 ```julia
 @assert_noalloc kernel!(C, A, B)     # StrictMode: the scan — warns

@@ -7,33 +7,31 @@ using Pkg
 Pkg.add("StrictMode")
 ```
 
-`StrictMode` on its own analyzes with a value-free engine — inferred return types plus a scan of
-typed IR — that needs no extra dependency and is cheap enough to run at load time. It **reports**.
+`StrictMode` reads inferred types and typed IR. It needs no other package, is fast enough to run at
+load time, and it **reports** — it warns, it never breaks your build.
 
-The proofs — [AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl),
-[JET.jl](https://github.com/aviatesk/JET.jl), and TrimCheck.jl — are heavyweight, so they live in a
-companion package you add to your test environment only:
+The proofs are heavy, so they live in a second package you add to your test environment only:
+[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl),
+[JET.jl](https://github.com/aviatesk/JET.jl) and TrimCheck.jl.
 
 ```julia
 # in test/Project.toml, alongside StrictMode:
 Pkg.add("StrictModeTest")
 ```
 
-`StrictModeTest` **gates**: it supplies `@test_noalloc` / `@test_typestable` and the
-`test_signatures` / `test_compiled` / `test_registered` drivers, which throw on a violation. Which
-engine a call site uses is decided by the macro you wrote, not by ambient state:
-`StrictMode.proofs_loaded()` tells you which tier a session is in. Production code that depends on
-StrictMode needs neither package. If you want the live feedback loop, add `Revise` too.
+`StrictModeTest` **gates**: `@test_noalloc`, `@test_typestable` and the `test_signatures` /
+`test_compiled` / `test_registered` drivers all throw. The macro you write picks the engine —
+nothing else does. `proofs_loaded()` says which one a session has.
+
+Code that only depends on StrictMode needs neither. For the live loop, add `Revise`.
 
 ## Enable the checks
 
-Every guarantee sits behind a compile-time setting, **on by default**. A dev or test environment
-therefore needs no setup at all: depend on StrictMode and the guarantees run. That default is
-deliberate — a preference you have to remember to add is a preference that goes missing, and with
-checks off every `@assert_*` is a no-op, so a suite full of them passes vacuously.
+Checks are **on by default**, so a dev or test environment needs no setup. That matters: with checks
+off every `@assert_*` is a no-op, and a suite full of them passes while testing nothing.
 
-A shipped application turns them off. Add a section to the deployed project's `Project.toml` (or a
-`LocalPreferences.toml` next to it):
+Turn them off for a shipped application in the deployed `Project.toml` (or a `LocalPreferences.toml`
+next to it):
 
 ```toml
 [preferences.StrictMode]
@@ -42,12 +40,11 @@ checks_enabled = false
 
 With it off, the macros expand to the bare call and there's nothing left to run.
 
-Either way, run in a **fresh Julia process** after changing the setting — it is read when Julia
-compiles the package, not while a session is already running.
+Restart Julia after changing it. The setting is read when the package compiles, not while a session
+runs.
 
-To catch the setting having been turned off where it matters, start your strict tests with
-[`assert_enabled`](@ref): it returns `checks_enabled()` locally but **errors under CI** when checks
-are disabled.
+Start your strict tests with [`assert_enabled`](@ref). It returns `checks_enabled()` locally and
+**errors under CI** when checks are off, so a disarmed suite cannot pass quietly.
 
 For interactive use, `disable_checks!()`/`enable_checks!()` write the setting for you:
 
@@ -59,11 +56,10 @@ StrictMode.disable_checks!()   # writes the setting; restart Julia to apply
 StrictMode.enable_checks!()    # back on
 ```
 
-!!! note "Why does a restart matter?"
-    StrictMode's checks compile away to nothing when disabled, so the setting must be fixed before
-    Julia compiles the package. Calling `disable_checks!()` and then asserting in the same process
-    still runs every check — the existing compiled image is already baked. Restart Julia (or start
-    a fresh process for your tests) after changing the setting.
+!!! note "Why the restart?"
+    Disabled checks compile away to nothing, so the setting has to be fixed before the package
+    compiles. Call `disable_checks!()` and keep asserting in the same session and every check still
+    runs — that image is already built.
 
 Check the current state at any time:
 
@@ -102,12 +98,11 @@ y = @strict weighted(2.0, 4.0)
 
 ## The other half: proving it
 
-Everything above **reports**. `@assert_noalloc` reads typed IR, where an allocation LLVM later
-deletes is still visible, so it can only tell you something looks wrong — and a check that guesses
-must not be able to break your build.
+Everything above **reports**. `@assert_noalloc` reads typed IR, which still shows allocations LLVM
+later deletes — so it can only say something looks wrong, and a guess must not break your build.
 
-When you want the same property to actually fail CI, reach for the macro from `StrictModeTest`. It
-is the same question asked of AllocCheck instead, and it throws:
+To make the same property fail CI, use the `StrictModeTest` macro. Same question, asked of
+AllocCheck, and it throws:
 
 ```julia
 using StrictMode, StrictModeTest
@@ -116,21 +111,31 @@ using StrictMode, StrictModeTest
 @test_noalloc   square_sum((1.0, 2.0, 3.0))   # throws — AllocCheck's proof, over every path
 ```
 
-This pairing is the thing to carry away from this page. Which engine runs is decided by **the macro
-you wrote**, when it expands — there is no mode to switch, no environment variable, and nothing
-ambient choosing for you. `@assert_*` while you iterate, `@test_*` in the test suite, and
-[`proofs_loaded()`](@ref) if you ever need to ask which tier a session is in.
+That pairing is what to take from this page:
 
-See [StrictModeTest](proof_tier.md) for the whole proving surface.
+```text
+  your Project.toml          your test/Project.toml
+  ─────────────────          ─────────────────────
+  StrictMode                 StrictMode + StrictModeTest
+  @assert_noalloc            @test_noalloc
+  reads typed IR             asks AllocCheck
+  warns  ⚠                   throws  ✗
+```
+
+The macro you write picks the column. There is no mode to switch and no environment variable.
+`@assert_*` while you iterate, `@test_*` in the test suite.
+
+See [StrictModeTest](proof_tier.md) for the full proving surface.
 
 ## When a guarantee fails
 
-When a guarantee doesn't hold you get a [`StrictViolation`](@ref) naming the call and explaining
-what went wrong — for the guarantees that gate. There is no mode to set: whether a given guarantee
-throws or warns is fixed per guarantee, and the ones that infer rather than observe only warn (see
-[Guarantees](guarantees.md)). Indexing a heterogeneous tuple with a runtime
-value is a good example: it produces a `Union` return type and boxes behind your back. Here that
-silence becomes an error:
+A guarantee that gates throws a [`StrictViolation`](@ref) naming the call and what went wrong.
+Whether a guarantee throws or warns is fixed per guarantee, not configured — the ones that observe
+compiled output throw, the ones that infer only warn. [Guarantees](guarantees.md) lists which is
+which.
+
+Indexing a heterogeneous tuple with a runtime value is the classic case: it returns a `Union` and
+boxes behind your back. Here the silence becomes an error:
 
 ```julia
 state = (1, 2.0, "three")
