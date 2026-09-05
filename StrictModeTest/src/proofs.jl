@@ -296,8 +296,12 @@ function _trim_subprocess_script(in_path::String, out_path::String, modname::Uni
 end
 
 function _trim_validate_subprocess(@nospecialize(f), argtypes::Vector)
+    # Both handles are closed before the temp files are removed. Windows refuses to unlink a file
+    # that is still open (EBUSY), where Linux and macOS allow it — so dropping `mktemp`'s IO on the
+    # floor is a leak that only ever fails on one platform.
     in_path, in_io = mktemp()
-    out_path, _ = mktemp()
+    out_path, out_io = mktemp()
+    close(out_io)
     try
         serialize(in_io, (f, argtypes))
         close(in_io)
@@ -325,8 +329,15 @@ function _trim_validate_subprocess(@nospecialize(f), argtypes::Vector)
     catch
         return nothing
     finally
-        rm(in_path; force = true)
-        rm(out_path; force = true)
+        # `close` is a no-op on an already-closed stream, and matters on the path where `serialize`
+        # threw before the close above. Cleanup itself is best-effort: a temp file that outlives the
+        # call is untidy, not a reason to fail a verification that already has its answer.
+        close(in_io)
+        try
+            rm(in_path; force = true)
+            rm(out_path; force = true)
+        catch
+        end
     end
 end
 
