@@ -12,9 +12,6 @@ StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
-[sources]
-StrictMode = {path = "../StrictMode"}
-
 [compat]
 AllocCheck = "0.2"
 JET = "0.11.4, 0.12"

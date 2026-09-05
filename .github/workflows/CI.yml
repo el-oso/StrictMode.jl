@@ -56,8 +56,14 @@ jobs:
       # StrictModeTest's own suite: the proof primitives (allocation classification, ignore_throw,
       # the JET and TrimCheck drivers) and the @test_* / test_* gating surface. StrictMode cannot test
       # these: it does not depend on AllocCheck, JET, or TrimCheck at all.
+      # `Pkg.develop` rather than a `[sources]` entry in StrictModeTest's own Project.toml: that
+      # file is registered, and a path source has no meaning once the package is installed from
+      # General. The sibling has to be wired up here instead, or resolution goes looking for a
+      # StrictMode release that may not exist yet.
       - name: StrictModeTest suite
-        run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test()'
+        run: |
+          julia --project=StrictModeTest -e 'import Pkg; Pkg.develop(path="StrictMode")'
+          julia --project=StrictModeTest -e 'import Pkg; Pkg.test()'
       # The consumer layout, end to end: StrictMode in a package's own Project.toml with
       # @strict_function in its src/, StrictModeTest only in its test/. Needs a real precompile of a
       # second package, so it is its own step rather than part of the main suite. It is the only
