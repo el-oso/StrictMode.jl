@@ -234,6 +234,21 @@ end
 # TrimCheck's own `Compiler` binding (as `validate_function` does) so we hit the same verifier.
 #
 # `types` may be a `Type{<:Tuple}` (e.g. `Tuple{Int,Float64}`) or a plain tuple of types.
+# `Compiler.typeinf_ext_toplevel` gained a fourth argument, `external_linkage::Bool`, in Julia
+# 1.13.0-rc4. Dispatching on whether that method exists, rather than on a version number, keeps this
+# working across the change in either direction — the argument arrived mid-release-candidate, so a
+# `VERSION` bound would have to name an rc.
+#
+# `false` reproduces what the three-argument form did: it passed nothing through to
+# `collectinvokes!`, whose own `external_linkage` keyword defaults to `false`.
+function _typeinf_toplevel(Comp, methods::Vector{Any}, worlds::Vector{UInt})
+    return if hasmethod(Comp.typeinf_ext_toplevel, Tuple{Vector{Any}, Vector{UInt}, UInt8, Bool})
+        Comp.typeinf_ext_toplevel(methods, worlds, Comp.TRIM_SAFE, false)
+    else
+        Comp.typeinf_ext_toplevel(methods, worlds, Comp.TRIM_SAFE)
+    end
+end
+
 function _trim_validate(@nospecialize(f), @nospecialize(types))
     argtypes = (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
     rts = Base.return_types(f, Tuple{argtypes...})
@@ -250,10 +265,10 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
     Comp = TrimCheck.Compiler
     try
         TrimCheck.hook_verify_typeinf_trim() do
-            Comp.typeinf_ext_toplevel(
+            _typeinf_toplevel(
+                Comp,
                 Any[Core.svec(ret_type, Tuple{typeof(f), argtypes...})],
                 [Base.get_world_counter()],
-                Comp.TRIM_SAFE,
             )
         end
         return (true, String[])

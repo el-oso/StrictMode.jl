@@ -13,9 +13,13 @@
     reflecty20(1)
     realerr = try
         TrimCheck.hook_verify_typeinf_trim() do
-            C = TrimCheck.Compiler
-            C.typeinf_ext_toplevel(
-                Any[Core.svec(Int, Tuple{typeof(reflecty20), Int})], [Base.get_world_counter()], C.TRIM_SAFE
+            # Through the same shim the source uses: `typeinf_ext_toplevel` takes a fourth argument
+            # from Julia 1.13.0-rc4 onward, and a raw three-argument call here would MethodError on
+            # the very release this fixture exists to characterise.
+            StrictModeTest._typeinf_toplevel(
+                TrimCheck.Compiler,
+                Any[Core.svec(Int, Tuple{typeof(reflecty20), Int})],
+                [Base.get_world_counter()],
             )
         end
         nothing
