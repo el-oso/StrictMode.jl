@@ -79,8 +79,10 @@ it never throws:
   (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime calls, `Core.Box`) — which is
   where the distinction is actually proved.
 - **`@assert_typestable`** requires a concrete inferred return type (exact, so it throws) and adds
-  an IR signal for internal dispatch behind a concrete return (a heuristic, so it warns).
-  **`@test_typestable`** replaces that second layer with `JET.@report_opt` and throws on it.
+  two IR signals behind a concrete return, both heuristics, so both warn: internal dynamic
+  dispatch, and a union-typed local that boxes a member on the way in. **`@test_typestable`**
+  replaces the first with `JET.@report_opt` and throws on it; for the second it consults the same
+  scan, because union splitting is not dispatch and JET cannot see it.
 - **`@assert_inlined`** compiles a wrapper around the call and checks its optimized IR for a
   surviving `:invoke` to the callee — best-effort, since inlining is a heuristic, but it observes
   compiled output rather than inferring, so it throws.

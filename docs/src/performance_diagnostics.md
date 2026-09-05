@@ -192,30 +192,6 @@ it only fails when you supply an explicit `max_rthroughput=`/`min_ipc=` bound yo
 (unlike Julia's own codegen path, which just warns and falls back), so `mca_report` checks first
 and substitutes `"generic"` if needed, warning once.
 
-## What the diagnostics can't see
-
-Some performance problems are invisible to static IR analysis:
-
-**Algorithmic choices above the kernel**: two kernel versions can look identical in IR — same
-vectorization, same intensity — yet differ by 25% because one packs a panel operand into
-contiguous memory before the inner loop. That kind of memory-orchestration choice is above the
-per-kernel view.
-
-**Input-distribution variance**: a search or formatting kernel may run 3× differently depending
-on the input values — same code path, different data. Benchmark across the value classes your
-kernel will actually see (small, large, uniform, worst-case) and report the spread rather than a
-single median.
-
-**Data-dependent load addresses**: a kernel that computes a slot index from a SIMD reduction and
-then loads `array[index]` exposes the full cache-miss latency of that load — the load can't issue
-until the reduction finishes. The guarantees are all green, but effective throughput may be limited.
-
-The division of labor: the asserts defend the **floor** (vectorized, allocation-free,
-type-stable) — properties whose loss costs 2–100× silently. The diagnostics (`kernel_report`,
-`register_report`) illuminate the **ceiling** — they help you see how far you are from the
-hardware limit, and why. Neither closes every gap; some require roofline reasoning or restructuring
-the algorithm above the single-kernel view.
-
 ## Static-binary compatibility (`@assert_trim_compatible`)
 
 Julia's ahead-of-time compiler (`juliac --trim=safe`) rejects dynamic dispatch and runtime
@@ -275,3 +251,27 @@ component(s, i) = s[i]
 #     ✗ @assert_typestable would fail
 #     ✗ @assert_noalloc would fail
 ```
+
+## What the diagnostics can't see
+
+Some performance problems are invisible to static IR analysis:
+
+**Algorithmic choices above the kernel**: two kernel versions can look identical in IR — same
+vectorization, same intensity — yet differ by 25% because one packs a panel operand into
+contiguous memory before the inner loop. That kind of memory-orchestration choice is above the
+per-kernel view.
+
+**Input-distribution variance**: a search or formatting kernel may run 3× differently depending
+on the input values — same code path, different data. Benchmark across the value classes your
+kernel will actually see (small, large, uniform, worst-case) and report the spread rather than a
+single median.
+
+**Data-dependent load addresses**: a kernel that computes a slot index from a SIMD reduction and
+then loads `array[index]` exposes the full cache-miss latency of that load — the load can't issue
+until the reduction finishes. The guarantees are all green, but effective throughput may be limited.
+
+The division of labor: the asserts defend the **floor** (vectorized, allocation-free,
+type-stable) — properties whose loss costs 2–100× silently. The diagnostics (`kernel_report`,
+`register_report`) illuminate the **ceiling** — they help you see how far you are from the
+hardware limit, and why. Neither closes every gap; some require roofline reasoning or restructuring
+the algorithm above the single-kernel view.

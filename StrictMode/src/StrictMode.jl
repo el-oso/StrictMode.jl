@@ -12,17 +12,26 @@ compile-time flag (`checks_enabled`, default `true`), so a dev or test environme
 without any setup. A shipped application turns them off with [`disable_checks!`](@ref); the macros
 then expand to the bare call and pay **nothing**.
 
-## v0.1 public API
-- [`@assert_noalloc`](@ref) — fail if a call allocates (static via AllocCheck, runtime fallback).
-- [`@assert_typestable`](@ref) — fail on type instability (JET + `@inferred`).
-- [`@strict`](@ref) — apply every per-call guarantee at once.
-- [`@strict_function`](@ref) — annotate a definition; checked at precompile (won't load if it
-  violates the contract — the "Rust compiler error" experience).
+## Two packages
+
+This one reads inferred types and typed IR, and depends on no analysis backend at all. The proofs —
+AllocCheck, JET and TrimCheck — live in `StrictModeTest`, a separate package for your test
+environment. The macro you write picks the engine: `@assert_noalloc` is this package's scan,
+`@test_noalloc` is the proof.
+
+## Where to start
+- [`@assert_noalloc`](@ref) — report if a call allocates, from a scan of typed IR.
+- [`@assert_typestable`](@ref) — throw on a non-concrete inferred return type; report the IR
+  signals for dispatch and boxing behind a concrete return.
+- [`@strict`](@ref) — type stability, owned scratch and allocation-freedom on one call.
+- [`@strict_function`](@ref) — annotate a definition, checked at the enclosing module's precompile.
 - [`@strict_contract`](@ref) / [`@verify_strict`](@ref) — pair a TypeContracts interface with
   StrictMode performance guarantees.
 - [`enable_checks!`](@ref) / [`disable_checks!`](@ref) / [`checks_enabled`](@ref).
 
-See the README and `docs/cookbook.md` for the trap → macro mapping.
+Which guarantees throw and which report is fixed per guarantee: the ones that read compiled output
+throw, the ones that infer report. `docs/src/guarantees.md` lists both, and `docs/src/cookbook.md`
+has the trap → macro mapping.
 """
 module StrictMode
 

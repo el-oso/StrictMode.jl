@@ -68,12 +68,19 @@ end
 Fail unless `f(args...)` is type stable.
 
 Two layers, graded differently. The inferred return type must be a single concrete type
-(`Base.return_types`) — that is exact for the question it asks, so a violation **throws**. On top of
-that, the IR boxing signal (`StrictMode._alloc_signals`) looks for internal dynamic dispatch hiding
-behind a concrete return — the classic "the return type is fine but something inside dispatches at
-runtime" shape — and that layer is a heuristic (a guarded `@warn` in an otherwise-clean numeric
-function trips it), so a violation there **warns**. `StrictModeTest`'s `@test_typestable` adds
-JET's optimization analysis, which is the proof for the second layer and does throw.
+(`Base.return_types`) — that is exact for the question it asks, so a violation **throws**.
+
+On top of that sit two IR signals (`StrictMode._alloc_signals`), both heuristics, so both **warn**:
+
+- **internal dynamic dispatch** behind a concrete return — the classic "the return type is fine but
+  something inside dispatches at runtime" shape. A guarded `@warn` in an otherwise-clean numeric
+  function trips it.
+- **a union-typed local that boxes a member on the way in** — a `PhiNode` whose union is not an
+  isbits union, so at least one member must be heap-allocated to flow through it. Union splitting
+  is not dynamic dispatch, so JET cannot see this one at all.
+
+`StrictModeTest`'s `@test_typestable` adds JET's optimization analysis, which is the proof for the
+first signal and does throw; for the second it consults this scan, since JET is blind to it.
 
 Each argument is evaluated once, the macro returns the call's value, and disabled builds expand to
 the bare call.
