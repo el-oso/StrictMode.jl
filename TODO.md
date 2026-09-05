@@ -98,7 +98,7 @@ GitHub issues are the source of truth for anything with a number; the notes here
   default is usable. Note the reason it is this low is partly that `_guarantee_gates` demotes the
   allocation layer to a warning; the underlying scan still over-flags at the 8.1% recorded under #17.
 
-- [ ] **#19 / #20 — `@assert_trim_compatible` false FAILs.** Both live in
+- [x] **#19 / #20 — `@assert_trim_compatible` false FAILs.** BOTH CLOSED. Both live in
   `_be_trim_validate`, which moved to `StrictModeTest/src/StrictModeTest.jl` in 0.4.0; the
   issues still say `StrictModeTrimExt`, which no longer exists.
   #20 has a concrete, parse-free fix: `TrimVerificationErrors.errors` holds `warn::Bool =>
@@ -126,8 +126,9 @@ GitHub issues are the source of truth for anything with a number; the notes here
   failure, missing patch files) degrades to unpatched in-process verification with a warning
   carrying the child's own stderr — never to a FAIL.
 
-  What remains, and it caps the payoff: on a Julia shipping no juliac patch files there is nothing
-  to isolate, so verification stays stock-Base and the false-FAIL class is still present there.
+  CLOSED with one residual, deliberately: on a Julia shipping no juliac patch files there is
+  nothing to isolate, so verification stays stock-Base and the false-FAIL class survives there.
+  That is 1.13-specific and folds into the 1.13.0 work below rather than holding this issue open.
 
 - [x] **#13, #14, #15, #16 — AUDITED 2026-08-30; all four are addressed.**
   - **#13 — FIXED, and the issue's stated objection is measured wrong.** The issue argues no
@@ -284,6 +285,26 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 `test/unroll_test.jl` and `test/typestable_test.jl` had lost their power to fail;
 `test/standalone`'s isolation assertion was decorative (verified: it passes without
 `JULIA_LOAD_PATH`, so dropping the CI env var would leave the split-premise gate green).
+
+## Open — Julia 1.13.0
+
+- [ ] **Julia 1.13.0 support.** Three things are known to differ, each already handled defensively
+  but none actually working on 1.13:
+  (a) **juliac ships no trim patch files.** They are under `share/julia/juliac` on 1.12 and
+      1.13.0-rc3 and absent on rc4, so `set_juliac_patches!(true)` has nothing to apply and trim
+      verification stays stock-Base — the false-FAIL class from #19 is still present there.
+      `_trim_validate_subprocess` refuses to return that verdict as a patched one, so the failure
+      is loud rather than mislabelled, but the class is not fixed. Find where juliac moved them,
+      or reproduce what they do.
+  (b) **The escape-analysis mitigation for #17 is dead.** `_all_news_nonescaping` returns `false`
+      on 1.13 because `Core.Compiler.EscapeAnalysis` moved; the fallback is "assume it escapes",
+      so the issue's own reproducer is flagged again. Locate the internal on 1.13.
+  (c) **`typeinf_ext_toplevel` gained a fourth argument** (`external_linkage::Bool`) in 1.13.0-rc4.
+      Already handled by `_typeinf_toplevel`'s `hasmethod` dispatch rather than a `VERSION` bound,
+      since the argument arrived mid-release-candidate.
+
+  The 1.13 CI job is `continue-on-error`, which is why none of these gate. That flag should come
+  off as part of this work, or the job is decoration.
 
 ## Planned — v0.5
 
