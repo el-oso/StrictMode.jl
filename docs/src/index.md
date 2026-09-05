@@ -58,7 +58,7 @@ your package.
          while you iterate                   in your tests
 ```
 
-The macro you write picks the side. There is no mode to switch.
+Two macros, different use. One lightweight for interactive develop one rigorous for testing.
 
 ```julia
 @assert_noalloc kernel!(C, A, B)     # StrictMode: the scan — warns

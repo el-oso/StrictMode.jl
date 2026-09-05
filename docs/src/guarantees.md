@@ -1,40 +1,38 @@
 # Guarantees
 
 Each guarantee pins a *necessary* property of a hot kernel — allocation-free, type-stable,
-vectorized — and tells you the moment an edit breaks it. Once an assert is in place it fences
+vectorized — and tells you the moment an edit breaks it. Once an assert is in place it watches
 every future edit: refactor freely and get told the instant something crosses the line. They keep
 you on the fast path; they don't promise you've found the *fastest* path.
 
-This page is the guarantees themselves. Two neighbors cover what surrounds them: `@explain` and
-the rest of the tools for the gap between "passing" and "fast" are in
-[Performance diagnostics](performance_diagnostics.md), and the techniques for fixing what a
-guarantee flags — `@unroll` among them — are in the [Cookbook](cookbook.md).
+For the gap between "passing" and "fast" — `@explain` and the rest of the tools — see
+[Performance diagnostics](performance_diagnostics.md). For the techniques that fix what a
+guarantee flags, `@unroll` among them, see the [Cookbook](cookbook.md).
 
 ## Key concepts
 
-If these terms are unfamiliar, a quick definition before diving in:
+If these terms are unfamiliar, a quick definition first:
 
 - **Type stability** — the compiler can predict a function's return type without running it. A
   stable function always returns `Float64`, say; an unstable one might return `Float64` or `Int`
   depending on a runtime condition. Instability forces the compiler to generate slower, more
-  general code downstream.
+  general code.
 
 - **Boxing** — wrapping a value in a generic heap-allocated container because its type can't be
   predicted at compile time. A runtime index into a heterogeneous tuple (e.g. `t[i]` where `t`
-  holds mixed types) causes boxing. Each box costs a heap allocation and prevents SIMD vectorization.
+  holds mixed types) causes it. Each box costs a heap allocation and prevents SIMD vectorization.
 
-- **Dynamic dispatch** — resolving which method to call at runtime rather than at compile time.
-  Happens when the compiler can't pin down the type of a receiver, and adds a function-table lookup
-  to every call.
+- **Dynamic dispatch** — deciding which method to call at runtime instead of compile time. Happens
+  when the compiler can't pin down the type of a receiver, and adds a function-table lookup to
+  every call.
 
-Allocation-free code avoids boxing and dispatch. Type-stable code avoids instability (and
-usually boxing too). The macros below enforce each property separately so you can be precise about
-what you need.
-See [Key Concepts](concepts.md) for worked examples of each.
+Allocation-free code avoids boxing and dispatch; type-stable code avoids instability (and usually
+boxing too). The macros below check each property separately, so you can be precise about what you
+need. See [Key Concepts](concepts.md) for worked examples of each.
 
-Every example here is live. The docs are built with checks enabled, so the analysis runs as the
-page is generated. Calls that pass are shown as real `@example` blocks; calls that are meant to
-fail are shown as annotated code, so the build itself stays green.
+Every example here is live: the docs are built with checks enabled, so the analysis runs as the
+page is generated. Passing calls appear as real `@example` blocks; calls meant to fail appear as
+annotated code, keeping the build green.
 
 ```@example guide
 using StrictMode
@@ -51,8 +49,8 @@ dot3(a, b) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 @assert_noalloc dot3((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 ```
 
-`static = false` measures the call directly with `@allocated` after a warmup pass instead — a
-value-dependent measurement of what actually ran, rather than a signature-level verdict:
+`static = false` skips the scan and measures the call directly with `@allocated`, after a warmup
+pass — a value-dependent measurement of what actually ran, not a signature-level verdict:
 
 ```julia
 @assert_noalloc static = false stream_step!(buffer, x)
@@ -79,9 +77,9 @@ end
 
 **Reported, not thrown** — see [Why `@assert_noalloc` reports instead of
 gating](#Why-@assert_noalloc-reports-instead-of-gating) below. The proof is
-`StrictModeTest`'s `@test_noalloc`, which hands the call to
-[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and asks it to prove there is no way the
-call can allocate, on any path:
+`StrictModeTest`'s `@test_noalloc`: it hands the call to
+[AllocCheck.jl](https://github.com/JuliaLang/AllocCheck.jl) and asks for a proof that the call
+cannot allocate on any path:
 
 ```julia
 using StrictMode, StrictModeTest        # test/Project.toml
@@ -89,30 +87,6 @@ using StrictMode, StrictModeTest        # test/Project.toml
 # ERROR: StrictViolation (@noalloc): guarantee not satisfied
 #   reason:  allocates (… site(s)) …
 ```
-
-### One-time-init calibration doesn't have to break this
-
-A `Base.OncePerProcess`/`OncePerThread`-memoized lazy calibration allocates once, then reads a
-memoized value forever after — but AllocCheck's all-paths proof sees the initializer's one-time
-allocation as statically reachable and would otherwise red a call that's provably alloc-free in
-steady state. The IR scan recognizes the two `Base` once-guard types automatically and stops at
-them, and `@test_noalloc`/`@test_noboxing` honor that: on a call whose ONLY allocation risk is the
-barrier they substitute the (already-correct) steady-state scan for AllocCheck's all-paths proof,
-rather than reporting the cold-path allocation as a violation — logged once per session via
-`@info`, never silently:
-
-```julia
-const _NP_ONCE = Base.OncePerProcess{Int}(_measure_calibration)
-steady(x::Int) = x + _NP_ONCE()
-
-@assert_noalloc steady(1)   # passes: the once-guard's cold path is exempted, not the caller's own code
-```
-
-For a hand-rolled memoization pattern that doesn't use one of those two `Base` types, register it
-explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
-auto-recognized (its implementation has no detectable non-inlined callee boundary to key off of —
-wrap it in your own function and register that instead).
-
 
 ### Why `@assert_noalloc` reports instead of gating
 
@@ -134,10 +108,10 @@ mkvec(n::Int) = length(Vector{Float64}(undef, n))
 The scan flags it, AllocCheck does not, and the truth is 0 bytes. Measured over 120 compiled
 specializations from two real packages, 8.1% of the scan's findings were false this way.
 
-So these **warn** instead of throwing. It matters most at load time: [`@strict_function`](@ref) runs
-during your package's own precompile, where `StrictModeTest` cannot be loaded — it belongs to
-`test/`. A guess there would stop a consumer's package installing over code that may be perfectly
-clean.
+So these checks **warn** instead of throwing. It matters most at load time:
+[`@strict_function`](@ref) runs during your package's own precompile, where `StrictModeTest`
+cannot be loaded — it belongs to `test/`. A wrong guess there would stop a consumer's package
+installing over code that may be perfectly clean.
 
 The declaration is registered either way, so the proof still gets its turn:
 
@@ -147,18 +121,41 @@ using StrictMode, StrictModeTest     # in test/
 test_registered()                    # …or re-prove everything that was declared
 ```
 
-Guarantees whose check *observes* compiled output rather than inferring about it — `:typestable`'s
-return-type layer, `:memsafe`, `:vectorized`, `:no_spill`, `:inlined`, `:owned`, `:trusted` —
-throw from StrictMode directly. The ones that guess (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
-`:trimsafe`/`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and the
-union-typed local) report.
+Guarantees whose check *observes* compiled output — `:typestable`'s return-type layer, `:memsafe`,
+`:vectorized`, `:no_spill`, `:inlined`, `:owned`, `:trusted` — throw from StrictMode directly.
+The ones that infer what they cannot see (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
+`:trimsafe`/`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and
+the union-typed local) report.
+
+### One-time-init calibration doesn't have to break this
+
+A lazy calibration memoized with `Base.OncePerProcess`/`OncePerThread` allocates once, then reads
+the memoized value forever after. AllocCheck's all-paths proof sees the initializer's one-time
+allocation as statically reachable and would red a call that's provably alloc-free in steady
+state. The IR scan recognizes the two `Base` once-guard types automatically and stops at them,
+and `@test_noalloc`/`@test_noboxing` honor that: on a call whose ONLY allocation risk is the
+barrier, they substitute the steady-state scan for AllocCheck's all-paths proof rather than
+report the cold-path allocation as a violation — logged once per session via `@info`, never
+silently:
+
+```julia
+const _NP_ONCE = Base.OncePerProcess{Int}(_measure_calibration)
+steady(x::Int) = x + _NP_ONCE()
+
+@assert_noalloc steady(1)   # passes: the once-guard's cold path is exempted, not the caller's own code
+```
+
+For a hand-rolled memoization pattern that doesn't use one of those two `Base` types, register it
+explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not** auto-recognized
+— its implementation has no detectable non-inlined callee boundary to key off of — so wrap it in
+your own function and register that.
 
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
-[`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It only objects to the
+[`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It objects only to
 allocations that come from type uncertainty: boxing (the runtime-tuple-index trap, or a captured
-variable wrapped in a `Core.Box`) and dynamic dispatch. Honest typed heap allocations are fine by
-it. Reach for it on a hot path that's allowed to allocate a working buffer but must never box.
+variable wrapped in a `Core.Box`) and dynamic dispatch. Honest typed heap allocations are fine.
+Use it on a hot path that may allocate a working buffer but must never box.
 
 ```@example guide
 function fill_sum(n)
@@ -172,7 +169,7 @@ end
 @assert_noboxing fill_sum(3)        # passes: it allocates, but it does not box
 ```
 
-That same call doesn't get past `@assert_noalloc`, which forbids allocation of any kind:
+The same call doesn't get past `@assert_noalloc`, which forbids any allocation:
 
 ```julia
 @assert_noalloc fill_sum(3)
@@ -181,7 +178,7 @@ That same call doesn't get past `@assert_noalloc`, which forbids allocation of a
 # ERROR: StrictViolation (@noalloc): allocates (1 site(s)) …
 ```
 
-Boxing and dynamic dispatch, though, are still out:
+Boxing and dynamic dispatch are still out:
 
 ```julia
 boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, runtime index
@@ -189,28 +186,28 @@ boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, ru
 # ┌ Warning: StrictViolation (@noboxing): boxing / dynamic dispatch (value-free IR scan)
 ```
 
-Classifying an allocation as *boxing* specifically is what AllocCheck does exactly, so
-`@test_noboxing` is where the distinction is proved — the scan treats an abstract-eltype container
-as boxing, which is a code smell rather than a boxing proof.
+AllocCheck classifies an allocation as *boxing* exactly, so `@test_noboxing` is where the
+distinction is proved. The scan treats an abstract-eltype container as boxing — a code smell,
+not a proof.
 
 ## `@assert_typestable` / `@test_typestable` — concrete, stable types
 
-Three layers, graded differently. `@assert_typestable` insists the return type is concrete — exact
-for the question it asks, so a violation **throws**. On top of that it adds two IR signals, both
-heuristics and so both only **warning**: internal dispatch hiding behind a concrete return, and a
+Three layers, graded differently. `@assert_typestable` insists the return type is concrete —
+exact for the question it asks, so a violation **throws**. It also adds two IR signals, both
+heuristics, so both only **warn**: internal dispatch hiding behind a concrete return, and a
 union-typed local carrying a member that must be boxed to flow through it.
 
 `@test_typestable` replaces the dispatch signal with `JET.@report_opt` and throws on it. It keeps
-the union-typed-local signal as it is, because JET cannot see that class at all — union splitting is
+the union-typed-local signal as-is, because JET cannot see that class at all: union splitting is
 not dynamic dispatch, so `@report_opt` is silent on it at every signature. Without it the proof
 would be weaker than the scan it is meant to settle.
 
 ### A union-typed local that boxes
 
-A non-isbits union is a tagged pointer, so a member that normally lives unboxed has to be heap-boxed
-to flow through it. Member count is not what decides this; representation is. An isbits member rides
-the union's inline payload and a mutable one is already a pointer, but an immutable struct holding
-heap references — `SubArray`, `Adjoint`, `Transpose` — is boxed on the way in.
+A non-isbits union is a tagged pointer, so a member that normally lives unboxed has to be
+heap-boxed to flow through it. Representation decides, not member count: an isbits member rides
+the union's inline payload, and a mutable one is already a pointer, but an immutable struct
+holding heap references — `SubArray`, `Adjoint`, `Transpose` — is boxed on the way in.
 
 ```julia
 function through_union(A::AbstractMatrix{Float64}, take::Bool)
@@ -223,14 +220,15 @@ function through_union(A::AbstractMatrix{Float64}, take::Bool)
  end
 ```
 
-The return type here is `Float64` — concrete — so the first layer sees nothing, and the box leaves
-no `:new` and no allocating `foreigncall` in optimized IR, so the allocation scan sees nothing
+The return type here is `Float64` — concrete — so the first layer sees nothing. The box leaves no
+`:new` and no allocating `foreigncall` in optimized IR, so the allocation scan sees nothing
 either. Its only trace is the phi's own type.
 
 This rides `:typestable` rather than `:noalloc` deliberately. "This local is union-typed with a
-box-on-entry member" is a property of the code as written; whether the box survives is LLVM's call
-and moves with inlining — the same function measures 16 B per call across a module boundary and 0 B
-once it inlines into its caller. Reporting it as an allocation would red kernels LLVM made free.
+box-on-entry member" is a property of the code as written; whether the box survives is LLVM's
+call and moves with inlining — the same function measures 16 B per call across a module boundary
+and 0 B once it inlines into its caller. Reporting it as an allocation would red kernels LLVM
+made free.
 
 ```@example guide
 affine(x) = 2x + 1
@@ -238,8 +236,8 @@ affine(x) = 2x + 1
 @assert_typestable affine(3.0)
 ```
 
-Runtime tuple indexing, the trap that keeps coming up, produces a `Union` return type and boxes.
-It doesn't pass:
+Runtime tuple indexing — the trap that keeps coming up — produces a `Union` return type and
+boxes. It doesn't pass:
 
 ```julia
 state = (1, 2.0, "three")     # heterogeneous tuple
@@ -253,12 +251,12 @@ component(s, i) = s[i]        # i is a runtime value → Union{Int,Float64,Strin
 
 ## Keyword calls and explicit signatures
 
-Every guarantee macro accepts two extra forms, so you can point them straight at a real API instead
-of an internal positional driver.
+Every guarantee macro accepts two extra forms, so you can point them straight at a real API
+instead of an internal positional driver.
 
-**Keyword arguments.** A keyword call is checked as written — StrictMode routes it through
+**Keyword arguments.** A keyword call is checked as written: StrictMode routes it through
 `Core.kwcall`, so inference, AllocCheck and JET all see the keyword sorter's real specialization.
-That holds under a `types = (…)` override too: the override pins the POSITIONAL types and the
+That holds under a `types = (…)` override too — the override pins the POSITIONAL types and the
 kwcall wrapper is kept, so the analyzed signature stays the one the call actually reaches.
 
 ```julia
@@ -267,9 +265,9 @@ kwcall wrapper is kept, so the analyzed signature stays the one the call actuall
 ```
 
 **`types = (…)` — pin the analyzed signature.** By default the signature comes from
-`typeof.(args)`, so `typeof(Float64) == DataType`. For a *type-argument* function that widens a
-genuine false positive: over `Tuple{DataType, …}` the parameter `T` is unresolvable, so the return
-type widens to non-concrete. Supply the real specialization explicitly:
+`typeof.(args)`, so `typeof(Float64) == DataType`. For a *type-argument* function that becomes a
+genuine false positive: over `Tuple{DataType, …}` the parameter `T` is unresolvable, and the
+return type widens to non-concrete. Supply the real specialization explicitly:
 
 ```julia
 tmp(::Type{T}, n) where {T} = Vector{T}(undef, n)
@@ -280,8 +278,8 @@ tmp(::Type{T}, n) where {T} = Vector{T}(undef, n)
 @assert_typestable tmp(Float64, 4) types=(Type{Float64}, Int)   # ok: real call-site specialization
 ```
 
-`types = (…)` works on `@assert_noalloc`, `@strict`, `@kernel` and the rest the same way. It is the
-general escape hatch whenever `typeof.(args)` doesn't name the specialization you actually run.
+`types = (…)` works on `@assert_noalloc`, `@strict`, `@kernel` and the rest the same way. It is
+the escape hatch for whenever `typeof.(args)` doesn't name the specialization you actually run.
 
 ## `@assert_inlined` — keep the call on the fast path (best-effort)
 
@@ -289,9 +287,9 @@ general escape hatch whenever `typeof.(args)` doesn't name the specialization yo
 StrictMode compiles a tiny wrapper around it and reads the optimized IR: if the call is still
 sitting there as an `:invoke`, it wasn't absorbed, and the assert fails.
 
-Inlining is a heuristic, not a promise, so this one is best-effort by nature. A failure only means
-the compiler chose not to inline under the current settings, which may or may not matter to you.
-That's why it isn't part of [`@strict`](@ref).
+Inlining is a heuristic, not a promise — a failure only means the compiler chose not to inline
+under the current settings, which may or may not matter. That's why it isn't part of
+[`@strict`](@ref).
 
 ```julia
 @inline   hot(x) = x * x + 1
@@ -305,19 +303,19 @@ That's why it isn't part of [`@strict`](@ref).
 ## `@assert_trim_compatible` — static-binary (`juliac --trim`) compatibility
 
 [`@assert_trim_compatible`](@ref) reports when `f(args...)` looks incompatible with
-`juliac --trim=safe`, the static-binary build mode that rejects dynamic dispatch and reflection. It
-is a value-free scan of the typed IR: unresolved dynamic calls, reflection, and calls left
+`juliac --trim=safe`, the static-binary build mode that rejects dynamic dispatch and reflection.
+It is a value-free scan of the typed IR: unresolved dynamic calls, reflection, and calls left
 unresolved by exceeding the union-split limit.
 
-The authoritative answer is a different macro, not a different mode. `StrictModeTest`'s
+The authoritative answer is a different macro, not a different mode: `StrictModeTest`'s
 `@test_trim_compatible` runs juliac's own `verify_typeinf_trim` over the exact signature and
 **throws**, with deduplicated, source-mapped findings. Nothing switches based on which packages
 happen to be loaded — the macro you wrote decides.
 
-Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's
-whole-program verifier over the real build is the final word. [`@assert_trim_safe`](@ref) is the
-same scan under an older name — deprecated, and it warns once per session. The reactive
-counterpart, for a real build log, is [`explain_trim`](@ref).
+Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref):
+juliac's whole-program verifier over the real build is the final word.
+[`@assert_trim_safe`](@ref) is the same scan under an older name — deprecated, and it warns once
+per session. The reactive counterpart, for a real build log, is [`explain_trim`](@ref).
 
 ```julia
 clean(x::Int) = x * 2 + 1
@@ -340,9 +338,9 @@ test_signatures([(reflecty, (Int,))]; guarantees = (:trim_compatible,))   # prov
 
 ## `@strict` — the guarantees a hot path wants, together
 
-[`@strict`](@ref) checks three things in order: type stability first, since that's usually what's
-behind a surprise allocation; then owned scratch; then allocation-freedom. It returns the call's
-value, so you can drop it in around an expression you already have:
+[`@strict`](@ref) checks three things in order: type stability first (that's usually what's
+behind a surprise allocation), then owned scratch, then allocation-freedom. It returns the
+call's value, so you can drop it in around an expression you already have:
 
 ```@example guide
 saxpy(a, x, y) = a .* x .+ y
@@ -350,15 +348,13 @@ saxpy(a, x, y) = a .* x .+ y
 result = @strict saxpy(2.0, (1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
 ```
 
-Only the type-stability check throws. The other two warn: the owned-scratch rule flags *any*
-runtime dictionary accessor, which is right when you name it yourself and too broad applied to
-every call site, and the allocation check is a heuristic scan. Use [`@assert_owned`](@ref) for a
-hard gate on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of
-allocation-freedom.
+Only the type-stability check throws; the other two warn. The owned-scratch rule flags *any*
+runtime dictionary accessor — right when you name it yourself, too broad applied to every call
+site — and the allocation check is a heuristic scan. Use [`@assert_owned`](@ref) for a hard gate
+on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of allocation-freedom.
 
-`@assert_noboxing` is not part of it. Its rule is a strict subset of `@assert_noalloc`'s — every
-violation it finds, the allocation check already reports — so including both would say the same
-thing twice.
+`@assert_noboxing` is not part of it: its rule is a strict subset of `@assert_noalloc`'s, so
+including both would say the same thing twice.
 
 ## `@strict_function` — verify a definition at load time
 
@@ -372,9 +368,9 @@ scaled(2.0, (1.0, 2.0, 3.0))
 ```
 
 A later edit that makes the return type non-concrete stops the module loading. An allocation only
-**warns** here: this runs at your own package's precompile, where the proof is not loadable, and a
-guess must not stop a consumer installing. `test_registered()` re-proves the same signature from
-`test/`, and that one fails.
+**warns** here: this runs at your own package's precompile, where the proof is not loadable, and
+a guess must not stop a consumer installing. `test_registered()` re-proves the same signature
+from `test/`, and that one fails.
 
 ```julia
 @strict_function maybe(x::Int) = x > 0 ? x : 1.0     # Union{Int,Float64} return
@@ -388,16 +384,16 @@ guess must not stop a consumer installing. `test_registered()` re-proves the sam
 
 ### When the declaration names no concrete types
 
-A generic declaration cannot be checked as written. Inference has nothing to work with:
+A generic declaration cannot be checked as written — inference has nothing to work with:
 
 ```@example guide
 pick(t::Tuple, i::Int) = t[i]
 Base.return_types(pick, Tuple{Tuple, Int})
 ```
 
-`Any` — so verifying the declared signature directly would fail every generic function ever written.
-That is why such a definition is skipped with a warning rather than checked. The same function is
-perfectly answerable once you fix the tuple type, and the answer differs per instantiation:
+`Any` — so verifying the declared signature directly would fail every generic function ever
+written. That's why such a definition is skipped with a warning rather than checked. The same
+function is answerable once you fix the tuple type, and the answer differs per instantiation:
 
 ```@example guide
 [Base.return_types(pick, Tuple{T, Int}) for T in
@@ -416,10 +412,10 @@ sigs = [(NTuple{3,Float64}, Int), (Tuple{Float64,String}, Int)]
 # the second entry infers Union{Float64,String}, so the module fails to load
 ```
 
-**Or check whatever callers create** — [`@strict_stable`](@ref) moves the body into a hidden inner
-function and has the public one infer its return type. That inference is a compile-time constant, so
-a stable specialization compiles to exactly the code the unannotated definition would, and an
-unstable one throws as it is compiled:
+**Or check whatever callers create** — [`@strict_stable`](@ref) moves the body into a hidden
+inner function and has the public one infer its return type. That inference is a compile-time
+constant, so a stable specialization compiles to exactly the code the unannotated definition
+would, and an unstable one throws as it is compiled:
 
 ```@example guide
 @strict_stable spick(t::Tuple, i::Int) = t[i]
@@ -431,19 +427,19 @@ spick((1.0, "a"), 2)           # Union{Float64,String}
 # ERROR: StrictViolation (@typestable): return type is not concrete for this specialization …
 ```
 
-The trade is real and worth stating: `@strict_stable` forms its verdict per specialization rather
-than once at load, and inference is not stable under an open world — a definition that loaded clean
-can begin to throw after unrelated code changes what inference can prove. Reach for `signatures`
-when the contract is a fixed set of types you own; reach for `@strict_stable` for an entry point
-whose callers pick the types. Only type stability travels this way: allocation and vectorization are
-read from compiled output.
+The trade: `@strict_stable` forms its verdict per specialization rather than once at load, and
+inference is not stable under an open world — a definition that loaded clean can begin to throw
+after unrelated code changes what inference can prove. Reach for `signatures` when the contract
+is a fixed set of types you own; reach for `@strict_stable` for an entry point whose callers
+pick the types. Only type stability travels this way: allocation and vectorization are read from
+compiled output.
 
 ## Interfaces + performance with TypeContracts
 
 When you define an interface (an abstract type with a required set of methods), you can also
-require that every implementation of it is fast. [`@strict_contract`](@ref) declares the interface
-with performance guarantees attached, and [`@verify_strict`](@ref) checks both sides: that an
-implementation has the right methods, and that those methods are fast.
+require that every implementation of it is fast. [`@strict_contract`](@ref) declares the
+interface with performance guarantees attached, and [`@verify_strict`](@ref) checks both sides:
+that an implementation has the right methods, and that those methods are fast.
 
 ```@example guide
 using TypeContracts
@@ -477,8 +473,8 @@ end
 
 ## Static ownership — one method per type, not a lookup table
 
-When each type needs its own value — a workspace, a unit, a scratch buffer — write one method per
-type instead of keying a dict by the type:
+When each type needs its own value — a workspace, a unit, a scratch buffer — write one method
+per type instead of keying a dict by the type:
 
 ```julia
 # lookup table: a probe on every call
@@ -506,11 +502,11 @@ Both are called the same way, `unit(Float64)`. What differs is **when the answer
   the call is gone                   ~130 ns, every time
 ```
 
-Julia cannot skip the dict probe: the type is an ordinary value at runtime, and a mutable dict's
-contents are not knowable while compiling. Base works the method way — `one(::Type{T})` was never
-going to be a dict.
+Julia cannot skip the dict probe: the type is an ordinary value at runtime, and a mutable
+dict's contents are not knowable while compiling. Base works the method way — `one(::Type{T})`
+was never going to be a dict.
 
-The idea comes from the Linux-kernel principle that *data has a clear static owner, reached through
+The idea comes from a Linux-kernel principle: *data has a clear static owner, reached through
 that owner — never a global registry*. In real code the owned value is usually a workspace:
 
 ```julia
@@ -523,28 +519,30 @@ _ws(::Type{Float32}) = _WS_F32
 const _WS = IdDict{Type, Any}()
 _ws(::Type{T}) where {T} = get!(() -> Workspace{T}(), _WS, T)
 ```
+
 **Why no other check catches it.** A warm dict hit allocates nothing (measured: 0 bytes). Narrow
 its result — a type assert, or a concretely-typed dict — and `@assert_typestable`,
-`@assert_noalloc` and `@assert_noboxing` all pass. The cost is pure latency, about **130 ns** per
-call, so only a benchmark or a structural lint finds it.
+`@assert_noalloc` and `@assert_noboxing` all pass. The cost is pure latency, about **130 ns**
+per call, so only a benchmark or a structural lint finds it.
 
-It hides from IR inspection too. When `T` is a static parameter the optimizer folds `get!` into raw
-`jl_eqtable_*` foreigncalls, so the recognizable pattern is gone from optimized IR — which is why
-[`static_ownership_suggestions`](@ref) reads **unoptimized** typed IR instead.
+It hides from IR inspection too: when `T` is a static parameter the optimizer folds `get!` into
+raw `jl_eqtable_*` foreigncalls, so the recognizable pattern is gone from optimized IR. That's
+why [`static_ownership_suggestions`](@ref) reads **unoptimized** typed IR instead.
 
 **Why `juliac --trim` needs it.** A static build keeps only calls it can resolve to a concrete
 method while compiling. One method per type resolves trivially — one callee, a `const` body,
-inlined away. A dict lookup does not: the trimmer can see which `get!` runs, but never what comes
-out of the table, because that association lives in mutable memory rather than in the type system.
+inlined away. A dict lookup does not: the trimmer can see which `get!` runs, but never what
+comes out of the table, because that association lives in mutable memory rather than in the type
+system.
 
-Allocation splits the same way. The dict allocates on first miss, so an all-paths proof sees a
-reachable allocation forever, even though steady state is clean. The `const` owner allocates once
-at module load, leaving the hot path provably allocation-free with no exemptions.
+Allocation splits the same way: the dict allocates on first miss, so an all-paths proof sees a
+reachable allocation forever, even though steady state is clean. The `const` owner allocates
+once at module load, leaving the hot path provably allocation-free with no exemptions.
 
 **Why it is advice, not a proof.** A `Dict` is sometimes the right tool — a config table parsed
-once, an open-ended memo cache. The idiom's own escape hatch is a `Dict` fallback for a rare-type
-tail (Example 2 below), which is itself a runtime lookup. Swept over a whole package, a hard gate
-would break the build on the fallback the idiom recommends.
+once, an open-ended memo cache. The idiom's own escape hatch is a `Dict` fallback for a
+rare-type tail (Example 2 below), which is itself a runtime lookup. A hard gate swept over a
+whole package would break the build on the fallback the idiom recommends.
 
 **Two tools, for two different jobs.** StrictMode gives you a precise tool and a broad one, and
 they don't overlap in scope (different guarantee names, no shared registry entry):
@@ -555,20 +553,19 @@ they don't overlap in scope (different guarantee names, no shared registry entry
 | Failure mode | hard `StrictViolation` — breaks the build | `status = :info` — never a failure, `nfailures` ignores it |
 | Where it runs | one call site you write by hand, like [`@assert_inlined`](@ref) | `audit(MyPkg; static_ownership_suggest = true)`, a whole-module/whole-registry sweep |
 
-Reach for `@assert_owned` the same way you'd reach for `@assert_inlined`: on a call you've already
-identified as hot and want a permanent regression guard on. Reach for
-`static_ownership_suggestions` (or `audit(...; static_ownership_suggest = true)`) when you don't
-yet know where the pattern shows up and want a package-wide pass that can't break anything while
-you look — the same relationship [`inline_suggestions`](@ref) has to `@assert_inlined`.
+Use `@assert_owned` the way you'd use `@assert_inlined`: on a call you've already identified as
+hot and want a permanent regression guard on. Use `static_ownership_suggestions` (or
+`audit(...; static_ownership_suggest = true)`) when you don't yet know where the pattern shows
+up and want a package-wide pass that can't break anything while you look — the same relationship
+[`inline_suggestions`](@ref) has to `@assert_inlined`.
 
 **Why `@assert_owned` isn't swept in by default.** `@strict f(x)` does run it on the call you
-named, but as a warning. Keep the *throwing* form scoped to calls you assert by hand;
-don't add it to `register_strict!`'s guarantee list or a `@strict module`'s default set. The
-pattern's own sanctioned escape hatch — a `Dict` fallback for a rare-type tail that doesn't earn
-its own `const` — is *also* a runtime dict lookup, and a broad sweep would flag (and, since
-`@assert_owned` hard-fails, break the build on) the very fallback the idiom recommends. A
-narrow, opt-in `@assert_owned` on your known-hot calls avoids that; the advisory sweep is built
-for exactly the "show me everywhere, break nothing" case instead.
+named, but as a warning. Keep the *throwing* form scoped to calls you assert by hand; don't add
+it to `register_strict!`'s guarantee list or a `@strict module`'s default set. The sanctioned
+escape hatch — a `Dict` fallback for a rare-type tail that doesn't earn its own `const` — is
+*also* a runtime dict lookup, and a broad sweep would flag (and, since `@assert_owned`
+hard-fails, break the build on) it. A narrow, opt-in `@assert_owned` on known-hot calls avoids
+that; the advisory sweep is built for the "show me everywhere, break nothing" case.
 
 ### Example 1 — the anti-pattern, caught both ways
 
@@ -606,8 +603,8 @@ static_ownership_suggestions(_ws2, (Type{Float64},))   # empty: nothing left to 
 ### Example 2 — whole-package discovery, and the sanctioned fallback
 
 The realistic shape combines dispatch for the hot types with a `Dict` fallback for a rare-type
-tail — exactly the case `@assert_owned` would break the build on if swept broadly, and exactly
-the case the advisory sweep is built to surface without breaking anything:
+tail. That's the case `@assert_owned` would break the build on if swept broadly, and the case
+the advisory sweep is built to surface without breaking anything:
 
 ```@example guide
 module Workspaces
@@ -630,13 +627,13 @@ nfailures(fs)   # 0 — only the fallback is flagged, and an advisory finding ne
 
 ### Example 3 — real packages doing this
 
-This isn't a StrictMode-specific idiom; it's how Julia packages that care about it already solve
-the "per-type registry" problem.
+This isn't a StrictMode-specific idiom; it's how Julia packages that care already solve the
+"per-type registry" problem.
 
 **TypeContracts.jl** — a separate interface-contract package. The obvious design for
-`@contract AbstractShape begin ... end` is a global `Dict{Type,ContractSpec}` mutated by the macro
-and queried by the checker. TypeContracts deliberately has no mutable registry at all: `@contract
-I` instead *emits methods* —
+`@contract AbstractShape begin ... end` is a global `Dict{Type,ContractSpec}` mutated by the
+macro and queried by the checker. TypeContracts deliberately has no mutable registry at all:
+`@contract I` instead *emits methods* —
 
 ```julia
 @generated function TypeContracts.interface_trait(::Type{I}, ::Type{T}) where {T}
@@ -645,15 +642,15 @@ end
 ```
 
 — plus a `_contract_specs(::Type{I})` method holding the spec. The generic fallback,
-`interface_trait(::Type{I}, ::Type{T}) where {I,T} = NotImplemented{I}()`, makes "not registered"
-a dispatch outcome too, not a `haskey` branch. The payoff is the whole list: method
-definitions serialize into the precompile cache and survive package reloads (a dict would be
-wiped, needing an `__init__` re-registration step); no world-age problems; and `interface_trait`
-is `juliac --trim`-safe precisely because there is no runtime registry lookup for the trimmer to
-fail to prove — just ordinary, statically-resolvable methods.
+`interface_trait(::Type{I}, ::Type{T}) where {I,T} = NotImplemented{I}()`, makes "not
+registered" a dispatch outcome too, not a `haskey` branch. The payoff: method definitions
+serialize into the precompile cache and survive package reloads (a dict would be wiped, needing
+an `__init__` re-registration step); there are no world-age problems; and `interface_trait` is
+`juliac --trim`-safe because there is no runtime registry lookup for the trimmer to fail to
+prove — just ordinary, statically-resolvable methods.
 
-**Julia Base — `IteratorSize`/`IteratorEltype`** (`base/generator.jl`). A textbook per-type trait
-registry, shipped as pure dispatch:
+**Julia Base — `IteratorSize`/`IteratorEltype`** (`base/generator.jl`). A textbook per-type
+trait registry, shipped as pure dispatch:
 
 ```julia
 IteratorSize(x) = IteratorSize(typeof(x))
@@ -664,28 +661,28 @@ IteratorSize(::Type{<:AbstractArray{<:Any, N}}) where {N} = HasShape{N}()
 
 Packages "register" by defining their own `Base.IteratorSize(::Type{MyIter}) = HasShape{2}()`
 method rather than inserting into a table. `IteratorSize(Vector{Int})` const-folds to
-`HasShape{1}()`, and `collect`'s dispatch on it specializes completely; a `Dict{Type,...}` version
-would put an eqtable probe inside every `collect` call and be opaque to inference.
+`HasShape{1}()`, and `collect`'s dispatch on it specializes completely; a `Dict{Type,...}`
+version would put an eqtable probe inside every `collect` call and be opaque to inference.
 
-One caveat so the idiom isn't over-applied: dispatch-per-type means one compiled specialization per
-type. For a handful of known-hot types that's the whole point; for an unbounded, genuinely dynamic
-key population it's compile-time and method-table bloat instead — the honest answer there is a
-`Dict`, or the hybrid fallback shape in Example 2. Static ownership isn't "never use a `Dict`" — it's
-"the hot, statically-known associations belong in the method table, where the compiler can see
-them."
+One caveat so the idiom isn't over-applied: dispatch-per-type means one compiled specialization
+per type. For a handful of known-hot types that's the whole point; for an unbounded, genuinely
+dynamic key population it's compile-time and method-table bloat instead — the honest answer
+there is a `Dict`, or the hybrid fallback shape in Example 2. Static ownership isn't "never use
+a `Dict`" — it's "the hot, statically-known associations belong in the method table, where the
+compiler can see them."
 
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
-Every guarantee above is about **speed** — allocation, boxing, dispatch. [`@assert_memsafe`](@ref)
-is about **safety**: it catches an out-of-bounds array read or write in an unsafe hand-vectorized
-kernel *deterministically*, instead of the way these bugs usually surface — flakily, once in a
-long benchmark run, only when the next page happens to be unmapped.
+Every guarantee above is about **speed** — allocation, boxing, dispatch.
+[`@assert_memsafe`](@ref) is about **safety**: it catches an out-of-bounds array read or write
+in an unsafe hand-vectorized kernel *deterministically*, instead of the way these bugs usually
+surface — flakily, once in a long benchmark run, only when the next page happens to be unmapped.
 
 The motivating shape: a masked SIMD load reads a full lane width at a tile pointer, up to `W-1`
 elements past a partial-row tile's valid region — via a raw pointer (`unsafe_load`, a
 `VecElement`/LLVM-intrinsic vector load, or equivalent), not `getindex`. That kernel is
-type-stable, allocation-free, and `--trim`-tolerated — every other guarantee in this package
-passes it — because none of them model runtime memory addresses. A benchmark using ordinary heap
+type-stable, allocation-free, and `--trim`-tolerated; every other guarantee in this package
+passes it, because none of them model runtime memory addresses. A benchmark on ordinary heap
 arrays (whose trailing page happens to be mapped) may never trip it at all.
 
 ```julia
@@ -705,40 +702,40 @@ end
 ```
 
 **Why not just `julia --check-bounds=yes`?** Use it when you can — for a plain `@inbounds a[i]`
-overrun it turns the bug into a catchable `BoundsError`, and a `@test_throws BoundsError` under that
-flag beats this whole harness.
+overrun it turns the bug into a catchable `BoundsError`, and a `@test_throws BoundsError` under
+that flag beats this whole harness.
 
-It cannot help here. The flag re-enables the bounds branch inside `getindex`/`setindex!`/
+It cannot help here: the flag re-enables the bounds branch inside `getindex`/`setindex!`/
 `checkbounds` lowering, and `unsafe_load`, `unsafe_store!`, raw `Ptr` arithmetic and SIMD vector
-loads never go through `checkbounds` at all — so it has no effect on them. (Checked at the
-`@code_llvm` level: `getindex` compiles a bounds branch, `unsafe_load` compiles none.) That is the
-access pattern the bug above uses, which is why `@assert_memsafe` is a separate tool rather than a
-wrapper around a flag.
+loads never go through `checkbounds` at all, so it has no effect on them. (Checked at the
+`@code_llvm` level: `getindex` compiles a bounds branch, `unsafe_load` compiles none.) That's
+the access pattern the bug above uses — the reason `@assert_memsafe` is a separate tool rather
+than a wrapper around a flag.
 
 How it works:
 
-- `Array` arguments are copied into `mmap` buffers that end flush against a `PROT_NONE` guard page,
-  so a one-element overrun faults on **every** run — not only when the allocator happens to leave
-  the next page unmapped.
-- The probe runs in a subprocess, the only way to catch an out-of-bounds **read**: that is a fatal
-  `SIGSEGV` and cannot be caught in-process.
+- `Array` arguments are copied into `mmap` buffers that end flush against a `PROT_NONE` guard
+  page, so a one-element overrun faults on **every** run — not only when the allocator happens
+  to leave the next page unmapped.
+- The probe runs in a subprocess, the only way to catch an out-of-bounds **read**: that is a
+  fatal `SIGSEGV` and cannot be caught in-process.
 - A **poisoned canary** classifies writes. The bytes past the data carry a per-buffer,
   position-dependent pattern, read back before the child touches the guard page, so a store past
   the end is reported at its exact offset. This is needed because a write fault destroys its own
   backtrace (`unknown function (ip: …)`, zero frames).
-- Arguments holding the same array share one guarded buffer, so a kernel with an aliasing-dependent
-  path sees the aliasing it was called with.
+- Arguments holding the same array share one guarded buffer, so a kernel with an
+  aliasing-dependent path sees the aliasing it was called with.
 
-There is no in-process mode: an in-process probe can only use the canary, and a load past the end
-disturbs no canary, so its clean verdict would be indistinguishable from no overrun at all — in
-exactly the case this harness exists for.
+There is no in-process mode: an in-process probe can only use the canary, and a load past the
+end disturbs no canary, so its clean verdict would be indistinguishable from no overrun at all —
+in exactly the case this harness exists for.
 
-See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array` arguments
-only, end-of-buffer overruns only — no interior or underrun detection). Arguments the harness
-cannot guard — a `view`, an `Adjoint`, a struct carrying arrays in its fields — are listed in the
-report's `unguarded` field, so a clean verdict over a partially covered call does not read like a
-clean verdict over a fully covered one; [`@assert_memsafe`](@ref) rejects the ones the caller can
-materialize outright.
+See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array`
+arguments only, end-of-buffer overruns only — no interior or underrun detection). Arguments the
+harness cannot guard — a `view`, an `Adjoint`, a struct carrying arrays in its fields — are
+listed in the report's `unguarded` field, so a clean verdict over a partially covered call does
+not read like a clean verdict over a fully covered one; [`@assert_memsafe`](@ref) rejects the
+ones the caller can materialize outright.
 
 ## `@assert_trusted` — check data from outside before using it
 
@@ -752,9 +749,9 @@ frame = Untrusted(read(sock, n))
 ```
 
 That changes its type, so nothing written for `Vector{UInt8}` accepts it. `sum(frame)` and
-`frame[1]` are `MethodError`s; `frame.x` throws. You can pass it around, and that is all. Wrapping
-costs nothing — same layout as the payload, no allocation — and the type is still there in a
-shipped build.
+`frame[1]` are `MethodError`s; `frame.x` throws. You can pass it around, and that is all.
+Wrapping costs nothing — same layout as the payload, no allocation — and the type is still there
+in a shipped build.
 
 One function opens it, and its name says so:
 
@@ -794,19 +791,19 @@ One wrapper, one door, one place to get it right:
 
 Two limits, both real.
 
-**The type does most of the work on its own.** An `Untrusted{T}` matches no method written for `T`,
-in a shipped build as much as in tests. The check is only there for the deliberate way out:
+**The type does most of the work on its own.** An `Untrusted{T}` matches no method written for
+`T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
 that.
 
-**Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header` really
-checks what it read, or that it copied instead of handing back the caller's buffer. Both matter,
-and both are on you.
+**Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header`
+really checks what it read, or that it copied instead of handing back the caller's buffer. Both
+matter, and both are on you.
 
 The idea is the Linux kernel's `__user` annotation: a pointer from userspace gets its own type,
-`copy_from_user` is the crossing that checks and copies, and `__force` is the one cast around it.
-The kernel's marker disappears unless a separate checker is run, which is why it so often isn't.
-`Untrusted` is a real type, so it holds either way.
+`copy_from_user` is the crossing that checks and copies, and `__force` is the one cast around
+it. The kernel's marker disappears unless a separate checker is run, which is why it so often
+isn't. `Untrusted` is a real type, so it holds either way.
 
 ## Promise scope
 
@@ -815,16 +812,16 @@ StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vect
 (via [`@assert_no_spill`](@ref)), **static-binary (`juliac --trim`) compatibility** (via
 [`@assert_trim_compatible`](@ref)), **owned scratch** (via [`@assert_owned`](@ref)), **validated
 foreign data** (via [`@assert_trusted`](@ref)), and, deterministically rather than flakily,
-**out-of-bounds array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is
-explicitly out of scope: **bit-reproducibility**.
+**out-of-bounds array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property
+is explicitly out of scope: **bit-reproducibility**.
 
-SIMD reduction order is LLVM-codegen-defined. The lane-combine order for a vector reduction —
-for example, how four `<4 x double>` lanes are collapsed to a scalar — is chosen by the compiler
+SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction —
+how four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler
 and may differ from a reference implementation, even when both produce IEEE-correct results. A
-~1-ULP difference between your kernel and a Rust or C reference is expected behavior and is *not*
-a StrictMode failure.
+~1-ULP difference between your kernel and a Rust or C reference is expected behavior and *not* a
+StrictMode failure.
 
-If you are testing numerical correctness against a reference, use tolerance-aware comparisons for
-SIMD reductions. Exact matching remains valid for deterministic operations (non-reduction
-arithmetic, memory copies, index computations). See also [the golden-harness methodology](cookbook.md)
-in the cookbook for a practical port workflow.
+When testing numerical correctness against a reference, use tolerance-aware comparisons for SIMD
+reductions. Exact matching remains valid for deterministic operations (non-reduction arithmetic,
+memory copies, index computations). See also [the golden-harness methodology](cookbook.md) in
+the cookbook for a practical port workflow.
