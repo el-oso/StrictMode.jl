@@ -4,7 +4,10 @@ on:
   push:
     branches:
       - master
-    tags: ['*']
+    # Only StrictMode's own releases build a versioned site. StrictModeTest ships prefixed tags
+    # (`StrictModeTest-v0.4.0`), and Documenter cannot read a version out of one — the build would
+    # run and then decline to deploy.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 

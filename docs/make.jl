@@ -31,6 +31,7 @@ makedocs(;
         ],
         "Reference" => [
             "Guarantees" => "guarantees.md",
+            "StrictModeTest" => "proof_tier.md",
             "API Reference" => "api.md",
         ],
         "In practice" => [
