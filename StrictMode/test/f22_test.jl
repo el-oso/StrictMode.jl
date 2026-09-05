@@ -33,9 +33,19 @@
         end
         idx
     end
-    # `--check-bounds=yes` (Pkg.test's default) reshapes the loop so the scalar-FP-loop signature
-    # is no longer present; the scan is about vectorizable loop shape, which forced bounds checks remove.
-    if Base.JLOptions().check_bounds != 1
+    # The scan is about vectorizable loop shape, so this only means anything where the surrounding
+    # codegen can auto-vectorize at all. Ask the compiled output rather than a flag: forced bounds
+    # checks and coverage instrumentation both suppress vectorization, and which of them is on by
+    # default has already changed once between Julia versions. `count_byte` above cannot answer this
+    # — explicit SIMD.jl vectors survive either setting — so probe with an ordinary `@simd` loop.
+    @noinline function _autovec_probe(v::Vector{Float64})
+        s = 0.0
+        @inbounds @simd for i in eachindex(v)
+            s += v[i]
+        end
+        return s
+    end
+    if StrictMode._vectorized(_autovec_probe, (Vector{Float64},))
         @test StrictMode.scalar_fp_loops(first_gt, (Vector{Int64}, Int64))
     else
         @test_skip false
