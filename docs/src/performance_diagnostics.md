@@ -216,15 +216,18 @@ type-stable) — properties whose loss costs 2–100× silently. The diagnostics
 hardware limit, and why. Neither closes every gap; some require roofline reasoning or restructuring
 the algorithm above the single-kernel view.
 
-## Static-binary compatibility (`@assert_trim_safe`)
+## Static-binary compatibility (`@assert_trim_compatible`)
 
 Julia's ahead-of-time compiler (`juliac --trim=safe`) rejects dynamic dispatch and runtime
 reflection. StrictMode can flag incompatible patterns before a slow `juliac` build reveals them:
 
 ```julia
-@assert_trim_safe my_kernel(a, b)   # warns if the compiled body looks like --trim would reject it
-audit(MyPkg; sweep = true, guarantees = (:typestable, :noalloc, :trimsafe))
+@assert_trim_compatible my_kernel(a, b)  # warns if the body looks like --trim would reject it
+audit(MyPkg; sweep = true, guarantees = (:typestable, :noalloc, :trim_compatible))
 ```
+
+`@assert_trim_safe` / `:trimsafe` are the same scan under an older name. They are deprecated and
+warn once per session; use the names above.
 
 When a real `juliac --trim` run fails, [`explain_trim`](@ref) translates the verifier output into
 source-mapped hints with per-site suggestions.

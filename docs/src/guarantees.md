@@ -311,8 +311,8 @@ happen to be loaded — the macro you wrote decides.
 
 Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's
 whole-program verifier over the real build is the final word. [`@assert_trim_safe`](@ref) is the
-same scan under a name that says "static only". The reactive counterpart, for a real build log, is
-[`explain_trim`](@ref).
+same scan under an older name — deprecated, and it warns once per session. The reactive
+counterpart, for a real build log, is [`explain_trim`](@ref).
 
 ```julia
 clean(x::Int) = x * 2 + 1
@@ -518,7 +518,7 @@ and splice the literal into `@unroll` from a `@generated` method:
 end
 ```
 
-## GKH ownership — one method per type, not a lookup table
+## Static ownership — one method per type, not a lookup table
 
 When each type needs its own value — a workspace, a unit, a scratch buffer — write one method per
 type instead of keying a dict by the type:
@@ -528,7 +528,7 @@ type instead of keying a dict by the type:
 const UNITS = Dict{Type, Any}(Int => 1, Float64 => 1.0)
 unit(::Type{T}) where {T} = UNITS[T]
 
-# GKH ownership: one method per type
+# Static ownership: one method per type
 unit(::Type{Int})     = 1
 unit(::Type{Float64}) = 1.0
 ```
@@ -626,10 +626,10 @@ only(static_ownership_suggestions(_ws, (Type{Float64},)))    # advisory: an :inf
 @assert_owned _ws(Float64) types = (Type{Float64},)
 # ERROR: StrictViolation (@owned): guarantee not satisfied
 #   target:  _ws(Float64)
-#   reason:  hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): …
+#   reason:  hot path resolves a runtime AbstractDict lookup (static-ownership violation): …
 ```
 
-The GKH-dispatch fix satisfies both — `@assert_owned` passes, and the advisory sweep has nothing
+The dispatch fix satisfies both — `@assert_owned` passes, and the advisory sweep has nothing
 left to say:
 
 ```@example guide
@@ -688,7 +688,7 @@ end
 
 — plus a `_contract_specs(::Type{I})` method holding the spec. The generic fallback,
 `interface_trait(::Type{I}, ::Type{T}) where {I,T} = NotImplemented{I}()`, makes "not registered"
-a dispatch outcome too, not a `haskey` branch. The payoff is the GKH list verbatim: method
+a dispatch outcome too, not a `haskey` branch. The payoff is the whole list: method
 definitions serialize into the precompile cache and survive package reloads (a dict would be
 wiped, needing an `__init__` re-registration step); no world-age problems; and `interface_trait`
 is `juliac --trim`-safe precisely because there is no runtime registry lookup for the trimmer to
@@ -712,7 +712,7 @@ would put an eqtable probe inside every `collect` call and be opaque to inferenc
 One caveat so the idiom isn't over-applied: dispatch-per-type means one compiled specialization per
 type. For a handful of known-hot types that's the whole point; for an unbounded, genuinely dynamic
 key population it's compile-time and method-table bloat instead — the honest answer there is a
-`Dict`, or the hybrid fallback shape in Example 2. GKH ownership isn't "never use a `Dict`" — it's
+`Dict`, or the hybrid fallback shape in Example 2. Static ownership isn't "never use a `Dict`" — it's
 "the hot, statically-known associations belong in the method table, where the compiler can see
 them."
 

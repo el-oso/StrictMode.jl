@@ -25,7 +25,7 @@ _mkfinding(md, fn, sg, g, fail::Bool, reason, file, line) = StrictFinding(
 
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
-    :no_scalar_loops, :no_spill, :trimsafe, :trim_compatible,
+    :no_scalar_loops, :no_spill, :trimsafe, :trim_compatible, :trusted,
 )
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
@@ -34,7 +34,7 @@ const _GUARANTEES = (
 function _compiled_output_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
     if g === :owned
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
-        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (GKH violation)", s.file, s.line)
+        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
@@ -47,6 +47,10 @@ function _compiled_output_finding(g::Symbol, @nospecialize(f), @nospecialize(typ
         return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0)
     elseif g === :trimsafe
         return _trimsafe_finding(f, types, md, fn, sg)
+    elseif g === :trusted
+        # No proving counterpart: the scan reads a call on a type inference has already fixed, so
+        # there is nothing a backend could add. Both tiers therefore answer from here.
+        return _trusted_finding(f, types, md, fn, sg)
     end
     return nothing
 end

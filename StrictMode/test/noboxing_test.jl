@@ -82,7 +82,7 @@ end
 
 @testitem "the two engines answer DIFFERENT questions on a memoized accessor" begin
     using StrictMode, StrictModeTest
-    # The PureBLAS `_l3ws` / GKH-ownership shape, and a correction: an earlier version of this item
+    # The PureBLAS `_l3ws` / static-ownership shape, and a correction: an earlier version of this item
     # claimed `:fast` was RIGHT here and AllocCheck merely conservative. That was a category error.
     # It measured `@allocated` WARM — steady state — and then credited whichever engine agreed with
     # it. AllocCheck does not answer that question. It proves "cannot allocate on ANY path", and

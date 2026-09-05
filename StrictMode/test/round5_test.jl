@@ -209,3 +209,30 @@ end
         @test r.vec_regs_total == 0
     end
 end
+
+@testitem "_alloc_signals memoizes the top body, and clear_cache! invalidates it" begin
+    using StrictMode
+    f_memo(a::Vector{Float64}, b::Vector{Float64}) = (s = 0.0; @inbounds @simd for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end; s)
+    tt = (Vector{Float64}, Vector{Float64})
+    f_memo(rand(4), rand(4))
+
+    StrictMode.clear_cache!()
+    sig = Base.signature_type(f_memo, Tuple{tt...})
+    @test !haskey(StrictMode._TOP_SIGNAL_MEMO, sig)
+
+    first_result = StrictMode._alloc_signals(f_memo, tt)
+    @test haskey(StrictMode._TOP_SIGNAL_MEMO, sig)
+    # The cached answer must equal the uncached one, field for field — a memo that returns
+    # something else is worse than no memo.
+    @test StrictMode._alloc_signals(f_memo, tt) == first_result
+    @test StrictMode._alloc_signals_uncached(f_memo, tt, sig, StrictMode._FAST_ALLOC_DEPTH[]) == first_result
+
+    # Keyed by depth as well as signature, so a different depth is a different question.
+    StrictMode._alloc_signals(f_memo, tt; depth = 0)
+    @test length(StrictMode._TOP_SIGNAL_MEMO[sig]) == 2
+
+    StrictMode.clear_cache!()
+    @test !haskey(StrictMode._TOP_SIGNAL_MEMO, sig)
+end

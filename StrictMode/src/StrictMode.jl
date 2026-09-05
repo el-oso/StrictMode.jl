@@ -46,6 +46,7 @@ export StrictViolation, StrictReport, StrictFinding
 export findings, audit, format_findings, nfailures, watch, unwatch
 export inline_suggestions, migration_report
 export static_ownership_suggestions
+export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
 export register_alloc_barrier!
@@ -64,6 +65,7 @@ include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
 include("static_ownership.jl")
+include("trusted.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("findings.jl")

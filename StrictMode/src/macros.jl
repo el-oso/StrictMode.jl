@@ -145,13 +145,16 @@ function _guarantee_expr(call, runner, extra_args...; types = nothing)
     end
 end
 
-# `@strict` — apply every per-call guarantee at once. Binds the arguments a single time so the
-# combined check never double-evaluates side effects. (v0.2 will also fold in `@assert_noboxing`
-# and `@assert_inlined`.)
+# `@strict` — the guarantees every hot path wants, applied together. Binds the arguments a single
+# time so the combined check never double-evaluates side effects.
+#
+# `:noboxing` is deliberately absent: its rule is a strict subset of `:noalloc`'s
+# (`check.jl` fails `:noalloc` on `alloc || boxing || abscontainer` and `:noboxing` on
+# `boxing || abscontainer`), so including both reports every boxing violation twice and detects
+# nothing extra.
 
-# Build the gated expression for a single `f(args...)` call: type-stable + non-allocating, or
-# the bare call when checks are disabled. Factored out so `@verify_strict` can reuse it without
-# fragile nested-macro composition.
+# Build the gated expression for a single `f(args...)` call, or the bare call when checks are
+# disabled. Factored out so `@verify_strict` can reuse it without fragile nested-macro composition.
 function _strict_expr(call; types = nothing)
     target = string(call)
     p = _call_parts(call; types)
@@ -161,7 +164,12 @@ function _strict_expr(call; types = nothing)
         $(p.binds...)
         # (1) type stability (root cause of most surprise allocations, so checked first)
         $(_typestable_check_expr(target, p.checkfn, p.types))
-        # (2) allocation-freedom (also returns the call's value)
+        # (2) owned scratch. Reports here rather than throwing as `@assert_owned` does: the rule
+        # flags ANY runtime `AbstractDict` accessor on the hot path, which is right for a check you
+        # asked for by name and too broad for one applied to every `@strict` site — a value-keyed
+        # cache is legitimate. Runs before the call so the static scan precedes execution.
+        $(_assert_owned)($target, $(p.checkfn), $(p.types); gates = false)
+        # (3) allocation-freedom (also returns the call's value)
         $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); mode = $(QuoteNode(mode)))
     end
     return _gate(checked, esc(call))
@@ -170,9 +178,21 @@ end
 """
     @strict f(args...)
 
-Ask for all of StrictMode's per-call guarantees on `f(args...)` at once: type stability
-([`@assert_typestable`](@ref)) and allocation-freedom ([`@assert_noalloc`](@ref)). Type stability
-comes first, since instability is usually what's behind a surprise allocation.
+Apply the guarantees a hot path wants to `f(args...)` at once:
+
+1. type stability ([`@assert_typestable`](@ref)) — checked first, since instability is usually
+   what's behind a surprise allocation;
+2. owned scratch ([`@assert_owned`](@ref)) — a runtime `AbstractDict` lookup on the hot path is
+   type-stable and non-allocating on the warm hit, so the other two pass it;
+3. allocation-freedom ([`@assert_noalloc`](@ref)).
+
+Only type stability **throws** here. The owned-scratch and allocation checks warn: the first flags
+any runtime dictionary accessor, which is right when you name it yourself and too broad applied to
+every call site, and the second is a heuristic scan. Use [`@assert_owned`](@ref) directly for a hard
+gate on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of allocation-freedom.
+
+`@assert_noboxing` is not included: its rule is a strict subset of `@assert_noalloc`'s, so it would
+report the same violations a second time and catch nothing extra.
 
 Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
 bare call. Keyword-argument calls and a `types = (…)` signature override are both supported, exactly

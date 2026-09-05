@@ -16,7 +16,7 @@ function register_strict!(@nospecialize(f), @nospecialize(types); guarantees = (
     # `isdispatchtuple`, not `all(isconcretetype, tt)`: a `::Type{T}` argument is a valid,
     # fully-specified dispatch signature (there's exactly one value of `Type{Float64}`), but
     # `isconcretetype(Type{Float64})` is `false` — a real Julia quirk that would otherwise skip
-    # every `::Type{T}`-argument function, silently, including the GKH-dispatch idiom this
+    # every `::Type{T}`-argument function, silently, including the dispatch idiom this
     # package's own `:static_ownership` guarantee recommends.
     if !Base.isdispatchtuple(Tuple{tt...})
         @warn "register_strict!: skipping $(_func_name(f))$(_sig_string(tt)) — non-concrete argument types."

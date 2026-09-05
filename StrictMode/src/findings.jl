@@ -36,7 +36,8 @@ end
 # Actionable fix hint per guarantee — the structured equivalent of what `@explain` tells a human.
 function _suggestion(guarantee::Symbol)
     guarantee === :noboxing && return "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter."
-    guarantee === :owned && return "runtime AbstractDict lookup on owned scratch (GKH-ownership violation): replace the keyed dictionary probe with a const-dispatched, per-concrete-type accessor (a Ref/field owned by the type)."
+    guarantee === :owned && return "runtime AbstractDict lookup on owned scratch (static-ownership violation): replace the keyed dictionary probe with a const-dispatched, per-concrete-type accessor (a Ref/field owned by the type)."
+    guarantee === :trusted && return "payload of an Untrusted value read outside a trust boundary: move the read into a validating function that returns a plain value, and register it with `trust_boundary!`."
     guarantee === :typestable && return "type instability: annotate the unstable variable, split the method, or push sizes/flags into the type domain (Val). Note: small isbits unions (Union{T,Nothing}, Union{T,Missing}) are accepted — only heap-allocating unions fail."
     guarantee === :noalloc && return "allocation in a hot path: preallocate the buffer, use @views for slices, or @unroll to avoid boxing."
     guarantee === :inlined && return "not inlined: add @inline to the callee, or accept it (inlining is a heuristic)."

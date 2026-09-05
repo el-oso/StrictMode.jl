@@ -51,7 +51,7 @@ unchecked; opting out requires a visible exempt.
 (`nfailures` ignores them) — a prompt to benchmark, not a gate.
 
 `static_ownership_suggest = true` additionally runs [`static_ownership_suggestions`](@ref):
-informational "consider GKH ownership" findings (`guarantee = :static_ownership`,
+informational "consider static ownership" findings (`guarantee = :static_ownership`,
 `status = :info`) for type/symbol-keyed registry lookups. Also never a failure.
 
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.

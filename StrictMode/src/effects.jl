@@ -60,6 +60,51 @@ function _static_callee(ci, @nospecialize(a))
     return nothing
 end
 
+# --- unoptimized-IR statement reading -----------------------------------------------------------
+# The three helpers below read `code_typed(...; optimize = false)` instead of the optimized form
+# the rest of this file uses. Two scans need that view — `:static_ownership` (a `Type{T}`-keyed
+# lookup const-folds away entirely under optimization) and `:trusted` (a small trust boundary
+# inlines, and its `getfield` then surfaces in the IR of an innocent caller). Both ask about the
+# shape of the source, not about a provable per-specialization cost, so both must look before the
+# optimizer erases the pattern.
+
+_unwrap_lattice(@nospecialize(T)) = T isa Core.Const ? Core.Typeof(T.val) : (T isa Core.PartialStruct ? T.typ : T)
+
+# Argument type at unoptimized-IR statement granularity: slots (`SlotNumber`) are the pre-SSA
+# argument/local representation here, not `Core.Argument` (that's optimized-IR-only) — the reason
+# these scans can't reuse `_stmt_arg_type`.
+function _unopt_arg_type(ci, @nospecialize(a))
+    a isa Core.SSAValue && return _unwrap_lattice(ci.ssavaluetypes[a.id])
+    a isa Core.SlotNumber && return isnothing(ci.slottypes) ? Any : _unwrap_lattice(ci.slottypes[a.id])
+    a isa GlobalRef && return isconst(a.mod, a.name) ? Core.Typeof(getglobal(a.mod, a.name)) : Any
+    a isa QuoteNode && return Core.Typeof(a.value)
+    a isa Expr && return Any
+    return Core.Typeof(a)
+end
+
+# Resolve a callee value, following one level of SSA indirection (unoptimized IR routinely
+# assigns `%1 = GlobalRef(Base, :get!)` as its own statement, then calls `(%1)(args...)`).
+function _unopt_callee(ci, @nospecialize(a))
+    if a isa Core.SSAValue
+        # A module-qualified callee is an `Expr` the structural walk below cannot resolve —
+        # `Core.getfield(x, :f)` lowers to `getproperty(Core, :getfield)` and then a call through
+        # that SSA value. Inference constant-folds it, so take the folded callee from the SSA type.
+        T = ci.ssavaluetypes[a.id]
+        T isa Core.Const && return T.val
+        return _unopt_callee(ci, ci.code[a.id])
+    end
+    a isa GlobalRef && isconst(a.mod, a.name) && return getglobal(a.mod, a.name)
+    a isa QuoteNode && return a.value
+    a isa Function && return a
+    return nothing
+end
+
+function _call_callee_and_args(ci, st)
+    Meta.isexpr(st, :call) && return _unopt_callee(ci, st.args[1]), st.args[2:end]
+    Meta.isexpr(st, :invoke) && return _unopt_callee(ci, st.args[2]), st.args[3:end]
+    return nothing, ()
+end
+
 # Is `st` a `Core.getfield(receiver, field, ...)` call whose FIELD/INDEX argument is a
 # compile-time constant (a literal `Symbol`/`Int` or `QuoteNode`), as opposed to a runtime value
 # (an `SSAValue`/`Argument` — a Phi-fed loop variable, say)? A constant field/index always reads
@@ -74,7 +119,7 @@ function _static_getfield(@nospecialize(callee), st)
 end
 
 # `AbstractDict` accessors whose appearance on the hot path means a runtime keyed lookup — the
-# "owned scratch / GKH-ownership" violation: an owned workspace must resolve to a const-dispatched
+# "static ownership" violation: an owned workspace must resolve to a const-dispatched
 # per-type accessor, never a runtime dictionary probe (measured ~130 ns/call, type-stable and
 # non-allocating on the warm hit, so it slips past every value-based check). Same category as
 # boxing: read from optimized IR, no timing.
@@ -208,7 +253,7 @@ dynamic-dispatch subclass:
 
 A small all-concrete `Union` result stays unflagged (union-split, not boxing — flagging those
 over-reported on type-stable SIMD/pointer kernels). `dictlookup` flags a runtime `AbstractDict`
-accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the owned-scratch/GKH-ownership
+accessor (`$(_DICT_ACCESSORS)`) reached on the hot path — the static-ownership
 violation — following non-inlined callees like `alloc` (the lookup usually lives in a workspace
 accessor callee, not the top function). `barrier` flags a call reaching a recognized one-time-init
 allocation barrier (`Base.OncePerProcess`/`OncePerThread`, or a `register_alloc_barrier!`-registered
@@ -220,11 +265,40 @@ recorded, and `barrier == false` alongside those three means "not looked for". R
 combination with a clean `alloc`/`boxing` result, which is the state where it is exhaustive.
 Location is the method's definition site.
 """
+const _AllocSignals = @NamedTuple{
+    alloc::Bool, boxing::Bool, dictlookup::Bool, abscontainer::Any,
+    barrier::Bool, unionphi::Bool, file::String, line::Int,
+}
+
+# The scan of `f`'s OWN body, memoized on the same terms as the callee recursion below: identity on
+# the signature, keyed by `(depth, world)`, so any new method definition invalidates. Sharing
+# `_SIGNAL_MEMO_LOCK` is safe because the scan itself runs outside the critical section.
+#
+# The macros re-run their check on EVERY execution of the call site, not once per site, so an
+# uncached top body is paid per iteration of any loop containing one: measured 450 µs uncached
+# against 240 ns cached on a 256-element dot product whose bare call is 19 ns. `@assert_noalloc`
+# (heuristic mode) and `@assert_owned` ask at the same default depth, so they share one entry.
+const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, _AllocSignals}}()
+
 function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
+    sig = Base.signature_type(f, Tuple{types...})
+    key = (depth, Base.get_world_counter())
+    memo = @lock _SIGNAL_MEMO_LOCK begin
+        bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
+        isnothing(bysig) ? nothing : get(bysig, key, nothing)
+    end
+    isnothing(memo) || return memo
+    r = _alloc_signals_uncached(f, types, sig, depth)
+    @lock _SIGNAL_MEMO_LOCK get!(
+        Dict{Tuple{Int, UInt64}, _AllocSignals}, _TOP_SIGNAL_MEMO, sig
+    )[key] = r
+    return r
+end
+
+function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int)
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
-    sig = Base.signature_type(f, Tuple{types...})
     cts = try
         Base.code_typed(f, types; optimize = true)
     catch
@@ -240,8 +314,8 @@ function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::In
     catch
         nothing
     end
-    file = m === nothing ? "" : string(m.file)
-    line = m === nothing ? 0 : Int(m.line)
+    file = isnothing(m) ? "" : string(m.file)
+    line = isnothing(m) ? 0 : Int(m.line)
     return (; alloc, boxing, dictlookup, abscontainer, barrier, unionphi, file, line)
 end
 

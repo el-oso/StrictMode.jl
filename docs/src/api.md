@@ -58,16 +58,17 @@ McaReport
 
 ## Static-binary compatibility
 
-Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` and
-`@assert_trim_safe` are the same TypeContracts static scan and both **report**; juliac's
-authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s `@test_trim_compatible`, which
-gates. The reactive `explain_trim` translates a real build log.
+Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` **reports**;
+juliac's authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s
+`@test_trim_compatible`, which gates. The reactive `explain_trim` translates a real build log.
+`@assert_trim_safe` is the same scan under an older name — deprecated, warns once per session.
 
 The static-scan path has one known coverage gap it can't heuristically close without
 false-positiving on safe code: N simultaneous small-`Union` arguments whose specialization count
 can exceed juliac's reachability limit on a large/opaque callee. A PASS reached only via the
-static scan logs a one-time session note about this; see [`@assert_trim_safe`](@ref)'s docstring
-for why, and use `StrictModeTest.@test_trim_compatible` when it matters.
+static scan logs a one-time session note about this; see
+[`@assert_trim_compatible`](@ref)'s docstring for why, and use
+`StrictModeTest.@test_trim_compatible` when it matters.
 
 ```@docs
 @assert_trim_compatible
@@ -93,6 +94,28 @@ rejects the ones the caller can materialize. See the docstring for the full scop
 @assert_memsafe
 memsafe_report
 MemsafeReport
+```
+
+## Trusted data
+
+`Untrusted(x)` marks data that came from outside the program — a socket, a file, `ARGS`, a device.
+Wrapping is free (same layout as `x`, nothing allocated) and it changes the *type*, so no method
+written for the payload matches it: an accidental use raises a `MethodError` rather than quietly
+succeeding, and it does so in a shipped build too, because the type is never checked away. The one
+way to the value is [`unsafe_trust`](@ref), and [`@assert_trusted`](@ref) reports every function
+that calls it outside a validating boundary registered with [`trust_boundary!`](@ref).
+
+This is the Linux kernel's `__user` pointer annotation, in Julia. There the type records that a
+pointer came from userspace, `__force` is the one cast that crosses the line, and an external
+checker reports where that cast appears — which helps only when somebody runs it. Here the type
+does the same work, `unsafe_trust` is the cast, and the check rides the same registry sweep as
+every other guarantee.
+
+```@docs
+Untrusted
+unsafe_trust
+trust_boundary!
+@assert_trusted
 ```
 
 ## Concurrency safety

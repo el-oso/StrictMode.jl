@@ -86,7 +86,12 @@ const _TRIM_HEURISTIC_CAVEAT = "StrictMode: this trim-safety PASS is from the st
     "`StrictModeTest.@test_trim_compatible` (or a real `juliac --trim=safe` build) before relying " *
     "on this pass alone."
 
+const _TRIM_SAFE_DEPRECATED = "StrictMode: `@assert_trim_safe` is deprecated and will be removed. " *
+    "It runs the same scan as `@assert_trim_compatible`, which is the name to use — the two spellings " *
+    "answer one question. `StrictModeTest.@test_trim_compatible` remains the verifier-backed gate."
+
 function _assert_trim_safe(target, @nospecialize(f), @nospecialize(types::Tuple))
+    @warn _TRIM_SAFE_DEPRECATED maxlog = 1
     r = _trim_report(f, types)
     if r.passed
         @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
@@ -103,8 +108,13 @@ end
 """
     @assert_trim_safe f(args...)
 
-The same static scan as [`@assert_trim_compatible`](@ref), kept as a distinct name for call sites
-that want to say "static scan" explicitly.
+!!! warning "Deprecated"
+    Use [`@assert_trim_compatible`](@ref) instead — it runs this exact scan under the name that
+    describes it. Two spellings for one question is surface with nothing behind it. This macro
+    warns once per session and will be removed; `StrictModeTest`'s `@test_trim_compatible` remains
+    the verifier-backed gate.
+
+The same static scan as [`@assert_trim_compatible`](@ref), under an older name.
 
 Report if `f(args...)` looks incompatible with `juliac --trim=safe` by a value-free
 `TypeContracts.trim_report` scan of the typed IR: dynamic dispatch (a call whose result infers to

@@ -29,7 +29,7 @@ fail CI, write the `@test_*` macro of the same name from
 ### Guard a hot call
 
 ```julia
-@strict kernel(a, b)        # type-stable + non-allocating, or it throws; returns the value
+@strict kernel(a, b)        # type-stable, owned scratch, non-allocating; returns the value
 ```
 
 ### Lock in a definition's contract

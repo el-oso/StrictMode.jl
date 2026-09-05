@@ -31,11 +31,20 @@ StrictMode/src/
                         register_alloc_barrier!/_is_base_barrier_type/_mi_is_barrier (issue #14
                         one-time-init allocation barriers: OncePerProcess/OncePerThread auto-
                         recognized (NOT OncePerTask — different Base implementation, no detectable
-                        :invoke boundary) + user-registered, both feed the `barrier` alloc signal)
+                        :invoke boundary) + user-registered, both feed the `barrier` alloc signal),
+                        _unopt_arg_type/_unopt_callee/_call_callee_and_args (UNOPTIMIZED typed-IR
+                        statement reading, for the two scans that must look before the optimizer
+                        erases their pattern — static_ownership.jl and trusted.jl)
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES
-  static_ownership.jl — static_ownership_suggestions (module-sweep GKH-ownership advisory)
+  static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)
+  trusted.jl          — Untrusted{T}/unsafe_trust/trust_boundary!/@assert_trusted (:trusted — the
+                        payload of foreign data may only be read inside a registered boundary; the
+                        Julia form of the kernel's `__user` annotation). Dispatch enforces the type
+                        with no checker at all; the scan covers what the language cannot, reading
+                        UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
+                        boundary inlines and its getfield would surface in an innocent caller
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
   strict_function.jl  — @strict_function (load-time enforcement; `signatures = [...]` verifies
                         concrete instantiations a generic declaration cannot name, since such a
@@ -182,7 +191,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   `test_registered()`/`test_signatures` at runtime instead.
 - **`_guarantee_gates` (report.jl) decides throw-vs-warn, per guarantee.** A check that OBSERVES
   compiled output gates (`:typestable`'s return-type layer, `:memsafe`, `:vectorized`, `:no_spill`,
-  `:inlined`, `:owned`). A check that INFERS something it cannot see reports:
+  `:inlined`, `:owned`, `:trusted`). A check that INFERS something it cannot see reports:
   `:noalloc`/`:noboxing` (typed IR cannot see what LLVM elides — 8.1% false over a 120-specialization
   corpus, and 75% recall in the other direction, issue #17), `:no_scalar_loops` (SLP output forges
   its discriminator), `:trimsafe`/

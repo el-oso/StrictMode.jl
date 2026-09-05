@@ -75,7 +75,7 @@ using StrictMode
 
 @assert_noalloc    sum(rand(100))         # warns if the call looks like it allocates
 @assert_typestable muladd(2.0, 3.0, 1.0)  # throws on an inconcrete return type
-@strict            dot(u, v)              # all per-call guarantees at once
+@strict            dot(u, v)              # the guarantees a hot path wants, together
 ```
 
 From here you can follow [Getting Started](getting_started.md) for a walkthrough, read through the

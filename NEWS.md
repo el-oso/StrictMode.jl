@@ -101,7 +101,7 @@ under-reported heuristic gaps, and a round of dead-code/duplication cleanup.
   for any `@simd`/`@fastmath` kernel — and gave no indication the kernel relies on relaxed IEEE
   semantics at all. `KernelReport` gains a `fastmath_ops` field, and `show` prints a standing `⚠`
   warning whenever it's nonzero, rather than folding fast-math ops silently into the normal counts.
-- **`:owned` (GKH ownership) scan** now also flags `delete!`/`getkey`, not just
+- **`:owned` (static ownership) scan** now also flags `delete!`/`getkey`, not just
   `get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!`.
 - **`:new`-allocation rule broadened.** The old rule (`mutable || Array || Memory || Box`) missed
   escaping non-isbits *immutables* (e.g. `Some{Any}(x)`) — a real false negative found via a
@@ -117,13 +117,13 @@ under-reported heuristic gaps, and a round of dead-code/duplication cleanup.
 
 ## v0.3.5
 
-Additive, non-breaking. GKH ownership — a `const`-owner-per-type idiom for replacing runtime
+Additive, non-breaking. Static ownership — a `const`-owner-per-type idiom for replacing runtime
 type/symbol-keyed registry lookups — gets both a precise tool and a broad one, plus a `:fast`
 accuracy fix and a dispatch-signature bugfix found while dogfooding the new guarantee ([#7], [#8]).
 
 - **`@assert_owned f(args...)`** — fails if the call reaches a runtime `AbstractDict` lookup
   (`get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!`) on its hot path: the *owned-scratch* /
-  GKH-ownership violation. A structural IR lint (no backend, no timing), like `@assert_noboxing`:
+  static-ownership violation. A structural IR lint (no backend, no timing), like `@assert_noboxing`:
   it follows non-inlined callees (the lookup often lives in a workspace accessor a level down) and
   matches the `jl_eqtable_*` foreigncall shape an `IdDict` lookup on a statically-known key
   const-folds to. Opt-in per call site, like `@assert_inlined` — deliberately **not** part of

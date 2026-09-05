@@ -1,4 +1,4 @@
-@testitem "@assert_owned fails on a runtime IdDict scratch lookup (GKH-ownership violation)" begin
+@testitem "@assert_owned fails on a runtime IdDict scratch lookup (static-ownership violation)" begin
     using StrictMode
     # A workspace accessor that falls through to a runtime keyed lookup for the type — the exact
     # PureBLAS `_symm_scr` shape: type-stable, non-allocating on the warm hit, so @assert_noalloc /
@@ -52,4 +52,18 @@ end
     const _WS2 = Dict{Symbol, Int}(:a => 1)
     rungk(x::Int) = (getkey(_WS2, :a, :missing); x)
     @test_throws StrictViolation (@assert_owned rungk(1))
+end
+
+@testitem "@strict reports owned-scratch violations without throwing" begin
+    using StrictMode
+    # `@assert_owned` gates; inside `@strict` the same check warns, because there it applies to
+    # every call site rather than to one the caller named.
+    const _WS_STRICT = IdDict{Type, Vector{Float64}}()
+    ws_strict(::Type{T}) where {T} = get!(() -> zeros(4), _WS_STRICT, T)
+    scratch_user(x::Float64) = (w = ws_strict(Float64); w[1] = x; w[1])
+    scratch_user(1.0)
+
+    @test StrictMode._alloc_signals(scratch_user, (Float64,)).dictlookup   # the violation is real
+    @test_throws StrictViolation (@assert_owned scratch_user(1.0))         # named check still gates
+    @test (@test_logs (:warn,) match_mode = :any (@strict scratch_user(2.0))) == 2.0
 end

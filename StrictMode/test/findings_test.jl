@@ -54,7 +54,7 @@ end
     # cannot see reports. Both lists are spelled out here rather than derived, precisely so that
     # moving a guarantee between them has to be a deliberate edit in two places.
     reports = (:noalloc, :noboxing, :no_scalar_loops, :trimsafe, :trim_compatible)
-    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill)
+    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted)
     for g in reports
         @test !StrictMode._guarantee_gates(g)
     end

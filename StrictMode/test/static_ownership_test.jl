@@ -1,4 +1,4 @@
-@testitem "static_ownership_suggestions flags a Type-keyed IdDict get! (GKH anti-pattern)" begin
+@testitem "static_ownership_suggestions flags a Type-keyed IdDict get! (static-ownership anti-pattern)" begin
     using StrictMode
 
     struct SOWorkspace{T} end
@@ -67,7 +67,7 @@ end
     @test only(fs).guarantee === :static_ownership
 end
 
-@testitem "static_ownership_suggestions: the dispatch (GKH) form produces no finding" begin
+@testitem "static_ownership_suggestions: the dispatch (static-ownership) form produces no finding" begin
     using StrictMode
 
     struct SOL3{T} end
@@ -104,7 +104,7 @@ end
 @testitem "audit(Module; static_ownership_suggest=true) surfaces suggestions without failing" begin
     using StrictMode
 
-    # The GKH shape end-to-end: two `::Type{T}`-dispatched hot-path methods (clean) plus a Dict
+    # The dispatch shape end-to-end: two `::Type{T}`-dispatched hot-path methods (clean) plus a Dict
     # fallback for the rare-type tail (flagged, but advisory — never fails nfailures). Depends on
     # the compiled sweep recognizing a `::Type{T}` argument as a valid dispatch tuple (F37);
     # `isconcretetype(Type{Float64}) == false` used to make every such method invisible here.

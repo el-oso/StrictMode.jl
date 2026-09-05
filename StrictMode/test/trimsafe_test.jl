@@ -129,3 +129,14 @@ end
     r3 = StrictMode._trim_report(UnionSplit.three, (Vector{Float64}, Bool, Bool, Bool))
     @test contains(only(filter(contains("max_union_splitting"), r3.findings)), "8 specializations")
 end
+
+@testitem "@assert_trim_safe warns that it is deprecated, and still works" begin
+    using StrictMode
+    clean_trim(x::Float64) = x * 2.0
+    clean_trim(1.0)
+    # Deprecated, not removed: the warning must not cost the caller the macro's value or behavior.
+    r = @test_logs (:warn,) match_mode = :any (@assert_trim_safe clean_trim(3.0))
+    @test r == 6.0
+    @test occursin("deprecated", StrictMode._TRIM_SAFE_DEPRECATED)
+    @test occursin("@assert_trim_compatible", StrictMode._TRIM_SAFE_DEPRECATED)
+end

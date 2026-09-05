@@ -272,6 +272,83 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 `test/standalone`'s isolation assertion was decorative (verified: it passes without
 `JULIA_LOAD_PATH`, so dropping the CI env var would leave the split-premise gate green).
 
+## Planned — v0.5
+
+- [ ] **Widen `@strict`'s default set, and let a package declare it.** BREAKING (see (a)).
+  0.4.x ships the non-breaking half: `:owned` runs inside `@strict` as a REPORT (`gates = false`
+  at the call site in `_strict_expr`), so the dict-lookup class is visible on every `@strict` site
+  without changing whether anything throws. `@assert_owned` still gates when named directly.
+
+  The 0.5 change is to promote it and make the set declarable:
+  (a) `:owned` GATES from `@strict`. Breaking: any `@strict` site reaching a runtime `AbstractDict`
+      accessor starts throwing where it passed. Note the rule flags ANY dict accessor, key type
+      unchecked, deliberately (`static_ownership.jl` — `@assert_owned` is about any runtime-keyed
+      owned scratch). A legitimate value-keyed cache under `@strict` would fail, which is the
+      whole reason 0.4.x reports instead. Gate only with evidence on the false-positive rate,
+      the way `:noalloc` earned its reporting status in #17.
+  (b) `:trim_compatible` joins the set, behind a declared preference — it is pure noise for a
+      package that never runs juliac, and it adds a `_trim_report` per call site (unmeasured).
+  (c) `set_default_guarantees!(...)` as a Preference beside `checks_enabled`, so "mandatory, then
+      opt out when not necessary or possible" is a per-package declaration rather than one
+      hardcoded set. `(:typestable, :noalloc)` is currently hardcoded in four places —
+      `check.jl` (`findings`), `registry.jl` (`register_strict!`, `_compiled_items`,
+      `_findings_compiled`).
+  (d) `exclude = (...)` on `@strict`, the per-call escape, mirroring `@strict_exempt`'s role for
+      `@strict module`.
+
+  Not in the set: `:noboxing` (its rule is a strict subset of `:noalloc`'s — reports the same
+  violations twice, detects nothing extra) and `:trusted` (a safety invariant, so it belongs in
+  the module sweep as deny-by-default, not in a per-call macro).
+
+  Widening `@strict` broadens what you LEARN while editing; it does not make anything ensured.
+  The scan is unsound by measurement (75% recall on `:noalloc`, #17). Assurance comes from
+  widening `register_strict!`'s default, since that is what `test_registered()` re-proves in CI
+  through StrictModeTest.
+
+- [ ] **`:trusted` — deny-by-default in the module sweep.** Additive; nothing below removes API.
+  0.4.x ships the mechanism and a per-call diagnostic: `Untrusted{T}`, `unsafe_trust`,
+  `trust_boundary!`, `@assert_trusted`. Dispatch already enforces the type with no checker at all
+  (an `Untrusted{Vector{UInt8}}` matches no method written for `Vector{UInt8}`, in a shipped build
+  too, since the type is never gated away).
+
+  What is missing is that the check is opt-in, which is the failure the pattern exists to prevent —
+  the kernel's `__user` annotations are only checked when someone runs `make C=1`, and a safety
+  invariant nobody runs is not an invariant. The v0.5 pieces:
+  (a) No new macro. `trust_boundary!(f)` stays the way a boundary is declared: a plain function,
+      the same shape as the exported `register_alloc_barrier!(f)`. The load-order window it opens
+      (a sweep running between the definition and the registration call) is closed by running the
+      sweep at the END of the module, not by wrapping every boundary in a macro.
+  (b) Sweep every method of a `@strict module` at precompile, refusing to load on a payload read
+      outside a boundary. `_auto_check_module` already walks the module; `@strict_exempt` already
+      provides the opt-out.
+  (c) Scan LOWERED method ASTs (`Base.uncompressed_ast`), not `code_typed`. Verified: this finds
+      `unsafe_trust` in a method that was never called, has zero compiled specializations, and
+      carries no type annotations — closing both the per-specialization coverage gap and the
+      `Any`-erasure gap. Precise for `unsafe_trust` (its only method takes `Untrusted`, so a
+      syntactic call IS a crossing); over-approximate for `getfield`/`getproperty` without types,
+      which is why the typed scan stays as the second layer.
+
+  Costs nothing for a package that never uses `Untrusted`: no `unsafe_trust` calls, so the sweep
+  finds nothing. That is what makes it safe to make always-on, unlike `:trim_compatible`.
+
+  Not closable, ever: `getfield` is a builtin and reads any field of any object, so the payload
+  cannot be made unforgeable — Julia has no privacy primitive. The achievable goal is Rust's
+  practical one, that the escape hatch is rare, named, greppable and deniable, not that it is
+  impossible.
+
+- [ ] **Remove `@assert_trim_safe` / `:trimsafe`.** BREAKING. Deprecated in 0.4.x — it warns once
+  per session and its docstring points at `@assert_trim_compatible`; this item is the removal.
+  The package already treated it as superseded — `check.jl`'s `_trimsafe_finding` calls it "the
+  static-only subset of `:trim_compatible`, kept for compatibility", and its own docstring said
+  prefer the other. Two macros for one question is the kind of surface that makes 26 exported
+  macros feel like 26 separate things to learn rather than one family with a naming rule.
+
+  Counting rule for anything proposed here: a new guarantee costs ONE macro, `@assert_<name>`,
+  because `_macro_names` derives that spelling and `findings_test.jl` asserts it exists. Anything
+  beyond that — a second spelling, a declaration form, a variant — needs to justify itself against
+  this list, not against its own usefulness in isolation. `:trusted` deliberately adds no second
+  macro: `trust_boundary!` is a function.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding

@@ -1,5 +1,5 @@
 # `:static_ownership` — advisory-only. Flags a runtime type/symbol-keyed registry lookup
-# (`d[SomeType]` on a `Dict`/`IdDict`) and suggests GKH ownership instead: give each type a
+# (`d[SomeType]` on a `Dict`/`IdDict`) and suggests static ownership instead: give each type a
 # `const` owner reached by dispatch (`_ws(::Type{T}) = _WS_T`), so it const-folds — trim-safe,
 # 0-alloc, no runtime lookup. See `staticval`/`@unroll` (idioms.jl) for the dispatch-form fix.
 #
@@ -18,37 +18,8 @@
 
 const _REGISTRY_FUNCS = (Base.getindex, Base.get, Base.get!, Base.setindex!, Base.haskey)
 
-_unwrap_lattice(@nospecialize(T)) = T isa Core.Const ? Core.Typeof(T.val) : (T isa Core.PartialStruct ? T.typ : T)
 _is_type_or_symbol_key(@nospecialize(T)) = (U = _unwrap_lattice(T); U isa Type && (U <: Type || U <: Symbol))
 _is_dict_like(@nospecialize(T)) = (U = _unwrap_lattice(T); U isa Type && U <: AbstractDict)
-
-# Argument type at unoptimized-IR statement granularity: slots (`SlotNumber`) are the pre-SSA
-# argument/local representation here, not `Core.Argument` (that's optimized-IR-only) — the reason
-# this scan can't reuse `_stmt_arg_type` from effects.jl.
-function _unopt_arg_type(ci, @nospecialize(a))
-    a isa Core.SSAValue && return _unwrap_lattice(ci.ssavaluetypes[a.id])
-    a isa Core.SlotNumber && return ci.slottypes === nothing ? Any : _unwrap_lattice(ci.slottypes[a.id])
-    a isa GlobalRef && return isconst(a.mod, a.name) ? Core.Typeof(getglobal(a.mod, a.name)) : Any
-    a isa QuoteNode && return Core.Typeof(a.value)
-    a isa Expr && return Any
-    return Core.Typeof(a)
-end
-
-# Resolve a callee value, following one level of SSA indirection (unoptimized IR routinely
-# assigns `%1 = GlobalRef(Base, :get!)` as its own statement, then calls `(%1)(args...)`).
-function _unopt_callee(ci, @nospecialize(a))
-    a isa Core.SSAValue && return _unopt_callee(ci, ci.code[a.id])
-    a isa GlobalRef && isconst(a.mod, a.name) && return getglobal(a.mod, a.name)
-    a isa QuoteNode && return a.value
-    a isa Function && return a
-    return nothing
-end
-
-function _call_callee_and_args(ci, st)
-    Meta.isexpr(st, :call) && return _unopt_callee(ci, st.args[1]), st.args[2:end]
-    Meta.isexpr(st, :invoke) && return _unopt_callee(ci, st.args[2]), st.args[3:end]
-    return nothing, ()
-end
 
 struct _RegistrySite
     line::Int
@@ -170,7 +141,7 @@ end
     static_ownership_suggestions(mod::Module; only = nothing, exempt = ()) -> Vector{StrictFinding}
 
 Scan for runtime type/symbol-keyed registry lookups (`d[SomeType]` on a `Dict`/`IdDict`) and
-suggest **GKH ownership** instead: give each type a `const` owner reached by dispatch, so the
+suggest **static ownership** instead: give each type a `const` owner reached by dispatch, so the
 lookup const-folds — trim-safe, 0-alloc, no runtime hash/eq-table hit.
 
 Advisory only — findings are `status = :info` and [`nfailures`](@ref) never counts them, so this

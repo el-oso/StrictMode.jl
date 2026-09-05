@@ -135,19 +135,23 @@ macro assert_noboxing(args...)
     return _gate(checked, esc(call))
 end
 
-# --- @assert_owned: no runtime AbstractDict lookup on owned scratch (GKH-ownership lint) ---
+# --- @assert_owned: no runtime AbstractDict lookup on owned scratch (static-ownership lint) ---
 # Value-free structural lint (same category as @assert_noboxing): scans optimized typed IR for a
 # runtime `AbstractDict` accessor reached on the hot path, following non-inlined callees (the
 # lookup usually lives in a workspace accessor, not the top function). No backend, no timing.
 
-function _assert_owned(target, @nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
+function _assert_owned(
+        target, @nospecialize(f), @nospecialize(types::Tuple);
+        depth::Int = _FAST_ALLOC_DEPTH[], gates::Bool = _guarantee_gates(:owned)
+    )
     sig = _alloc_signals(f, types; depth = depth)
     if sig.dictlookup
         _fail(
             :owned, target,
-            "hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): give " *
+            "hot path resolves a runtime AbstractDict lookup (static-ownership violation): give " *
                 "the type a const-dispatched accessor (Ref-per-concrete-type) instead of a runtime " *
-                "keyed lookup."
+                "keyed lookup.";
+            gates = gates
         )
     end
     return nothing
@@ -156,8 +160,8 @@ end
 """
     @assert_owned f(args...)
 
-Fail if the call reaches a **runtime `AbstractDict` lookup** on its hot path — the *owned-scratch*
-(a.k.a. GKH-ownership) violation: an owned workspace/scratch accessor must resolve to a
+Fail if the call reaches a **runtime `AbstractDict` lookup** on its hot path — the
+*static-ownership* violation: an owned workspace/scratch accessor must resolve to a
 const-dispatched, per-concrete-type accessor (a `Ref`/field owned by the type), never a runtime
 keyed dictionary probe (`get`/`getindex`/`get!`/`setindex!`/`haskey`/`pop!` on a `<:AbstractDict`).
 
