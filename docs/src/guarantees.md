@@ -111,23 +111,28 @@ wrap it in your own function and register that instead).
 
 ### Why `@assert_noalloc` reports instead of gating
 
-`@assert_noalloc` and `@assert_noboxing` are decided by a value-free scan of **typed IR**.
-AllocCheck works on **LLVM IR**, after the optimizer has run, so an allocation LLVM elides is
-invisible to the proof and still plainly visible to the scan. The classic shape:
+The scan reads **typed IR**. AllocCheck reads **LLVM IR**, after the optimizer has run. Anything
+LLVM deletes in between is still visible to the scan and already gone for the proof:
+
+```text
+  your code  →  typed IR  →  LLVM optimizes  →  LLVM IR  →  machine code
+                   ↑                              ↑
+              the scan reads here            AllocCheck reads here
+              sees the allocation            it has been deleted
+```
 
 ```julia
 mkvec(n::Int) = length(Vector{Float64}(undef, n))
 @allocated mkvec(4)     # => 0   — the array is never materialized
 ```
 
-The scan flags it; AllocCheck does not; the truth is 0 bytes. On one real consumer package, 19 of
-68 such findings were false, every one measuring 0 bytes.
+The scan flags it, AllocCheck does not, and the truth is 0 bytes. Measured over 120 compiled
+specializations from two real packages, 8.1% of the scan's findings were false this way.
 
-A check that guesses must not be able to abort a build, so these emit a **warning** rather than
-throwing a [`StrictViolation`](@ref). That matters most at load time: [`@strict_function`](@ref)
-runs at the annotated module's own precompile, where `StrictModeTest` is a test-environment
-dependency and therefore not loadable by construction — a structural guess there would break a
-consumer's module load for code that may be provably clean.
+So these **warn** instead of throwing. It matters most at load time: [`@strict_function`](@ref) runs
+during your package's own precompile, where `StrictModeTest` cannot be loaded — it belongs to
+`test/`. A guess there would stop a consumer's package installing over code that may be perfectly
+clean.
 
 The declaration is registered either way, so the proof still gets its turn:
 
@@ -515,20 +520,31 @@ end
 
 ## GKH ownership — static dispatch over runtime registries
 
-**What it is.** GKH ownership (named for the Greg Kroah-Hartman / Linux-kernel principle that
-*data has a clear static owner, reached through that owner — never a global registry*) is the
-idiom of giving each concrete type a `const` value, reached by dispatch, instead of storing it in
-a runtime-keyed lookup table. The two forms have the same call-site shape (`_ws(Float64)`) but
-resolve the association through completely different machinery:
+Give each type a `const` value reached by dispatch, instead of looking it up in a dict at runtime.
+The name comes from the Linux-kernel principle that *data has a clear static owner, reached through
+that owner — never a global registry*.
 
-- **Dispatch form:** the mapping `Float64 → _WS_F64` lives in the **method table**. When the
-  compiler specializes a caller for `Float64`, method selection happens at *compile time* — there
-  is exactly one applicable method, its body is a `const` global read, so the whole call
-  const-folds. At runtime there is nothing left: no call, no probe, no branch.
-- **Dict form:** the mapping lives in a **runtime data structure**. The type `T` is a value at
-  runtime, so `get!` must probe the table — hash (or an identity-scan for `IdDict`) plus a key
-  comparison — on *every* call. The compiler cannot fold this away, because a mutable dict's
-  contents aren't knowable at compile time.
+Both forms look identical at the call site (`_ws(Float64)`). They resolve through completely
+different machinery:
+
+```text
+  _ws(Float64)                       _ws(Float64)
+       │                                  │
+  ┌────┴─────────────┐              ┌─────┴──────────────┐
+  │  METHOD TABLE    │              │  IdDict at runtime │
+  │  one applicable  │              │  hash the key      │
+  │  method, body is │              │  probe the table   │
+  │  a const read    │              │  compare, return   │
+  └────┬─────────────┘              └─────┬──────────────┘
+       │ compile time                     │ every single call
+       ↓                                  ↓
+   nothing left:                     a probe, a branch,
+   the call is gone                  a result typed Any
+```
+
+The dispatch form const-folds because there is exactly one applicable method and its body is a
+`const` read — by runtime the call has disappeared. The dict form cannot fold: `T` is a value at
+runtime and a mutable dict's contents are not knowable at compile time.
 
 ```julia
 # GKH ownership: each type owns a const value, reached by compile-time dispatch.

@@ -183,10 +183,12 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 - **`_guarantee_gates` (report.jl) decides throw-vs-warn, per guarantee.** A check that OBSERVES
   compiled output gates (`:typestable`'s return-type layer, `:memsafe`, `:vectorized`, `:no_spill`,
   `:inlined`, `:owned`). A check that INFERS something it cannot see reports:
-  `:noalloc`/`:noboxing` (typed IR cannot see what LLVM elides — ~28% false on a real consumer,
-  issue #17), `:no_scalar_loops` (SLP output forges its discriminator), `:trimsafe`/
+  `:noalloc`/`:noboxing` (typed IR cannot see what LLVM elides — 8.1% false over a 120-specialization
+  corpus, and 75% recall in the other direction, issue #17), `:no_scalar_loops` (SLP output forges
+  its discriminator), `:trimsafe`/
   `:trim_compatible` (the static scan does not model juliac's reachability limit), and
-  `:typestable`'s depth-0 boxing signal (`gates = false` at its call site in `typestability.jl`).
+  `:typestable`'s depth-0 boxing signal and its union-typed-local signal (both `gates = false` at
+  their call sites in `typestability.jl`).
   Do NOT make StrictMode's allocation verdicts gate: a heuristic false positive aborting a
   consumer's precompile is issue #18, and it made checks-on unusable in PureBLAS. The proofs in
   `StrictModeTest` gate unconditionally — that is what that package is.
