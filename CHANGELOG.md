@@ -46,6 +46,57 @@ Measured on 600 compiled stdlib specializations: it fires on **2** (0.3%), both 
 `LinearAlgebra.wrap` builds a `Union{Adjoint, Transpose, Symmetric, Hermitian, Matrix}`, where the
 four immutable wrappers box and the `Matrix` does not.
 
+### `:trusted` — foreign data has to be checked before it's used
+
+`Untrusted(x)` marks data from a socket, a file, `ARGS`, or a device. It changes the type, so no
+method written for the payload matches it: an ordinary use is a `MethodError`, in a shipped build
+too, since the type is never gated away. `unsafe_trust` is the one way out, `trust_boundary!`
+registers the function allowed to use it, and `@assert_trusted` fails on any other function that
+reads a payload.
+
+This is the Julia form of the kernel's `__user` annotation: a distinct type, a single greppable
+cast, and a checker for where that cast appears. Dispatch does most of the work with no checker at
+all; the scan covers the part the language cannot, since `getfield` is a builtin callable anywhere.
+
+Detection reads UNOPTIMIZED typed IR — a small boundary inlines under optimization and its
+`getfield` then surfaces in an innocent caller's IR. `_unopt_callee` also resolves a callee from a
+constant-folded SSA type, without which `Core.getfield` (which lowers to a call through
+`getproperty(Core, :getfield)`) was invisible.
+
+### The allocation scan is memoized — `@strict` is 266× faster
+
+`_alloc_signals` ran `code_typed` unconditionally on every call, and the `@assert_*` macros run
+their check on every EXECUTION of a call site, not once per site — so a `@strict` inside a loop paid
+a full re-inference per iteration. The `_SIGNAL_MEMO` that existed covered only the callee
+recursion.
+
+Measured on a 256-element dot product whose bare call is 19.8 ns:
+
+| | before | after |
+|---|---|---|
+| `_alloc_signals` | 449.9 µs, 13,230 allocs | 255.7 ns, 4 allocs |
+| `@strict` | 914 µs, 26,512 allocs | 3.43 µs, 64 allocs |
+
+Cached on the same terms as the inner memo — identity on the signature, keyed by `(depth, world)`,
+so any new method definition invalidates — and cleared by `clear_cache!`.
+
+### `@strict` also reports owned scratch
+
+A runtime dict lookup is type-stable and non-allocating on the warm hit, so `:typestable` and
+`:noalloc` both pass it; only `:owned` sees it. It **reports** from `@strict` rather than throwing,
+because the rule flags any `AbstractDict` accessor — right for a check you name at a call site, too
+broad applied to every one, since a value-keyed cache is legitimate. `@assert_owned` still throws
+when called directly. `@assert_noboxing` stays out of `@strict`: its rule is a strict subset of
+`@assert_noalloc`'s, so it would report the same violations twice.
+
+`@strict` gained this check and still got faster, because both ask at the same depth and now share
+one memo entry.
+
+### `@assert_trim_safe` is deprecated
+
+It runs the same scan as `@assert_trim_compatible` under an older name. It warns once per session
+and will be removed.
+
 ## 0.4.0 — the tier split
 
 **Read this before upgrading.** The breaking change is *silent*: every `StrictMode` macro keeps its
