@@ -184,10 +184,42 @@ as boxing, which is a code smell rather than a boxing proof.
 
 ## `@assert_typestable` / `@test_typestable` — concrete, stable types
 
-Two layers, graded differently. `@assert_typestable` insists the return type is concrete —
-exact for the question it asks, so a violation **throws** — and adds an IR signal for internal
-dispatch hiding behind a concrete return, which is a heuristic and so only **warns**.
-`@test_typestable` replaces that second layer with `JET.@report_opt`, and throws on it.
+Three layers, graded differently. `@assert_typestable` insists the return type is concrete — exact
+for the question it asks, so a violation **throws**. On top of that it adds two IR signals, both
+heuristics and so both only **warning**: internal dispatch hiding behind a concrete return, and a
+union-typed local carrying a member that must be boxed to flow through it.
+
+`@test_typestable` replaces the dispatch signal with `JET.@report_opt` and throws on it. It keeps
+the union-typed-local signal as it is, because JET cannot see that class at all — union splitting is
+not dynamic dispatch, so `@report_opt` is silent on it at every signature. Without it the proof
+would be weaker than the scan it is meant to settle.
+
+### A union-typed local that boxes
+
+A non-isbits union is a tagged pointer, so a member that normally lives unboxed has to be heap-boxed
+to flow through it. Member count is not what decides this; representation is. An isbits member rides
+the union's inline payload and a mutable one is already a pointer, but an immutable struct holding
+heap references — `SubArray`, `Adjoint`, `Transpose` — is boxed on the way in.
+
+```julia
+function through_union(A::AbstractMatrix{Float64}, take::Bool)
+    local x = take ? view(A, :, 1:1) : A   # Union{SubArray, Matrix}: the SubArray boxes, the Matrix does not
+    s = 0.0
+    for i in eachindex(x)
+        s += @inbounds x[i]
+    end
+    return s
+ end
+```
+
+The return type here is `Float64` — concrete — so the first layer sees nothing, and the box leaves
+no `:new` and no allocating `foreigncall` in optimized IR, so the allocation scan sees nothing
+either. Its only trace is the phi's own type.
+
+This rides `:typestable` rather than `:noalloc` deliberately. "This local is union-typed with a
+box-on-entry member" is a property of the code as written; whether the box survives is LLVM's call
+and moves with inlining — the same function measures 16 B per call across a module boundary and 0 B
+once it inlines into its caller. Reporting it as an allocation would red kernels LLVM made free.
 
 ```@example guide
 affine(x) = 2x + 1

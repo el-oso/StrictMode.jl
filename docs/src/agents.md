@@ -69,8 +69,9 @@ not check" and "is fine" must not render the same.
 
 **How much a `fail` is worth depends on which package produced it, not on a field.** `audit`'s
 `noalloc`/`noboxing` verdicts come from a value-free scan of typed IR, where an allocation site LLVM
-will later elide is still present. That over-flags: on one real consumer, 19 of 68 such findings
-were false, every one measuring 0 bytes. Treat them as "investigate", and re-run the same signatures
+will later elide is still present. That over-flags: measured over 120 compiled specializations from two real
+consumers, 8.1% of such findings were false, every one measuring 0 bytes — and in the other
+direction it misses 23 of the 91 signatures AllocCheck flags, a recall of 75%. Treat them as "investigate", and re-run the same signatures
 through `StrictModeTest`'s `test_*` drivers — which run AllocCheck and JET — before acting as if a
 finding were proved. The same rule explains why [`@strict_function`](@ref) warns rather than
 throwing: it runs at the annotated module's own precompile, where the proof is unreachable by

@@ -7,6 +7,10 @@ CurrentModule = StrictMode
 ```@index
 ```
 
+```@docs
+StrictMode.StrictMode
+```
+
 ## Per-call guarantees
 
 These go at a call site. Each one evaluates its arguments once and hands back the call's value, so
@@ -179,6 +183,10 @@ verifier — and **gates**: a violation throws a [`StrictViolation`](@ref). Add 
 
 ```@meta
 CurrentModule = StrictModeTest
+```
+
+```@docs
+StrictModeTest.StrictModeTest
 ```
 
 ### Proving macros

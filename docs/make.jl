@@ -15,7 +15,9 @@ makedocs(;
         devbranch = "master",
         devurl = "dev",
         repo = "github.com/el-oso/StrictMode.jl",
-        sidebar_drawer = true
+        sidebar_drawer = true,
+        # The repository root is not a package, so Documenter cannot read a version from it.
+        inventory_version = string(pkgversion(StrictMode))
     ),
     # Grouped rather than flat: ten top-level entries overflowed the navbar. Only the two entry
     # points a first-time reader needs stay at the top level; the rest nest one level down.
