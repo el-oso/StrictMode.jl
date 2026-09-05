@@ -65,14 +65,29 @@ end
     # the rest of the session — the whole of StrictMode's reporting tier, reporting nothing.
     @test !StrictModeTest.juliac_patches()
     @test !StrictModeTest._JULIAC_PATCHED[]
-    patchsrc = read(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac-trim-base.jl"), String)
-    @test occursin("current_logger_for_env", patchsrc)   # the reason the default is off
 
-    # The patch files must actually exist for the default to mean anything: a silently missing path
-    # would leave every verification running against stock Base while reporting normally.
+    # juliac does not ship these at the same path on every Julia: they are under
+    # `share/julia/juliac` on 1.12 and 1.13.0-rc3, and absent there on rc4. Where they exist, check
+    # that the stub naming the reason for the default is still in them; where they do not, check the
+    # behaviour that actually protects a user — `_apply_juliac_patches` warns rather than throwing,
+    # so enabling the option on such a Julia degrades to stock-Base verification instead of breaking
+    # the caller.
     dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
-    for f in ("juliac-trim-base.jl", "juliac-trim-stdlib.jl")
-        @test isfile(joinpath(dir, f))
+    base_patch = joinpath(dir, "juliac-trim-base.jl")
+    if isfile(base_patch)
+        @test occursin("current_logger_for_env", read(base_patch, String))   # the reason the default is off
+        @test isfile(joinpath(dir, "juliac-trim-stdlib.jl"))
+    else
+        old = StrictModeTest.juliac_patches()
+        patched = StrictModeTest._JULIAC_PATCHED[]
+        try
+            StrictModeTest.set_juliac_patches!(true)
+            StrictModeTest._JULIAC_PATCHED[] = false
+            @test_logs (:warn,) match_mode = :any StrictModeTest._apply_juliac_patches()
+        finally
+            StrictModeTest.set_juliac_patches!(old)
+            StrictModeTest._JULIAC_PATCHED[] = patched
+        end
     end
 
     # The shape from the issue: an ordinary argument-validation throw with a 4-piece interpolation.
