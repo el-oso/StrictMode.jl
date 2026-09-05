@@ -173,7 +173,7 @@ r.ipc                # steady-state instructions/cycle estimate
 r.block_rthroughput   # cycles per iteration of the hot loop, at the hardware's real throughput
 ```
 
-**Informational only — `@assert_mca` never fails on its own.** A naive whole-function `llvm-mca`
+**Informational only.** A naive whole-function `llvm-mca`
 run models the entire function body as a single loop; a store→reload of the output pointer at the
 function boundary then creates a *false* loop-carried dependency that serializes the estimate —
 ground-truth runtime has disagreed with a naive run in exactly this shape. `mca_report` sidesteps

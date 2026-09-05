@@ -67,15 +67,18 @@ no_scalar_loops | no_spill | trimsafe | trim_compatible`, and `status` is one of
 A guarantee the analysis could not evaluate is `fail`, carrying the error text in `reason` — "could
 not check" and "is fine" must not render the same.
 
-**How much a `fail` is worth depends on which package produced it, not on a field.** `audit`'s
-`noalloc`/`noboxing` verdicts come from a value-free scan of typed IR, where an allocation site LLVM
-will later elide is still present. That over-flags: measured over 120 compiled specializations from two real
-consumers, 8.1% of such findings were false, every one measuring 0 bytes — and in the other
-direction it misses 23 of the 91 signatures AllocCheck flags, a recall of 75%. Treat them as "investigate", and re-run the same signatures
-through `StrictModeTest`'s `test_*` drivers — which run AllocCheck and JET — before acting as if a
-finding were proved. The same rule explains why [`@strict_function`](@ref) warns rather than
-throwing: it runs at the annotated module's own precompile, where the proof is unreachable by
-construction, and a build must not be decidable by a guess.
+**A `fail` is worth what the package behind it is worth, and no field tells you that.** `audit`'s
+`noalloc` and `noboxing` verdicts come from the scan, which reads typed IR and still sees
+allocations LLVM later deletes.
+
+Measured over 120 compiled specializations from two real packages: **8.1%** of those findings were
+false, every one measuring 0 bytes — and in the other direction the scan misses **23 of the 91**
+signatures AllocCheck flags, a recall of 75%.
+
+So treat them as "investigate". Re-run the same signatures through `StrictModeTest`'s `test_*`
+drivers before acting as though a finding were proved. It is the same reason
+[`@strict_function`](@ref) warns: it runs during your package's own precompile, where the proof
+cannot be loaded, and a guess must not decide a build.
 
 The `suggestion` field is
 the structured version of what [`@explain`](@ref) would tell a person, so an agent can act on it

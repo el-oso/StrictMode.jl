@@ -1,12 +1,12 @@
 # StrictModeTest — the proofs
 
-`StrictMode` analyzes with a value-free engine built on Base's own inference. It needs no analysis
-backend, which is what makes it safe to depend on from `src`, and it is why its allocation verdicts
-**report** rather than gate: typed IR still shows allocations LLVM later deletes.
+`StrictMode` reads inferred types and typed IR. It needs no other package, which is what makes it
+safe to depend on from `src` — and why it **reports**: typed IR still shows allocations LLVM later
+deletes, so it can only say something looks wrong.
 
-`StrictModeTest` is the other half. You add it to your **test** environment, it brings AllocCheck,
-JET and TrimCheck, and its checks **throw** — so a violation fails the build. Keeping the two apart
-means your users never install the heavy backends just to use your package.
+`StrictModeTest` is the other half. It goes in your **test** environment, brings AllocCheck, JET and
+TrimCheck, and **throws** — a violation fails the build. Keeping them apart means your users never
+install those backends just to use your package.
 
 ```julia
 # test/Project.toml:  [deps] StrictMode, StrictModeTest
@@ -16,8 +16,7 @@ using StrictMode, StrictModeTest
 test_compiled(MyPkg)               # gate everything the module actually compiled
 ```
 
-Which engine runs is decided by the macro you wrote, when it expands. There is no mode to switch and
-no ambient state choosing for you.
+The macro you write picks the engine. There is no mode to switch.
 
 | report (StrictMode) | prove and gate (StrictModeTest) |
 | --- | --- |

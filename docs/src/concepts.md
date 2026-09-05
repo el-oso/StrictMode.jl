@@ -6,12 +6,11 @@ what those properties are and why they matter — useful background before the
 
 ## Type stability
 
-A function is **type-stable** when the compiler can determine the return type from the argument
-types alone, without running the function. With a known concrete return type, the compiler
-generates tight machine code and can chain optimizations across calls.
+A function is **type-stable** when the compiler can work out the return type from the argument types
+alone, without running it. Knowing that, it emits tight machine code and optimizes across calls.
 
-**Type instability** produces a `Union` or `Any` return — the compiler doesn't know which type
-it's dealing with until the function actually runs:
+**Type instability** returns a `Union` or `Any` — the compiler cannot tell which type it will get
+until the function runs:
 
 ```julia
 function pick(items, i)
@@ -36,9 +35,9 @@ JIT compiles pick(items, i):
 
 ## Boxing
 
-**Boxing** is what the compiler does when it can't predict a value's type: it wraps the value in
-a heap-allocated container — a "box" — with a type tag, so it can be handled generically at
-runtime. Unboxing it later costs a heap lookup and a type-check per value.
+**Boxing** is what the compiler does when it cannot predict a value's type: it wraps the value on
+the heap with a type tag, so anything can be handled generically. Reading it back costs a heap
+lookup and a type check, every time.
 
 ```text
 Unboxed (type-stable path — fast):
@@ -57,8 +56,8 @@ Boxed (type-unknown path — slow):
 └───────┘ └───────┘
 ```
 
-In a tight numeric loop, the difference between boxed and unboxed is often 100× or more. The
-most common cause is indexing a heterogeneous tuple with a runtime index:
+In a tight numeric loop, boxed versus unboxed is often 100× or more. The usual cause is indexing a
+heterogeneous tuple with a runtime index:
 
 ```julia
 t = (1.0, 2, "three")
@@ -80,9 +79,9 @@ source.
 
 ## Dynamic dispatch
 
-**Dynamic dispatch** is a function call resolved at runtime instead of compile time. It happens
-when the compiler doesn't know the concrete type of the receiver, so it can't select the method
-at compile time and must look it up during execution.
+**Dynamic dispatch** is a call resolved while the program runs, not while it compiles. It happens
+when the compiler does not know the argument's concrete type, so it cannot pick the method ahead of
+time and has to look it up on every call.
 
 ```julia
 function apply(f, x)

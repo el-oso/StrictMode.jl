@@ -746,30 +746,30 @@ end
 #            SIGSEGV. Child's own signal report (names the faulting op): …
 ```
 
-**Why not just `julia --check-bounds=yes`?** That flag forces Julia's own bounds check even inside
-`@inbounds` blocks, turning a plain `@inbounds a[i]` overrun into a catchable `BoundsError` — for
-*that* bug shape it's simpler than this whole harness, and you don't need `@assert_memsafe` for it
-(a `@test_throws BoundsError` run under the flag is enough). But `--check-bounds` only re-enables
-the bounds branch inside `getindex`/`setindex!`/`checkbounds` lowering — it has **no effect at
-all** on `unsafe_load`/`unsafe_store!`, raw `Ptr` arithmetic, or SIMD-intrinsic vector loads,
-because those never go through `checkbounds` in the first place (confirmed at both the runtime and
-`@code_llvm` level: `getindex` compiles a bounds branch, `unsafe_load` compiles none). That's
-exactly the access pattern the motivating bug above uses, and exactly why `@assert_memsafe` exists
-as a distinct tool rather than a wrapper around a compiler flag: it catches the class of
-out-of-bounds access that is invisible to `--check-bounds` by construction, not the class that
-flag already handles.
+**Why not just `julia --check-bounds=yes`?** Use it when you can — for a plain `@inbounds a[i]`
+overrun it turns the bug into a catchable `BoundsError`, and a `@test_throws BoundsError` under that
+flag beats this whole harness.
 
-Mechanically: `Array` arguments are copied into `mmap`-backed buffers whose data ends flush
-against a trailing `PROT_NONE` guard region, so a one-element overrun faults on *every* run, not
-just when a real allocation happens to leave the trailing page unmapped. The probe runs in a
-subprocess — the only way to catch an out-of-bounds *read*, since that is a fatal,
-otherwise-uncatchable `SIGSEGV`. Classification of a write is done by a **poisoned canary**: the
-bytes past the data are filled with a per-buffer, position-dependent pattern and read back before
-the child touches the guard pages, so a store past the end is reported with its exact offset. That
-is necessary because a guard-page write fault is fatal and its backtrace is destroyed (`unknown
-function (ip: …)`, zero frames), so nothing can be recovered from the fault itself. Argument
-positions holding the same array share one guarded buffer, so a kernel with an aliasing-dependent
-path sees the aliasing it was called with.
+It cannot help here. The flag re-enables the bounds branch inside `getindex`/`setindex!`/
+`checkbounds` lowering, and `unsafe_load`, `unsafe_store!`, raw `Ptr` arithmetic and SIMD vector
+loads never go through `checkbounds` at all — so it has no effect on them. (Checked at the
+`@code_llvm` level: `getindex` compiles a bounds branch, `unsafe_load` compiles none.) That is the
+access pattern the bug above uses, which is why `@assert_memsafe` is a separate tool rather than a
+wrapper around a flag.
+
+How it works:
+
+- `Array` arguments are copied into `mmap` buffers that end flush against a `PROT_NONE` guard page,
+  so a one-element overrun faults on **every** run — not only when the allocator happens to leave
+  the next page unmapped.
+- The probe runs in a subprocess, the only way to catch an out-of-bounds **read**: that is a fatal
+  `SIGSEGV` and cannot be caught in-process.
+- A **poisoned canary** classifies writes. The bytes past the data carry a per-buffer,
+  position-dependent pattern, read back before the child touches the guard page, so a store past
+  the end is reported at its exact offset. This is needed because a write fault destroys its own
+  backtrace (`unknown function (ip: …)`, zero frames).
+- Arguments holding the same array share one guarded buffer, so a kernel with an aliasing-dependent
+  path sees the aliasing it was called with.
 
 There is no in-process mode: an in-process probe can only use the canary, and a load past the end
 disturbs no canary, so its clean verdict would be indistinguishable from no overrun at all — in
