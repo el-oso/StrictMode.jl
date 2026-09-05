@@ -16,8 +16,13 @@ nothing for a shipped application.
 | **A call that should inline but doesn't** (cost-model misfire, `@noinline`) | call overhead, lost cross-call optimization | `@assert_inlined` (best-effort) |
 | **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (combines the per-call guarantees) |
 | **A `@generated`/SIMD kernel that must vectorize and stay on the fast path** | silent ~100× regression from boxing, or vectorization silently disabled — easy to miss during exploration | `@kernel` (bundles `@assert_noalloc` + `@assert_vectorized` + `@assert_typestable`; makes the boxing check reflexive) |
-| **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (fails at precompile / load) |
+| **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (return type checked at load; allocation re-proved by `test_registered()`) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
+
+Every `@assert_*` above comes from `StrictMode` and reports. Where you want the same property to
+fail CI, write the `@test_*` macro of the same name from
+[`StrictModeTest`](proof_tier.md) — `@test_noalloc`, `@test_noboxing`, `@test_typestable`,
+`@test_trim_compatible`, `@test_strict`, `@test_kernel`.
 
 ## Patterns
 

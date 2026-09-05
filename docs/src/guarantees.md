@@ -294,17 +294,20 @@ That's why it isn't part of [`@strict`](@ref).
 
 ## `@assert_trim_compatible` — static-binary (`juliac --trim`) compatibility
 
-[`@assert_trim_compatible`](@ref) fails unless `f(args...)` is compatible with `juliac --trim=safe`, the
-static-binary build mode that rejects dynamic dispatch and reflection. It **escalates** with whether
-`TrimCheck` is loaded: without it, a value-free `TypeContracts`
-scan of the typed IR; with it (`StrictModeTest` depends on `TrimCheck`) juliac's
-*authoritative* `verify_typeinf_trim` verifier over the exact signature, returning deduplicated,
-source-mapped findings.
+[`@assert_trim_compatible`](@ref) reports when `f(args...)` looks incompatible with
+`juliac --trim=safe`, the static-binary build mode that rejects dynamic dispatch and reflection. It
+is a value-free scan of the typed IR: unresolved dynamic calls, reflection, and calls left
+unresolved by exceeding the union-split limit.
+
+The authoritative answer is a different macro, not a different mode. `StrictModeTest`'s
+`@test_trim_compatible` runs juliac's own `verify_typeinf_trim` over the exact signature and
+**throws**, with deduplicated, source-mapped findings. Nothing switches based on which packages
+happen to be loaded — the macro you wrote decides.
 
 Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref): juliac's
 whole-program verifier over the real build is the final word. [`@assert_trim_safe`](@ref) is the
-static-only subset (never escalates; needs no `TrimCheck`). The reactive counterpart, for a real build log,
-is [`explain_trim`](@ref).
+same scan under a name that says "static only". The reactive counterpart, for a real build log, is
+[`explain_trim`](@ref).
 
 ```julia
 clean(x::Int) = x * 2 + 1
@@ -312,8 +315,9 @@ clean(x::Int) = x * 2 + 1
 
 reflecty(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection → trim-unsafe
 @assert_trim_compatible reflecty(3)
-# ERROR: StrictViolation (@trim_compatible): trim-incompatible (juliac --trim=safe):
-#   Base.indexed_iterate(…)::Any  [myfile.jl:NN]; … (+N more call site(s))
+# ┌ Warning: StrictViolation (@trim_compatible): likely trim-incompatible (static scan —
+# │ `@test_trim_compatible` runs the authoritative juliac verifier):
+# │   Base.indexed_iterate(…)::Any  [myfile.jl:NN]; … (+N more call site(s))
 ```
 
 As an engine guarantee it is `:trim_compatible` (with `:trimsafe` the static subset):
