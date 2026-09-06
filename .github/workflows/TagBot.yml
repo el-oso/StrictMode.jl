@@ -65,6 +65,34 @@ jobs:
         with:
           fetch-depth: 0
 
+      # TagBot skips a version whose COMMIT already carries a tag, whatever prefix that tag has and
+      # whatever prefix it would itself have used. Both packages register from the same commit, so
+      # the `Tag StrictMode` step's `v{VERSION}` makes the `Tag StrictModeTest` step skip
+      # `StrictModeTest-v{VERSION}` entirely — its log says "Skipping v0.4.1: commit … is already
+      # tagged as v0.4.1". That is why `StrictModeTest-v0.4.1` does not exist, while
+      # `StrictModeTest-v0.4.0` does: at 0.4.0 the two registrations happened to land on different
+      # commits.
+      #
+      # The packages ship in lockstep and their versions move together (see CLAUDE.md), so the
+      # StrictModeTest tag belongs on exactly the commit StrictMode's tag is on.
+      - name: Mirror StrictMode's tag for StrictModeTest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(git tag --list 'v*' --sort=-creatordate | head -n 1)
+          if [ -z "$tag" ]; then
+            echo "No v* tag found; nothing to mirror."
+            exit 0
+          fi
+          mirror="StrictModeTest-$tag"
+          if git rev-parse -q --verify "refs/tags/$mirror" >/dev/null; then
+            echo "$mirror already exists."
+            exit 0
+          fi
+          sha=$(git rev-list -n 1 "$tag")
+          echo "Creating $mirror at $sha"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$mirror" -f sha="$sha"
+
       - name: Publish docs for the new tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
