@@ -16,8 +16,15 @@ changed which banner was reachable. Reported from PureBLAS.jl, whose CI builds a
 
 Measured against juliac's own verifier, and it rules out the obvious fix: `printstyled`, `print`
 and `write` are all unresolvable from `__init__`; only a foreigncall verifies clean. The banner now
-goes out through `ccall(:jl_safe_printf, …)`, with the message as an argument to a `"%s"` format so
-a `%` in the text cannot be interpreted. It loses its color.
+goes out through `ccall(:jl_safe_printf, …)` and loses its color.
+
+That call passes NO variadic arguments, which matters more than it looks. `jl_safe_printf` is
+declared `void jl_safe_printf(const char *fmt, ...)`, and naming an extra argument in the `ccall`
+signature describes a non-variadic call: x86-64 SysV passes it in a register and the callee happens
+to find it, while the AArch64 Apple ABI passes variadic arguments on the stack. The first attempt
+did exactly that and segfaulted every macOS CI job at `using StrictMode`, with Linux and Windows
+green. The message is therefore the format string itself, so the banner text must contain no `%` —
+pinned by a test.
 
 A `banner` preference was added alongside it:
 

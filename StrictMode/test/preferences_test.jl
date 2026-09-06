@@ -80,3 +80,24 @@ end
         @test occursin("checks ENABLED", err_on)
     end
 end
+
+@testitem "issue #28: the load banner is trim-safe and printf-safe" begin
+    using StrictMode
+    # `_eprint` passes its message as `jl_safe_printf`'s FORMAT string, with no variadic arguments:
+    # a `ccall` signature naming an extra argument describes a non-variadic call, which x86-64 SysV
+    # tolerates and the AArch64 Apple ABI does not — that segfaulted every macOS job at
+    # `using StrictMode`. The cost of passing no varargs is that a `%` in the text would be read as
+    # a format specifier, so the banners must not contain one.
+    @test !occursin('%', StrictMode._BANNER_REPORTING)
+    @test !occursin('%', StrictMode._BANNER_CI_DISABLED)
+
+    # Both are non-empty and end in a newline: a format string without one runs the next line of
+    # output into the banner.
+    for b in (StrictMode._BANNER_REPORTING, StrictMode._BANNER_CI_DISABLED)
+        @test !isempty(b)
+        @test endswith(b, '\n')
+    end
+
+    # And it really does write — a no-op writer would satisfy everything above.
+    @test isnothing(StrictMode._eprint(""))
+end

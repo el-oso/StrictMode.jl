@@ -115,9 +115,16 @@ end
 # leave an unresolved call — they route through `styled_print`/`invoke_in_world`, and `stderr` is
 # typed `IO` — while a foreigncall verifies clean.
 #
-# The message is an ARGUMENT to a `"%s"` format, not the format itself: as the format, a `%` in the
-# text would be interpreted. Color is what a trim-clean load costs.
-_eprint(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s", msg)
+# The message IS the format string, and the call passes no variadic arguments. `jl_safe_printf` is
+# declared `void jl_safe_printf(const char *fmt, ...)`, and a `ccall` signature naming an extra
+# argument describes a NON-variadic call: x86-64 SysV passes it in a register and the callee happens
+# to find it, while the AArch64 Apple ABI passes variadic arguments on the stack, so the callee
+# reads garbage and the process dies. Measured — `("%s", msg)` segfaulted every macOS CI job at
+# `using StrictMode` while Linux and Windows passed.
+#
+# Passing the message as the format means a `%` in it would be interpreted, so the banner text must
+# not contain one. `test/preferences_test.jl` pins that. Color is what a trim-clean load costs.
+_eprint(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring,), msg)
 
 """
     StrictMode.banner_enabled() -> Bool
@@ -135,6 +142,19 @@ be provably silent than trust that the writer stays trim-clean.
 banner_enabled() = BANNER_ENABLED
 const BANNER_ENABLED = @load_preference("banner", true)::Bool
 
+# The two banner texts, named so a test can assert what `_eprint` requires of them: no `%`, because
+# the message is passed as the format string.
+const _BANNER_CI_DISABLED = "┌ StrictMode: checks are DISABLED and CI is set.\n" *
+    "│ Every @assert_* in this run is a bare call: a green suite proves nothing.\n" *
+    "└ Remove `checks_enabled = false` from this environment's preferences.\n"
+
+const _BANNER_REPORTING = "┌ StrictMode: checks ENABLED — reporting tier.\n" *
+    "│ The allocation and trim guarantees REPORT (they guess, so they warn);\n" *
+    "│ the ones that read compiled output still throw. For the allocation\n" *
+    "│ proofs, add StrictModeTest and use @test_* / test_signatures /\n" *
+    "│ test_compiled / test_registered.\n" *
+    "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n"
+
 function _announce_tier()
     # A compile-time const, so with the banner off this whole function folds to `nothing` and
     # `juliac --trim` never sees the write at all.
@@ -148,21 +168,10 @@ function _announce_tier()
         # suite full of them passes while checking nothing. `assert_enabled` is the guard for that,
         # and it only helps a suite that remembers to call it; announcing here covers the ones that
         # do not. Loading `StrictModeTest` turns the same state into a hard error.
-        isempty(get(ENV, "CI", "")) || _eprint(
-            "┌ StrictMode: checks are DISABLED and CI is set.\n" *
-                "│ Every @assert_* in this run is a bare call: a green suite proves nothing.\n" *
-                "└ Remove `checks_enabled = false` from this environment's preferences.\n"
-        )
+        isempty(get(ENV, "CI", "")) || _eprint(_BANNER_CI_DISABLED)
         return nothing
     end
-    _eprint(
-        "┌ StrictMode: checks ENABLED — reporting tier.\n" *
-            "│ The allocation and trim guarantees REPORT (they guess, so they warn);\n" *
-            "│ the ones that read compiled output still throw. For the allocation\n" *
-            "│ proofs, add StrictModeTest and use @test_* / test_signatures /\n" *
-            "│ test_compiled / test_registered.\n" *
-            "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n"
-    )
+    _eprint(_BANNER_REPORTING)
     return nothing
 end
 
