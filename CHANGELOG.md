@@ -1,4 +1,75 @@
 # Changelog
+## 0.4.2
+
+Three consumer-breaking bugs. Anyone on 0.4.0 or 0.4.1 shipping a `juliac --trim` artifact, or
+using `@strict_function` on a parametric method, or opting a module in with `@strict module`, wants
+this release.
+
+### The load banner broke `juliac --trim` for every consumer (#28)
+
+`__init__` called `_announce_tier`, which wrote the banner with `printstyled`. `juliac --trim`
+retains `__init__` as a root, so everything it reaches must be statically resolvable —
+`printstyled` routes through `styled_print`/`invoke_in_world`, which the verifier cannot resolve.
+`using StrictMode` alone was enough; no macro had to be called, and `checks_enabled = false` only
+changed which banner was reachable. Reported from PureBLAS.jl, whose CI builds a real
+`--trim=safe --compile-ccallable` artifact.
+
+Measured against juliac's own verifier, and it rules out the obvious fix: `printstyled`, `print`
+and `write` are all unresolvable from `__init__`; only a foreigncall verifies clean. The banner now
+goes out through `ccall(:jl_safe_printf, …)`, with the message as an argument to a `"%s"` format so
+a `%` in the text cannot be interpreted. It loses its color.
+
+A `banner` preference was added alongside it:
+
+    [preferences.StrictMode]
+    banner = false
+
+Being a compile-time const, that folds `_announce_tier` to `nothing` and leaves `__init__` with no
+body at all — for anyone who would rather their load be provably silent than trust that the writer
+stays trim-clean. A binary built with `checks_enabled = false` is already silent without it
+(measured: zero bytes on stderr).
+
+### `@strict_function` on a parametric method failed to load (#28 audit, F1)
+
+    @strict_function f(x::T) where {T<:Real} = x
+    # UndefVarError: `T` not defined
+
+A `where` binds its type variables to the method, not to the enclosing module, and the macro
+evaluated the declared argument types at module top level. Checks are on by default, so this failed
+in every dev and test environment while working in production.
+
+The types are no longer evaluated when the signature is parametric. Nothing is lost: `Tuple{T}` is
+not a dispatch tuple, so the check took its abstract-signature path anyway — it now says so and
+points at `signatures = [...]`, which still verifies the concrete instantiations.
+
+### `@strict module` aborted a consumer's precompile on the allocation heuristic (#28 audit, F2)
+
+`_auto_check_module` threw on any failing finding without consulting `_guarantee_gates`, so the
+value-free allocation scan — 8.1% false over a 120-specialization corpus (#17) — could stop a module
+loading. That is issue #18's shape: fixed for `@strict_function`, left live for the module form,
+where the blast radius is every definition in the module rather than one.
+
+It now splits on `_guarantee_gates` exactly as `@strict_function` does: the allocation verdict warns,
+and the checks that observe compiled output still throw.
+
+### Also
+
+- `Pkg.test` merges the parent project's preferences into its sandbox, so a package shipping
+  `checks_enabled = false` carries it into its own suite and `StrictModeTest.__init__` errors. The
+  source comment claimed the opposite; the error message now names the actual remedy
+  (`checks_enabled = true` in `test/Project.toml`).
+- `signatures = [(T,)]` naming a type with no method reported "return type is not concrete …
+  inferred Any[]", which sends the reader looking for an instability that is not there. It now says
+  no method matches.
+
+### The gap that let #28 ship twice
+
+CI had no trim build, and the consumer fixture only ran `Pkg.test` in an ordinary process, where
+`__init__` is never a trim root. CI now builds that fixture as a real `--trim=safe` executable and
+runs it, which covers StrictMode's `__init__`, every transitive dependency's, and whatever the
+definition-level macros leave behind in a trimmed image. Verified to fail when the `printstyled`
+banner is restored.
+
 
 ## 0.4.1
 

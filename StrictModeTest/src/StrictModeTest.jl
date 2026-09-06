@@ -89,9 +89,15 @@ function __init__()
         "StrictModeTest was loaded but `StrictMode.checks_enabled()` is false in this " *
             "environment, so every `@assert_*` expands to a bare call and nothing registers — " *
             "`test_registered()` would sweep an empty registry and report success. Checks are on " *
-            "by default, so something set them off: remove `checks_enabled = false` from this " *
-            "environment's `[preferences.StrictMode]` block (or its LocalPreferences.toml) and " *
-            "restart."
+            "by default, so something set them off.\n" *
+            "Most often it is the package's OWN `Project.toml`: `Pkg.test` merges the parent " *
+            "project's preferences into the test sandbox, so a shipped-application " *
+            "`checks_enabled = false` follows the suite in even though it is not written there. " *
+            "Add\n" *
+            "    [preferences.StrictMode]\n" *
+            "    checks_enabled = true\n" *
+            "to `test/Project.toml` to override it for the suite, or remove the `false` from " *
+            "wherever it is set, and restart."
     )
     _announce()
     return nothing

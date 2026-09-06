@@ -72,6 +72,31 @@ jobs:
         run: |
           julia --project=StrictMode/test/consumer/ConsumerPkg -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
           cd StrictMode/test/consumer/ConsumerPkg && julia --project=. -e 'import Pkg; Pkg.test()'
+      # The step above runs the consumer in an ORDINARY process, where `__init__` is never a trim
+      # root — which is why issue #28 shipped in both 0.4.0 and 0.4.1. A load banner written with
+      # `printstyled` broke the build of every consumer shipping a trimmed artifact, `using
+      # StrictMode` alone was enough to trigger it, and nothing here could see it. A downstream user
+      # reported it.
+      #
+      # This builds the same fixture as a real `--trim=safe` executable, so the whole load path has
+      # to be statically resolvable: StrictMode's `__init__`, every transitive dependency's, and
+      # whatever `@strict_function` leaves behind in a trimmed image. Verified to FAIL when the
+      # `printstyled` banner is restored, so it tests something.
+      #
+      # Linux only: one platform is enough to catch a load-path regression, and juliac is slowest
+      # where it matters least.
+      - name: Consumer as a juliac --trim=safe binary
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd StrictMode/test/consumer
+          juliac=$(julia -e 'print(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl"))')
+          if [ ! -f "$juliac" ]; then
+            echo "juliac.jl not shipped by this Julia ($juliac) — skipping the trim build."
+            exit 0
+          fi
+          julia --startup-file=no --project=ConsumerPkg "$juliac" \
+            --output-exe consumer_trim --experimental --trim=safe trim_entry.jl
+          ./consumer_trim
       # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the
       # pre-release job, and Windows path quirks).
       - uses: julia-actions/julia-processcoverage@v1

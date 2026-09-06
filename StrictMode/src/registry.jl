@@ -157,7 +157,17 @@ end
 # `StrictModeTest` is loadable and this module's own precompile is not happening.
 function _auto_check_module(mod::Module)
     CHECKS_ENABLED || return nothing
-    _run_and_report(_registered_findings_in(mod), :strict_module, string(nameof(mod)), :error)
+    fs = _registered_findings_in(mod)
+    # Split on `_guarantee_gates` exactly as `@strict_function` does. This runs at the CONSUMER'S
+    # own precompile, where `StrictModeTest` is not loadable, so the allocation verdict here is the
+    # value-free scan — measured 8.1% false over a 120-specialization corpus (issue #17). Aborting a
+    # module load on that is issue #18, the thing that made checks-on unusable in PureBLAS; it was
+    # fixed for `@strict_function` and left in place here, where the blast radius is every
+    # definition in the module rather than one.
+    gating = filter(f -> _guarantee_gates(f.guarantee), fs)
+    reporting = filter(f -> !_guarantee_gates(f.guarantee), fs)
+    _run_and_report(reporting, :strict_module, string(nameof(mod)), :warn)
+    _run_and_report(gating, :strict_module, string(nameof(mod)), :error)
     return nothing
 end
 

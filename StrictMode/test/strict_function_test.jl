@@ -36,11 +36,53 @@ end
     empty!(StrictMode.registered_strict())
     # `Type{Float64}` is a fully-specified dispatch signature, not a non-concrete one — it used to
     # be silently skipped (isconcretetype(Type{Float64}) == false) even though it's checkable. (A
-    # `where {T}`-generic `::Type{T}` argument is a separate, pre-existing limitation: the macro
-    # evaluates the argument-type expression outside the method body, where a `where`-bound `T`
-    # isn't a valid symbol — unrelated to the isdispatchtuple fix, so tested here with a literal
-    # concrete `Type{Float64}` argument instead.)
+    # `where {T}`-generic argument is checked separately below: the macro no longer evaluates the
+    # declared types when the signature is parametric.)
     @strict_function typed_clean(::Type{Float64}, n::Int) = n + 1
     @test !isempty(StrictMode.registered_strict())
     @test typed_clean(Float64, 3) == 4
+end
+
+@testitem "@strict_function accepts a parametric (where) declaration" begin
+    using StrictMode
+    # The type variables of a `where` belong to the METHOD, not the enclosing module, so evaluating
+    # the declared argument types at module top level raised `UndefVarError: T`. Checks are on by
+    # default, so this failed to load in every dev and test environment while working in production.
+    @strict_function pgen(x::T) where {T <: Real} = x * 2
+    @test pgen(2.0) == 4.0
+    @test pgen(3) == 6
+
+    # Nothing is lost by not evaluating them: `Tuple{T}` is not a dispatch tuple, so the check would
+    # have taken its abstract-signature path anyway. It says so rather than passing silently.
+    @test_logs (:warn,) match_mode = :any (@eval @strict_function pgen2(x::T) where {T <: Real} = x)
+
+    # `signatures = [...]` remains the way to name the concrete instantiations, and still verifies.
+    @strict_function pgen3(x::T) where {T <: Real} = x + one(T)  signatures = [(Float64,)]
+    @test pgen3(1.0) == 2.0
+end
+
+@testitem "@strict module reports the allocation verdict and gates the rest" begin
+    using StrictMode
+    # `@strict module` runs at the CONSUMER'S own precompile, where StrictModeTest is not loadable,
+    # so its allocation verdict is the value-free scan — 8.1% false over a 120-specialization corpus
+    # (issue #17). Aborting a module load on that is issue #18, fixed for `@strict_function` and
+    # left live here, where the blast radius is every definition in the module rather than one.
+    @test_logs (:warn,) match_mode = :any (@eval @strict module _SMAlloc
+            leaky(n::Int) = (v = Int[]; for i in 1:n
+                    push!(v, i)
+                end; sum(v))
+        end)
+    @test _SMAlloc.leaky(3) == 6
+
+    # The half that must still throw: a non-concrete return is observed, not guessed.
+    @test_throws StrictViolation (@eval @strict module _SMBad
+            badret(x::Int) = x > 0 ? x : "not a number"
+        end)
+
+    # A small isbits union is accepted by design, so this is NOT a violation — pinning it keeps the
+    # gate above from being read as "any Union fails".
+    @eval @strict module _SMUnion
+        maybe(x::Int) = x > 0 ? x : 1.0
+    end
+    @test _SMUnion.maybe(2) == 2
 end

@@ -216,3 +216,25 @@ end
         StrictModeTest._JULIAC_PATCHED[] = patched
     end
 end
+
+@testitem "issue #28: StrictMode.__init__ is trim-clean" begin
+    using StrictMode, StrictModeTest
+    # `juliac --trim` keeps `__init__` as a root, so anything it can reach must be statically
+    # resolvable. The 0.4 load banner used `printstyled`, which routes through
+    # `styled_print`/`invoke_in_world` — unresolvable — and that broke the build of every consumer
+    # shipping a `--trim` artifact, without them calling a single StrictMode macro.
+    #
+    # This asserts against juliac's own verifier, not a heuristic: the package that exists to catch
+    # this class shipped it twice (0.4.0 and 0.4.1) because nothing ran the verifier on its own load
+    # path.
+    ok, why = StrictModeTest._trim_validate(StrictMode.__init__, ())
+    @test ok || error("StrictMode.__init__ is not trim-clean:\n  " * join(why, "\n  "))
+
+    # The banner is what reaches IO, so pin it directly too — `__init__` is a one-liner today and
+    # could stop being the interesting frame tomorrow.
+    ok2, why2 = StrictModeTest._trim_validate(StrictMode._announce_tier, ())
+    @test ok2 || error("_announce_tier is not trim-clean:\n  " * join(why2, "\n  "))
+
+    # And the writer itself: a foreigncall verifies clean where `print`/`write`/`printstyled` do not.
+    @test first(StrictModeTest._trim_validate(StrictMode._eprint, (String,)))
+end

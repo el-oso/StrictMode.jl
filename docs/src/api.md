@@ -227,10 +227,15 @@ Checks are gated behind a compile-time setting, on by default. Toggling it write
 `LocalPreferences.toml` and takes effect on the next Julia start. See
 [Getting Started](getting_started.md) for the `Project.toml` pattern a shipped application wants.
 
+`banner_enabled` reports the `banner` preference, which controls the one-line tier banner printed
+at load. Set `banner = false` to silence it; with it off `__init__` has no body at all, which is
+what a `juliac --trim` build wants.
+
 ```@docs
 enable_checks!
 disable_checks!
 checks_enabled
+banner_enabled
 proofs_loaded
 assert_enabled
 mca_available

@@ -58,6 +58,7 @@ export static_ownership_suggestions
 export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
+export banner_enabled
 export register_alloc_barrier!
 
 include("preferences.jl")

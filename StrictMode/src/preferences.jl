@@ -1,7 +1,12 @@
 # Compile-time gating. `CHECKS_ENABLED` is baked at precompile from Preferences; Preferences.jl
 # tracks it, so flipping the preference forces a recompile of StrictMode and every module that uses
-# its macros — exactly the dev/CI-vs-production switch we want. Preferences are read from the ACTIVE
-# project only, so a package and its `test/` environment can disagree and each gets its own pkgimage.
+# its macros — exactly the dev/CI-vs-production switch we want.
+#
+# A `test/` environment does NOT start clean: `Pkg.test` builds its sandbox with the parent project
+# on the load path and merges that project's preferences in, so a package shipping
+# `checks_enabled = false` in its own `Project.toml` carries it into its own suite — where every
+# `@assert_*` becomes a bare call and `StrictModeTest.__init__` errors. Overriding it needs an
+# explicit `[preferences.StrictMode] checks_enabled = true` in `test/Project.toml`.
 
 """
     checks_enabled() -> Bool
@@ -103,7 +108,37 @@ end
 # What a session gets, stated at load. The state worth announcing is not "checks are off" but
 # "checks are on, and `@assert_noalloc` is a scan rather than a proof" — StrictModeTest prints the
 # authoritative variant when it loads, so the two tiers are visibly different at a glance.
+# `__init__` is kept as a root by `juliac --trim`, so everything it can reach has to be statically
+# resolvable — and a session banner is not worth breaking a consumer's build over (issue #28: a
+# `--trim` artifact stopped building the moment its author upgraded to 0.4, without calling a single
+# StrictMode macro). Measured against juliac's own verifier: `printstyled`, `print` and `write` each
+# leave an unresolved call — they route through `styled_print`/`invoke_in_world`, and `stderr` is
+# typed `IO` — while a foreigncall verifies clean.
+#
+# The message is an ARGUMENT to a `"%s"` format, not the format itself: as the format, a `%` in the
+# text would be interpreted. Color is what a trim-clean load costs.
+_eprint(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s", msg)
+
+"""
+    StrictMode.banner_enabled() -> Bool
+
+Whether StrictMode prints its one-line tier banner to `stderr` when it loads. Controlled by the
+`banner` preference, default `true`. Silence it with
+
+    [preferences.StrictMode]
+    banner = false
+
+Baked at precompile like `checks_enabled`, so a change needs a restart. With it off `__init__` has
+no body left at all, which is a second answer to issue #28 for anyone who would rather their load
+be provably silent than trust that the writer stays trim-clean.
+"""
+banner_enabled() = BANNER_ENABLED
+const BANNER_ENABLED = @load_preference("banner", true)::Bool
+
 function _announce_tier()
+    # A compile-time const, so with the banner off this whole function folds to `nothing` and
+    # `juliac --trim` never sees the write at all.
+    BANNER_ENABLED || return nothing
     # Quiet while a dependent package is being precompiled: that output is captured and replayed
     # per package, so the banner would appear once per dependent instead of once per session.
     iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
@@ -113,24 +148,20 @@ function _announce_tier()
         # suite full of them passes while checking nothing. `assert_enabled` is the guard for that,
         # and it only helps a suite that remembers to call it; announcing here covers the ones that
         # do not. Loading `StrictModeTest` turns the same state into a hard error.
-        isempty(get(ENV, "CI", "")) || printstyled(
-            stderr,
+        isempty(get(ENV, "CI", "")) || _eprint(
             "┌ StrictMode: checks are DISABLED and CI is set.\n" *
                 "│ Every @assert_* in this run is a bare call: a green suite proves nothing.\n" *
-                "└ Remove `checks_enabled = false` from this environment's preferences.\n";
-            color = :yellow, bold = true
+                "└ Remove `checks_enabled = false` from this environment's preferences.\n"
         )
         return nothing
     end
-    printstyled(stderr, "┌ StrictMode: checks ENABLED — reporting tier.\n"; color = :cyan)
-    printstyled(
-        stderr,
-        "│ The allocation and trim guarantees REPORT (they guess, so they warn);\n" *
+    _eprint(
+        "┌ StrictMode: checks ENABLED — reporting tier.\n" *
+            "│ The allocation and trim guarantees REPORT (they guess, so they warn);\n" *
             "│ the ones that read compiled output still throw. For the allocation\n" *
             "│ proofs, add StrictModeTest and use @test_* / test_signatures /\n" *
             "│ test_compiled / test_registered.\n" *
-            "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n";
-        color = :cyan
+            "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n"
     )
     return nothing
 end

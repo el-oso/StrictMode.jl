@@ -32,6 +32,14 @@ function _argtype(a)
     return :Any
 end
 
+# A parametric declaration reaches this instead of `_verify_strict_def`: its type variables cannot
+# be evaluated outside the method, and the resulting signature would not be a dispatch tuple in any
+# case. Same verdict the abstract path gives, same remedy.
+_warn_parametric_decl(target) = @warn "@strict_function $target: the signature is parametric " *
+    "(`where`), so it names no concrete argument types and precompile guarantees are skipped. " *
+    "List the instantiations with `signatures = [(T1, …), …]`, or use `@strict_stable` to check " *
+    "every specialization as it compiles."
+
 # Runs at precompile/module-load. Only verifies *concrete* signatures; abstract ones warn once.
 function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), target; warn_abstract::Bool = true)
     Base.isdispatchtuple(Tuple{types...}) || return begin
@@ -47,6 +55,13 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
     register_strict!(f, types)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
+    # No method at all is its own mistake — usually a typo in `signatures = [...]`. Reporting it as
+    # "return type is not concrete … inferred Any[]" sends the reader looking for an instability
+    # that is not there.
+    isempty(rts) && _fail(
+        :strict_function, target,
+        "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         _fail(
             :strict_function, target,
@@ -130,8 +145,29 @@ macro strict_function(args...)
     argtypes = Expr(:tuple, (esc(_argtype(a)) for a in argexprs)...)
     target = string(fname) * "(" * join((string(_argtype(a)) for a in argexprs), ", ") * ")"
     sigs = get(opts, :signatures, nothing)
+    # A `where` binds its type variables to the METHOD, not to the enclosing module, so evaluating
+    # the declared argument types at module top level raises `UndefVarError: T`. `_strictdef_sig`
+    # peels the `where` to find the call, which left `T` in `argtypes` — and since checks are on by
+    # default, `f(x::T) where {T}` failed to load in every dev and test environment while working
+    # in production.
+    #
+    # Nothing is lost by not evaluating them: `Tuple{T}` is not a dispatch tuple, so
+    # `_verify_strict_def` would take its abstract-signature path anyway. That path is reproduced
+    # here without touching the types, and `signatures = [...]` remains the way to name the concrete
+    # instantiations a parametric declaration stands for.
+    parametric = Meta.isexpr(def.args[1], :where)
 
-    checked = if sigs === nothing
+    checked = if parametric && isnothing(sigs)
+        quote
+            $(esc(def))
+            $(_warn_parametric_decl)($target)
+        end
+    elseif parametric
+        quote
+            $(esc(def))
+            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)))
+        end
+    elseif isnothing(sigs)
         quote
             $(esc(def))
             $(_verify_strict_def)($(esc(fname)), $argtypes, $target)
