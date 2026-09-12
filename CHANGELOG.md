@@ -1,4 +1,54 @@
 # Changelog
+## 0.4.3
+
+### A guarded call site allocates nothing (#29)
+
+`@strict f(args...)` ran its three checks on every execution, and those checks allocate while they
+run. That allocation landed in the *enclosing* function's body, so `@allocated` — or
+`StrictModeTest.@test_noalloc` — pointed at the enclosing function measured the guard rather than
+the kernel it guards.
+
+The consequence for a consumer, as reported: a package that puts `@strict` on its hot kernels could
+not prove those kernels allocation-free in the configuration where `@strict` is active. In
+`UpdatableFactorizations.jl` the four guarded entry points were marked `@test_broken`, and proving
+the property at all needed a separate Julia process with `checks_enabled = false` — a compile-time
+`const`, so it cannot be flipped in-process.
+
+Measured on a warm 64-element dot product:
+
+| | bytes per call |
+|---|---|
+| bare call | 0 |
+| `@strict`, before | 4,528 |
+| `@strict`, now | **0** |
+
+The checks now run once per (call site, argument signature), on a cold branch:
+
+- **Type stability** asks inference, through `Base.promote_op`. The answer is a compile-time
+  constant, so a stable call folds the test away and keeps no branch — the mechanism
+  `@strict_stable` already used.
+- **The IR scans** cannot fold: they inspect compiled output, and Julia forbids code reflection
+  inside a generated function (`Base.check_generated_context`), so they cannot move to compile time
+  either. Each `(site, signature)` gets its own flag instead. The warm path is one load and a
+  compare; the scan sits behind the branch. The generator that mints the flag performs no
+  reflection, which is why it is permitted.
+
+The flag carries Julia's world counter, so defining any method re-arms every site. A check can
+never stay ticked against code that has since changed — the Revise callback that would otherwise
+clear it returns early when the registry is empty, which is exactly the case for a `@strict` call
+site, since one registers nothing. The cost is an occasional extra scan after a recompile, which
+the warm path does not pay. `clear_cache!` re-arms everything explicitly on top of that.
+
+A regression test pins all three properties: zero allocation warm, the checks still firing, and the
+flag re-arming. It was verified to fail when the per-call behaviour is restored.
+
+### `Base.return_types` is memoized
+
+The type-stability check called it fresh on every execution — 3,872 of the 4,528 bytes above. It is
+now cached on the same terms as the IR scan: identity on the signature, keyed by world age, cleared
+by `clear_cache!`. This no longer matters for `@strict`, which asks inference directly, but it still
+does for `findings` and the registry sweeps.
+
 ## 0.4.2
 
 Three consumer-breaking bugs. Anyone on 0.4.0 or 0.4.1 shipping a `juliac --trim` artifact, or

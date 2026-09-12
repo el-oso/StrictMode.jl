@@ -36,9 +36,11 @@ function clear_cache!()
         _CACHE_HITS[] = 0
         _CACHE_MISSES[] = 0
     end
+    _GENERATION[] += 1                            # re-arm every per-site guard (issue #29)
     @lock _SIGNAL_MEMO_LOCK begin                  # the scan memos share the staleness contract
         empty!(_SIGNAL_MEMO)
         empty!(_TOP_SIGNAL_MEMO)
+        empty!(_RETTYPE_MEMO)
     end
     @lock _ESCAPE_MEMO_LOCK empty!(_ESCAPE_MEMO)   # …as does the escape-analysis memo
     return nothing

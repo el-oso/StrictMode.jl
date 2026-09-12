@@ -18,8 +18,33 @@ _is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(
 # `get!` behind a `::L3Workspace{T}` assert) the caller stays stable. JET's :full opt-analysis agrees
 # (it flags dynamic dispatch, not resolved invokes). Depth-2 (the noalloc/noboxing depth, which counts
 # a callee's runtime cost) over-flagged concrete-return callers of boxy helpers. See check.jl.
-function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
+# `Base.return_types` runs inference and builds a result vector on every call. The guarantee macros
+# run their check at every EXECUTION of a call site, so an un-memoized call here is paid per
+# iteration of any loop containing one — measured at 3,872 of the 4,528 bytes a `@strict` site cost
+# per call, 85% of the total (issue #29). That allocation lands in the CALLER's body, so a consumer
+# cannot measure the very allocation-freedom `@strict` is about without building a second Julia
+# process with checks off.
+#
+# Cached on the same terms as `_TOP_SIGNAL_MEMO`: identity on the signature (concrete signature
+# `DataType`s are interned, and `hash(::DataType)` walks the whole type), keyed by world age so any
+# new method definition invalidates. Cleared by `clear_cache!` with the other memos.
+const _RETTYPE_MEMO = IdDict{Any, Dict{UInt64, Vector{Any}}}()
+
+function _return_types_memo(@nospecialize(f), @nospecialize(types::Tuple))
+    sig = Base.signature_type(f, Tuple{types...})
+    world = Base.get_world_counter()
+    memo = @lock _SIGNAL_MEMO_LOCK begin
+        bysig = get(_RETTYPE_MEMO, sig, nothing)
+        isnothing(bysig) ? nothing : get(bysig, world, nothing)
+    end
+    isnothing(memo) || return memo
     rts = Base.return_types(f, Tuple{types...})
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{UInt64, Vector{Any}}, _RETTYPE_MEMO, sig)[world] = rts
+    return rts
+end
+
+function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
+    rts = _return_types_memo(f, types)
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
         _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")

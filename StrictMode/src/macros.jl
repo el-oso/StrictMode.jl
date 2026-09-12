@@ -145,6 +145,41 @@ function _guarantee_expr(call, runner, extra_args...; types = nothing)
     end
 end
 
+# --- once-per-specialization guarding (issue #29) ------------------------------------------------
+#
+# A guarantee macro's checks allocate while they run, and they run inside the caller's body. Run
+# per execution, that allocation is what `@allocated` and `@test_noalloc` measure when they are
+# pointed at the enclosing function — the guard, not the kernel it guards. A package must be able
+# to prove its own hot paths allocation-free with the checks active, so the checks sit on a cold
+# branch that runs once per (call site, specialization):
+#
+#   * Type stability asks INFERENCE, via `Base.promote_op`, exactly as `@strict_stable` does. The
+#     result is a compile-time constant, so a stable call folds the test away and keeps no branch.
+#   * The IR scans cannot fold — they inspect compiled output, and Julia forbids code reflection
+#     inside a generated function (`Base.check_generated_context`), so they cannot move to compile
+#     time either. Instead each (site, signature) gets its own flag; the warm path is one load and
+#     a compare, and the scan itself sits behind the branch.
+#
+# The generator below performs NO reflection. It only mints a fresh `Ref` per `(site, Sig)`, which
+# is permitted, and the result const-folds into the caller.
+#
+# Measured on a warm 64-element dot product: 0 bytes and the same ~5 ns as the unguarded call, with
+# the scan running exactly once however many times the site executes.
+@generated _site_flag(::Val{site}, ::Type{Sig}) where {site, Sig} = Ref{UInt}(0)
+
+# The stamp a flag must match to count as already checked. A site whose flag differs re-runs its
+# checks.
+#
+# The world counter carries the load: it moves whenever any method is defined, so a site re-arms by
+# itself after an edit, with no dependence on `clear_cache!` being called or on Revise running. A
+# flag that silently stayed ticked against code that has since changed is the vacuous-green shape
+# this package exists to remove, so correctness here is worth an occasional extra scan — the cost
+# of a re-arm is one cold branch, and the warm path stays at zero either way.
+#
+# `_GENERATION` adds explicit invalidation on top, for `clear_cache!`.
+const _GENERATION = Ref{UInt}(0)
+@inline _guard_stamp() = Base.get_world_counter() + _GENERATION[]
+
 # `@strict` — the guarantees every hot path wants, applied together. Binds the arguments a single
 # time so the combined check never double-evaluates side effects.
 #
@@ -158,21 +193,45 @@ end
 function _strict_expr(call; types = nothing)
     target = string(call)
     p = _call_parts(call; types)
+    site = QuoteNode(gensym(:strictsite))
 
-    mode = _noalloc_mode(nothing)
     checked = quote
         $(p.binds...)
-        # (1) type stability (root cause of most surprise allocations, so checked first)
-        $(_typestable_check_expr(target, p.checkfn, p.types))
-        # (2) owned scratch. Reports here rather than throwing as `@assert_owned` does: the rule
-        # flags ANY runtime `AbstractDict` accessor on the hot path, which is right for a check you
-        # asked for by name and too broad for one applied to every `@strict` site — a value-keyed
-        # cache is legitimate. Runs before the call so the static scan precedes execution.
-        $(_assert_owned)($target, $(p.checkfn), $(p.types); gates = false)
-        # (3) allocation-freedom (also returns the call's value)
-        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); mode = $(QuoteNode(mode)))
+        # (1) Type stability, from inference. `promote_op` is a compile-time constant, so a stable
+        # call folds this away and keeps no branch at all.
+        local var"#T" = $(Base.promote_op)($(p.checkfn), $(p.types)...)
+        $(_is_typestable_return)(var"#T") || $(_stable_violation)($target, var"#T")
+        # (2) The IR scans, once per (site, specialization). `Sig` is constant in the specialization
+        # and `_site_flag` const-folds, so the warm path is a load and a compare.
+        local var"#flag" = $(_site_flag)(Val($site), Tuple{typeof($(p.checkfn)), $(p.types)...})
+        local var"#stamp" = $(_guard_stamp)()
+        if var"#flag"[] != var"#stamp"
+            $(_strict_scan)($target, $(p.checkfn), $(p.types))
+            var"#flag"[] = var"#stamp"
+        end
+        $(p.litcall)
     end
     return _gate(checked, esc(call))
+end
+
+# The inspection half of `@strict`, off the hot path. `@noinline` keeps its frame out of the
+# caller: the guarded body should carry the branch and nothing else.
+#
+# Owned scratch REPORTS here rather than throwing as `@assert_owned` does — the rule flags ANY
+# runtime `AbstractDict` accessor, which is right for a check named at one call site and too broad
+# for one applied to every `@strict` site, since a value-keyed cache is legitimate. The allocation
+# verdict reports for the reason `_guarantee_gates` gives: the scan reads typed IR and cannot see
+# what LLVM later elides.
+@noinline function _strict_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
+    _assert_owned(target, f, types; gates = false)
+    sig = _alloc_signals(f, types)
+    if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
+        _fail(
+            :noalloc, target,
+            _box_msg("allocates / boxes (value-free IR scan)", sig); gates = false
+        )
+    end
+    return nothing
 end
 
 """
@@ -197,6 +256,25 @@ report the same violations a second time and catch nothing extra.
 Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
 bare call. Keyword-argument calls and a `types = (…)` signature override are both supported, exactly
 as for [`@assert_typestable`](@ref) / [`@assert_noalloc`](@ref).
+
+!!! note "A guarded call allocates nothing"
+    The checks run **once per call site and argument signature**, not on every execution, so a
+    guarded call measures the same as an unguarded one: 0 bytes, and the same time. That matters
+    because the checks allocate while they run, and they run inside the *enclosing* function — if
+    they ran per call, `@allocated` or `StrictModeTest.@test_noalloc` pointed at that function
+    would measure the guard instead of the kernel it guards (issue #29).
+
+    Type stability is asked of inference, so a stable call folds the test away completely. The IR
+    scans cannot fold — they inspect compiled output, and Julia forbids code reflection inside a
+    generated function — so they sit behind a per-signature flag instead: one load and a compare on
+    the warm path.
+
+    The flag carries the world counter, so defining any method re-arms every site. A check never
+    stays ticked against code that has since changed; the cost is an occasional extra scan after a
+    recompile, which the warm path does not pay.
+
+    [`@strict_function`](@ref) is still the right tool for a definition you want checked at module
+    load rather than at first call.
 
 ```julia
 @strict dot(u, v)              # ok: stable + non-allocating

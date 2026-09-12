@@ -356,6 +356,39 @@ on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of allocati
 `@assert_noboxing` is not part of it: its rule is a strict subset of `@assert_noalloc`'s, so
 including both would say the same thing twice.
 
+### A guarded call allocates nothing
+
+The checks run **once per call site and argument signature**, not on every execution. Measured on a
+warm 64-element dot product:
+
+```text
+  bare call                          0 bytes
+  @strict at the call site           0 bytes
+  @strict_function on a definition   0 bytes
+```
+
+This matters because the checks allocate while they run, and they run inside the *enclosing*
+function. If they ran per call, `@allocated` — or `StrictModeTest.@test_noalloc` — pointed at that
+function would measure the guard rather than the kernel it guards, and a package could not prove
+its own hot paths allocation-free with checks on (issue #29).
+
+Each half gets there differently:
+
+- **Type stability** is a question inference already answers, via `Base.promote_op`. The result is
+  a compile-time constant, so a stable call folds the test away and keeps no branch. This is the
+  same mechanism [`@strict_stable`](@ref) uses.
+- **The IR scans** cannot fold — they inspect compiled output, and Julia forbids code reflection
+  inside a generated function (`Base.check_generated_context`). They sit behind a per-signature
+  flag instead: one load and a compare on the warm path, the scan itself on a cold branch.
+
+The flag carries Julia's world counter, so defining any method re-arms every site. A check can
+never stay ticked against code that has since changed — a silent skip is the failure this package
+exists to remove. The price is an occasional extra scan after a recompile, which the warm path
+does not pay.
+
+Use [`@strict_function`](@ref) when you want a definition checked at module load rather than at its
+first call.
+
 ## `@strict_function` — verify a definition at load time
 
 Put it on a definition and StrictMode checks that definition against its declared argument types,
