@@ -85,6 +85,11 @@ function _typestable_check_expr(target, fe, types)
     return :($(_typestable_fast)($target, $fe, $types))
 end
 
+# Guarded form, for the macros that expand a call site. `_typestable_fast` reads only the signature.
+function _typestable_guarded_expr(p, target)
+    return _guarded_check(p, _typestable_check_expr(target, p.checkfn, p.types))
+end
+
 """
     @assert_typestable f(args...)
     @assert_typestable f(args...; kw...)
@@ -137,7 +142,7 @@ macro assert_typestable(args...)
     checked = quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(_typestable_check_expr(target, p.checkfn, p.types))
+        $(_typestable_guarded_expr(p, target))
         _val
     end
     return _gate(checked, esc(call))

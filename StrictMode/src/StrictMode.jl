@@ -91,6 +91,13 @@ include("migration.jl")
 # The proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` gating API live in the
 # companion `StrictModeTest` package. Nothing here calls them, and nothing here is a stub they fill.
 
-__init__() = _announce_tier()
+function __init__()
+    # A per-process nonce, so a guard flag baked into a pkgimage during someone else's precompile
+    # can never match a stamp computed here. `time_ns` is a foreigncall, so this keeps `__init__`
+    # trim-clean (issue #28).
+    _GENERATION[] = UInt(time_ns())
+    _announce_tier()
+    return nothing
+end
 
 end # module StrictMode

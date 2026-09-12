@@ -1,53 +1,35 @@
 # Changelog
+
 ## 0.4.3
 
-### A guarded call site allocates nothing (#29)
+### The assertion macros are allocation-free
 
-`@strict f(args...)` ran its three checks on every execution, and those checks allocate while they
-run. That allocation landed in the *enclosing* function's body, so `@allocated` — or
-`StrictModeTest.@test_noalloc` — pointed at the enclosing function measured the guard rather than
-the kernel it guards.
+A guarded call measures the same as an unguarded one. Per call, warm, on a 64-element dot product:
 
-The consequence for a consumer, as reported: a package that puts `@strict` on its hot kernels could
-not prove those kernels allocation-free in the configuration where `@strict` is active. In
-`UpdatableFactorizations.jl` the four guarded entry points were marked `@test_broken`, and proving
-the property at all needed a separate Julia process with `checks_enabled = false` — a compile-time
-`const`, so it cannot be flipped in-process.
-
-Measured on a warm 64-element dot product:
-
-| | bytes per call |
+| macro | bytes |
 |---|---|
 | bare call | 0 |
-| `@strict`, before | 4,528 |
-| `@strict`, now | **0** |
+| `@strict` | 0 |
+| `@assert_noalloc` | 0 |
+| `@assert_typestable` | 0 |
+| `@assert_noboxing` | 0 |
+| `@assert_owned` | 0 |
+| `@assert_inlined` | 0 |
 
-The checks now run once per (call site, argument signature), on a cold branch:
+Each check reads only the signature, so it runs once per `(call site, argument signature)` rather
+than on every execution (#29).
 
-- **Type stability** asks inference, through `Base.promote_op`. The answer is a compile-time
-  constant, so a stable call folds the test away and keeps no branch — the mechanism
-  `@strict_stable` already used.
-- **The IR scans** cannot fold: they inspect compiled output, and Julia forbids code reflection
-  inside a generated function (`Base.check_generated_context`), so they cannot move to compile time
-  either. Each `(site, signature)` gets its own flag instead. The warm path is one load and a
-  compare; the scan sits behind the branch. The generator that mints the flag performs no
-  reflection, which is why it is permitted.
+`StrictModeTest`'s `@test_noalloc` and `@test_typestable` pass on a guarded call whose kernel is
+clean, and still fail on one whose kernel is not.
 
-The flag carries Julia's world counter, so defining any method re-arms every site. A check can
-never stay ticked against code that has since changed — the Revise callback that would otherwise
-clear it returns early when the registry is empty, which is exactly the case for a `@strict` call
-site, since one registers nothing. The cost is an occasional extra scan after a recompile, which
-the warm path does not pay. `clear_cache!` re-arms everything explicitly on top of that.
-
-A regression test pins all three properties: zero allocation warm, the checks still firing, and the
-flag re-arming. It was verified to fail when the per-call behaviour is restored.
+Two checks stay per call, because they read values rather than types:
+`@assert_noalloc static = false` measures the call it just made, and `@assert_memsafe` runs the real
+arguments through a guarded buffer.
 
 ### `Base.return_types` is memoized
 
-The type-stability check called it fresh on every execution — 3,872 of the 4,528 bytes above. It is
-now cached on the same terms as the IR scan: identity on the signature, keyed by world age, cleared
-by `clear_cache!`. This no longer matters for `@strict`, which asks inference directly, but it still
-does for `findings` and the registry sweeps.
+Cached on the same terms as the IR scan: identity on the signature, keyed by world age, cleared by
+`clear_cache!`.
 
 ## 0.4.2
 

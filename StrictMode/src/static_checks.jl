@@ -19,6 +19,15 @@
 _noalloc_mode(static_opt::Union{Nothing, Bool}) =
     isnothing(static_opt) ? :heuristic : static_opt ? :static : :empirical
 
+# The scan half on its own, with no thunk: the caller already has the value.
+function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
+    sig = _alloc_signals(f, types)
+    if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
+        _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
+    end
+    return nothing
+end
+
 function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), thunk::F; mode::Symbol) where {F}
     mode === :static && throw(
         ArgumentError(
@@ -92,9 +101,25 @@ macro assert_noalloc(args...)
     target = string(call)
     p = _call_parts(call; types = get(opts, :types, nothing))
 
-    checked = quote
-        $(p.binds...)
-        $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); mode = $(QuoteNode(mode)))
+    # The scan reads only the signature, so it runs once per (site, signature) and the call itself
+    # supplies the value — `_assert_noalloc` is not used on this path, because it calls the thunk to
+    # produce that value and would therefore run the call a second time on the cold branch, breaking
+    # the evaluate-once guarantee every one of these macros makes.
+    #
+    # `static = false` is measurement, not a scan: it asks what THIS call did, so it stays per call
+    # and keeps running through `_assert_noalloc`.
+    checked = if mode === :heuristic
+        quote
+            $(p.binds...)
+            local _val = $(p.litcall)
+            $(_guarded_check(p, :($(_assert_noalloc_scan)($target, $(p.checkfn), $(p.types)))))
+            _val
+        end
+    else
+        quote
+            $(p.binds...)
+            $(_assert_noalloc)($target, $(p.checkfn), $(p.types), $(p.thunk); mode = $(QuoteNode(mode)))
+        end
     end
     return _gate(checked, esc(call))
 end
@@ -196,7 +221,7 @@ macro assert_owned(args...)
     checked = quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(_assert_owned)($target, $(p.checkfn), $(p.types); depth = $depth_expr)
+        $(_guarded_check(p, :($(_assert_owned)($target, $(p.checkfn), $(p.types); depth = $depth_expr))))
         _val
     end
     return _gate(checked, esc(call))

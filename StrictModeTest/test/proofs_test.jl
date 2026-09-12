@@ -81,3 +81,31 @@ end
     @test bad isa Bool
     @test why isa Vector{String}
 end
+
+@testitem "issue #29: the guard frame is excluded from both proofs" begin
+    using StrictMode, StrictModeTest
+    dot29(a::Vector{Float64}, b::Vector{Float64}) = (s = 0.0; @inbounds @simd for i in eachindex(a, b)
+            s += a[i] * b[i]
+        end; s)
+    guarded29(a::Vector{Float64}, b::Vector{Float64}) = @strict dot29(a, b)
+    a = rand(8); b = rand(8)
+    guarded29(a, b)
+
+    # `@strict` keeps its checks on a cold branch, so the guarded call allocates nothing at runtime
+    # — but the branch is still in the compiled call graph, and both proofs analyze every path. The
+    # issue is about proving a guarded kernel clean, so the proofs must not trip over the guard.
+    @test iszero(@allocated guarded29(a, b))
+    @test_noalloc guarded29(a, b)
+    @test_typestable guarded29(a, b)
+
+    # The filter must be narrow: a guarded kernel that really allocates still fails. Without this,
+    # excluding the guard frame could hide the user's own finding, which is worse than the bug.
+    SINK29 = Ref{Any}(nothing)
+    dirty29(n::Int) = (v = Vector{Float64}(undef, n); SINK29[] = v; length(v))
+    gdirty29(n::Int) = @strict dirty29(n)
+    gdirty29(4)
+    @test_throws StrictViolation (@test_noalloc gdirty29(4))
+
+    # An unguarded allocating call is unaffected either way.
+    @test_throws StrictViolation (@test_noalloc dirty29(4))
+end

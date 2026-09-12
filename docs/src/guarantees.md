@@ -356,7 +356,7 @@ on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of allocati
 `@assert_noboxing` is not part of it: its rule is a strict subset of `@assert_noalloc`'s, so
 including both would say the same thing twice.
 
-### A guarded call allocates nothing
+### A `@strict` call allocates nothing
 
 The checks run **once per call site and argument signature**, not on every execution. Measured on a
 warm 64-element dot product:
@@ -367,10 +367,19 @@ warm 64-element dot product:
   @strict_function on a definition   0 bytes
 ```
 
+This holds for `@strict` alone. [`@kernel`](@ref) and the single-guarantee `@assert_*` macros still
+check on every execution — per call, on the same fixture: `@assert_noalloc` 112 B,
+`@assert_typestable` 208 B, `@kernel` ~583 KB.
+
 This matters because the checks allocate while they run, and they run inside the *enclosing*
 function. If they ran per call, `@allocated` — or `StrictModeTest.@test_noalloc` — pointed at that
 function would measure the guard rather than the kernel it guards, and a package could not prove
 its own hot paths allocation-free with checks on (issue #29).
+
+`StrictModeTest` excludes the guard frame from its proofs too, so `@test_noalloc` and
+`@test_typestable` pass on a guarded call whose kernel is clean — and still fail on one whose kernel
+is not. Those two are what the reporter had to mark `@test_broken`, so a zero `@allocated` alone
+would not have answered the issue.
 
 Each half gets there differently:
 

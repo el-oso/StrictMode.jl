@@ -140,8 +140,31 @@ function _guarantee_expr(call, runner, extra_args...; types = nothing)
     return quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(runner)($target, $(p.checkfn), $(p.types), $(extra_args...))
+        $(_guarded_check(p, :($(runner)($target, $(p.checkfn), $(p.types), $(extra_args...)))))
         _val
+    end
+end
+
+# Wrap a check so it runs once per (call site, argument signature) instead of once per execution.
+#
+# Every check reached this way reads only the SIGNATURE — a scan of typed IR or of compiled output —
+# so its verdict cannot change between two calls at the same types, and running it again per call
+# buys nothing while allocating. A check that reads the VALUES must not come through here:
+# `@assert_noalloc static = false` measures the call it just made, and `@assert_memsafe` runs the
+# real arguments through a guarded buffer. Those stay per call, because that is the question they
+# ask.
+#
+# `Sig` is constant within the specialization and `_site_flag` const-folds, so the warm path is a
+# load, an add and a compare. See the `_site_flag` comment for why the stamp is shaped as it is.
+function _guarded_check(p, body)
+    site = QuoteNode(gensym(:site))
+    return quote
+        local var"#flag" = $(_site_flag)(Val($site), Tuple{typeof($(p.checkfn)), $(p.types)...})
+        local var"#stamp" = $(_guard_stamp)()
+        if var"#flag"[] != var"#stamp"
+            $body
+            var"#flag"[] = var"#stamp"
+        end
     end
 end
 
@@ -176,7 +199,16 @@ end
 # this package exists to remove, so correctness here is worth an occasional extra scan — the cost
 # of a re-arm is one cold branch, and the warm path stays at zero either way.
 #
-# `_GENERATION` adds explicit invalidation on top, for `clear_cache!`.
+# `_GENERATION` adds explicit invalidation on top, for `clear_cache!`, and carries a per-process
+# nonce set in `__init__`.
+#
+# The nonce is what makes a baked flag safe. `_site_flag`'s `Ref` is inlined into the caller as a
+# literal, so a flag SET during a consumer's precompile is serialized into the pkgimage with its
+# stamp still in it — `code_typed` on a guarded function in a fresh process shows the value from the
+# build process. World counters are reproducible enough across processes that a fresh session can
+# reach that exact stamp, at which point the site reads as already-checked and its scan is skipped
+# with nothing said. Reproduced deterministically before this line existed. A nonce cannot collide
+# with a value baked by a different process.
 const _GENERATION = Ref{UInt}(0)
 @inline _guard_stamp() = Base.get_world_counter() + _GENERATION[]
 
@@ -231,6 +263,17 @@ end
             _box_msg("allocates / boxes (value-free IR scan)", sig); gates = false
         )
     end
+    # F39, and it belongs to `:typestable` rather than `:noalloc`: a union-typed local whose members
+    # do not all ride unboxed is an instability the return type cannot show. The shape it exists for
+    # — concrete return, no allocation site, an immutable non-isbits member boxed on entry — sets
+    # none of the three flags above, so without this the signal is simply absent from `@strict`.
+    if sig.unionphi
+        _fail(
+            :typestable, target,
+            "a union-typed local carries a member that must be boxed to flow through it " *
+                "(concrete return; IR heuristic)"; gates = false
+        )
+    end
     return nothing
 end
 
@@ -254,15 +297,29 @@ gate on owned scratch, and `StrictModeTest`'s `@test_noalloc` for a proof of all
 report the same violations a second time and catch nothing extra.
 
 Arguments are evaluated once, and the macro returns the call's value. Disabled builds expand to the
-bare call. Keyword-argument calls and a `types = (…)` signature override are both supported, exactly
-as for [`@assert_typestable`](@ref) / [`@assert_noalloc`](@ref).
+bare call. Keyword-argument calls and a `types = (…)` signature override are both supported.
 
-!!! note "A guarded call allocates nothing"
+The override differs from [`@assert_typestable`](@ref)'s in one case. This macro asks inference for
+the return type through `Base.promote_op`, which JOINS the results when the signature matches more
+than one method; `@assert_typestable` uses `Base.return_types` and fails outright on more than one.
+So `types = (Real,)` against methods returning `Int` and `Float64` passes here — the join is an
+isbits union, which this package accepts — and throws there. Name a concrete signature if you want
+the two to agree.
+
+!!! note "A `@strict` call allocates nothing"
     The checks run **once per call site and argument signature**, not on every execution, so a
-    guarded call measures the same as an unguarded one: 0 bytes, and the same time. That matters
-    because the checks allocate while they run, and they run inside the *enclosing* function — if
-    they ran per call, `@allocated` or `StrictModeTest.@test_noalloc` pointed at that function
-    would measure the guard instead of the kernel it guards (issue #29).
+    guarded call measures the same as an unguarded one: 0 bytes, and the same time.
+
+    This holds for `@strict` alone. [`@kernel`](@ref) and the single-guarantee `@assert_*` macros
+    still check on every execution — measured per call on a warm 64-element dot product:
+    `@assert_noalloc` 112 B, `@assert_typestable` 208 B, `@kernel` ~583 KB.
+
+    It matters because the checks allocate while they run, and they run inside the *enclosing*
+    function. Run per call, that allocation is what `@allocated` — or
+    `StrictModeTest.@test_noalloc` — measures when pointed at the enclosing function: the guard,
+    not the kernel it guards. `StrictModeTest` also excludes the guard frame from its proofs, so
+    `@test_noalloc` and `@test_typestable` pass on a guarded call whose kernel is clean, and still
+    fail on one whose kernel is not (issue #29).
 
     Type stability is asked of inference, so a stable call folds the test away completely. The IR
     scans cannot fold — they inspect compiled output, and Julia forbids code reflection inside a

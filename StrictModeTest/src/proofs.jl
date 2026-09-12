@@ -68,11 +68,42 @@ function set_ignore_barrier!(b::Bool)
     return b
 end
 
+# StrictMode's own guard frame, excluded from both proofs.
+#
+# A `@strict` call site keeps its checks on a cold branch that runs once per signature, so the
+# guarded function allocates nothing at runtime — but the branch is still part of the compiled call
+# graph, and AllocCheck and JET both analyze every path regardless of how often it is taken. Left
+# in, the guard makes `@test_noalloc`/`@test_typestable` fail on the enclosing function, which is
+# the measurement issue #29 is about: a package that guards its hot kernels could not then prove
+# those kernels clean.
+#
+# Excluding it is sound in the direction that matters. `_strict_scan` is StrictMode's own analysis
+# code, not the user's, and it cannot run in a build with checks off — the whole branch is erased by
+# `_gate`. What it can never do is hide a finding in the guarded kernel: these filters drop
+# instances attributed to the guard frame, not to the call it guards.
+const _GUARD_FRAME = :_strict_scan
+
+_is_guard_alloc(@nospecialize(inst)) =
+    hasproperty(inst, :fname) && Symbol(getproperty(inst, :fname)) === _GUARD_FRAME
+
+function _is_guard_report(@nospecialize(rep))
+    hasproperty(rep, :vst) || return false
+    return any(rep.vst) do fr
+        mi = fr.linfo
+        mi isa Core.MethodInstance || return false
+        d = mi.def
+        return d isa Method && d.name === _GUARD_FRAME
+    end
+end
+
 # `StrictMode.ignore_throw()` (default true): don't count allocations on never-taken error/throw branches
 # (BoundsError etc.) — they are not on the hot path and produce false positives on
 # runtime-zero-alloc code.
-_raw_allocs(@nospecialize(f), @nospecialize(types)) =
+_raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) =
     AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw())
+
+_raw_allocs(@nospecialize(f), @nospecialize(types)) =
+    filter(!_is_guard_alloc, _raw_allocs_unfiltered(f, types))
 
 # Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
 # uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
@@ -141,7 +172,7 @@ end
 # propagating raw from inside JET (see `AnalysisError`).
 function _opt_reports(target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple))
     try
-        return JET.get_reports(JET.report_opt(f, types))
+        return filter(!_is_guard_report, JET.get_reports(JET.report_opt(f, types)))
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
     end
