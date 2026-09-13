@@ -231,3 +231,17 @@ end
         @test StrictMode._alloc_signals(f, T).alloc
     end
 end
+
+@testitem "a :new whose type is a GlobalRef is judged by the type it names" begin
+    using StrictMode
+    # Complex division compiles to `%new(Base.ComplexF64, …)`: the type is a `GlobalRef`, not the
+    # `DataType`. ComplexF64 is isbits, so it must not count as an allocation.
+    cdiv(a::ComplexF64, b::ComplexF64) = a / b
+    globalref_new = any(first(Base.code_typed(/, (ComplexF64, ComplexF64)))[1].code) do st
+        Meta.isexpr(st, :new) && st.args[1] isa GlobalRef
+    end
+    @test globalref_new
+    cdiv(1.0im, 2.0 + 0im)
+    @test iszero(@allocated cdiv(1.0im, 2.0 + 0im))
+    @test !StrictMode._alloc_signals(cdiv, (ComplexF64, ComplexF64)).alloc
+end

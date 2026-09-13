@@ -528,6 +528,10 @@ function _boxes_into_field(ci, @nospecialize(sig), st::Expr, @nospecialize(nt))
     return false
 end
 
+# The type a `:new` constructs. Optimized IR may name it with a `GlobalRef` (`%new(Base.ComplexF64, …)`)
+# instead of holding the `DataType`.
+_new_type(ci, st::Expr) = (a = st.args[1]; a isa Type ? a : _static_callee(ci, a))
+
 function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
     i in seen && return false
     push!(seen, i)
@@ -546,7 +550,7 @@ function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
             ps = mi.specTypes.parameters
             (k - 1 <= length(ps) && isconcretetype(ps[k - 1])) || return true
         elseif Meta.isexpr(st, :new)
-            ct = st.args[1]
+            ct = _new_type(ci, st)
             if ct isa DataType && !ismutabletype(ct)
                 _immutable_escapes(ci, uses, dead, j, seen) && return true
             else
@@ -588,7 +592,7 @@ end
 
 function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     st = ci.code[i]
-    nt = st.args[1]
+    nt = _new_type(ci, st)
     nt isa Type || return true
     Base.isbitstype(nt) && return false
     _boxes_into_field(ci, sig, st, nt) && return true
