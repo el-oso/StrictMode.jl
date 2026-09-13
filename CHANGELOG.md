@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.5
+
+### Complex arithmetic is no longer reported as allocating
+
+Optimized IR can name the type of a `:new` with a `GlobalRef` instead of the type itself — complex
+division builds `%new(Base.ComplexF64, …)`. The allocation scan treated such a type as unknown and
+reported an allocation. It now resolves the name first. On 120 compiled PureBLAS and PureIPM
+specializations, the scan agrees with AllocCheck on all 120; 0.4.4 reported 6 `ComplexF64` LAPACK
+routines that allocate nothing.
+
 ## 0.4.4
 
 ### The allocation scan no longer flags `ccall` `Ref`s and passed-down wrappers
