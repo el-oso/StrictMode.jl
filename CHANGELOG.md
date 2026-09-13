@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
 
 ### The allocation scan no longer flags `ccall` `Ref`s and passed-down wrappers
 
