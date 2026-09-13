@@ -72,6 +72,15 @@ GitHub issues are the source of truth for anything with a number; the notes here
   release that moves it degrades the rate rather than breaking the guarantee — but the fallback is
   silent, so the corpus re-measurement is also how a future regression would be noticed.
 
+  *NEW `:new` RULE, 0.4.4 (2026-09-13).* Escape analysis was the wrong tool: it treats any value
+  passed to a callee or a `ccall` as escaping. `_new_allocates` (effects.jl) now judges each
+  non-isbits `:new` by its SSA uses. A value stored into an abstractly typed field is boxed. An
+  immutable allocates only when it reaches a use that needs a box. A mutable used only by a `ccall`
+  and its own field is a stack `Ref`. Any other mutable still goes to escape analysis, and any use
+  the rules do not recognize counts as a box. Measured on PureOSQP's `admm_step!` and
+  `update_residuals!` across 13 backends: agreement with AllocCheck went from 8 of 26 signatures to
+  26 of 26. Not yet re-measured on the 120-specialization corpus above.
+
   The change immediately exposed a false-premise test: `once_barrier_test.jl` asserted a fixture
   "genuinely allocates on every call" that measures **0 bytes** — a #17 false positive living inside
   the suite and asserting itself as correct. The fixture now escapes its allocation, and the
