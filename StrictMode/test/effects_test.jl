@@ -166,3 +166,68 @@ end
         @test StrictMode._alloc_signals(mkvec, (Int,)).alloc   # degraded to over-flagging, as designed
     end
 end
+
+@testitem "a ccall's Ref argument is not an allocation; a Ref that outlives the call is" begin
+    using StrictMode
+    # The shape every BLAS/LAPACK wrapper compiles to: `Ref`s built for the call, one of them read
+    # back afterwards the way `info[]` is. Typed IR still holds a `:new` for each; codegen puts them
+    # on the stack. Flagging them reported every caller of `BLAS.symv!` or `LAPACK.potrs!` as
+    # allocating while it measured 0 bytes.
+    const REF_SINK = Ref{Any}(nothing)
+    refarg(n::Int) = (
+        src = Ref(n); dst = Ref(0);
+        ccall(:memmove, Ptr{Cvoid}, (Ref{Int}, Ref{Int}, Csize_t), dst, src, sizeof(Int)); dst[]
+    )
+    refleak(n::Int) = (
+        src = Ref(n); dst = Ref(0); REF_SINK[] = dst;
+        ccall(:memmove, Ptr{Cvoid}, (Ref{Int}, Ref{Int}, Csize_t), dst, src, sizeof(Int)); dst[]
+    )
+    measure(f, n) = (f(n); @allocated f(n))
+    refnew(f) = any(first(Base.code_typed(f, (Int,); optimize = true))[1].code) do st
+        Meta.isexpr(st, :new) && st.args[1] isa Type && st.args[1] <: Base.RefValue
+    end
+
+    # Both fixtures must still exhibit the shape, or the verdicts below say nothing.
+    @test refnew(refarg) && refnew(refleak)
+    @test refarg(5) == 5
+
+    @test iszero(measure(refarg, 5))
+    @test !StrictMode._alloc_signals(refarg, (Int,)).alloc
+
+    @test measure(refleak, 5) > 0
+    @test StrictMode._alloc_signals(refleak, (Int,)).alloc
+end
+
+@testitem "an immutable wrapper allocates only where it is boxed" begin
+    using StrictMode
+    # `view`, `Diagonal`, `A'` are immutable structs holding heap references. Passed to a resolved
+    # call or returned with a concrete type they stay on the stack; stored in an abstractly typed
+    # slot or handed to a dynamic call they are boxed. Every fixture is measured, so one that stops
+    # exhibiting its behavior fails here instead of quietly agreeing with the scan.
+    const VIEW_SINK = Ref{Any}(nothing)
+    const DYNAMIC = Any[sum]
+    const View = SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int}}, true}
+    @noinline total(v::View) = sum(v)
+    @noinline mkview(v::Vector{Float64}) = view(v, 1:2)
+    passed(v::Vector{Float64}) = total(view(v, 1:2))
+    returned(v::Vector{Float64}) = sum(mkview(v))
+    stored(v::Vector{Float64}) = (VIEW_SINK[] = view(v, 1:2); nothing)
+    dynamic(v::Vector{Float64}) = (DYNAMIC[1](view(v, 1:2)); nothing)
+
+    x = [1.0, 2.0, 3.0]
+    measure(f) = (f(x); @allocated f(x))
+    T = (Vector{Float64},)
+    viewnew(f) = any(first(Base.code_typed(f, T; optimize = true))[1].code) do st
+        Meta.isexpr(st, :new) && st.args[1] <: SubArray
+    end
+    @test viewnew(passed) && viewnew(stored) && viewnew(dynamic)
+
+    for f in (passed, returned, mkview)
+        @test iszero(measure(f))
+        @test !StrictMode._alloc_signals(f, T).alloc
+    end
+    for f in (stored, dynamic)
+        @test measure(f) > 0
+        @test StrictMode._alloc_signals(f, T).alloc
+    end
+end

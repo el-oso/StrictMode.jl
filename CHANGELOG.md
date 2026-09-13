@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### The allocation scan no longer flags `ccall` `Ref`s and passed-down wrappers
+
+The value-free scan counted every non-isbits `:new` in typed IR as a heap allocation unless escape
+analysis cleared the whole frame, which it almost never does in library code. Two shapes that
+codegen places on the stack were reported as allocating:
+
+- the `Ref` arguments every BLAS/LAPACK wrapper builds for its `ccall`, including the `info` it
+  reads back;
+- immutable wrappers such as `view`, `Diagonal` and `A'`, passed to a resolved call or returned with
+  a concrete type.
+
+Each `:new` is now judged by where its value goes. A value stored into an abstractly typed field is
+boxed, as before (`Some{Any}(x)`). An immutable allocates only when it reaches a slot that needs a
+box. A mutable object used only by a `ccall` and its own field is a stack `Ref`; any other mutable
+still goes through escape analysis. A use the rules do not recognize counts as a box.
+
+On PureOSQP's `admm_step!` and `update_residuals!` across 13 backends, the scan disagreed with
+AllocCheck on 18 of 26 signatures; it now agrees on all 26, with no new false negatives. A cold scan
+of those signatures is no slower.
+
 ## 0.4.3
 
 ### The assertion macros are allocation-free

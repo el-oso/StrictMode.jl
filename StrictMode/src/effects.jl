@@ -466,6 +466,137 @@ end
 _box_on_entry(@nospecialize m) = !(m isa DataType) ? true :
     (Base.allocatedinline(m) && !Base.isbitstype(m) && !Base.issingletontype(m))
 
+# --- which non-isbits `:new` is a heap allocation ------------------------------------------------
+#
+# A non-isbits `:new` in typed IR is not by itself a heap object. Two shapes that dominate library
+# code are placed on the stack by codegen, and flagging them reported allocation-free BLAS/LAPACK
+# callers as allocating:
+#
+#   `Ref{BlasInt}(n)` passed to a `ccall`       used only by the call (its `jl_value_ptr`
+#                                               conversion and GC-root slot) and its own `:x` field
+#   `view(v, 1:2)`, `Diagonal(d)`, `A'`         immutable wrappers handed to a resolved `:invoke`,
+#                                               a constant-field read, or returned concretely
+#
+# Each case is decided by where the value GOES, so the rules below read its uses:
+#
+# - A value placed in a field declared with an abstract type is boxed, whatever holds it
+#   (`Some{Any}(x)`, the F38 false negative) — checked first, for mutable and immutable alike.
+# - An immutable is boxed only when it reaches a slot that needs a box: a dynamic call, a store
+#   builtin, a `foreigncall`, a non-concrete `:invoke` parameter or phi, a mutable container's
+#   abstract field, or an abstract return. Wrapping in another immutable or a tuple follows the
+#   wrapper.
+# - A mutable is a `ccall` `Ref` argument when every use is the call itself or a read/write of its
+#   own field. Anything else falls back to escape analysis.
+#
+# Every unrecognized use counts as a box, so a shape these rules do not model stays flagged.
+const _STORE_BUILTINS = Tuple(
+    getfield(Core, s) for s in (
+            :setfield!, :swapfield!, :modifyfield!, :replacefield!, :setfieldonce!, :setglobal!,
+            :setglobalonce!, :memoryrefset!, :memoryrefswap!, :memoryrefmodify!,
+            :memoryrefreplace!, :memoryrefsetonce!,
+        ) if isdefined(Core, s)
+)
+
+# For each SSA value, the (statement, argument position) pairs that read it.
+function _ssa_uses(ci)
+    uses = [Tuple{Int, Int}[] for _ in eachindex(ci.code)]
+    for (j, st) in enumerate(ci.code)
+        vals = st isa Expr ? st.args :
+            st isa Core.PhiNode ? st.values :
+            st isa Core.PiNode ? Any[st.val] :
+            st isa Core.ReturnNode && isdefined(st, :val) ? Any[st.val] : Any[]
+        for k in eachindex(vals)
+            isassigned(vals, k) || continue   # a phi's edge from an unreachable predecessor
+            v = vals[k]
+            v isa Core.SSAValue && push!(uses[v.id], (j, k))
+        end
+    end
+    return uses
+end
+
+function _boxes_into_field(ci, @nospecialize(sig), st::Expr, @nospecialize(nt))
+    nt isa DataType || return true
+    for k in 2:length(st.args)
+        FT = k - 1 <= fieldcount(nt) ? fieldtype(nt, k - 1) : Any
+        isconcretetype(FT) && continue
+        AT = _stmt_arg_type(ci, sig, st.args[k])
+        AT = AT isa Core.Const ? typeof(AT.val) : AT
+        if AT isa DataType && isconcretetype(AT) && !ismutabletype(AT) && !Base.issingletontype(AT)
+            return true
+        end
+    end
+    return false
+end
+
+function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
+    i in seen && return false
+    push!(seen, i)
+    for (j, k) in uses[i]
+        dead[j] && continue
+        st = ci.code[j]
+        if st isa Core.ReturnNode
+            isconcretetype(ci.rettype) || return true
+        elseif st isa Core.PhiNode || st isa Core.PiNode
+            isconcretetype(ci.ssavaluetypes[j]) || return true
+            _immutable_escapes(ci, uses, dead, j, seen) && return true
+        elseif Meta.isexpr(st, :invoke)
+            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+            mi isa Core.MethodInstance || return true
+            # `args[2]` is the callee and lines up with `specTypes.parameters[1]`.
+            ps = mi.specTypes.parameters
+            (k - 1 <= length(ps) && isconcretetype(ps[k - 1])) || return true
+        elseif Meta.isexpr(st, :new)
+            ct = st.args[1]
+            if ct isa DataType && !ismutabletype(ct)
+                _immutable_escapes(ci, uses, dead, j, seen) && return true
+            else
+                (ct isa DataType && k - 1 <= fieldcount(ct) && isconcretetype(fieldtype(ct, k - 1))) ||
+                    return true
+            end
+        elseif Meta.isexpr(st, :call)
+            callee = _static_callee(ci, st.args[1])
+            if callee === Core.tuple
+                _immutable_escapes(ci, uses, dead, j, seen) && return true
+            elseif callee isa Core.Builtin || callee isa Core.IntrinsicFunction
+                # Position 2 is the object being written into, not the value being stored.
+                (k > 2 && any(b -> callee === b, _STORE_BUILTINS)) && return true
+            else
+                return true
+            end
+        else
+            return true
+        end
+    end
+    return false
+end
+
+function _ccall_ref_only(ci, uses, i::Int)
+    sawccall = false
+    for (j, k) in uses[i]
+        st = ci.code[j]
+        if Meta.isexpr(st, :foreigncall)
+            sawccall = true
+        elseif Meta.isexpr(st, :call) && k == 2
+            callee = _static_callee(ci, st.args[1])
+            (callee === Core.getfield || callee === Core.setfield!) || return false
+        else
+            return false
+        end
+    end
+    return sawccall
+end
+
+function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
+    st = ci.code[i]
+    nt = st.args[1]
+    nt isa Type || return true
+    Base.isbitstype(nt) && return false
+    _boxes_into_field(ci, sig, st, nt) && return true
+    nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, uses, dead, i)
+    _ccall_ref_only(ci, uses, i) && return false
+    return !newsdead()
+end
+
 function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     alloc = false
     boxing = false
@@ -480,6 +611,9 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     escmemo = Ref{Union{Nothing, Bool}}(nothing)
     newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+    # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
+    usememo = Ref{Union{Nothing, Vector{Vector{Tuple{Int, Int}}}}}(nothing)
+    ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci)) : usememo[]
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if abscontainer === nothing && _abstract_container(T)
@@ -513,16 +647,8 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
-            nt = st.args[1]
-            # F38 — any non-isbits `:new` is a real heap allocation, not just mutable/Array/Memory/
-            # Box: an escaping *immutable* wrapper (e.g. `Some{Any}(x)`, a Tuple of heap refs) heap-
-            # allocates too. `!isbitstype` subsumes the old mutable/Array/Memory/Box checks (none of
-            # those are ever isbits) and additionally catches the immutable case AllocCheck sees but
-            # the old rule missed. Corpus-measured (PureFFT+BlazingPorts, 569 specializations): fixed
-            # 2 false negatives, net 1 new false positive on `Base.CodeUnits{UInt8,String}`-style
-            # non-escaping stdlib wrappers (no escape analysis here to tell those apart) — an
-            # acceptable tradeoff since over-flagging is the safe direction for an alloc guarantee.
-            (!alloc && nt isa Type && !Base.isbitstype(nt) && !newsdead()) && (alloc = true)
+            # Which non-isbits `:new`s allocate is decided by `_new_allocates`; see the note above it.
+            (!alloc && _new_allocates(ci, sig, ssauses(), dead, i, newsdead)) && (alloc = true)
         elseif Meta.isexpr(st, :invoke)
             # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
             # with an abstract recorded result (mutating helpers with an unused return are typed
