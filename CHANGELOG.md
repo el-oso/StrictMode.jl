@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.6
 
 ### `@test_typestable` no longer fails a target that wakes or yields a task
 
