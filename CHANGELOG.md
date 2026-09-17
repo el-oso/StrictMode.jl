@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### `@test_typestable` no longer fails a target that wakes or yields a task
+
+On Julia 1.13, JET reports an optimization failure inside Base's scheduler (`yield` → `wait` →
+`OncePerThread`) for any call graph that reaches `notify` or `yield`. `@test_typestable`,
+`test_signatures` and the other drivers failed such a target, and every caller of it, although the
+reports were located entirely in Base. An optimization-failure report is now dropped when its
+innermost frame lies in a different top-level module from the target. A cycle inside the target's own
+package still fails, and so does every other kind of JET report.
+
+A failing finding now names each report's kind and location, for example
+`1 JET report(s): RuntimeDispatchReport in MyPkg.f`.
+
 ## 0.4.5
 
 ### Complex arithmetic is no longer reported as allocating

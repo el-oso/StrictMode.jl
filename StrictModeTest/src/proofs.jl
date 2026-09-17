@@ -168,11 +168,33 @@ end
 
 # ── JET ──────────────────────────────────────────────────────────────────────────────────────────
 
+# JET reports an optimization failure where inference gave up on a recursive cycle. Julia 1.13's
+# scheduler holds one (`yield` → `wait` → `OncePerThread`), so a target that wakes or yields a task gets
+# reports located entirely in Base, and they say nothing about the target's own code. Such a report is
+# dropped only when its innermost frame lies in a different top-level module from the target's entry
+# frame; a cycle inside the target's package still counts, and so does every other kind of report.
+# See #30.
+_frame_module(@nospecialize(fr)) =
+    (mi = fr.linfo; mi isa Core.MethodInstance && mi.def isa Method ? Base.moduleroot(mi.def.module) : nothing)
+
+function _is_foreign_opt_failure(@nospecialize(rep))
+    rep isa JET.OptimizationFailureReport || return false
+    inner = _frame_module(rep.vst[end])
+    return inner !== nothing && inner !== _frame_module(rep.vst[1])
+end
+
+# Where a report sits: its kind and the innermost frame, e.g. `RuntimeDispatchReport in PureBLAS.f`.
+function _report_location(@nospecialize(rep))
+    mi = rep.vst[end].linfo
+    loc = mi isa Core.MethodInstance && mi.def isa Method ? string(mi.def.module, ".", mi.def.name) : string(mi)
+    return string(nameof(typeof(rep)), " in ", loc)
+end
+
 # Wraps `JET.report_opt` so a backend failure names the check target and signature instead of
 # propagating raw from inside JET (see `AnalysisError`).
 function _opt_reports(target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple))
     try
-        return filter(!_is_guard_report, JET.get_reports(JET.report_opt(f, types)))
+        return filter(r -> !_is_guard_report(r) && !_is_foreign_opt_failure(r), JET.get_reports(JET.report_opt(f, types)))
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
     end
@@ -558,7 +580,8 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
     reports = _opt_reports(target, f, types)
     isempty(reports) || return StrictMode._mkfinding(
         md, fn, sg, :typestable, true,
-        "internal instability / runtime dispatch ($(length(reports)) JET report(s))", "", 0
+        "internal instability / runtime dispatch ($(length(reports)) JET report(s): " *
+            join(unique(_report_location.(reports)), "; ") * ")", "", 0
     )
     # F39. JET cannot see this class at all: a union-typed local that boxes a member on the way in is
     # not dynamic dispatch, so `@report_opt` is silent at every signature. Without this the proof

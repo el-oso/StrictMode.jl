@@ -28,3 +28,33 @@
     @test StrictMode._failed(f)
     @test occursin("union-typed local", f.reason)
 end
+
+# Issue #30: on Julia 1.13 JET reports an optimization failure inside Base's scheduler for any target
+# that wakes or yields a task. That report is located in Base and must not fail the target.
+@testitem "issue #30: a task-waking target is not failed by Base's scheduler" begin
+    using StrictMode, StrictModeTest
+    const JET = StrictModeTest.JET
+    const EV = Base.Event(true)
+    wake(x::Int) = (notify(EV); yield(); x + 1)
+    dispatch(v::Vector{Any}) = (v[1] + 1)::Int
+    wake(1)
+    dispatch(Any[1])
+
+    raw = JET.get_reports(JET.report_opt(wake, (Int,)))
+    if VERSION >= v"1.13"
+        # The fixture must still reach the Base cycle, or the assertions below prove nothing.
+        @test !isempty(raw)
+        @test all(r -> r isa JET.OptimizationFailureReport, raw)
+        @test all(StrictModeTest._is_foreign_opt_failure, raw)
+        # The same cycle, entered from Base itself, is not foreign and still counts.
+        @test !isempty(StrictModeTest._opt_reports("probe", yield, ()))
+    end
+    @test isempty(StrictModeTest._opt_reports("probe", wake, (Int,)))
+    @test !StrictMode._failed(only(proof_findings(wake, (Int,); guarantees = (:typestable,))))
+
+    # A report in the target's own code still fails, and the reason says where it is.
+    f = only(proof_findings(dispatch, (Vector{Any},); guarantees = (:typestable,)))
+    @test StrictMode._failed(f)
+    @test occursin("RuntimeDispatchReport in ", f.reason)
+    @test occursin(".dispatch", f.reason)
+end
