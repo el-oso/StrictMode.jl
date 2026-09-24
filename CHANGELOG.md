@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.7
 
 ### The tier banner no longer reaches a library's users
 
