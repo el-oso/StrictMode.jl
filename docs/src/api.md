@@ -227,15 +227,21 @@ Checks are gated behind a compile-time setting, on by default. Toggling it write
 `LocalPreferences.toml` and takes effect on the next Julia start. See
 [Getting Started](getting_started.md) for the `Project.toml` pattern a shipped application wants.
 
-`banner_enabled` reports the `banner` preference, which controls the one-line tier banner printed
-at load. Set `banner = false` to silence it; with it off `__init__` has no body at all, which is
-what a `juliac --trim` build wants.
+`banner_enabled` reports the `banner` preference, which controls the tier banner printed at load.
+Set `banner = false` to silence it; with it off `__init__` has no body at all, which is what a
+`juliac --trim` build wants.
+
+The banner also only prints where StrictMode was chosen: `direct_dependency` asks whether an
+environment this session loads from names StrictMode itself. A package that uses StrictMode inside
+its own `src` is a dependency of projects that never named it, and loading such a package says
+nothing about a tier its users can act on, so those sessions stay silent.
 
 ```@docs
 enable_checks!
 disable_checks!
 checks_enabled
 banner_enabled
+StrictMode.direct_dependency
 proofs_loaded
 assert_enabled
 mca_available

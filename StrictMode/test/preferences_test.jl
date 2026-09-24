@@ -101,3 +101,55 @@ end
     # And it really does write — a no-op writer would satisfy everything above.
     @test isnothing(StrictMode._eprint(""))
 end
+
+@testitem "the tier banner reaches only a direct dependent" begin
+    using StrictMode
+    # A library that uses StrictMode in its own `src` would otherwise announce the tier to everyone
+    # who types `using ThatLibrary` — about a tool they did not choose and cannot silence from
+    # their own project. The banner is gated on StrictMode appearing in the ACTIVE project file.
+    proj = joinpath(pkgdir(StrictMode), "Project.toml")
+    @test occursin(StrictMode.UUID_STRING, read(proj, String))
+
+    # This environment names StrictMode, so the banner path stays live where it is meant to be.
+    # Under `Pkg.test` the sandbox arrives on `LOAD_PATH` with no active project set, which is why
+    # the search covers the load path as well as `Base.ACTIVE_PROJECT`.
+    @test StrictMode.direct_dependency()
+
+    # A project that does not name it is silent, and an unreadable one counts as "not named"
+    # rather than falling back to noise. `Base.ACTIVE_PROJECT` holds whatever `--project` was
+    # given, so both the file and the containing directory have to resolve.
+    mktempdir() do dir
+        file = joinpath(dir, "Project.toml")
+        oldproj, oldload, olddepot = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH), copy(Base.DEPOT_PATH)
+        try
+            # Point the other two sources at nothing, so only the project under test can answer.
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            empty!(Base.DEPOT_PATH)
+            push!(Base.DEPOT_PATH, joinpath(dir, "depot"))
+
+            write(file, "[deps]\n")
+            for p in (file, dir)
+                Base.set_active_project(p)
+                @test !StrictMode.direct_dependency()
+            end
+            write(file, "[deps]\nStrictMode = \"$(StrictMode.UUID_STRING)\"\n")
+            for p in (file, dir)
+                Base.set_active_project(p)
+                @test StrictMode.direct_dependency()
+            end
+            Base.set_active_project(joinpath(dir, "does_not_exist", "Project.toml"))
+            @test !StrictMode.direct_dependency()
+
+            # The `Pkg.test` shape: no active project, the sandbox on `LOAD_PATH`.
+            push!(Base.LOAD_PATH, dir)
+            @test StrictMode.direct_dependency()
+        finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+            empty!(Base.DEPOT_PATH)
+            append!(Base.DEPOT_PATH, olddepot)
+        end
+    end
+end

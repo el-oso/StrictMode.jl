@@ -482,9 +482,9 @@ _box_on_entry(@nospecialize m) = !(m isa DataType) ? true :
 # - A value placed in a field declared with an abstract type is boxed, whatever holds it
 #   (`Some{Any}(x)`, the F38 false negative) — checked first, for mutable and immutable alike.
 # - An immutable is boxed only when it reaches a slot that needs a box: a dynamic call, a store
-#   builtin, a `foreigncall`, a non-concrete `:invoke` parameter or phi, a mutable container's
-#   abstract field, or an abstract return. Wrapping in another immutable or a tuple follows the
-#   wrapper.
+#   builtin writing a slot that cannot hold it inline, a `foreigncall`, a non-concrete `:invoke`
+#   parameter or phi, a mutable container's abstract field, or an abstract return. Wrapping in
+#   another immutable or a tuple follows the wrapper.
 # - A mutable is a `ccall` `Ref` argument when every use is the call itself or a read/write of its
 #   own field. Anything else falls back to escape analysis.
 #
@@ -496,6 +496,31 @@ const _STORE_BUILTINS = Tuple(
             :memoryrefreplace!, :memoryrefsetonce!,
         ) if isdefined(Core, s)
 )
+
+# The declared type of the slot a store builtin writes `st.args[k]` into, or `nothing` when these
+# rules cannot name it. A slot whose declared type is concrete and `Base.allocatedinline` holds the
+# value's fields in place, so nothing is heap-allocated to store it; a pointer slot (an abstract or
+# union-typed field, a `Vector{Any}` element) needs the value boxed first. Only the two forms that
+# carry the destination in a fixed argument position are modeled — everything else returns `nothing`
+# and stays flagged.
+function _store_slot_type(ci, @nospecialize(sig), @nospecialize(callee), st::Expr, k::Int)
+    a = st.args
+    if callee === Core.setfield! && k == 4 && length(a) >= 4
+        recv = _stmt_arg_type(ci, sig, a[2])
+        recv isa Core.Const && (recv = Core.Typeof(recv.val))
+        fld = a[3] isa QuoteNode ? a[3].value : a[3]
+        (recv isa DataType && (fld isa Symbol || fld isa Int)) || return nothing
+        return try
+            fieldtype(recv, fld)
+        catch
+            nothing
+        end
+    elseif callee === Core.memoryrefset! && k == 3 && length(a) >= 3
+        mr = _stmt_arg_type(ci, sig, a[2])
+        return mr isa Type && mr <: Core.GenericMemoryRef ? eltype(mr) : nothing
+    end
+    return nothing
+end
 
 # For each SSA value, the (statement, argument position) pairs that read it.
 function _ssa_uses(ci)
@@ -532,7 +557,7 @@ end
 # instead of holding the `DataType`.
 _new_type(ci, st::Expr) = (a = st.args[1]; a isa Type ? a : _static_callee(ci, a))
 
-function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
+function _immutable_escapes(ci, @nospecialize(sig), uses, dead, i::Int, seen::BitSet = BitSet())
     i in seen && return false
     push!(seen, i)
     for (j, k) in uses[i]
@@ -542,7 +567,7 @@ function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
             isconcretetype(ci.rettype) || return true
         elseif st isa Core.PhiNode || st isa Core.PiNode
             isconcretetype(ci.ssavaluetypes[j]) || return true
-            _immutable_escapes(ci, uses, dead, j, seen) && return true
+            _immutable_escapes(ci, sig, uses, dead, j, seen) && return true
         elseif Meta.isexpr(st, :invoke)
             mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
             mi isa Core.MethodInstance || return true
@@ -552,7 +577,7 @@ function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
         elseif Meta.isexpr(st, :new)
             ct = _new_type(ci, st)
             if ct isa DataType && !ismutabletype(ct)
-                _immutable_escapes(ci, uses, dead, j, seen) && return true
+                _immutable_escapes(ci, sig, uses, dead, j, seen) && return true
             else
                 (ct isa DataType && k - 1 <= fieldcount(ct) && isconcretetype(fieldtype(ct, k - 1))) ||
                     return true
@@ -560,10 +585,15 @@ function _immutable_escapes(ci, uses, dead, i::Int, seen::BitSet = BitSet())
         elseif Meta.isexpr(st, :call)
             callee = _static_callee(ci, st.args[1])
             if callee === Core.tuple
-                _immutable_escapes(ci, uses, dead, j, seen) && return true
+                _immutable_escapes(ci, sig, uses, dead, j, seen) && return true
             elseif callee isa Core.Builtin || callee isa Core.IntrinsicFunction
-                # Position 2 is the object being written into, not the value being stored.
-                (k > 2 && any(b -> callee === b, _STORE_BUILTINS)) && return true
+                # Position 2 is the object being written into, not the value being stored. A store
+                # into a slot that holds the value inline copies its fields into place and needs no
+                # box; any other destination — or one these rules cannot name — does.
+                if k > 2 && any(b -> callee === b, _STORE_BUILTINS)
+                    FT = _store_slot_type(ci, sig, callee, st, k)
+                    (FT isa Type && isconcretetype(FT) && Base.allocatedinline(FT)) || return true
+                end
             else
                 return true
             end
@@ -596,7 +626,7 @@ function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     nt isa Type || return true
     Base.isbitstype(nt) && return false
     _boxes_into_field(ci, sig, st, nt) && return true
-    nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, uses, dead, i)
+    nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, sig, uses, dead, i)
     _ccall_ref_only(ci, uses, i) && return false
     return !newsdead()
 end

@@ -245,3 +245,43 @@ end
     @test iszero(@allocated cdiv(1.0im, 2.0 + 0im))
     @test !StrictMode._alloc_signals(cdiv, (ComplexF64, ComplexF64)).alloc
 end
+
+@testitem "an immutable stored into a slot that holds it inline is not an allocation" begin
+    using StrictMode
+    # A concrete, `allocatedinline` destination — a concretely typed mutable field, or a
+    # concretely typed array element — takes the value's fields by copy. Only a pointer slot (an
+    # abstract or union-typed field, a `Vector{Any}` element) needs the value boxed first. Every
+    # fixture is measured, so one that stops exhibiting its behavior fails here rather than
+    # quietly agreeing with the scan.
+    struct Wrap
+        v::Vector{Float64}
+        n::Int
+    end
+    mutable struct Tight
+        f::Wrap
+    end
+    mutable struct Loose
+        f::Any
+    end
+    mutable struct Maybe
+        f::Union{Nothing, Wrap}
+    end
+    tight!(t::Tight, v::Vector{Float64}, n::Int) = (t.f = Wrap(v, n); nothing)
+    loose!(l::Loose, v::Vector{Float64}, n::Int) = (l.f = Wrap(v, n); nothing)
+    maybe!(m::Maybe, v::Vector{Float64}, n::Int) = (m.f = Wrap(v, n); nothing)
+    anyelt!(a::Vector{Any}, v::Vector{Float64}, n::Int) = (a[1] = Wrap(v, n); nothing)
+    wrapelt!(a::Vector{Wrap}, v::Vector{Float64}, n::Int) = (a[1] = Wrap(v, n); nothing)
+
+    v = [1.0, 2.0, 3.0]
+    measure(f, o) = (f(o, v, 2); @allocated f(o, v, 2))
+    sig(f, o) = StrictMode._alloc_signals(f, (typeof(o), Vector{Float64}, Int))
+
+    for (f, o) in ((tight!, Tight(Wrap(v, 1))), (wrapelt!, [Wrap(v, 1)]))
+        @test iszero(measure(f, o))
+        @test !sig(f, o).alloc
+    end
+    for (f, o) in ((loose!, Loose(Wrap(v, 1))), (maybe!, Maybe(nothing)), (anyelt!, Any[Wrap(v, 1)]))
+        @test measure(f, o) > 0
+        @test sig(f, o).alloc
+    end
+end

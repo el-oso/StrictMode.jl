@@ -27,6 +27,10 @@ to the deployed project's `Project.toml`. Both trigger recompilation, so restart
 checks_enabled() = CHECKS_ENABLED
 const CHECKS_ENABLED = @load_preference("checks_enabled", true)::Bool
 
+# StrictMode's own UUID, spelled as a project file's `[deps]` block spells it. `test/` pins it
+# against `Project.toml`.
+const UUID_STRING = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
+
 """
     assert_enabled() -> Bool
 
@@ -129,8 +133,8 @@ _eprint(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring,), msg)
 """
     StrictMode.banner_enabled() -> Bool
 
-Whether StrictMode prints its one-line tier banner to `stderr` when it loads. Controlled by the
-`banner` preference, default `true`. Silence it with
+Whether StrictMode prints its tier banner to `stderr` when it loads. Controlled by the `banner`
+preference, default `true`. Silence it with
 
     [preferences.StrictMode]
     banner = false
@@ -138,6 +142,9 @@ Whether StrictMode prints its one-line tier banner to `stderr` when it loads. Co
 Baked at precompile like `checks_enabled`, so a change needs a restart. With it off `__init__` has
 no body left at all, which is a second answer to issue #28 for anyone who would rather their load
 be provably silent than trust that the writer stays trim-clean.
+
+Even with it on, the reporting-tier notice is printed only where StrictMode was chosen — see
+[`StrictMode.direct_dependency`](@ref). The disabled-and-CI banner is not gated that way.
 """
 banner_enabled() = BANNER_ENABLED
 const BANNER_ENABLED = @load_preference("banner", true)::Bool
@@ -155,6 +162,62 @@ const _BANNER_REPORTING = "┌ StrictMode: checks ENABLED — reporting tier.\n"
     "│ test_compiled / test_registered.\n" *
     "└ Turn checks off for a shipped application with StrictMode.disable_checks!().\n"
 
+# The shared environment `@v#.#` names. `VERSION` is fixed for a pkgimage, so this is a constant.
+const _DEFAULT_ENV = "v$(VERSION.major).$(VERSION.minor)"
+
+# Does the project file at `p` — or in the directory `p` — name StrictMode's UUID? Searches the
+# bytes rather than parsing TOML, and reads a fixed-size buffer rather than the whole file, because
+# both `TOML.parsefile` and `filesize`/`read(::String, String)` reach code `juliac --trim` cannot
+# resolve. 64 KiB holds a project file with thousands of dependencies; a longer one reads as "no".
+function _names_strictmode(@nospecialize(p))
+    p isa String || return false
+    f = isfile(p) ? p :
+        isfile(joinpath(p, "JuliaProject.toml")) ? joinpath(p, "JuliaProject.toml") :
+        joinpath(p, "Project.toml")
+    isfile(f) || return false
+    io = open(f)
+    buf = Vector{UInt8}(undef, 1 << 16)
+    n = readbytes!(io, buf, length(buf))
+    close(io)
+    return occursin(UUID_STRING, String(@view buf[1:n]))
+end
+
+"""
+    StrictMode.direct_dependency() -> Bool
+
+Whether an environment this session loads packages from names StrictMode itself. This is who the
+tier banner is addressed to: someone who chose StrictMode and can act on which tier is live. A
+package that uses StrictMode in its own `src` is a dependency of projects that never named it, and
+those sessions stay silent.
+
+Three places are searched, because no single one covers every way a session is started: the active
+project (`Base.ACTIVE_PROJECT`), every explicit path on `LOAD_PATH` (`Pkg.test` puts its sandbox
+there and clears the active project), and the shared `@v#.#` environment. Anything a project file
+names — `[deps]`, `[extras]`, `[weakdeps]` — counts: each is a deliberate mention by whoever wrote
+that project.
+
+`__init__` is a `juliac --trim` root, so every call this reaches has to stay statically resolvable
+(issue #28), and that dictates the shape: it reads the `Base.ACTIVE_PROJECT` and `LOAD_PATH` slots
+rather than `Base.active_project()`/`Base.load_path()`, whose search does not resolve.
+`StrictModeTest`'s trim-clean test verifies that against juliac's own verifier. Anything unreadable
+counts as "not named", so an unexpected shape leaves a load quiet rather than noisy.
+"""
+function direct_dependency()
+    return try
+        _names_strictmode(Base.ACTIVE_PROJECT[]) && return true
+        for e in Base.LOAD_PATH
+            # `@`-prefixed entries are names, not paths — the active project and `@v#.#` among
+            # them, both covered separately.
+            startswith(e, '@') && continue
+            _names_strictmode(e) && return true
+        end
+        !isempty(Base.DEPOT_PATH) &&
+            _names_strictmode(joinpath(Base.DEPOT_PATH[1], "environments", _DEFAULT_ENV))
+    catch
+        false
+    end
+end
+
 function _announce_tier()
     # A compile-time const, so with the banner off this whole function folds to `nothing` and
     # `juliac --trim` never sees the write at all.
@@ -168,9 +231,13 @@ function _announce_tier()
         # suite full of them passes while checking nothing. `assert_enabled` is the guard for that,
         # and it only helps a suite that remembers to call it; announcing here covers the ones that
         # do not. Loading `StrictModeTest` turns the same state into a hard error.
+        # Not gated on `direct_dependency`, unlike the notice below: this one reports a run whose
+        # checks prove nothing, which is worth saying wherever it happens.
         isempty(get(ENV, "CI", "")) || _eprint(_BANNER_CI_DISABLED)
         return nothing
     end
+    # Which tier is live is only actionable for whoever chose StrictMode.
+    direct_dependency() || return nothing
     _eprint(_BANNER_REPORTING)
     return nothing
 end

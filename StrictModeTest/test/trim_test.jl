@@ -237,4 +237,10 @@ end
 
     # And the writer itself: a foreigncall verifies clean where `print`/`write`/`printstyled` do not.
     @test first(StrictModeTest._trim_validate(StrictMode._eprint, (String,)))
+
+    # The banner's audience test reads the active project file, so it is on the same root path.
+    # `Base.active_project()` is NOT clean here — its load-path search is unresolvable — which is
+    # why `direct_dependency` reads the `Base.ACTIVE_PROJECT` slot directly.
+    ok3, why3 = StrictModeTest._trim_validate(StrictMode.direct_dependency, ())
+    @test ok3 || error("direct_dependency is not trim-clean:\n  " * join(why3, "\n  "))
 end

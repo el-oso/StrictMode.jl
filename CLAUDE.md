@@ -22,7 +22,10 @@ StrictMode/src/
   macros.jl           — @strict (composite guarantee), @kernel (SIMD shorthand)
   preferences.jl      — checks_enabled/enable_checks!/disable_checks!/proofs_loaded, _gate (the
                         zero-cost compile-time expansion switch), assert_enabled, _announce_tier
-                        (the load-time banner naming which TIER a session is in)
+                        (the load-time banner naming which TIER a session is in), direct_dependency
+                        (whether an environment this session loads from names StrictMode — the
+                        reporting banner's audience test, written to stay trim-clean because
+                        __init__ is a juliac root, issue #28)
   static_checks.jl    — @assert_noalloc, @assert_noboxing, @assert_owned
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)

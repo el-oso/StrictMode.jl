@@ -90,3 +90,30 @@ end
     @test all(StrictMode._failed, vcat(ff, fl))    # BOTH engines flagged the call
     @test isempty(divergence_report(boxy, T; guarantees = (:noalloc, :noboxing)).diverged)
 end
+
+@testitem "a factorization stored into a concretely typed field agrees between the engines" begin
+    using StrictMode, StrictModeTest, LinearAlgebra
+    # The `:new` of the `Cholesky` wrapper is an immutable holding a heap reference, and it is
+    # written straight into a concretely typed mutable field — an inline store, so nothing is
+    # heap-allocated and AllocCheck proves it. The scan has to reach the same verdict: a rule that
+    # counts every store builtin as a box reds this shape while the proof passes it.
+    mutable struct Core2{T}
+        cap::Matrix{T}
+        rho::Vector{T}
+        fact::Cholesky{T, Matrix{T}}
+    end
+    function refresh!(c::Core2{T}) where {T}
+        for i in eachindex(c.rho)
+            c.cap[i, i] += inv(c.rho[i])
+        end
+        c.fact = cholesky!(Symmetric(c.cap); check = false)
+        return issuccess(c.fact)
+    end
+
+    k = 4
+    c = Core2(Matrix{Float64}(I, k, k), fill(2.0, k), cholesky(Matrix{Float64}(I, k, k)))
+    refresh!(c)
+    T = (typeof(c),)
+    @test !StrictMode._alloc_signals(refresh!, T).alloc
+    @test isempty(divergence_report(refresh!, T; guarantees = (:noalloc, :noboxing)).diverged)
+end

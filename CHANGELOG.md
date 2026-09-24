@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### The tier banner no longer reaches a library's users
+
+Loading any package that uses StrictMode in its own `src` printed the tier banner, about a tool
+that package's users did not choose and cannot silence from their own project. The banner now
+prints only where StrictMode is named by an environment the session loads from —
+`StrictMode.direct_dependency()`, which searches the active project, the explicit paths on
+`LOAD_PATH` (`Pkg.test` puts its sandbox there) and the shared `@v#.#` environment. The disabled-
+and-CI banner is unchanged: that one reports a run whose checks prove nothing, and it is loud
+wherever it happens.
+
+`__init__` stays `juliac --trim`-clean, which is what shapes the search: it reads the
+`Base.ACTIVE_PROJECT`/`LOAD_PATH` slots rather than `Base.active_project()`/`Base.load_path()`,
+searches each project file's bytes rather than parsing TOML, and reads a fixed-size buffer.
+
+### An immutable stored into a concretely typed slot is no longer reported as allocating
+
+The allocation scan counted every store builtin as a box, so a factorization written straight into
+a field — `ls.fact = cholesky!(Symmetric(ls.cap); check = false)` — was reported as allocating
+while AllocCheck proved it did not. A slot whose declared type is concrete and
+`Base.allocatedinline` takes the value's fields by copy; only a pointer slot (an abstract or
+union-typed field, a `Vector{Any}` element) needs the value boxed first, and those stay flagged.
+
 ## 0.4.6
 
 ### `@test_typestable` no longer fails a target that wakes or yields a task
