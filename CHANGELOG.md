@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.8
+
+### A type-stability failure names the declaration to edit
+
+`:typestable` findings now identify the cause when one is recognizable, and carry the fix that
+matches it instead of the generic "annotate the unstable variable": a non-`const` global, a field
+declared with an abstract type, an abstractly typed container whose element flows into the body,
+reflection (`return_types`, `invokelatest`, `which`, `methods`), or more matching methods than
+inference enumerates. The classifier (`StrictMode._instability_cause`) reads typed IR and the method
+table; it needs no backend and runs on both tiers.
+
+### `dispatch_report`
+
+New: where a module dispatches at run time, and where a call sits at exactly `max_methods` matching
+methods — static today, dynamic as soon as one more method is defined anywhere, with no edit to the
+calling code. The new [dynamic dispatch](https://el-oso.github.io/StrictMode.jl/dev/dynamic_dispatch)
+page carries the measured cost (per element over 1000 elements: 24.02 µs / 32 kB with an abstract
+element type, 0.58 µs / 0 B with a concrete one or a `Union` of concrete types) and the fixes that
+work — including two that do not, a `where {S<:Abstract}` parameter and a function barrier.
+
+### `@test_typestable` no longer fails on an optimizer bail
+
+A JET `OptimizationFailureReport` says inference declined to optimize a recursive frame. It does not
+say a type is unknown, and it does not mask a dispatch report — a dynamic call inside the declined
+frame is still reported. Such a report is now logged once, naming the frame, instead of failing the
+guarantee. Every other JET report kind still fails it.
+
+### `audit` carries dispatch findings
+
+The same sites as informational findings (`guarantee = :dispatch`, `status = :info`, never a failure),
+so a JSON audit carries them next to the guarantees. On by default: an at-the-limit call is a hazard
+nobody thinks to ask about, since the code looks fine today. Measured on 10,974 PureBLAS
+specializations the pass reports nothing and costs 17.8% of the sweep (one extra typed-IR read per
+specialization); `dispatch_suggest = false` skips it.
+
+### A bailed frame's own body is scanned for dispatch
+
+JET's dispatch analysis runs on optimized IR, and a frame that produced none cannot report a dispatch
+from its own body. Those bodies are now scanned directly, and a runtime dispatch found there fails
+`:typestable` like any other.
+
+### Removed
+
+`@assert_trim_safe` and the `:trimsafe` guarantee, deprecated since 0.4.0. Use
+`@assert_trim_compatible` and `:trim_compatible`, which run the same scan; `migration_report` names
+the replacement.
+
 ## 0.4.7
 
 ### The tier banner no longer reaches a library's users
