@@ -349,6 +349,27 @@ findings(reflecty, (Int,); guarantees = (:trim_compatible,))     # report
 test_signatures([(reflecty, (Int,))]; guarantees = (:trim_compatible,))   # prove (StrictModeTest)
 ```
 
+### A trimmed build needs checks off
+
+`--trim=safe` rejects any call it cannot resolve statically, and with checks **enabled** a guarded call
+site reaches StrictMode's IR scan, which uses reflection. Measured: a consumer with one
+`@strict dot3(a, b)` inside code the binary runs fails with **248 verifier errors**, traced from the
+macro through `macros.jl` into the scan. With `checks_enabled = false` the same source builds and runs
+— every macro expands to the bare call, so nothing of StrictMode is left to resolve.
+
+So a package that ships a trimmed artifact sets the preference off in the environment it builds from:
+
+```toml
+# LocalPreferences.toml, next to the Project.toml you build with
+[StrictMode]
+checks_enabled = false
+```
+
+Both halves are gates in this repo's CI (`StrictMode/test/consumer`): the armed build proves the load
+path and `@strict_function` declarations trim, and the shipping build proves an embedded call-site
+macro leaves nothing behind. Per-call allocation is 0 bytes in **both** configurations — the check
+runs once per site, not per call.
+
 ## `@strict` — the guarantees a hot path wants, together
 
 [`@strict`](@ref) checks three things in order: type stability first (that's usually what's

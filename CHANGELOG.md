@@ -41,6 +41,18 @@ JET's dispatch analysis runs on optimized IR, and a frame that produced none can
 from its own body. Those bodies are now scanned directly, and a runtime dispatch found there fails
 `:typestable` like any other.
 
+### The trim gate covers an embedded macro, and stops skipping on 1.13
+
+The consumer trim build proved the load path and `@strict_function` declarations, but nothing reached
+a call-site macro inside code the binary compiles — the case the guarantee is about. CI now builds two
+binaries: the armed one as before, and a shipping one (`checks_enabled = false`) whose entry calls a
+function containing `@strict`. Measured: that source fails with 248 verifier errors while checks are
+enabled, and builds and runs with them off, so both halves are pinned.
+
+The step also looked for `juliac.jl` in Julia's share directory and skipped silently when absent —
+which is every Julia 1.13, where it moved into the JuliaC.jl app. It now uses the app instead, and a
+Julia with neither fails the step rather than passing it.
+
 ### Removed
 
 `@assert_trim_safe` and the `:trimsafe` guarantee, deprecated since 0.4.0. Use

@@ -85,18 +85,36 @@ jobs:
       #
       # Linux only: one platform is enough to catch a load-path regression, and juliac is slowest
       # where it matters least.
+      #
+      # TWO builds, because the guarantee has two halves and one fixture cannot hold both:
+      #   - `trim_entry.jl` with checks ENABLED (ConsumerPkg's own env, no preference block): the load
+      #     path and `@strict_function` declarations must trim. This is the issue #28 regression.
+      #   - `trim_entry_ship.jl` with checks DISABLED (`ship/`): an embedded `@strict` call site inside
+      #     code the binary compiles and RUNS must leave nothing behind. Verified to fail with checks
+      #     enabled (248 verifier errors from the IR scan), which is why the armed build reaches only
+      #     declarations — `--trim` verifies reachable code only.
+      #
+      # Julia 1.12 ships `juliac.jl` in its share directory; 1.13 moved it into the JuliaC.jl app. Both
+      # are handled, and a Julia with neither fails the step rather than skipping it: a silent skip is
+      # how this gate would quietly stop testing anything.
       - name: Consumer as a juliac --trim=safe binary
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd StrictMode/test/consumer
           juliac=$(julia -e 'print(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl"))')
-          if [ ! -f "$juliac" ]; then
-            echo "juliac.jl not shipped by this Julia ($juliac) — skipping the trim build."
-            exit 0
+          if [ -f "$juliac" ]; then
+            build() { julia --startup-file=no --project="$1" "$juliac" --output-exe "$2" --experimental --trim=safe "$3"; }
+          else
+            echo "juliac.jl not in this Julia's share directory — using the JuliaC.jl app instead."
+            julia --project=@juliac -e 'using Pkg; Pkg.add("JuliaC")'
+            build() { julia --project=@juliac -e 'using JuliaC; JuliaC.main(ARGS)' -- --project="$1" --output-exe "$2" --experimental --trim=safe "$3"; }
           fi
-          julia --startup-file=no --project=ConsumerPkg "$juliac" \
-            --output-exe consumer_trim --experimental --trim=safe trim_entry.jl
+          build ConsumerPkg consumer_trim trim_entry.jl
           ./consumer_trim
+          julia --project=ship -e 'using Pkg; Pkg.develop([PackageSpec(path = "../ConsumerPkg"), PackageSpec(path = "../../..")])'
+          julia --project=ship -e 'using StrictMode; StrictMode.checks_enabled() && error("ship/ must build with checks disabled")'
+          build ship consumer_ship trim_entry_ship.jl
+          ./consumer_ship
       # Collect & upload coverage from the release Linux job only (avoids duplicate uploads, the
       # pre-release job, and Windows path quirks).
       - uses: julia-actions/julia-processcoverage@v1

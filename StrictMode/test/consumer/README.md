@@ -27,3 +27,18 @@ What it pins:
    from its cached pkgimage, so `registered_strict()` is empty there. The test asserts the loud
    empty-registry warning in that case rather than pinning the bug's current side, so it stays
    correct if the registry leg is ever fixed.
+
+## Two builds
+
+`trim_entry.jl` (env `ConsumerPkg`, checks **on**) covers the load path and `@strict_function`
+declarations — the issue #28 regression. `trim_entry_ship.jl` (env `ship`, checks **off**) covers an
+embedded call-site macro inside code the binary compiles and runs.
+
+They cannot be one build: `--trim` verifies reachable code only, and with checks on a reachable
+`@strict` site reaches the IR scan, which uses reflection (measured: 248 verifier errors). `ship`'s
+`Project.toml` is generated at build time, so its `[sources]` paths stay relative to the checkout:
+
+```bash
+cd StrictMode/test/consumer/ship
+julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path = "../ConsumerPkg"), PackageSpec(path = "../../..")])'
+```

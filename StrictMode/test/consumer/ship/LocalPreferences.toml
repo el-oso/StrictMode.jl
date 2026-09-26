@@ -1,0 +1,6 @@
+# The shipping configuration: checks OFF, so every StrictMode macro expands to the bare call.
+# `--trim=safe` then has nothing of StrictMode to resolve. With checks ON the same source fails the
+# verifier (measured: 248 errors, traced from `@strict` into the IR scan), which is why the armed
+# build next door reaches only declarations.
+[StrictMode]
+checks_enabled = false
