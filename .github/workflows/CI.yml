@@ -111,7 +111,9 @@ jobs:
           fi
           build ConsumerPkg consumer_trim trim_entry.jl
           ./consumer_trim
-          julia --project=ship -e 'using Pkg; Pkg.develop([PackageSpec(path = "../ConsumerPkg"), PackageSpec(path = "../../..")])'
+          # From INSIDE `ship`: `Pkg.develop` resolves a relative path against the current directory,
+          # not against `--project`.
+          (cd ship && julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path = "../ConsumerPkg"), PackageSpec(path = "../../..")])')
           julia --project=ship -e 'using StrictMode; StrictMode.checks_enabled() && error("ship/ must build with checks disabled")'
           build ship consumer_ship trim_entry_ship.jl
           ./consumer_ship
