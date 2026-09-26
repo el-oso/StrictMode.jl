@@ -58,3 +58,58 @@ end
     @test occursin("RuntimeDispatchReport in ", f.reason)
     @test occursin(".dispatch", f.reason)
 end
+
+# Issue #31: an OptimizationFailureReport located in the target's OWN package says the optimizer
+# declined a recursive frame. The types are known, so it is logged, not failed.
+@testitem "issue #31: an optimizer bail is logged, not a type-stability failure" begin
+    using StrictMode, StrictModeTest
+    const JET = StrictModeTest.JET
+    # Types grow with depth, so inference limits the cycle and declines to optimize the frame.
+    grow(t::Tuple, n::Int)::Float64 = n <= 0 ? sum(Float64[t...]) : grow((t..., Float64(n)), n - 1)
+    dispatch(v::Vector{Any}) = (v[1] + 1)::Int
+    grow((1.0,), 3)
+    dispatch(Any[1])
+    tt = (Tuple{Float64}, Int)
+
+    raw = JET.get_reports(JET.report_opt(grow, tt))
+    if VERSION >= v"1.13"
+        # The fixture must still produce the report, or this proves nothing.
+        @test any(r -> r isa JET.OptimizationFailureReport, raw)
+        # It is in the target's own module, so #30's filter keeps it — #31 is about the verdict.
+        @test !any(StrictModeTest._is_foreign_opt_failure, raw)
+        @test !isempty(StrictModeTest._opt_reports("probe", grow, tt))
+    end
+    f = only(proof_findings(grow, tt; guarantees = (:typestable,)))
+    @test !StrictMode._failed(f)
+    @test @test_logs (:info, r"no optimized IR") match_mode = :any (proof_findings(grow, tt; guarantees = (:typestable,))) isa Vector
+
+    # A real dispatch still fails, and now names its cause and fix.
+    g = only(proof_findings(dispatch, (Vector{Any},); guarantees = (:typestable,)))
+    @test StrictMode._failed(g)
+    @test occursin("RuntimeDispatchReport in ", g.reason)
+    @test occursin("Vector{Any}", g.reason)
+    @test occursin("concrete element type", g.suggestion)
+end
+
+# The bail has a cost JET cannot cover: its dispatch analysis reads optimized IR, and a bailed frame
+# has none, so that frame's own body can never produce a dispatch report. It is scanned directly.
+@testitem "issue #31: a dynamic call inside an unoptimized frame still fails" begin
+    using StrictMode, StrictModeTest
+    const SINK = Any[sin]
+    # Same limited-recursion shape as the clean fixture, with a dynamic call in the body.
+    growdyn(t::Tuple, n::Int)::Float64 =
+        n <= 0 ? (SINK[1](1.0)::Float64) : growdyn((t..., Float64(n)), n - 1)
+    growdyn((1.0,), 3)
+    tt = (Tuple{Float64}, Int)
+
+    f = only(proof_findings(growdyn, tt; guarantees = (:typestable,)))
+    @test StrictMode._failed(f)
+    @test occursin("runtime dispatch", f.reason)
+
+    # The scanner that covers the bailed frame, exercised directly on its own reports.
+    reps = StrictModeTest._opt_reports("probe", growdyn, tt)
+    bails = filter(r -> r isa StrictModeTest.JET.OptimizationFailureReport, reps)
+    if VERSION >= v"1.13" && !isempty(bails)
+        @test !isempty(reduce(vcat, StrictModeTest._bail_frame_dispatches.(bails)))
+    end
+end

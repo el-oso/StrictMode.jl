@@ -328,6 +328,20 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
 
 ## Planned — v0.5
 
+- [ ] **Share one typed-IR read across a sweep.** `audit(mod; sweep = true)` reads `code_typed` once
+  per specialization for the allocation/type-stability scan, and the dispatch pass reads it again.
+  Measured on PureBLAS (10,974 specializations): the dispatch pass costs 43.5 s, of which
+  `code_typed` alone is 43.2 s — the analysis on top is ~0.2 s. So the whole 17.8% sweep overhead is
+  the duplicate read, and plumbing one `CodeInfo` per `(f, tt)` through
+  `_findings_compiled`/`_alloc_signals`/`_dispatch_sites` removes it. Touches the core scan path,
+  which is why it is not a patch release.
+
+- [ ] **Expose `audit` as a tool on the Julia MCP server.** `audit(...; format = :json)` is already
+  machine-readable, so what a tool adds is the warm session: an agent pays Julia's full compile tax on
+  every cold invocation today. Options weighed: a tool in the existing `julia_*` server (cheapest,
+  reuses its worker), a standalone `StrictModeMCP.jl` stdio server (own lifecycle, own release), or
+  documenting the cold one-liner (free, keeps the tax). Prefer the first.
+
 - [ ] **Widen `@strict`'s default set, and let a package declare it.** BREAKING (see (a)).
   0.4.x ships the non-breaking half: `:owned` runs inside `@strict` as a REPORT (`gates = false`
   at the call site in `_strict_expr`), so the dict-lookup class is visible on every `@strict` site

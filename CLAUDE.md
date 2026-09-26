@@ -42,6 +42,13 @@ StrictMode/src/
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES
   static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)
+  dispatch.jl         — _instability_cause (which declaration made a body unstable: a non-const
+                        global, an abstract field, an abstract container eltype, reflection, or more
+                        matching methods than max_methods) and dispatch_report/DispatchReport (a
+                        module's dynamic call sites, plus the ones sitting AT max_methods — static
+                        today, dynamic as soon as one more method is defined anywhere). A
+                        method-enumerated (union-split) call is recognized by its
+                        Core.throw_methoderror fallthrough, since the split itself leaves no call
   trusted.jl          — Untrusted{T}/unsafe_trust/trust_boundary!/@assert_trusted (:trusted — the
                         payload of foreign data may only be read inside a registered boundary; the
                         Julia form of the kernel's `__user` annotation). Dispatch enforces the type

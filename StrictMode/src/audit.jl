@@ -50,6 +50,13 @@ unchecked; opting out requires a visible exempt.
 `@generated` / in-loop callees the compiler left non-inlined. They are **never failures**
 (`nfailures` ignores them) — a prompt to benchmark, not a gate.
 
+`dispatch_suggest` (default `true`) runs [`dispatch_suggestions`](@ref): informational findings
+(`guarantee = :dispatch`, `status = :info`, never a failure) for call sites that dispatch at run time,
+and for those sitting at exactly `max_methods` matching methods — static today, dynamic as soon as one
+more method is defined anywhere. On by default because the at-the-limit hazard is one nobody thinks to
+ask about: the code looks fine today. Measured on 10,974 PureBLAS specializations it reports nothing,
+and costs 17.8% of the sweep — one extra typed-IR read per specialization. Pass `false` to skip it.
+
 `static_ownership_suggest = true` additionally runs [`static_ownership_suggestions`](@ref):
 informational "consider static ownership" findings (`guarantee = :static_ownership`,
 `status = :info`) for type/symbol-keyed registry lookups. Also never a failure.
@@ -75,6 +82,7 @@ function _audit(
         exempt = (),
         inline_suggest::Bool = false,
         static_ownership_suggest::Bool = false,
+        dispatch_suggest::Bool = true,
     )
     require === nothing || require === :public ||
         throw(ArgumentError("$name: require must be :public (or nothing), got $(require)"))
@@ -83,12 +91,13 @@ function _audit(
     fs = StrictFinding[]
     if target === :registered
         append!(fs, _findings_all(analyze; guarantees))
-        if inline_suggest || static_ownership_suggest
+        if inline_suggest || static_ownership_suggest || dispatch_suggest
             for ((f, types), _) in STRICT_REGISTRY
                 _is_exempt(f) && continue
                 try
                     inline_suggest && append!(fs, inline_suggestions(f, types))
                     static_ownership_suggest && append!(fs, static_ownership_suggestions(f, types))
+                    dispatch_suggest && append!(fs, dispatch_suggestions(f, types))
                 catch err
                     err isa StrictViolation && rethrow()
                     # Not dropped: the user asked for suggestions over this signature and would
@@ -109,6 +118,7 @@ function _audit(
         # and noisy, so opt-in.
         inline_suggest && append!(fs, inline_suggestions(target; only, exempt))
         static_ownership_suggest && append!(fs, static_ownership_suggestions(target; only, exempt))
+        dispatch_suggest && append!(fs, dispatch_suggestions(target; only, exempt))
     else
         throw(ArgumentError("$name target must be :registered or a Module, got $(target)"))
     end

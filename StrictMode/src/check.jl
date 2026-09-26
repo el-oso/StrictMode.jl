@@ -19,8 +19,9 @@ end
 # success for every method in a sweep.
 _unevaluated(md, fn, sg, g, why) = StrictFinding(md, fn, sg, g, :fail, "", 0, why, _suggestion(g))
 
-_mkfinding(md, fn, sg, g, fail::Bool, reason, file, line) = StrictFinding(
-    md, fn, sg, g, fail ? :fail : :pass, file, line, fail ? reason : "", fail ? _suggestion(g) : ""
+_mkfinding(md, fn, sg, g, fail::Bool, reason, file, line, suggestion = "") = StrictFinding(
+    md, fn, sg, g, fail ? :fail : :pass, file, line, fail ? reason : "",
+    fail ? (isempty(suggestion) ? _suggestion(g) : suggestion) : ""
 )
 
 const _GUARANTEES = (
@@ -130,11 +131,15 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             # A concrete return can hide internal runtime dispatch; the IR boxing signal catches
             # that shape, so this checks both.
             fail = badret || local_boxing || local_unionphi
-            reason = badret ? "return type is not concrete (inference)" :
+            base = badret ? "return type is not concrete (inference)" :
                 local_boxing ? "internal dynamic dispatch (concrete return; IR heuristic)" :
                 "a union-typed local carries a member that must be boxed to flow through it " *
                 "(concrete return; IR heuristic)"
-            push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0))
+            # Name the declaration behind the instability when one is recognizable, so the finding
+            # says what to edit rather than only that the body is unstable.
+            cause = fail ? _instability_cause(f, types) : nothing
+            reason = isnothing(cause) ? base : base * " — " * _cause_reason(cause...)
+            push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0, isnothing(cause) ? "" : _cause_suggestion(cause[1])))
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))

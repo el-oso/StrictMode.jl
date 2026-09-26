@@ -47,7 +47,9 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = _return_types_memo(f, types)
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
-        _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt")
+        cause = _instability_cause(f, types)
+        why = isnothing(cause) ? "" : "\n  " * _cause_reason(cause...) * "\n  → " * _cause_suggestion(cause[1])
+        _fail(:typestable, target, "return type is not concrete or isbits-union (inference): $rt" * why)
         return nothing
     end
     # The two layers are graded separately. Return-type concreteness above is exact for the
@@ -56,8 +58,11 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     # passes it, and that shape must not be able to abort a build.
     sig = _alloc_signals(f, types; depth = 0)
     if sig.boxing
+        cause = _instability_cause(f, types)
+        why = isnothing(cause) ? "" : "\n  " * _cause_reason(cause...) * "\n  → " * _cause_suggestion(cause[1])
         _fail(
-            :typestable, target, "internal dynamic dispatch (concrete return; fast IR heuristic)";
+            :typestable, target,
+            "internal dynamic dispatch (concrete return; fast IR heuristic)" * why;
             gates = false
         )
     end

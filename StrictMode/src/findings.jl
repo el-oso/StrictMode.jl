@@ -34,6 +34,19 @@ struct StrictFinding
 end
 
 # Actionable fix hint per guarantee — the structured equivalent of what `@explain` tells a human.
+# A `:typestable` suggestion narrowed to the declaration that caused the instability. The numbers
+# come from the measured comparison in `docs/src/dynamic_dispatch.md`.
+function _cause_suggestion(cause::Symbol)
+    cause === :captured_variable && return "a closure captured a local that is reassigned, so it is held in a `Core.Box`: assign the captured value once (or bind a fresh one with `let`), or hold the mutable state in a concretely typed `Ref`."
+    cause === :nonconst_global && return "make the binding `const`; for state that must change, `const x = Ref(value)` or a typed binding (`global x::Int`) keeps the read concrete. Passing the value in as an argument works too."
+    cause === :abstract_field && return "parametrize the struct so the field has a concrete type: `struct S{T}; x::T; end`. A field holding a callable is the same problem — parametrize it rather than declaring `::Function`."
+    cause === :abstract_eltype && return "give the container a concrete element type, or a `Union` of the concrete types it holds — a `Union` element type splits statically (measured over 1000 elements: 0.58 µs / 0 B, against 24.02 µs / 32 kB for an abstract one). Keep the `Union` small if the call must also stay trim-compatible."
+    cause === :reflection && return "reflection cannot be resolved statically: compute the type at the call site, or move the query to load time."
+    cause === :runtime_type_parameter && return "the type is built from a value known only at run time: push that value into the type domain at the boundary (`Val(n)` created once from a literal, or a type parameter on the caller) so the size/flag is a compile-time constant."
+    cause === :method_count && return "reduce the methods matching this call to `max_methods` or fewer, narrow the argument to a `Union` of concrete types, or raise the limit where the callee lives with `Base.Experimental.@max_methods N`. Adding `where {T<:Abstract}` does NOT help — it cannot recover a type the caller does not have."
+    return ""
+end
+
 function _suggestion(guarantee::Symbol)
     guarantee === :noboxing && return "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter."
     guarantee === :owned && return "runtime AbstractDict lookup on owned scratch (static-ownership violation): replace the keyed dictionary probe with a const-dispatched, per-concrete-type accessor (a Ref/field owned by the type)."

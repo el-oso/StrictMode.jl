@@ -116,6 +116,20 @@ trust_boundary!
 @assert_trusted
 ```
 
+## Dynamic dispatch
+
+`dispatch_report` lists where a module dispatches at run time, and where a call sits at
+`max_methods` matching methods — static today, dynamic as soon as one more method is defined
+anywhere. A module or function that raises the limit with `Base.Experimental.@max_methods` is honored
+per call site. The [dynamic dispatch](@ref dynamic-dispatch) page has the measured cost and the fixes
+that work.
+
+```@docs
+dispatch_report
+DispatchReport
+dispatch_suggestions
+```
+
 ## Concurrency safety
 
 `@assert_concurrency_safe` checks that a function treats its plan/workspace argument as read-only

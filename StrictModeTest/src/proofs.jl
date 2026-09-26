@@ -183,6 +183,34 @@ function _is_foreign_opt_failure(@nospecialize(rep))
     return inner !== nothing && inner !== _frame_module(rep.vst[1])
 end
 
+# The dynamic calls in the body of a frame JET could not optimize, as `MyMod.caller → callee` strings.
+# JET reports dispatch from optimized IR only, so this frame's own body is invisible to it; scanning
+# the unoptimized IR is the only way to cover it. An empty result means the body dispatches nowhere.
+function _bail_frame_dispatches(@nospecialize(rep))
+    out = String[]
+    hasproperty(rep, :vst) && !isempty(rep.vst) || return out
+    mi = rep.vst[end].linfo               # the frame the report is about, as `_report_location` reads it
+    mi isa Core.CodeInstance && (mi = mi.def)
+    mi isa Core.MethodInstance || return out
+    where = mi.def isa Method ? string(mi.def.module, ".", mi.def.name) : string(mi)
+    cis = try
+        Base.code_typed_by_type(mi.specTypes; optimize = true)
+    catch
+        return out
+    end
+    for pair in cis
+        ci = pair isa Pair ? pair.first : pair
+        ci isa Core.CodeInfo || continue
+        for st in ci.code
+            Meta.isexpr(st, :call) || continue
+            callee = StrictMode._static_callee(ci, st.args[1])
+            (callee isa Core.Builtin || callee isa Core.IntrinsicFunction) && continue
+            push!(out, string(where, " → ", isnothing(callee) ? "callee not statically known" : nameof(callee)))
+        end
+    end
+    return out
+end
+
 # Where a report sits: its kind and the innermost frame, e.g. `RuntimeDispatchReport in PureBLAS.f`.
 function _report_location(@nospecialize(rep))
     mi = rep.vst[end].linfo
@@ -575,14 +603,51 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
     rts = Base.return_types(f, Tuple{types...})
     if length(rts) != 1 || !StrictMode._is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
-        return StrictMode._mkfinding(md, fn, sg, :typestable, true, "return type $rt is not concrete (inference)", "", 0)
+        cause = StrictMode._instability_cause(f, types)
+        reason = "return type $rt is not concrete (inference)"
+        isnothing(cause) || (reason *= " — " * StrictMode._cause_reason(cause...))
+        return StrictMode._mkfinding(
+            md, fn, sg, :typestable, true, reason, "", 0,
+            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1])
+        )
     end
+    # An optimization-failure report says one frame produced no optimized IR (typically a recursive
+    # cycle). It does NOT say a type is unknown, so it is logged rather than failed — issue #30 dropped
+    # the ones located in another module, and issue #31 drops the rest from the verdict.
+    #
+    # It does cost coverage, though: JET's dispatch analysis runs on optimized IR, so a bailed frame
+    # can never report a dispatch from its own body. `_bail_frame_dispatches` scans those bodies
+    # directly, and a dynamic call found there fails the guarantee like any other.
     reports = _opt_reports(target, f, types)
-    isempty(reports) || return StrictMode._mkfinding(
-        md, fn, sg, :typestable, true,
-        "internal instability / runtime dispatch ($(length(reports)) JET report(s): " *
-            join(unique(_report_location.(reports)), "; ") * ")", "", 0
-    )
+    bails = filter(r -> r isa JET.OptimizationFailureReport, reports)
+    uncertain = filter(r -> !(r isa JET.OptimizationFailureReport), reports)
+    bailsites = String[]
+    for r in bails
+        append!(bailsites, _bail_frame_dispatches(r))
+    end
+    if !isempty(bails)
+        @info "StrictModeTest: $target — $(length(bails)) frame(s) produced no optimized IR " *
+            "(typically a recursive cycle): $(join(unique(_report_location.(bails)), "; ")). " *
+            "The types are known; this costs optimization, not type stability. Those frames' own " *
+            "bodies were scanned for runtime dispatch separately." maxlog = 1 _id = Symbol(:bail, target)
+    end
+    if !isempty(uncertain) || !isempty(bailsites)
+        cause = StrictMode._instability_cause(f, types)
+        parts = String[]
+        isempty(uncertain) || push!(
+            parts, "$(length(uncertain)) JET report(s): " *
+                join(unique(_report_location.(uncertain)), "; ")
+        )
+        isempty(bailsites) || push!(
+            parts, "runtime dispatch in an unoptimized frame: " * join(unique(bailsites), "; ")
+        )
+        reason = "internal instability / runtime dispatch (" * join(parts, " | ") * ")"
+        isnothing(cause) || (reason *= " — " * StrictMode._cause_reason(cause...))
+        return StrictMode._mkfinding(
+            md, fn, sg, :typestable, true, reason, "", 0,
+            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1])
+        )
+    end
     # F39. JET cannot see this class at all: a union-typed local that boxes a member on the way in is
     # not dynamic dispatch, so `@report_opt` is silent at every signature. Without this the proof
     # would be WEAKER than the scan it is supposed to settle — `@assert_typestable` catches it and

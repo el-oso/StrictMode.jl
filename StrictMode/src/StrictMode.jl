@@ -55,6 +55,7 @@ export StrictViolation, StrictReport, StrictFinding
 export findings, audit, format_findings, nfailures, watch, unwatch
 export inline_suggestions, migration_report
 export static_ownership_suggestions
+export dispatch_report, DispatchReport, dispatch_suggestions
 export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
@@ -84,6 +85,7 @@ include("check.jl")
 include("memsafe.jl")
 include("mca.jl")
 include("registry.jl")
+include("dispatch.jl")
 include("audit.jl")
 include("golden.jl")
 include("migration.jl")

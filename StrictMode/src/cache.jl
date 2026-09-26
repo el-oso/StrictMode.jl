@@ -41,6 +41,7 @@ function clear_cache!()
         empty!(_SIGNAL_MEMO)
         empty!(_TOP_SIGNAL_MEMO)
         empty!(_RETTYPE_MEMO)
+        empty!(_MATCH_MEMO)
     end
     @lock _ESCAPE_MEMO_LOCK empty!(_ESCAPE_MEMO)   # …as does the escape-analysis memo
     return nothing
