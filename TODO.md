@@ -79,7 +79,18 @@ GitHub issues are the source of truth for anything with a number; the notes here
   and its own field is a stack `Ref`. Any other mutable still goes to escape analysis, and any use
   the rules do not recognize counts as a box. Measured on PureOSQP's `admm_step!` and
   `update_residuals!` across 13 backends: agreement with AllocCheck went from 8 of 26 signatures to
-  26 of 26. Not yet re-measured on the 120-specialization corpus above.
+  26 of 26.
+
+  *CORPUS RE-MEASURED, 2026-09-13 (0.4.5).* The same 120 compiled PureBLAS + PureIPM specializations,
+  AllocCheck as the oracle, the new rule A/B'd against the old one in one process: both agree with
+  AllocCheck on **120 of 120** — 64 findings, 0 false positives, 0 missed — and a cold scan costs the
+  same (old 4.5 s, new 4.3 s). The 8.1% / 75%-recall figures above are pre-0.4.3 numbers on this
+  corpus and no longer reproduce. The gap they describe is structural — typed IR before LLVM against
+  LLVM IR after it — and can return on other code, which is why this stays open.
+
+  The rule shipped one regression, fixed in 0.4.5: optimized IR may name a `:new`'s type with a
+  `GlobalRef` (`%new(Base.ComplexF64, …)`), and an unresolved name counted as an allocation, which
+  flagged 6 `ComplexF64` LAPACK routines that allocate nothing. `_new_type` resolves the name first.
 
   The change immediately exposed a false-premise test: `once_barrier_test.jl` asserted a fixture
   "genuinely allocates on every call" that measures **0 bytes** — a #17 false positive living inside

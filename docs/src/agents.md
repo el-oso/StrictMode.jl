@@ -72,9 +72,11 @@ not check" and "is fine" must not render the same.
 `noalloc` and `noboxing` verdicts come from the scan, which reads typed IR and still sees
 allocations LLVM later deletes.
 
-Measured over 120 compiled specializations from two real packages: **8.1%** of those findings were
-false, every one measuring 0 bytes — and in the other direction the scan misses **23 of the 91**
-signatures AllocCheck flags, a recall of 75%.
+Both directions have been measured over 120 compiled specializations from two real packages, with
+AllocCheck as the oracle. On that corpus the scan currently agrees on all 120. Earlier releases did
+not: **8.1%** of findings were false, every one measuring 0 bytes, and in the other direction the scan
+missed **23 of the 91** signatures AllocCheck flags, a recall of 75%. The gap is structural, so it can
+return on code the corpus does not cover.
 
 So treat them as "investigate". Re-run the same signatures through `StrictModeTest`'s `test_*`
 drivers before acting as though a finding were proved. It is the same reason

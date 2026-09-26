@@ -195,9 +195,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 - **`_guarantee_gates` (report.jl) decides throw-vs-warn, per guarantee.** A check that OBSERVES
   compiled output gates (`:typestable`'s return-type layer, `:memsafe`, `:vectorized`, `:no_spill`,
   `:inlined`, `:owned`, `:trusted`). A check that INFERS something it cannot see reports:
-  `:noalloc`/`:noboxing` (typed IR cannot see what LLVM elides — 8.1% false over a 120-specialization
-  corpus, and 75% recall in the other direction, issue #17), `:no_scalar_loops` (SLP output forges
-  its discriminator), `:trimsafe`/
+  `:noalloc`/`:noboxing` (typed IR cannot see what LLVM elides; 120/120 agreement with AllocCheck on
+  the 120-specialization corpus as of 0.4.5, but 8.1% false and 75% recall on earlier releases of the
+  same corpus — the gap is structural, issue #17), `:no_scalar_loops` (SLP output forges its
+  discriminator), `:trimsafe`/
   `:trim_compatible` (the static scan does not model juliac's reachability limit), and
   `:typestable`'s depth-0 boxing signal and its union-typed-local signal (both `gates = false` at
   their call sites in `typestability.jl`).
