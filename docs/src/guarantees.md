@@ -202,6 +202,21 @@ the union-typed-local signal as-is, because JET cannot see that class at all: un
 not dynamic dispatch, so `@report_opt` is silent on it at every signature. Without it the proof
 would be weaker than the scan it is meant to settle.
 
+One JET report kind does **not** fail the guarantee: an optimization failure, which says a frame
+produced no optimized IR (typically a recursive cycle). That is a statement about the optimizer, not
+about types, so it is logged rather than failed. Because JET reads dispatch from optimized IR, such a
+frame's own body cannot produce a dispatch report either — so that body is scanned directly, and a
+runtime dispatch found there fails like any other.
+
+### The finding names the declaration to edit
+
+A failure identifies what to change, not just that the body is unstable: a captured variable in a
+`Core.Box`, an untyped non-`const` global, an abstractly typed field, a container with an abstract
+payload type, reflection, a type built from a runtime value, or more matching methods than inference
+enumerates. The [dynamic dispatch](@ref dynamic-dispatch) guide lists each cause with the fix and its
+measured effect, and [`dispatch_report`](@ref) shows where a module dispatches at run time — including
+calls that are static today and one method away from dynamic.
+
 ### A union-typed local that boxes
 
 A non-isbits union is a tagged pointer, so a member that normally lives unboxed has to be

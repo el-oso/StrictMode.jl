@@ -192,6 +192,17 @@ it only fails when you supply an explicit `max_rthroughput=`/`min_ipc=` bound yo
 (unlike Julia's own codegen path, which just warns and falls back), so `mca_report` checks first
 and substitutes `"generic"` if needed, warning once.
 
+## Where a module dispatches: `dispatch_report`
+
+`dispatch_report(MyPkg)` lists every call site that dispatches at run time, and every one that is
+static today while matching exactly `max_methods` methods — one more method on that function, defined
+anywhere, makes it dynamic with no edit to your code. `audit` carries the same sites as `:dispatch`
+findings unless you pass `dispatch_suggest = false`.
+
+The measured stakes, per element over 1000 elements: 24.02 µs and 32 kB with an abstract element type
+against 0.58 µs and 0 B with a concrete one or a `Union` of concrete types. See
+[dynamic dispatch](@ref dynamic-dispatch) for the causes and the fixes that work.
+
 ## Static-binary compatibility (`@assert_trim_compatible`)
 
 Julia's ahead-of-time compiler (`juliac --trim=safe`) rejects dynamic dispatch and runtime

@@ -57,7 +57,8 @@ Each finding is one object (here pretty-printed):
 
 `guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |
 no_scalar_loops | no_spill | trim_compatible | trusted`; the
-advisory passes also emit `coverage`, `inline_suggestion` and `static_ownership`. `status` is one of
+advisory passes also emit `dispatch` (on by default), `coverage`, `inline_suggestion` and
+`static_ownership`. `status` is one of
 `fail | pass | info`:
 
 | status | meaning | counts as a failure? |

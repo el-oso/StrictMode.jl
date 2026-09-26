@@ -12,7 +12,7 @@ nothing for a shipped application.
 | **Untyped accumulator** (`acc = []` / `acc = 0` later holding mixed types) | per-iteration allocation, dispatch | `@assert_noalloc` / `@strict` |
 | **Allocating hot loop** (`push!` into a fresh `Vector`, `collect`, slices) | heap traffic, GC pressure in inner loops | `@assert_noalloc` |
 | **Boxing, but buffers are fine** (must not box, may allocate scratch space) | runtime dispatch / `jl_get_nth_field_checked` only | `@assert_noboxing` (allows typed allocations) |
-| **Accidental dynamic dispatch** (abstract field types, `Any` args) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc` |
+| **Accidental dynamic dispatch** (abstract field types, `Any` args, a fourth method on an abstract argument) | runtime dispatch shows as allocation | `@assert_noboxing` / `@assert_noalloc`; `dispatch_report(MyPkg)` to see every site and its cause |
 | **A call that should inline but doesn't** (cost-model misfire, `@noinline`) | call overhead, lost cross-call optimization | `@assert_inlined` (best-effort) |
 | **A whole kernel that must stay on the fast path** | any of the above, anywhere in the call | `@strict` (type stability, owned scratch, allocation-freedom) |
 | **A `@generated`/SIMD kernel that must vectorize and stay on the fast path** | silent ~100× regression from boxing, or vectorization silently disabled — easy to miss during exploration | `@kernel` (bundles `@assert_noalloc` + `@assert_vectorized` + `@assert_typestable`; makes the boxing check reflexive) |
