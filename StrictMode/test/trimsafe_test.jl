@@ -1,17 +1,17 @@
-@testitem "@assert_trim_safe + :trimsafe guarantee (proactive, TypeContracts.trim_report)" begin
+@testitem "@assert_trim_compatible + :trim_compatible guarantee (proactive, TypeContracts.trim_report)" begin
     using StrictMode
     safe_fn(x::Int) = x * 2 + 1
     unsafe_fn(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection → trim-unsafe
 
-    @test (@assert_trim_safe safe_fn(3)) == 7                        # passes → returns the value
-    @test_logs (:warn,) match_mode = :any (@assert_trim_safe unsafe_fn(3))   # reflection → reported
+    @test (@assert_trim_compatible safe_fn(3)) == 7                        # passes → returns the value
+    @test_logs (:warn,) match_mode = :any (@assert_trim_compatible unsafe_fn(3))   # reflection → reported
 
     # As an engine guarantee — value-free, no backend needed.
-    @test all(f -> f.status === :pass, findings(safe_fn, (Int,); guarantees = (:trimsafe,)))
-    @test any(f -> f.status === :fail, findings(unsafe_fn, (Int,); guarantees = (:trimsafe,)))
+    @test all(f -> f.status === :pass, findings(safe_fn, (Int,); guarantees = (:trim_compatible,)))
+    @test any(f -> f.status === :fail, findings(unsafe_fn, (Int,); guarantees = (:trim_compatible,)))
 end
 
-@testitem ":trimsafe flows through the compiled sweep" begin
+@testitem ":trim_compatible flows through the compiled sweep" begin
     using StrictMode
     module TrimMix
     hotk(x::Int) = x + 1
@@ -19,7 +19,7 @@ end
     end
     TrimMix.hotk(1); TrimMix.reflecty(1)                                # compile both
 
-    fs = StrictMode._findings_compiled(TrimMix; guarantees = (:trimsafe,))
+    fs = StrictMode._findings_compiled(TrimMix; guarantees = (:trim_compatible,))
     @test any(f -> f.func == "reflecty" && f.status === :fail, fs)
     @test any(f -> f.func == "hotk" && f.status === :pass, fs)
 end
@@ -37,12 +37,11 @@ end
     # caveat — this pins the back-compat contract explicitly (a heuristic PASS is not distinguishable
     # from an authoritative one via `findings`; the caveat is macro-path-only visibility).
     safe_fn(x::Int) = x * 2 + 1
-    fs = only(findings(safe_fn, (Int,); guarantees = (:trimsafe,)))
+    fs = only(findings(safe_fn, (Int,); guarantees = (:trim_compatible,)))
     @test fs.status === :pass
     @test fs.reason == ""
 
     # The macro's own PASS is unaffected functionally (returns the call's value as before).
-    @test (@assert_trim_safe safe_fn(3)) == 7
     @test (@assert_trim_compatible safe_fn(3)) == 7
 
     # The one-time session note actually fires. `@test_logs` installs its own fresh logger for the
@@ -52,7 +51,7 @@ end
     # maxlog=1 message already fired once against Base's default logger is still captured by a
     # subsequent `@test_logs` on the same call, since maxlog counting lives on the active logger
     # instance, not globally per call site.
-    @test_logs (:info, r"not juliac's authoritative") match_mode = :any (@assert_trim_safe safe_fn(3))
+    @test_logs (:info, r"not juliac's authoritative") match_mode = :any (@assert_trim_compatible safe_fn(3))
 end
 
 # Fixtures for the union-split rule. `StrictModeTest`'s own suite defines the same four shapes and
@@ -128,15 +127,4 @@ end
     # The limit is read from the compiler, not hardcoded: three union args is 8, still over 4.
     r3 = StrictMode._trim_report(UnionSplit.three, (Vector{Float64}, Bool, Bool, Bool))
     @test contains(only(filter(contains("max_union_splitting"), r3.findings)), "8 specializations")
-end
-
-@testitem "@assert_trim_safe warns that it is deprecated, and still works" begin
-    using StrictMode
-    clean_trim(x::Float64) = x * 2.0
-    clean_trim(1.0)
-    # Deprecated, not removed: the warning must not cost the caller the macro's value or behavior.
-    r = @test_logs (:warn,) match_mode = :any (@assert_trim_safe clean_trim(3.0))
-    @test r == 6.0
-    @test occursin("deprecated", StrictMode._TRIM_SAFE_DEPRECATED)
-    @test occursin("@assert_trim_compatible", StrictMode._TRIM_SAFE_DEPRECATED)
 end

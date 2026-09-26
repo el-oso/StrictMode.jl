@@ -145,7 +145,7 @@ suggest **static ownership** instead: give each type a `const` owner reached by 
 lookup const-folds — trim-safe, 0-alloc, no runtime hash/eq-table hit.
 
 Advisory only — findings are `status = :info` and [`nfailures`](@ref) never counts them, so this
-can't break a gate. It's a judgment call (unlike `:noalloc`/`:trimsafe`, which have a sound
+can't break a gate. It's a judgment call (unlike `:noalloc`/`:trim_compatible`, which have a sound
 backend): a legitimately dynamic dict (a config table, a value-keyed memo cache, the pattern's own
 sanctioned rare-type fallback) will pass through unflagged by design elsewhere in this scan, but a
 false positive here costs a glance, not a broken build.

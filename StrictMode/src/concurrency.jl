@@ -1,6 +1,6 @@
 # Concurrency-safety guarantees — the multi-threading correctness layer.
 #
-# All value-free (`Base.code_typed` IR scans), like `trimsafe`/`scheduling`/`inlining`: no
+# All value-free (`Base.code_typed` IR scans), like `trimsafe.jl`/`scheduling.jl`/`inlining.jl`: no
 # AllocCheck/JET backend needed.
 
 """

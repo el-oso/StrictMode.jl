@@ -25,7 +25,7 @@ _mkfinding(md, fn, sg, g, fail::Bool, reason, file, line) = StrictFinding(
 
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
-    :no_scalar_loops, :no_spill, :trimsafe, :trim_compatible, :trusted,
+    :no_scalar_loops, :no_spill, :trim_compatible, :trusted,
 )
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
@@ -45,28 +45,12 @@ function _compiled_output_finding(g::Symbol, @nospecialize(f), @nospecialize(typ
     elseif g === :no_spill
         r = spill_report(f, types)
         return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0)
-    elseif g === :trimsafe
-        return _trimsafe_finding(f, types, md, fn, sg)
     elseif g === :trusted
         # No proving counterpart: the scan reads a call on a type inference has already fixed, so
         # there is nothing a backend could add. Both tiers therefore answer from here.
         return _trusted_finding(f, types, md, fn, sg)
     end
     return nothing
-end
-
-# `:trimsafe` finding — the static-only subset of `:trim_compatible`, kept for compatibility.
-# Value-free TypeContracts scan; never runs juliac's verifier. Prefer `:trim_compatible`.
-function _trimsafe_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
-    r = _trim_report(f, types)
-    m = try
-        which(f, types)
-    catch
-        nothing
-    end
-    file = isnothing(m) ? "" : string(m.file)
-    line = isnothing(m) ? 0 : Int(m.line)
-    return _mkfinding(md, fn, sg, :trimsafe, !r.passed, "trim-unsafe: " * join(r.findings, "; "), file, line)
 end
 
 """

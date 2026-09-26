@@ -1,8 +1,8 @@
 # Trim-safety guarantee, powered by TypeContracts (already a core dep — no backend needed).
 #
-# PROACTIVE: `@assert_trim_safe` and the `:trimsafe` guarantee scan a method's typed IR for what
-# `juliac --trim=safe` rejects — dynamic dispatch (a call whose result infers to `Any`), a call left
-# unresolved by exceeding the union-split limit (`_union_split_findings`), and
+# PROACTIVE: `@assert_trim_compatible` and the `:trim_compatible` guarantee scan a method's typed
+# IR for what `juliac --trim=safe` rejects — dynamic dispatch (a call whose result infers to
+# `Any`), a call left unresolved by exceeding the union-split limit (`_union_split_findings`), and
 # reflection (`return_types`/`invokelatest`/`which`/`methods`) — via `TypeContracts.trim_report`.
 # Value-free and dependency-free.
 #
@@ -86,73 +86,9 @@ const _TRIM_HEURISTIC_CAVEAT = "StrictMode: this trim-safety PASS is from the st
     "`StrictModeTest.@test_trim_compatible` (or a real `juliac --trim=safe` build) before relying " *
     "on this pass alone."
 
-const _TRIM_SAFE_DEPRECATED = "StrictMode: `@assert_trim_safe` is deprecated and will be removed. " *
-    "It runs the same scan as `@assert_trim_compatible`, which is the name to use — the two spellings " *
-    "answer one question. `StrictModeTest.@test_trim_compatible` remains the verifier-backed gate."
-
-function _assert_trim_safe(target, @nospecialize(f), @nospecialize(types::Tuple))
-    @warn _TRIM_SAFE_DEPRECATED maxlog = 1
-    r = _trim_report(f, types)
-    if r.passed
-        @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
-        return nothing
-    end
-    _fail(
-        :trimsafe, target,
-        "likely trim-unsafe ($(length(r.findings)) site(s); juliac --trim=safe is authoritative):\n  " *
-            join(r.findings, "\n  ")
-    )
-    return nothing
-end
-
-"""
-    @assert_trim_safe f(args...)
-
-!!! warning "Deprecated"
-    Use [`@assert_trim_compatible`](@ref) instead — it runs this exact scan under the name that
-    describes it. Two spellings for one question is surface with nothing behind it. This macro
-    warns once per session and will be removed; `StrictModeTest`'s `@test_trim_compatible` remains
-    the verifier-backed gate.
-
-The same static scan as [`@assert_trim_compatible`](@ref), under an older name.
-
-Report if `f(args...)` looks incompatible with `juliac --trim=safe` by a value-free
-`TypeContracts.trim_report` scan of the typed IR: dynamic dispatch (a call whose result infers to
-`Any`), reflection (`return_types`, `invokelatest`, `which`, `methods`), or a surviving call whose
-arguments union-split past `max_union_splitting`. It never runs the verifier, so it needs no
-`TrimCheck` dependency.
-
-**This reports; it does not gate** — the scan does not model juliac's reachability limit, so a PASS
-is incomplete and a FAIL is a guess about the same territory. `StrictModeTest`'s
-`@test_trim_compatible` runs the real verifier and does gate. Advisory either way, so **not** part
-of [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call. The
-reactive counterpart, for a real build failure, is [`explain_trim`](@ref).
-
-!!! note "union-split call sites"
-    A third rule covers the class the dispatch rule structurally cannot see: a call that survives
-    optimization with union-typed arguments whose specialization product exceeds inference's
-    `max_union_splitting`. juliac cannot materialize those, so the call stays unresolved and the
-    verifier rejects it — while the caller still infers a concrete return type, which is why the
-    "result infers to `Any`" rule misses it. A callee small enough to inline leaves no call behind,
-    and a product within the limit is split before optimization ends, so neither needs a size or
-    opacity threshold to be excluded.
-
-!!! note "a PASS here is still not the verifier"
-    This scan models neither juliac's full reachability analysis nor the Base patches juliac applies
-    before trim inference, so a PASS logs a one-time session note saying so. Use
-    `StrictModeTest.@test_trim_compatible` before relying on a green pass for a `juliac --trim` build.
-"""
-macro assert_trim_safe(args...)
-    pos, opts = _macro_call(args, (:types,))
-    isempty(pos) && throw(ArgumentError("@assert_trim_safe needs a call expression"))
-    call = pos[1]
-    checked = _guarantee_expr(call, _assert_trim_safe; types = get(opts, :types, nothing))
-    return _gate(checked, esc(call))
-end
-
 # ── `trim_compatible` ─────────────────────────────────────────────────────────────────────────────
-# The TypeContracts static IR scan — the same engine as the `@assert_trim_safe` subset. juliac's
-# authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s `@test_trim_compatible`.
+# The TypeContracts static IR scan. juliac's authoritative `verify_typeinf_trim` verifier is
+# `StrictModeTest`'s `@test_trim_compatible`.
 function _assert_trim_compatible(target, @nospecialize(f), @nospecialize(types::Tuple))
     r = _trim_report(f, types)
     if r.passed

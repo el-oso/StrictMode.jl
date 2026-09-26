@@ -202,9 +202,6 @@ reflection. StrictMode can flag incompatible patterns before a slow `juliac` bui
 audit(MyPkg; sweep = true, guarantees = (:typestable, :noalloc, :trim_compatible))
 ```
 
-`@assert_trim_safe` / `:trimsafe` are the same scan under an older name. They are deprecated and
-warn once per session; use the names above.
-
 When a real `juliac --trim` run fails, [`explain_trim`](@ref) translates the verifier output into
 source-mapped hints with per-site suggestions.
 

@@ -53,7 +53,7 @@ end
     # The rule it encodes: a check that OBSERVES compiled output gates; one that INFERS something it
     # cannot see reports. Both lists are spelled out here rather than derived, precisely so that
     # moving a guarantee between them has to be a deliberate edit in two places.
-    reports = (:noalloc, :noboxing, :no_scalar_loops, :trimsafe, :trim_compatible)
+    reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible)
     gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted)
     for g in reports
         @test !StrictMode._guarantee_gates(g)
@@ -76,7 +76,7 @@ end
     using StrictMode
     # `_fail`'s note used to interpolate `@$kind` / `@test_$kind`, which sends a user to
     # `@no_scalar_loops` and `@test_trimsafe` — neither of which exists. Only four guarantees have a
-    # proving counterpart at all, and `:trimsafe` is spelled `@assert_trim_safe`.
+    # proving counterpart at all.
     macro_exists(name) = isdefined(StrictMode, Symbol(name)) || isdefined(Main, Symbol(name))
     for g in StrictMode._GUARANTEES
         own, proof = StrictMode._macro_names(g)
@@ -86,6 +86,6 @@ end
         # rather than reaching across the package boundary from here.
         @test proof in ("@test_noalloc", "@test_noboxing", "@test_typestable", "@test_trim_compatible")
     end
-    @test StrictMode._macro_names(:trimsafe)[1] == "@assert_trim_safe"
+    @test StrictMode._macro_names(:trim_compatible) == ("@assert_trim_compatible", "@test_trim_compatible")
     @test isnothing(StrictMode._macro_names(:no_scalar_loops)[2])
 end

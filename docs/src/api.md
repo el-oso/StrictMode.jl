@@ -61,7 +61,6 @@ McaReport
 Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` **reports**;
 juliac's authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s
 `@test_trim_compatible`, which gates. The reactive `explain_trim` translates a real build log.
-`@assert_trim_safe` is the same scan under an older name — deprecated, warns once per session.
 
 The static-scan path has one known coverage gap it can't heuristically close without
 false-positiving on safe code: N simultaneous small-`Union` arguments whose specialization count
@@ -72,7 +71,6 @@ static scan logs a one-time session note about this; see
 
 ```@docs
 @assert_trim_compatible
-@assert_trim_safe
 explain_trim
 ```
 

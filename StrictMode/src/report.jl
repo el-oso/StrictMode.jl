@@ -35,7 +35,7 @@ end
 # - `:no_scalar_loops` separates a hand-written scalar tail from LLVM's own `@simd` epilogue by
 #   looking for `<N x …>` ops outside the loop-vectorizer's scaffolding, and LLVM's SLP vectorizer
 #   emits exactly that shape for ordinary complex arithmetic.
-# - `:trimsafe`/`:trim_compatible` use a static scan that does not model juliac's reachability
+# - `:trim_compatible` uses a static scan that does not model juliac's reachability
 #   limit, so a PASS is incomplete and a FAIL is a guess about the same territory.
 # - `:typestable` is split rather than listed: return-type concreteness gates, the depth-0 boxing
 #   signal does not (see `_typestable_fast`), so a guarded `@warn` in a numeric function cannot
@@ -43,17 +43,15 @@ end
 #
 # The proofs gate unconditionally — that is what `StrictModeTest` is.
 _guarantee_gates(kind::Symbol) =
-    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trimsafe, :trim_compatible))
+    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible))
 
-# The macro names for a guarantee, which are NOT derivable from its symbol: `:trimsafe` is spelled
-# `@assert_trim_safe`, and only four guarantees have a proving counterpart at all. Interpolating
-# `@$kind`/`@test_$kind` instead sends users to `@no_scalar_loops` and `@test_trimsafe`, neither of
-# which exists.
+# The macro names for a guarantee, which are NOT derivable from its symbol: only four guarantees have
+# a proving counterpart at all, and `:no_scalar_loops` has none. Interpolating `@$kind` instead sends
+# users to `@no_scalar_loops`, which does not exist.
 function _macro_names(kind::Symbol)
     kind === :noalloc && return ("@assert_noalloc", "@test_noalloc")
     kind === :noboxing && return ("@assert_noboxing", "@test_noboxing")
     kind === :trim_compatible && return ("@assert_trim_compatible", "@test_trim_compatible")
-    kind === :trimsafe && return ("@assert_trim_safe", "@test_trim_compatible")
     kind === :no_scalar_loops && return ("@assert_no_scalar_loops", nothing)
     return ("@assert_" * String(kind), nothing)
 end

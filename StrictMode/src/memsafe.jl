@@ -4,7 +4,7 @@
 # Motivation: a masked SIMD microkernel can OOB-read past a partial-row tile (a masked vector load
 # reads a full lane width at the tile pointer, up to W-1 elements past the valid region). That kind
 # of bug is allocation-layout-dependent — it only faults when the next page happens to be unmapped —
-# so it can pass `@assert_typestable`/`@assert_noalloc`/`@assert_trim_safe` and a green dogfood using
+# so it can pass `@assert_typestable`/`@assert_noalloc`/`@assert_trim_compatible` and a green dogfood using
 # ordinary heap arrays (whose trailing page happens to be mapped) forever, then crash once in a long
 # benchmark run. This harness re-allocates array arguments into `mmap`-backed buffers placed flush
 # against a trailing `PROT_NONE` guard page, so any read/write one element past the intended bounds

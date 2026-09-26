@@ -124,7 +124,7 @@ test_registered()                    # …or re-prove everything that was declar
 Guarantees whose check *observes* compiled output — `:typestable`'s return-type layer, `:memsafe`,
 `:vectorized`, `:no_spill`, `:inlined`, `:owned`, `:trusted` — throw from StrictMode directly.
 The ones that infer what they cannot see (`:noalloc`, `:noboxing`, `:no_scalar_loops`,
-`:trimsafe`/`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and
+`:trim_compatible`, and both of `:typestable`'s IR signals — internal dispatch and
 the union-typed local) report.
 
 ### One-time-init calibration doesn't have to break this
@@ -313,9 +313,8 @@ The authoritative answer is a different macro, not a different mode: `StrictMode
 happen to be loaded — the macro you wrote decides.
 
 Like `@assert_inlined`, this is advisory and **opt-in** — *not* part of [`@strict`](@ref):
-juliac's whole-program verifier over the real build is the final word.
-[`@assert_trim_safe`](@ref) is the same scan under an older name — deprecated, and it warns once
-per session. The reactive counterpart, for a real build log, is [`explain_trim`](@ref).
+juliac's whole-program verifier over the real build is the final word. The reactive counterpart,
+for a real build log, is [`explain_trim`](@ref).
 
 ```julia
 clean(x::Int) = x * 2 + 1
@@ -328,8 +327,7 @@ reflecty(x::Int) = length(Base.return_types(sin, (Float64,)))   # reflection →
 # │   Base.indexed_iterate(…)::Any  [myfile.jl:NN]; … (+N more call site(s))
 ```
 
-As an engine guarantee it is `:trim_compatible` (`:trimsafe` is the deprecated spelling of the
-same scan):
+As an engine guarantee it is `:trim_compatible`:
 
 ```julia
 findings(reflecty, (Int,); guarantees = (:trim_compatible,))     # report

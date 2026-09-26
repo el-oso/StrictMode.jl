@@ -3,13 +3,12 @@
 # A rename would have been caught by the compiler; this is the tool that stands in for that.
 
 # Guarantee macros whose StrictMode form REPORTS, paired with the StrictModeTest form that proves.
-# Keyed by the macro's spelling, which is not derivable from the guarantee symbol (`:trimsafe` is
-# `@assert_trim_safe`, and the composites are named for the bundle rather than a guarantee).
+# Keyed by the macro's spelling: the composites are named for the bundle rather than for a
+# guarantee, so the spelling is not derivable from the guarantee symbol.
 const _MIGRATION_MAP = (
     "@assert_noalloc" => "@test_noalloc",
     "@assert_noboxing" => "@test_noboxing",
     "@assert_no_scalar_loops" => nothing,
-    "@assert_trim_safe" => "@test_trim_compatible",
     "@assert_trim_compatible" => "@test_trim_compatible",
     "@strict" => "@test_strict",
     "@kernel" => "@test_kernel",
@@ -32,6 +31,7 @@ const _REMOVED_API = (
     "exit_on_fail" => "removed — `audit` reports; StrictModeTest's `test_*` drivers gate",
     "set_ignore_barrier!" => "StrictModeTest.set_ignore_barrier!",
     "divergence_report" => "StrictModeTest.divergence_report",
+    "@assert_trim_safe" => "@assert_trim_compatible (same scan, the name that describes it)",
 )
 
 """

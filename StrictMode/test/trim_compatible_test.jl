@@ -18,8 +18,4 @@
     fr = proof_findings(unsafe_fn, (Int,); guarantees = (:trim_compatible,))
     @test fr[1].status === :fail
     @test occursin("juliac", fr[1].reason)                         # cites the real verifier, not the static heuristic
-
-    # back-compat: the static-only @assert_trim_safe / :trimsafe still work
-    @test (@assert_trim_safe safe_fn(3)) == 7
-    @test any(f -> f.status === :fail, findings(unsafe_fn, (Int,); guarantees = (:trimsafe,)))
 end

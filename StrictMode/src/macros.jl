@@ -129,7 +129,7 @@ end
 # Shared shape for a per-call guarantee macro that runs one check function against
 # `(target, checkfn, types, extra_args...)` and returns the call's own value unchanged — the
 # common pattern behind most `@assert_*` macros (`@assert_inlined`, `@assert_noboxing`,
-# `@assert_vectorized`, `@assert_no_scalar_loops`, `@assert_trim_safe`,
+# `@assert_vectorized`, `@assert_no_scalar_loops`, `@assert_trim_compatible`,
 # `@assert_trim_compatible`, `@assert_no_threadid_state`, `@assert_effects`). `extra_args` are
 # already-escaped expressions (e.g. an effects tuple) appended after `types`. Builds the
 # checked-path expression only — callers still wrap the result with `_gate(expr, esc(call))`
