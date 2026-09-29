@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.9
+
+Two false positives a consumer sees on its own code, both reported from
+UpdatableFactorizations.jl and both fixed.
+
+### A guarded call site no longer reports StrictMode's own reflection
+
+With checks enabled, a `@strict` or `@assert_*` site leaves a live `:invoke` of `_strict_scan` behind
+its per-site flag, and the scan recursed into it like any callee. A scan of the **enclosing** function
+then reported the scan's own allocation, boxing, dict lookup and union phi, so `@verify_strict`,
+`audit` and `@assert_noalloc` flagged kernels that are clean. Callees whose module root is StrictMode
+are now skipped — and not recorded as a barrier, since a barrier grants an allocation exemption
+elsewhere while StrictMode's presence in a body says nothing about the caller's own cost.
+
+### An error path is dead even when it is reached by a jump
+
+`ignore_throw()` discounts error paths, but the mask marked only the block that **ends** in the
+unreachable return. A `throw`'s message is usually built earlier, in a block that jumps there, so its
+`print_to_string` stayed live and the scan reported allocation for text no successful call builds. The
+mask now computes reachability: a statement is an error path when no path from it reaches a return
+carrying a value. Loops are unaffected — a statement is alive when *some* path from it returns.
+
+Measured on the report's own code (the QR `lowrankupdate!` keyword body, 1833 statements): of its five
+`print_to_string` invokes, the rank-deficiency message at statement 1571 was live under the old rule
+and is dead under this one, and the dead count goes from 156 to 316.
+
 ## 0.4.8
 
 ### A type-stability failure names the declaration to edit
