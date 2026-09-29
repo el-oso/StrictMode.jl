@@ -285,3 +285,74 @@ end
         @test sig(f, o).alloc
     end
 end
+
+@testitem "issue #32: a guarded call site does not report StrictMode's own reflection" begin
+    using StrictMode
+    kernel(a::Vector{Float64}, b::Vector{Float64}) = @inbounds a[1] * b[1] + a[2] * b[2]
+    guarded(a::Vector{Float64}, b::Vector{Float64}) = @strict kernel(a, b)
+    a = rand(4)
+    b = rand(4)
+    guarded(a, b)
+    tt = (Vector{Float64}, Vector{Float64})
+    # The first `@allocated` compiles its own measuring closure, and that lands inside the measured
+    # window (~157 kB, identical with and without `--check-bounds=yes`); every later call is 0. So one
+    # measurement is discarded before the assertion, and both come before the `code_typed` below —
+    # reflection on `guarded` makes the next call to it pay a recompilation cost as well.
+    @allocated guarded(a, b)
+    @test iszero(@allocated guarded(a, b))
+
+    # With checks enabled the site leaves a live `:invoke` of `_strict_scan` behind its per-site flag.
+    # Recursing into it reported the scan's own allocation, boxing, dict lookup and union phi against
+    # the ENCLOSING function, which is how `@verify_strict`/`audit` flagged clean kernels.
+    @test any(Base.code_typed(guarded, tt)[1][1].code) do st
+        Meta.isexpr(st, :invoke) || return false
+        mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+        mi isa Core.MethodInstance && mi.def isa Method && mi.def.name === :_strict_scan
+    end
+    for s in (StrictMode._alloc_signals(kernel, tt), StrictMode._alloc_signals(guarded, tt))
+        @test !s.alloc
+        @test !s.boxing
+        @test !s.dictlookup
+        @test !s.unionphi
+        # Not a barrier either: `barrier = true` grants an allocation exemption elsewhere, and
+        # StrictMode's presence in a body says nothing about the caller's own allocations.
+        @test !s.barrier
+    end
+end
+
+@testitem "issue #33: an error path is dead even when it is reached by a jump" begin
+    using StrictMode
+    # The shape the per-block mask missed: the `throw`'s message is built in a block that JUMPS to
+    # the block holding the throw, so only the terminator block was marked and `print_to_string`
+    # stayed live — the scan then reported allocation for text no successful call builds.
+    code = Any[
+        Expr(:call, GlobalRef(Base, :<), Core.Argument(2), 1),
+        Core.GotoIfNot(Core.SSAValue(1), 6),
+        Expr(:call, GlobalRef(Base, :getindex), Core.Argument(3), 1),
+        Core.ReturnNode(Core.SSAValue(3)),        # the only normal return
+        Core.GotoNode(6),
+        Expr(:invoke, nothing, GlobalRef(Base, :print_to_string), Core.Argument(2)),
+        Core.GotoNode(8),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(6)),
+        Core.ReturnNode(),                        # unreachable
+    ]
+    dead = StrictMode._deadend_mask(code)
+    @test findall(!, dead) == [1, 2, 3, 4]        # only the returning path is live
+    @test dead[6]                                 # the message build
+    @test dead[8]                                 # the throw itself
+    @test !dead[4]
+
+    # A loop is not an error path: every statement can still reach the return.
+    loop = Any[
+        Expr(:call, GlobalRef(Base, :+), Core.Argument(2), 1),
+        Core.GotoIfNot(Core.SSAValue(1), 4),
+        Core.GotoNode(1),
+        Core.ReturnNode(Core.SSAValue(1)),
+    ]
+    @test !any(StrictMode._deadend_mask(loop))
+
+    # A body that cannot return at all is entirely an error path.
+    always = Any[Expr(:call, GlobalRef(Core, :throw), 1), Core.ReturnNode()]
+    @test all(StrictMode._deadend_mask(always))
+    @test isempty(StrictMode._deadend_mask(Any[]))
+end

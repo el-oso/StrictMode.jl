@@ -214,6 +214,19 @@ _is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f)
 # parameter 2, not 1 (verified against the actual optimized IR, not assumed).
 _is_base_barrier_type(@nospecialize(p)) = p isa Type && any(bt -> p <: bt, _BASE_BARRIER_TYPES)
 
+# StrictMode's own machinery, reached from a guarded call site. With checks enabled a `@strict` or
+# `@assert_*` site leaves a live `:invoke` of `_strict_scan` behind its per-site flag, and recursing
+# into it reports the scan's OWN reflection — allocation, boxing, a dict lookup and a union phi —
+# against the function under test (issue #32). Those costs belong to the tool, run once per site, and
+# vanish with `disable_checks!()`. The proof tier drops the same frame by name (`_GUARD_FRAME` in
+# StrictModeTest); this is the value-free scan's half.
+#
+# `moduleroot` rather than `=== StrictMode`, so a submodule counts too, and the whole package is
+# excluded rather than one function name: every entry point a guard can reach (`_fail`, `findings`,
+# `_alloc_signals` itself) is equally not the caller's cost.
+_mi_is_strictmode(mi::Core.MethodInstance) =
+    mi.def isa Method && Base.moduleroot(mi.def.module) === @__MODULE__
+
 function _mi_is_barrier(mi::Core.MethodInstance)
     st = mi.specTypes
     st isa DataType || return false
@@ -410,18 +423,48 @@ end
 # (real allocations, but never taken on the success path), and the proof doesn't count them, so the
 # scan must not either. A region is [previous terminator + 1 .. terminator]; it is dead-end
 # when its terminator is `ReturnNode()` with no value (= unreachable, i.e. after a throw).
+# Statements from which NO path reaches a normal return: the error paths `ignore_throw()` discounts.
+#
+# Reachability, not a per-block spelling. The block that ends in the unreachable `return` is only the
+# last one on such a path; a `throw`'s message is usually built earlier, in a block that merely JUMPS
+# there, and marking only the terminator block left an interpolated message live — so the scan
+# reported `print_to_string`'s allocation for text no successful call ever builds (issue #33).
+#
+# `alive` is seeded at every `ReturnNode` carrying a value and propagated BACKWARD to predecessors
+# until it stops growing. A loop cannot fool it: a statement is alive when *some* path from it returns,
+# which is exactly what backward propagation from the returns computes, and everything left over
+# leads only to a throw or to an unreachable terminator.
 function _deadend_mask(code::Vector{Any})
-    dead = falses(length(code))
-    start = 1
+    n = length(code)
+    iszero(n) && return falses(0)
+    preds = [Int[] for _ in 1:n]
+    alive = falses(n)
     for (i, st) in enumerate(code)
-        if st isa Core.ReturnNode || st isa Core.GotoNode || Meta.isexpr(st, :gotoifnot) || st isa Core.GotoIfNot
-            if st isa Core.ReturnNode && !isdefined(st, :val)
-                dead[start:i] .= true
-            end
-            start = i + 1
+        if st isa Core.ReturnNode
+            isdefined(st, :val) && (alive[i] = true)     # a normal return: the one live exit
+        elseif st isa Core.GotoNode
+            1 <= st.label <= n && push!(preds[st.label], i)
+        elseif st isa Core.GotoIfNot
+            1 <= st.dest <= n && push!(preds[st.dest], i)
+            i < n && push!(preds[i + 1], i)
+        elseif Meta.isexpr(st, :gotoifnot)
+            t = st.args[2]
+            t isa Integer && 1 <= t <= n && push!(preds[t], i)
+            i < n && push!(preds[i + 1], i)
+        elseif i < n
+            push!(preds[i + 1], i)                       # falls through
         end
     end
-    return dead
+    work = [i for i in 1:n if alive[i]]
+    while !isempty(work)
+        for p in preds[pop!(work)]
+            if !alive[p]
+                alive[p] = true
+                push!(work, p)
+            end
+        end
+    end
+    return map(!, alive)
 end
 
 # Session memo for the per-signature scan: the callee recursion re-visits shared helpers (Base
@@ -695,7 +738,12 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                 a1 = st.args[1]
                 mi = a1 isa Core.CodeInstance ? a1.def : a1
                 if mi isa Core.MethodInstance
-                    if _mi_is_barrier(mi)
+                    if _mi_is_strictmode(mi)
+                        # A guard the caller's own macros left behind: skipped entirely, not treated
+                        # as a barrier. A barrier records `barrier = true`, which grants an allocation
+                        # exemption elsewhere; StrictMode's presence in a body says nothing about
+                        # whether the caller's own code allocates, so it must leave no trace at all.
+                    elseif _mi_is_barrier(mi)
                         # The callee itself IS a recognized barrier (e.g. `(::OncePerProcess)()`,
                         # or a directly-registered function) — its one-time cold-path allocation
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
