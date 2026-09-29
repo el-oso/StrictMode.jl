@@ -88,6 +88,16 @@ GitHub issues are the source of truth for anything with a number; the notes here
   corpus and no longer reproduce. The gap they describe is structural — typed IR before LLVM against
   LLVM IR after it — and can return on other code, which is why this stays open.
 
+
+  *A recurring shape, measured 2026-09-30 in UpdatableFactorizations.jl.* An in-place broadcast
+  (`r ./= rho`) compiles to `Base.materialize!`, which keeps an `unalias` copy branch — `memorynew`
+  plus a `%new(Matrix{Float64})` — that never runs when source and destination are the same array.
+  The scan sees the statements, not the aliasing, so it reports `alloc`. The same shape appeared in
+  three places there (`r ./= rho`, `z ./= g`); rewriting them as explicit loops made the enclosing
+  keyword body scan `alloc = false`. Worth knowing before chasing an `alloc` finding on a body whose
+  only suspect is an in-place broadcast: `@test_noalloc` is the arbiter, and a `.=` over a
+  self-aliased array is a false positive by construction rather than a rule that can be tightened.
+
   The rule shipped one regression, fixed in 0.4.5: optimized IR may name a `:new`'s type with a
   `GlobalRef` (`%new(Base.ComplexF64, …)`), and an unresolved name counted as an allocation, which
   flagged 6 `ComplexF64` LAPACK routines that allocate nothing. `_new_type` resolves the name first.
