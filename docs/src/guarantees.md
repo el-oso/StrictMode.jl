@@ -138,7 +138,7 @@ site, and disappears with [`disable_checks!`](@ref). They are not treated as a o
 either — a barrier grants an allocation exemption, and StrictMode's presence says nothing about whether
 your code allocates.
 
-**Error paths**, while [`ignore_throw`](@ref) is `true` (the default). That means every statement from
+**Error paths**, while [`StrictMode.ignore_throw`](@ref) is `true` (the default). That means every statement from
 which no path reaches a `return` carrying a value, not just the `throw`: the message an
 `ArgumentError("… $x …")` builds is usually assembled in an earlier block that jumps to the throw, and
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
