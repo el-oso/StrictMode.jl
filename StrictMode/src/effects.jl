@@ -398,10 +398,16 @@ const _IGNORE_THROW = Ref(true)
 """
     ignore_throw() -> Bool
 
-Whether allocation analysis ignores allocations on never-taken throw branches — a `BoundsError`
-construction and the like (default `true`). Hot-path semantics: a runtime-zero-alloc kernel with
-bounds checks is not a violation. Both tiers honor it, so the scan and `StrictModeTest`'s
-AllocCheck proof answer the same question. See [`set_ignore_throw!`](@ref).
+Whether allocation analysis ignores allocations on an error path — a `BoundsError` construction and
+the like (default `true`). Hot-path semantics: a runtime-zero-alloc kernel with bounds checks is not a
+violation. Both tiers honor it, so the scan and `StrictModeTest`'s AllocCheck proof answer the same
+question. See [`set_ignore_throw!`](@ref).
+
+An error path is every statement from which no path reaches a `return` carrying a value — not only the
+`throw` itself. An interpolated message is usually built one block earlier, in a block that jumps to
+the throw, so counting only the throw's own block reported `print_to_string`'s allocation for text no
+successful call ever builds. A loop is never an error path: a statement is live when *some* path from
+it returns.
 """
 ignore_throw() = _IGNORE_THROW[]
 
