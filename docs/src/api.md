@@ -59,8 +59,10 @@ McaReport
 ## Static-binary compatibility
 
 Tools for checking compatibility with `juliac --trim=safe`. `@assert_trim_compatible` **reports**;
-juliac's authoritative `verify_typeinf_trim` verifier is `StrictModeTest`'s
-`@test_trim_compatible`, which gates. The reactive `explain_trim` translates a real build log.
+`StrictModeTest`'s `@test_trim_compatible` gates, running juliac's own `verify_typeinf_trim`
+verifier — against **stock** Base by default, and against the patched Base juliac itself compiles
+once `StrictModeTest.set_juliac_patches!(true)` is on. A rejection says which of the two it came
+from, because only the second is a juliac verdict. The reactive `explain_trim` translates a real build log.
 
 The static-scan path has one known coverage gap it can't heuristically close without
 false-positiving on safe code: N simultaneous small-`Union` arguments whose specialization count

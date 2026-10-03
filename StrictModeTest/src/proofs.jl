@@ -280,8 +280,10 @@ session keeps its logging: `juliac-trim-base.jl` stubs `Base.CoreLogging.current
 which silences every `@warn` and `@info` in whatever process applies it, and that process is now a
 throwaway child.
 
-The child costs a Julia start and a package load per verification, which is why this is off by
-default rather than always on. A signature whose function cannot be reached in a fresh process —
+The child costs a Julia start, a package load and a patch application, paid once per **gate**:
+`test_signatures`, `test_compiled` and `test_registered` verify every signature they cover in a
+single child. A verification outside a gate — `@test_trim_compatible`, or `proof_findings` called
+directly — pays for a child of its own, which is why this is off by default rather than always on. A signature whose function cannot be reached in a fresh process —
 a closure, or something defined in a module the child cannot load — falls back to unpatched
 in-process verification with a warning naming the reason.
 

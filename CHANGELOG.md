@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.10
+
+Four defects in trim verification, all reachable from one gate.
+
+### A verdict names the oracle that produced it
+
+A trim rejection reported itself as `juliac --trim=safe`, and the suggestion called it
+authoritative. By default the verifier runs against **stock** Base while juliac compiles a patched
+one, so such a rejection can name a construct juliac accepts — and the message sent readers to
+rewrite working code. A failure now names the oracle it came from, and a stock verdict points at
+`StrictModeTest.set_juliac_patches!(true)` for the question it did not answer.
+
+### The patched child verifies a whole gate, not one signature
+
+Each signature spawned its own Julia process, paying a start, a package load and a patch
+application every time. `test_signatures`, `test_compiled` and `test_registered` now verify every
+signature they cover in one child. Each signature travels in its own file and is read inside a
+`try`, so a function the child cannot resolve costs that one verdict rather than the whole run's.
+
+### The child loads the modules a signature needs
+
+It loaded `parentmodule(f)` — the module that *declared* the generic, not the one that defined the
+method. A package extending another package's generic therefore sent the child a module that
+cannot resolve the argument types the extending package owns, and the child died deserializing its
+own input, falling back to the stock verdict it was spawned to replace. The method's own module and
+every module each argument type's spelling depends on are now loaded, each named by the package
+`using` can load.
+
+### A finding carries the rejected call site
+
+The site was shown as a bare file name and the finding's own `file`/`line` named the function under
+test, so output could not reveal that the rejected construct lived in a dependency — where no
+rewrite of the signature can change the verdict. The path is kept whole, and the finding points at
+the site.
+
 ## 0.4.9
 
 Two false positives a consumer sees on its own code, both reported from
