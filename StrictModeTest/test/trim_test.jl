@@ -169,9 +169,11 @@ end
     try
         StrictModeTest.set_juliac_patches!(true)
 
-        # A Base function is reachable in a fresh child, so this really takes the subprocess path.
+        # Base functions are reachable in a fresh child, so this really takes the subprocess path.
+        # Two signatures in one call: the child process is per CALL, not per signature, and the cost
+        # of a trim gate is one Julia start either way.
         # `nothing` means it declined to answer — the child failed, or ran without the patches.
-        r = StrictModeTest._trim_validate_subprocess(abs, Any[Int])
+        r = StrictModeTest._trim_validate_subprocess([(abs, Any[Int]), (sqrt, Any[Float64])])
         if isnothing(r)
             # Declining is legitimate only when there is nothing to isolate — juliac ships no patch
             # files on some builds (1.13.0-rc4). Any other cause is a real failure, so the child's
@@ -183,7 +185,8 @@ end
                     StrictModeTest._TRIM_CHILD_STDERR[]
             )
         else
-            @test r == (true, String[])
+            @test length(r) == 2                    # one child, both verdicts
+            @test all(v -> v == (true, String[], Tuple{String, Int}[]), r)
         end
 
         # The point of the whole change: applying juliac's patches stubs
@@ -243,4 +246,71 @@ end
     # why `direct_dependency` reads the `Base.ACTIVE_PROJECT` slot directly.
     ok3, why3 = StrictModeTest._trim_validate(StrictMode.direct_dependency, ())
     @test ok3 || error("direct_dependency is not trim-clean:\n  " * join(why3, "\n  "))
+end
+
+@testitem "the child loads the modules a signature needs, not the function's own" begin
+    using StrictMode, StrictModeTest
+    # A package that extends another package's generic has `parentmodule(f)` pointing at the package
+    # that DECLARED the generic. Loading only that leaves the child unable to deserialize an
+    # argument type the extending package owns, and it then falls back to the stock verdict it was
+    # spawned to replace — after paying for a cold Julia start.
+    @test isempty(StrictModeTest._push_module!(Symbol[], parentmodule(show)))
+    @test :StrictMode in StrictModeTest._trim_child_modules(show, Any[IO, StrictMode.StrictFinding])
+
+    # An argument type's own package, including through a wrapper and in either parameter position.
+    @test StrictModeTest._trim_child_modules(identity, Any[Vector{StrictMode.StrictFinding}]) == [:StrictMode]
+    both = StrictModeTest._trim_child_modules(
+        identity, Any[Dict{StrictMode.StrictFinding, StrictModeTest.StrictDivergence}]
+    )
+    @test :StrictMode in both && :StrictModeTest in both
+
+    # Base and Core are loaded already; a submodule is named by the package `using` can load.
+    @test isempty(StrictModeTest._trim_child_modules(identity, Any[Int, Vector{Float64}]))
+    @test StrictModeTest._push_module!(Symbol[], StrictMode.Preferences) == [:Preferences]
+
+    # One child for the whole list: every signature's file and every module in one script.
+    script = StrictModeTest._trim_subprocess_script(["/tmp/a", "/tmp/b"], "/tmp/out", [:Foo, :Bar])
+    @test occursin("using Foo", script) && occursin("using Bar", script)
+    @test occursin("/tmp/a", script) && occursin("/tmp/b", script)
+    @test occursin("for __path", script)                 # a loop, not one child per signature
+
+    # The gate hands over exactly the signatures that asked for the guarantee.
+    sigs = StrictModeTest._trim_sigs(
+        Any[(identity, (Int,), (:noalloc,)), (identity, (Float64,), (:trim_compatible, :noalloc))]
+    )
+    @test sigs == [(identity, Any[Float64])]
+end
+
+@testitem "a trim verdict names the oracle that produced it, and the rejected site" begin
+    using StrictMode, StrictModeTest
+    # Reading "juliac --trim=safe" on a verdict reached against STOCK Base sends a reader to rewrite
+    # code juliac compiles clean. The stock message must not claim juliac, and must say what would.
+    stock = StrictModeTest._trim_reason(:stock, ["some call"])
+    @test !occursin("juliac --trim=safe", stock)
+    @test occursin("stock Base", stock) && occursin("set_juliac_patches!(true)", stock)
+    @test occursin("juliac --trim=safe", StrictModeTest._trim_reason(:patched, ["some call"]))
+
+    # The site, with its directory intact: a construct reached through a dependency is otherwise
+    # indistinguishable from one in the package under test.
+    path, io = mktemp()
+    write(io, "reflecty_sited(x::Int) = length(Base.return_types(sin, (Float64,)))\n")
+    close(io)
+    try
+        include(path)
+        Base.@invokelatest reflecty_sited(1)
+        f = Base.@invokelatest getfield(@__MODULE__, :reflecty_sited)
+        passed, fnds, sites = StrictModeTest._trim_validate_here(f, Any[Int])
+        @test !passed
+        @test !isempty(sites)
+        @test any(s -> first(s) == path, sites)
+        @test any(s -> occursin(dirname(path), s), fnds)      # the whole path, not its basename
+
+        # …and the finding carries that site rather than the signature that reached it.
+        got = StrictModeTest.proof_findings(f, (Int,); guarantees = (:trim_compatible,))
+        @test length(got) == 1
+        @test StrictMode._failed(only(got))
+        @test only(got).file == path
+    finally
+        rm(path; force = true)
+    end
 end

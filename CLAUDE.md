@@ -117,6 +117,12 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
   src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _opt_reports (JET,
                         wrapped in AnalysisError), _trim_validate (TrimCheck), _proof_findings/
                         proof_findings, ignore_barrier/set_ignore_barrier!
+                        _trim_validate returns (passed, findings, sites, ORACLE): :patched is the
+                        program juliac compiles, verified in one child per gate (_trim_batch!/
+                        _TRIM_BATCH, filled by _gate); :stock is this session's Base. _trim_reason
+                        names which, because a stock rejection is not a juliac rejection.
+                        _trim_child_modules resolves what the child must load — the METHOD's module
+                        and each argument type's, not parentmodule(f)
   src/macros.jl       — @test_noalloc/@test_noboxing/@test_typestable/@test_trim_compatible.
                         Deliberately NOT wrapped in _gate: a gate that compiles itself away under
                         a preference is a gate that can vanish silently

@@ -354,41 +354,120 @@ end
 # to the old answer, never to a FAIL.
 const _TRIM_CHILD_STDERR = Ref("")
 
-function _trim_subprocess_script(in_path::String, out_path::String, modname::Union{Nothing, Symbol})
-    load = isnothing(modname) ? "" : """
-        try
-            @eval using $modname
-        catch
-        end
-        """
+# Every module the child must load to resolve a signature. The method's own module, not the
+# function's: a package that extends another package's generic has `parentmodule(f)` pointing at
+# the package that DECLARED the generic, which cannot resolve an argument type the extending
+# package owns — the child then dies deserializing its own input. Submodules map to their root
+# package, because that is what `using` can load.
+function _trim_child_modules(@nospecialize(f), argtypes::Vector)
+    mods = Symbol[]
+    _push_module!(mods, parentmodule(f))
+    try
+        _push_module!(mods, which(f, Tuple{argtypes...}).module)
+    catch
+    end
+    for T in argtypes
+        _push_type_modules!(mods, T)
+    end
+    return mods
+end
+
+function _push_module!(mods::Vector{Symbol}, m)
+    m isa Module || return mods
+    root = Base.moduleroot(m)
+    (root === Main || root === Base || root === Core) && return mods
+    name = nameof(root)
+    name in mods || push!(mods, name)
+    return mods
+end
+
+# Every module a type's spelling depends on, parameters included: `Vector{Workspace}` resolves in
+# the child only if the package owning `Workspace` is loaded, and a parameter can come from a
+# different package than its wrapper.
+function _push_type_modules!(mods::Vector{Symbol}, @nospecialize(T), depth::Int = 0)
+    depth > 8 && return mods
+    T isa Type || return mods
+    base = Base.unwrap_unionall(T)
+    base isa DataType || return mods
+    _push_module!(mods, parentmodule(base))
+    for P in base.parameters
+        _push_type_modules!(mods, P, depth + 1)
+    end
+    return mods
+end
+
+function _trim_subprocess_script(in_paths::Vector{String}, out_path::String, modnames::Vector{Symbol})
+    load = join(
+        [
+            """
+            try
+                @eval using $name
+            catch
+            end
+            """ for name in modnames
+        ], "\n"
+    )
     # Only `StrictModeTest` is loaded by name. `Serialization` is reached through it rather than
     # with a `using` of its own: under `Pkg.test()` the child runs in the temporary test
     # environment, where Serialization is a dependency of this package but not a direct dependency
     # of that environment — so `using Serialization` there is an ArgumentError.
+    #
+    # One child verifies every signature it is given. Starting Julia, loading the packages and
+    # applying the patches is the whole cost, and it is the same cost for fifty signatures as for
+    # one. Each signature is read from its own file inside a `try`, so a function the child cannot
+    # resolve costs that one signature its verdict rather than the whole run's.
     return """
     using StrictModeTest
     $load
-    __f, __types = StrictModeTest.deserialize($(repr(in_path)))
     StrictModeTest.set_juliac_patches!(true)
     __patched = StrictModeTest._apply_juliac_patches()
-    __passed, __findings = StrictModeTest._trim_validate_here(__f, __types)
-    StrictModeTest.serialize($(repr(out_path)), (__patched, __passed, __findings))
+    __results = Any[]
+    for __path in $(repr(in_paths))
+        __r = try
+            __f, __types = StrictModeTest.deserialize(__path)
+            StrictModeTest._trim_validate_here(__f, __types)
+        catch
+            nothing
+        end
+        push!(__results, __r)
+    end
+    StrictModeTest.serialize($(repr(out_path)), (__patched, __results))
     """
 end
 
-function _trim_validate_subprocess(@nospecialize(f), argtypes::Vector)
-    # Both handles are closed before the temp files are removed. Windows refuses to unlink a file
-    # that is still open (EBUSY), where Linux and macOS allow it — so dropping `mktemp`'s IO on the
-    # floor is a leak that only ever fails on one platform.
-    in_path, in_io = mktemp()
+"""
+    _trim_validate_subprocess(sigs::Vector) -> Union{Nothing, Vector}
+
+Verify every `(f, argtypes)` in `sigs` against juliac's patched Base, in ONE child process.
+
+Returns a vector parallel to `sigs` holding each verdict, with `nothing` for a signature the child
+could not resolve — or `nothing` for the whole call when the child failed outright or ran on a
+build shipping no juliac patches, since that verdict would carry the very false-FAIL class this
+path exists to remove.
+"""
+function _trim_validate_subprocess(sigs::Vector)
+    isempty(sigs) && return nothing
+    in_paths = String[]
     out_path, out_io = mktemp()
     close(out_io)
     try
-        serialize(in_io, (f, argtypes))
-        close(in_io)
-        m = parentmodule(f)
-        modname = (m === Main || m === Base || m === Core) ? nothing : nameof(m)
-        script = _trim_subprocess_script(in_path, out_path, modname)
+        for (f, argtypes) in sigs
+            path, io = mktemp()
+            # Windows refuses to unlink a file that is still open (EBUSY), where Linux and macOS
+            # allow it — so dropping `mktemp`'s IO on the floor is a leak that only ever fails on
+            # one platform.
+            try
+                serialize(io, (f, argtypes))
+            finally
+                close(io)
+            end
+            push!(in_paths, path)
+        end
+        mods = Symbol[]
+        for (f, argtypes) in sigs, name in _trim_child_modules(f, argtypes)
+            name in mods || push!(mods, name)
+        end
+        script = _trim_subprocess_script(in_paths, out_path, mods)
         cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script`
         # The child's stderr is kept, not discarded: when it fails, that text is the only account of
         # why, and a silent decline here reads identically to "juliac ships no patches on this
@@ -400,40 +479,69 @@ function _trim_validate_subprocess(@nospecialize(f), argtypes::Vector)
             return nothing
         end
         r = open(deserialize, out_path)
-        r isa Tuple{Bool, Bool, Vector{String}} || return nothing
-        patched, passed, findings = r
+        r isa Tuple{Bool, Vector} || return nothing
+        patched, results = r
         # The child ran, but without the patches — juliac ships none on some builds (1.13.0-rc4).
-        # That verdict came from stock Base, so it carries the false-FAIL class this whole path
-        # exists to remove, and must not be returned as though it did not.
         patched || return nothing
-        return (passed, findings)
+        length(results) == length(sigs) || return nothing
+        return results
     catch
         return nothing
     finally
-        # `close` is a no-op on an already-closed stream, and matters on the path where `serialize`
-        # threw before the close above. Cleanup itself is best-effort: a temp file that outlives the
-        # call is untidy, not a reason to fail a verification that already has its answer.
-        close(in_io)
+        for path in in_paths
+            try
+                rm(path; force = true)
+            catch
+            end
+        end
         try
-            rm(in_path; force = true)
             rm(out_path; force = true)
         catch
         end
     end
 end
 
+# Verdicts for a whole gate, keyed by signature. `_gate` fills this before any finding is computed
+# and empties it afterwards, so one child process serves every signature in the gate instead of one
+# each. A miss is not a failure: the signature is then verified on its own.
+const _TRIM_BATCH = Dict{Tuple{Any, Vector{Any}}, Any}()
+
+_argtypes(@nospecialize(types)) =
+    (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
+
+function _trim_batch!(sigs::Vector)
+    empty!(_TRIM_BATCH)
+    (_JULIAC_PATCHES[] && !isempty(sigs)) || return _TRIM_BATCH
+    results = _trim_validate_subprocess(sigs)
+    isnothing(results) && return _TRIM_BATCH
+    for (i, sig) in enumerate(sigs)
+        isnothing(results[i]) || (_TRIM_BATCH[sig] = results[i])
+    end
+    return _TRIM_BATCH
+end
+
+"""
+    _trim_validate(f, types) -> (passed, findings, sites, oracle)
+
+`oracle` names what produced the verdict, and callers must report it rather than claim juliac:
+`:patched` is the program `juliac --trim=safe` compiles, verified in a child; `:stock` is the
+TrimCheck verifier against this session's own Base, which rejects some code juliac builds clean
+(issue #19).
+"""
 function _trim_validate(@nospecialize(f), @nospecialize(types))
-    argtypes = (types isa Type && types <: Tuple) ? collect(types.parameters) : collect(types)
+    argtypes = _argtypes(types)
     if _JULIAC_PATCHES[]
-        r = _trim_validate_subprocess(f, argtypes)
-        isnothing(r) || return r
+        cached = get(_TRIM_BATCH, (f, argtypes), nothing)
+        isnothing(cached) || return (cached..., :patched)
+        r = _trim_validate_subprocess([(f, argtypes)])
+        isnothing(r) || isnothing(r[1]) || return (r[1]..., :patched)
         @warn "StrictModeTest: could not run the patched trim verification in a subprocess for " *
             "`$(nameof(f))` (a closure, a function the child cannot load, or a build shipping no " *
             "juliac patches). Falling back to STOCK Base in this process, which rejects some code " *
             "juliac builds clean — a failure here may be a false alarm (issue #19)." *
             (isempty(_TRIM_CHILD_STDERR[]) ? "" : "\n  child stderr: " * first(_TRIM_CHILD_STDERR[], 500)) maxlog = 3
     end
-    return _trim_validate_here(f, argtypes)
+    return (_trim_validate_here(f, argtypes)..., :stock)
 end
 
 # The verification itself, in whatever process calls it. The child runs this with the patches
@@ -445,7 +553,7 @@ function _trim_validate_here(@nospecialize(f), argtypes::Vector)
             false, [
                 "could not infer a single concrete return type ($(length(rts)) results); " *
                     "trim verification needs a fully-inferred signature",
-            ],
+            ], Tuple{String, Int}[],
         )
     end
     ret_type = rts[1]
@@ -458,7 +566,7 @@ function _trim_validate_here(@nospecialize(f), argtypes::Vector)
                 [Base.get_world_counter()],
             )
         end
-        return (true, String[])
+        return (true, String[], Tuple{String, Int}[])
     catch err
         err isa TrimCheck.TrimVerificationErrors && return _trim_verdict(err)
         rethrow(err)
@@ -466,12 +574,15 @@ function _trim_validate_here(@nospecialize(f), argtypes::Vector)
 end
 
 """
-    _trim_verdict(err::TrimVerificationErrors) -> (passed::Bool, findings::Vector{String})
+    _trim_verdict(err::TrimVerificationErrors) -> (passed, findings, sites)
 
 Classify what the verifier raised. `err.errors` is a `Vector{Pair{Bool, Any}}` whose `Bool` is
 `warn`, and **juliac's own gate fails only on the non-warning entries** — so treating every entry as
 a failure reds signatures juliac itself would build (issue #20). A raise carrying nothing but
 warnings is a PASS here.
+
+`sites` carries each rejected call site as `(file, line)` so a finding can point at the construct
+instead of at the signature that reached it.
 
 Split out from `_trim_validate` so the classification can be tested against hand-built
 `TrimVerificationErrors` values — provoking a warnings-only raise from a real signature is not
@@ -483,7 +594,7 @@ function _trim_verdict(err)
     if isempty(real)
         nwarn > 0 && @info "StrictModeTest: juliac's trim verifier raised $nwarn warning(s) for this " *
             "signature and no errors — juliac's own gate accepts that, so this is a PASS." maxlog = 3
-        return (true, String[])
+        return (true, String[], Tuple{String, Int}[])
     end
     # Route the verifier output through TypeContracts' `TrimDiagnostics` — the same parser
     # `explain_trim` uses — for deduplicated, source-mapped sites (statement + user frame), instead
@@ -501,20 +612,44 @@ function _trim_verdict(err)
     end
     tf = TypeContracts.explain_trim_failure(raw)
     if !tf.recognized || isempty(tf.sites)
-        return (false, ["juliac --trim=safe rejected this signature ($(length(real)) error(s); verifier output not recognized)"])
+        return (
+            false,
+            ["the trim verifier rejected this signature ($(length(real)) error(s); verifier output not recognized)"],
+            Tuple{String, Int}[],
+        )
     end
     findings = String[]
+    sites = Tuple{String, Int}[]
     for s in tf.sites
-        # frames are innermost-first ⇒ the outermost frame is the user-relevant call site.
-        loc = isempty(s.frames) ? "" :
-            "  [" * basename(last(s.frames).file) * ":" * string(last(s.frames).line) * "]"
-        push!(findings, s.statement * loc)
+        # frames are innermost-first ⇒ the outermost frame is the user-relevant call site. The whole
+        # path is kept, not its basename: a construct reached through a dependency is otherwise
+        # indistinguishable from one in the package under test, and the two call for opposite
+        # responses.
+        if isempty(s.frames)
+            push!(findings, s.statement)
+            continue
+        end
+        frame = last(s.frames)
+        file, line = string(frame.file), Int(frame.line)
+        push!(findings, s.statement * "  [" * file * ":" * string(line) * "]")
+        push!(sites, (file, line))
     end
     if length(findings) > 8
         extra = length(findings) - 8
         findings = vcat(findings[1:8], ["… (+$extra more call site(s))"])
     end
-    return (false, findings)
+    return (false, findings, sites)
+end
+
+# Name the oracle in the failure text. A verdict from stock Base is not a juliac verdict: juliac
+# compiles a patched Base, so a rejection here can be a construct juliac accepts (issue #19), and a
+# message claiming otherwise sends a reader to rewrite correct code.
+function _trim_reason(oracle::Symbol, fnds::Vector{String})
+    joined = join(fnds, "; ")
+    oracle === :patched && return "trim-incompatible (juliac --trim=safe, patched Base): " * joined
+    return "trim-incompatible (TrimCheck verifier, stock Base, in-process): " * joined *
+        " — juliac compiles a patched Base this did not check; " *
+        "`StrictModeTest.set_juliac_patches!(true)` verifies the patched program"
 end
 
 # ── the proof engine ─────────────────────────────────────────────────────────────────────────────
@@ -576,17 +711,20 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
                 )
             end
         elseif g === :trim_compatible
-            passed, fnds = _trim_validate(f, Tuple{types...})
+            passed, fnds, sites, oracle = _trim_validate(f, Tuple{types...})
+            # The rejected call site, where there is one, rather than the signature that reached it:
+            # the construct frequently lives in a dependency, and a finding pointing at the function
+            # under test cannot say so — a rewrite there would not change the verdict.
             m = try
                 which(f, types)
             catch
                 nothing
             end
+            file = isempty(sites) ? (isnothing(m) ? "" : string(m.file)) : sites[1][1]
+            line = isempty(sites) ? (isnothing(m) ? 0 : Int(m.line)) : sites[1][2]
             push!(
                 out, StrictMode._mkfinding(
-                    md, fn, sg, g, !passed,
-                    "trim-incompatible (juliac --trim=safe): " * join(fnds, "; "),
-                    isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line)
+                    md, fn, sg, g, !passed, _trim_reason(oracle, fnds), file, line
                 )
             )
         else
