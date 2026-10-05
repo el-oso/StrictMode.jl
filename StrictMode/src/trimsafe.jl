@@ -75,7 +75,8 @@ end
 # `_union_split_findings` covers the class the base scan misses, but the scan as a whole is still
 # not the verifier: it models neither juliac.s wider reachability analysis nor the Base patches
 # juliac applies before trim inference. A PASS reached only through it therefore gets a one-time
-# session note, so a fast dev loop that never runs TrimCheck is not left reading a bare green.
+# session note, so a fast dev loop that never runs TrimCheck is not left reading a bare green. The
+# note is addressed to whoever runs that loop, so it is not emitted while generating output.
 # `status`/`reason` on the structured `StrictFinding` are deliberately left untouched (a heuristic
 # PASS stays `:pass` with an empty reason, matching every other guarantee and the existing
 # back-compat contract) — this is macro-path-only visibility, not a findings/check API change.
@@ -92,7 +93,11 @@ const _TRIM_HEURISTIC_CAVEAT = "StrictMode: this trim-safety PASS is from the st
 function _assert_trim_compatible(target, @nospecialize(f), @nospecialize(types::Tuple))
     r = _trim_report(f, types)
     if r.passed
-        @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
+        # Not while generating output: `maxlog = 1` counts per process, so a package asserting at
+        # precompile emits the note once per package per consumer rather than once per session, to
+        # a developer who is not there to read it. The same gate keeps the tier banner and the
+        # type-stability report out of build output.
+        iszero(ccall(:jl_generating_output, Cint, ())) && @info _TRIM_HEURISTIC_CAVEAT maxlog = 1
         return nothing
     end
     _fail(
@@ -123,8 +128,9 @@ for a real build failure, is [`explain_trim`](@ref).
 
 !!! note "a PASS here is still not the verifier"
     The scan models neither juliac's full reachability analysis nor the Base patches juliac applies
-    before trim inference, so a PASS logs a one-time session note saying so.
-    `StrictModeTest.@test_trim_compatible` runs the real verifier.
+    before trim inference, so a PASS logs a one-time session note saying so — in a session, not
+    while generating output, so a package asserting at precompile does not hand the note to every
+    consumer who builds it. `StrictModeTest.@test_trim_compatible` runs the real verifier.
 """
 macro assert_trim_compatible(args...)
     pos, opts = _macro_call(args, (:types,))

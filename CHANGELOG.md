@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.11
+
+### The heuristic trim note stays out of precompile output
+
+A `@assert_trim_compatible` PASS notes that the static scan is not juliac's verifier. A package
+that asserts at precompile — so inference sees its whole call graph before the module closes —
+therefore handed that note to everyone who built it, once per package, since `maxlog = 1` counts
+per process and each precompile is a fresh one. The note is now emitted only outside output
+generation, the same gate the tier banner and the type-stability report already use. A developer
+calling the macro in a session or a test still gets it.
+
 ## 0.4.10
 
 Four defects in trim verification, all reachable from one gate.

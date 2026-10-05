@@ -67,7 +67,8 @@ from, because only the second is a juliac verdict. The reactive `explain_trim` t
 The static-scan path has one known coverage gap it can't heuristically close without
 false-positiving on safe code: N simultaneous small-`Union` arguments whose specialization count
 can exceed juliac's reachability limit on a large/opaque callee. A PASS reached only via the
-static scan logs a one-time session note about this; see
+static scan logs a one-time session note about this — in a session, not while generating output,
+so a package asserting at precompile does not hand the note to every consumer who builds it. See
 [`@assert_trim_compatible`](@ref)'s docstring for why, and use
 `StrictModeTest.@test_trim_compatible` when it matters.
 

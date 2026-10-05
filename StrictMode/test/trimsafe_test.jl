@@ -54,6 +54,51 @@ end
     @test_logs (:info, r"not juliac's authoritative") match_mode = :any (@assert_trim_compatible safe_fn(3))
 end
 
+@testitem "the heuristic note stays out of precompile output" begin
+    using StrictMode
+    # A package that asserts at precompile — so inference sees its whole call graph — would emit the
+    # note once per package per consumer, to a developer who is not there to read it. Both halves
+    # are checked in one subprocess: the module asserts in its body while `jl_generating_output` is
+    # set, and the same assertion in a function the caller invokes afterwards still notes.
+    if Sys.iswindows()
+        @test_skip false
+    else
+        dir = mktempdir()
+        src = joinpath(dir, "TrimCaveatProbe", "src")
+        mkpath(src)
+        write(
+            joinpath(src, "TrimCaveatProbe.jl"), """
+            module TrimCaveatProbe
+            using StrictMode: @assert_trim_compatible
+            probe(x::Int) = x + 1
+            print(Core.stdout, "PRECOMPILING=", ccall(:jl_generating_output, Cint, ()), "\\n")
+            @assert_trim_compatible probe(1)
+            again() = @assert_trim_compatible probe(2)
+            end
+            """
+        )
+        # A directory entry on `LOAD_PATH` resolves the probe's `using StrictMode` from the
+        # environments after it, so the probe needs no project file of its own.
+        script = "using TrimCaveatProbe; TrimCaveatProbe.again()"
+        cmd = setenv(
+            `$(Base.julia_cmd()) --startup-file=no -e $script`,
+            merge(
+                ENV,
+                Dict("JULIA_LOAD_PATH" => "$dir:$(dirname(Base.active_project())):@stdlib")
+            )
+        )
+        out, err = IOBuffer(), IOBuffer()
+        p = run(pipeline(cmd; stdout = out, stderr = err); wait = false)
+        wait(p)
+        combined = String(take!(out)) * String(take!(err))
+        @test iszero(p.exitcode)
+        # The probe really did precompile, so a silent build is the gate and not a skipped pass.
+        @test occursin("PRECOMPILING=1", combined)
+        # One note, from the post-load call.
+        @test length(collect(eachmatch(r"not juliac's authoritative", combined))) == 1
+    end
+end
+
 # Fixtures for the union-split rule. `StrictModeTest`'s own suite defines the same four shapes and
 # checks the rule's verdicts against juliac's real verifier; these pin the verdicts themselves, with
 # no backend needed.
