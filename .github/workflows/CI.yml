@@ -12,20 +12,16 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} – ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # The 1.13 entry is a pre-release readiness check, not a gate: an RC can change under us, so a
-    # red run there must not block a PR. Remove `continue-on-error` once 1.13.0 final ships.
-    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
+        # `1.12` is the compat floor; `1` is whatever the newest 1.x release is, so the matrix
+        # tracks each release without naming it. Both gate.
         version: ["1.12"]
         os: [ubuntu-latest, macOS-latest, windows-latest]
         include:
-          # `"1.13"` would NOT match a pre-release (setup-julia excludes them from plain ranges);
-          # `~1.13.0-rc1` matches the current rc and every later 1.13, including the eventual final.
-          - version: "~1.13.0-rc1"
+          - version: "1"
             os: ubuntu-latest
-            experimental: true
     steps:
       - uses: actions/checkout@v6
       - uses: julia-actions/setup-julia@v3
