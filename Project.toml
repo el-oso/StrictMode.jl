@@ -1,0 +1,6 @@
+# The two shipped packages share one resolution: StrictModeTest reaches into StrictMode's internals
+# and the pair ships in lockstep, so a dev session must never resolve a StrictMode other than this
+# checkout's. The fixture environments under StrictMode/test are deliberately NOT members — each
+# emulates a consumer resolving StrictMode on its own terms, which is the thing they test.
+[workspace]
+projects = ["StrictMode", "StrictModeTest"]
