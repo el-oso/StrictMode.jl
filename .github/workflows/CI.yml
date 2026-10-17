@@ -22,20 +22,12 @@ jobs:
         include:
           - version: "1"
             os: ubuntu-latest
-    # TEMPORARY, for one verification run: resolve the registry straight from GitHub rather than
-    # from the package server, whose snapshot still predates TypeContracts 0.14.2. Revert after.
-    env:
-      JULIA_PKG_SERVER: ""
     steps:
       - uses: actions/checkout@v6
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
-      # TEMPORARY: assert the version actually under test, so a run that silently resolved an older
-      # TypeContracts fails here instead of passing and being read as evidence about 0.14.2.
-      - name: Assert TypeContracts 0.14.2 is what gets tested
-        run: julia --project=StrictMode -e 'import Pkg; Pkg.Registry.update(); Pkg.add(name = "TypeContracts", version = "0.14.2"); using TypeContracts; v = pkgversion(TypeContracts); println("TypeContracts ", v); v == v"0.14.2" || error("resolved $v, not 0.14.2")'
       # `Pkg.test()`, NOT `runtests.jl` directly: it builds the proper test environment and forces
       # `--check-bounds=yes`, which changes codegen. Running the file directly leaves bounds checking
       # at `auto` and silently skips that whole configuration — it is how five vectorization-shape
