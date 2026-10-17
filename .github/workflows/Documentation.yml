@@ -33,7 +33,10 @@ jobs:
       - name: Setup Julia
         uses: julia-actions/setup-julia@v3
         with:
-          version: "1.12"
+          # The newest 1.x release, as the test matrix also gates on: docstrings are evaluated
+          # against whichever Julia builds them, so a doctest or an `@example` that only holds on
+          # the compat floor would otherwise ship unnoticed.
+          version: "1"
       - name: Load Julia packages from cache
         id: julia-cache
         uses: julia-actions/cache@v3
