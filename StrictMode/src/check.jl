@@ -168,8 +168,9 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :noescape
             r = _escaping_scoped(Tuple{typeof(f), types...})
             reason = !isempty(r.escaped) ?
-                "a scoped value escapes the frame: " * join(r.escaped, ", ") *
-                " — it is returned, stored, or captured, and is valid only here" :
+                "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
+                " — it is returned, stored, or captured, or handed to a function this analysis " *
+                "cannot see through" :
                 !isempty(r.undetermined) ?
                 "cannot decide whether a scoped value escapes: " * join(r.undetermined, ", ") *
                 " arrives from a call that did not inline, and the escape state of a call result " *
@@ -180,7 +181,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
                     md, fn, sg, g,
                     !(isempty(r.escaped) && isempty(r.undetermined)), reason, "", 0,
                     !isempty(r.escaped) ?
-                        "return a copy, or restructure so the handle stays inside the scope that owns it" :
+                        "return a copy, keep the handle inside the scope that owns it, or inline the callee that receives it" :
                         isempty(r.undetermined) ? "" :
                         "mark the function that produces the handle `@inline`, or assert this where the handle is created"
                 )

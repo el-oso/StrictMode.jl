@@ -896,8 +896,11 @@ register_scoped!(ArenaHandle)
 @assert_noescape compute!(arena, A, b)
 ```
 
-Covers the value **leaving the frame**: returned, stored to a global or a field, or captured by a
-closure. Each is reported with the type that escaped.
+What it proves is **confinement**: that the handle is provably unable to leave this frame. A pass is
+trustworthy. A failure means confinement could not be proved, which covers the value being
+returned, stored to a global or a field, captured by a closure, OR handed to a function the
+analysis cannot see through — the escape state of an unanalyzed callee is assumed rather than
+computed, so those cases cannot be told apart. The finding names the type and lists them.
 
 Only a handle CREATED in the frame carries a verdict. The escape state of a call result is assumed
 rather than computed, so a handle from a producer that did not inline reads as escaping whatever it
@@ -924,6 +927,13 @@ end
 
 function _is_scoped_type(@nospecialize(T))
     T isa Type || return false
+    # `Union{}` is a subtype of every type, so a bare `T <: S` reads a statement that does not
+    # return a value — one whose only outcome is a throw — as carrying a scoped handle.
+    T === Union{} && return false
+    # A union carries a scoped value if any member is one. Without this a union-typed statement is
+    # skipped, because `Union{A,B} <: A` is false, and a handle hiding in one branch of a producer
+    # that did not inline would go unexamined rather than being reported as undecided.
+    T isa Union && return _is_scoped_type(T.a) || _is_scoped_type(T.b)
     @lock _SCOPED_LOCK for S in _SCOPED_TYPES
         T <: S && return true
     end

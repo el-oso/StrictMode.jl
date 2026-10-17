@@ -235,10 +235,12 @@ function _assert_noescape(
     if !isempty(r.escaped)
         _fail(
             :noescape, target,
-            "a scoped value escapes the frame: " * join(r.escaped, ", ") *
-                " — it is returned, stored to a global or a field, or captured by a closure, and " *
-                "it is valid only inside the frame that obtained it. Return a copy, or " *
-                "restructure so the handle stays inside the scope that owns it.";
+            "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
+                ". It is returned, stored to a global or a field, captured by a closure, or " *
+                "handed to a function this analysis cannot see through — the escape state of an " *
+                "unanalyzed callee is assumed, not computed, so these cannot be told apart. " *
+                "Return a copy, keep the handle inside the scope that owns it, or inline the " *
+                "callee that receives it.";
             gates = gates
         )
     elseif !isempty(r.undetermined)

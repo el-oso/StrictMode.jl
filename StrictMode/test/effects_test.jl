@@ -388,7 +388,7 @@ end
     @test !verdict(stores)
     @test !verdict(captures)
 
-    # The escaped type is named, so the finding says which handle left.
+    # The type is named, so the finding says which handle it was.
     f = only(findings(returns, (Int,); guarantees = (:noescape,)))
     @test occursin("Handle", f.reason)
 
@@ -422,9 +422,63 @@ end
     # The macro gates, and clears the case it should.
     @test (@assert_noescape stays(3)) == 4
     @test_throws StrictMode.StrictViolation (@assert_noescape returns(3))
-    @test_throws "scoped value escapes" (@assert_noescape stores(3))
+    @test_throws "not provably confined" (@assert_noescape stores(3))
 
     empty!(StrictMode._SCOPED_TYPES)     # a global registry: leave it as it was found
     StrictMode.clear_cache!()
     @test verdict(returns)
+end
+
+@testitem ":noescape proves confinement, and says so where it cannot" begin
+    using StrictMode
+
+    struct PtrMat{T}       # the shape an arena borrow takes: isbits, Ptr-backed, passed by value
+        p::Ptr{T}
+        m::Int
+    end
+    SINK = Ref{Any}(nothing)
+    register_scoped!(PtrMat)
+
+    # A producer with a non-isbits fallback: the branch folds per specialization, so a concrete
+    # element type yields either a handle or an ordinary heap array, never a union of the two.
+    @inline function borrow(::Type{T}, n::Int) where {T}
+        isbitstype(T) || return Matrix{T}(undef, n, n)
+        return PtrMat{T}(Ptr{T}(0), n)
+    end
+    @test only(Base.return_types(borrow, (Type{Float64}, Int))) === PtrMat{Float64}
+    @test only(Base.return_types(borrow, (Type{BigFloat}, Int))) === Matrix{BigFloat}
+
+    verdict(f, ts) = only(findings(f, ts; guarantees = (:noescape,)))
+    passes(f, ts) = !StrictMode._failed(verdict(f, ts))
+
+    @test passes((n::Int) -> (v = borrow(Float64, n); v.m + 1), (Int,))
+    @test !passes((n::Int) -> (v = borrow(Float64, n); SINK[] = v; n), (Int,))
+
+    # The heap fallback is not a scoped type and cannot dangle — it is garbage-collected — so
+    # neither using it nor leaking it is this guarantee's business.
+    @test passes((n::Int) -> (v = borrow(BigFloat, n); size(v, 1)), (Int,))
+    @test passes((n::Int) -> (v = borrow(BigFloat, n); SINK[] = v; n), (Int,))
+
+    # `Union{}` types a statement whose only outcome is a throw. It is a subtype of every type, so
+    # a bare subtype test reads it as carrying a handle and reports a frame that has none.
+    @test !StrictMode._is_scoped_type(Union{})
+    # A union carries a handle if any member does, so one hiding in a branch is not skipped.
+    @test StrictMode._is_scoped_type(Union{PtrMat{Float64}, Vector{Float64}})
+
+    # A handle from a producer that did not inline arrives as a call result. That is a structural
+    # fact read from the IR, not a verdict from the analysis, so it is reported as its own case.
+    @noinline borrow_ni(n::Int) = PtrMat{Float64}(Ptr{Float64}(0), n)
+    f = verdict((n::Int) -> (v = borrow_ni(n); v.m + 1), (Int,))
+    @test StrictMode._failed(f)
+    @test occursin("cannot decide", f.reason)
+
+    # What a failure claims is that confinement could not be PROVED, which is weaker than "it
+    # escaped" and has to stay weaker: the escape state of a callee the analysis did not see is
+    # assumed, so a handle passed to one is indistinguishable from one that left.
+    g = verdict((n::Int) -> (v = borrow(Float64, n); SINK[] = v; n), (Int,))
+    @test occursin("not provably confined", g.reason)
+    @test !occursin("escapes the frame", g.reason)
+
+    empty!(StrictMode._SCOPED_TYPES)
+    StrictMode.clear_cache!()
 end
