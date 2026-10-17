@@ -184,15 +184,18 @@ the note on `_BASE_BARRIER_TYPES` — wrap it in your own function and register 
 `StrictModeTest` honors the same registration: it substitutes this heuristic for AllocCheck's
 all-paths proof on a call whose only allocation risk is the barrier.
 
-"Alloc-free on every subsequent call" is the whole precondition, and it means *every* one — not
-"every subsequent call at this size". A pool that allocates again whenever it grows to a new
-high-water mark does not qualify, however many calls lie between growths, and neither does a
-per-task first touch, which allocates once per task forever. Those are ordinary allocating
-functions: `:noalloc` cannot express bounded growth, because "finitely many allocations, then none"
-is a property of the call sequence rather than of the code, and an all-paths proof must report the
-growth path forever. Excuse such a function visibly with
-`@strict_exempt :noalloc reason = "…"`, and assert the property it really has where it can be
-measured — warm the call, then check that a second identical call allocates nothing.
+The precondition is about the memoization **scope**, which is what "per process/thread/task" above
+means: the allocation is the one-time init *of that scope*, and nothing in that scope allocates
+again. A `OncePerTask` accessor satisfies it — once per task, then reads — and is the case this
+function exists for, since it is the one Base scope the scan cannot detect on its own.
+
+A **growing pool does not**, under any reading. It allocates again at a new high-water mark within
+the same process, thread and task, so there is no scope whose init has finished. That is an ordinary
+allocating function, and `:noalloc` cannot express what it really guarantees: "finitely many
+growths, then nothing" is a property of the call sequence rather than of the code, so an all-paths
+proof must report the growth path forever. Excuse it visibly with
+`@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured — warm
+the call, then check that a second identical call allocates nothing.
 
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).

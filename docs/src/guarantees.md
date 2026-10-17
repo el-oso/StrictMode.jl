@@ -167,13 +167,16 @@ explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
 — its implementation has no detectable non-inlined callee boundary to key off of — so wrap it in
 your own function and register that.
 
-What a barrier is, precisely: **the memoized accessor call**, whose cold path runs once. Recognition
-keys on that call, so it covers `_NP_ONCE()` and nothing else — not a function that happens to be
-reachable from it, and not a function that allocates every time it is asked to. A pool that
-allocates whenever it grows to a new high-water mark, or a routine that folds slabs, is an ordinary
-allocating function: there is no call whose cold path runs once, so no barrier exists to recognize
-and registering one by hand is what covers it. That difference is easy to miss when the allocator
-and a once-guard live in the same component.
+What a barrier is, precisely: **the memoized accessor call**, whose cold path is the one-time init
+of a scope — a process, a thread, or a task. Recognition keys on that call, so it covers
+`_NP_ONCE()` and nothing else: not a function that happens to be reachable from it, and not a
+function that allocates again within the same scope.
+
+A growing pool is the case that catches people out, because the allocator often lives beside a
+once-guard. It allocates again at a new high-water mark within the same process, thread and task,
+so no scope's init has finished and there is no cold path to key on. It is an ordinary allocating
+function, and registering it by hand does not make it a barrier — it tells the scan to stop there
+anyway.
 
 The distinction matters because the two call for different tools. A barrier is right where the
 allocation genuinely happens once per process or thread. Where it happens a bounded number of times
