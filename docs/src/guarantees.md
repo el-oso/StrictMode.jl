@@ -167,6 +167,22 @@ explicitly with [`register_alloc_barrier!`](@ref). `Base.OncePerTask` is **not**
 — its implementation has no detectable non-inlined callee boundary to key off of — so wrap it in
 your own function and register that.
 
+What a barrier is, precisely: **the memoized accessor call**, whose cold path runs once. Recognition
+keys on that call, so it covers `_NP_ONCE()` and nothing else — not a function that happens to be
+reachable from it, and not a function that allocates every time it is asked to. A pool that
+allocates whenever it grows to a new high-water mark, or a routine that folds slabs, is an ordinary
+allocating function: there is no call whose cold path runs once, so no barrier exists to recognize
+and registering one by hand is what covers it. That difference is easy to miss when the allocator
+and a once-guard live in the same component.
+
+The distinction matters because the two call for different tools. A barrier is right where the
+allocation genuinely happens once per process or thread. Where it happens a bounded number of times
+— a pool growing to its high-water mark — `:noalloc` cannot express that: "finitely many growths,
+then nothing" is a property of the call sequence, not of the code, so an all-paths proof must report
+the growth path forever. Excuse it visibly with
+`@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured, by
+warming the call and checking that a second identical call allocates nothing.
+
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It objects only to
