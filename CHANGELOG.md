@@ -68,6 +68,25 @@ everything above it. Submodules inherit a policy by lookup, so one changed in a 
 stale in a child, and a guarantee list may nest — a shared policy can live in one package and be
 named by every module that follows it.
 
+### The escape analysis had stopped running
+
+`:noalloc` suppresses a finding where LLVM would elide an allocation that never escapes its
+frame (issue #17), which it decides by running the compiler's escape analysis. That analysis asks
+`code_ircode_by_type` to stop after inlining, by name — and an unrecognized pass name is an ERROR,
+not a no-op. The name the compiler uses changed, so every call threw, a bare `catch` returned the
+conservative answer, and the analysis had not run at all: allocations that measure zero bytes were
+reported as real.
+
+The name is now read from the compiler's own published list where it has one, so it follows a
+rename rather than being keyed to a version. Measured on issue #17's own reproducer, which
+allocates zero bytes: reported as allocating before, clean after, on both supported Julia versions.
+
+The failure was invisible because the fallback is conservative — it only ever declines to suppress
+a finding — so the test now asserts a POSITIVE control unconditionally. The previous test accepted
+either answer and attributed the miss to a moved internal, which is how a fixable bug stayed
+hidden behind a documented degradation. If a future Julia moves this out of reach, that is a red
+build and a decision to make.
+
 ### `@test_steady_state` — allocation that stops once warmed
 
 `:noalloc` asks whether allocation is possible on any path, so a workspace pool that allocates

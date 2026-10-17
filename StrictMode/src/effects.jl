@@ -375,12 +375,29 @@ end
 const _ESCAPE_MEMO = IdDict{Any, Bool}()
 const _ESCAPE_MEMO_LOCK = ReentrantLock()
 
+# The pass `code_ircode_by_type` must stop at, by the name this compiler uses for it. The compiler
+# publishes its pass names where it has a list, and the names there carry a prefix (`"CC: INLINING"`)
+# while the older spelling is `"Inlining"` — an unrecognized name is an ERROR, not a no-op, so this
+# reads the list when there is one rather than keying on a version.
+const _INLINING_PASS = let CC = Core.Compiler
+    names = isdefined(CC, :ALL_PASS_NAMES) ? collect(String, CC.ALL_PASS_NAMES) : String[]
+    i = findfirst(n -> occursin("INLINING", uppercase(n)), names)
+    isnothing(i) ? "Inlining" : names[i]
+end
+
 function _all_news_nonescaping(@nospecialize(sig))
     cached = @lock _ESCAPE_MEMO_LOCK get(_ESCAPE_MEMO, sig, nothing)
     isnothing(cached) || return cached
     v = try
         _compute_all_news_nonescaping(sig)
-    catch
+    catch err
+        # `false` is the conservative answer — it only declines to suppress a finding — which is why
+        # this failing is invisible in a verdict. Say it once: when the compiler renamed its
+        # inlining pass, this threw on every call and the escape analysis stopped running at all,
+        # leaving the false positives of issue #17 unsuppressed with nothing to show for it.
+        @warn "StrictMode: escape analysis is unavailable, so allocations LLVM elides may be " *
+            "reported as real (issue #17). The verdicts stay conservative. Cause: " *
+            sprint(showerror, err) maxlog = 1
         false
     end
     @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = v)
@@ -389,7 +406,7 @@ end
 
 function _compute_all_news_nonescaping(@nospecialize(sig))
     EA = Core.Compiler.EscapeAnalysis
-    irs = Base.code_ircode_by_type(sig; optimize_until = "Inlining")
+    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
     isempty(irs) && return false
     ir = first(irs)[1]
     # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape

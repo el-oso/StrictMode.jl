@@ -147,24 +147,23 @@ end
     mkvec(7)
     @test iszero(@allocated(mkvec(7)))
 
-    # `Core.Compiler.EscapeAnalysis` is a compiler internal with no cross-version stability
-    # guarantee, and it has already moved once: on Julia 1.13 it is not where this looks for it, so
-    # `_all_news_nonescaping` returns false and the reproducer is flagged again.
+    # The escape analysis is a compiler internal and so is the PASS NAME `code_ircode_by_type`
+    # must stop at. An unrecognized name is an error rather than a no-op, so a rename does not
+    # degrade this analysis, it removes it: every call throws, the conservative `false` comes back,
+    # and the only symptom is allocations LLVM elides being reported as real. `_INLINING_PASS`
+    # resolves the name from the compiler's own published list.
     #
-    # These two assertions hold WHEREVER the analysis works, and they are the ones that matter,
-    # because they pin the direction of the fallback: a signature that really escapes is never
-    # cleared, and a non-signature is never trusted. Over-flagging is safe; a quiet pass is not.
-    @test !StrictMode._all_news_nonescaping(Tuple{typeof(escapes), Int})
-    @test !StrictMode._all_news_nonescaping(Nothing)      # not a signature at all → conservative
+    # The positive control comes first and is unconditional, because a check that can only ever
+    # pass is not evidence that anything ran. `mkvec` measures zero bytes above, so the analysis
+    # must clear it; if a future Julia moves this out of reach, that is a red build and a decision
+    # to make, not something to absorb silently.
+    @test StrictMode._all_news_nonescaping(Tuple{typeof(mkvec), Int})     # the analysis RUNS…
+    @test !StrictMode._alloc_signals(mkvec, (Int,)).alloc                 # …and issue #17 stays shut
 
-    # The issue's own reproducer comes back clean only where the analysis is actually reachable.
-    # Asserting it unconditionally would turn a documented degradation into a red build on every
-    # Julia that moves the internal.
-    if StrictMode._all_news_nonescaping(Tuple{typeof(mkvec), Int})
-        @test !StrictMode._alloc_signals(mkvec, (Int,)).alloc
-    else
-        @test StrictMode._alloc_signals(mkvec, (Int,)).alloc   # degraded to over-flagging, as designed
-    end
+    # The other direction, which is what makes the gating safe: a value that really escapes is
+    # never cleared, and a non-signature is never trusted.
+    @test !StrictMode._all_news_nonescaping(Tuple{typeof(escapes), Int})
+    @test !StrictMode._all_news_nonescaping(Nothing)
 end
 
 @testitem "a ccall's Ref argument is not an allocation; a Ref that outlives the call is" begin
