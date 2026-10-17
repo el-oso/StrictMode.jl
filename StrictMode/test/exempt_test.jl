@@ -104,3 +104,77 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "@strict_exempt takes a block, a guarantee, and an include" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+
+    # A block is one visible marker for a cold region instead of one per function. Each definition
+    # still records this line, so a report points at the function and at the region that excused it.
+    @strict_exempt reason = "plan-time setup" begin
+        blk_a(n::Int) = collect(1:n)
+        blk_b(x) = Dict(:k => x)
+    end
+    @test blk_a(2) == [1, 2]
+    @test StrictMode._is_exempt(blk_a) && StrictMode._is_exempt(blk_b)
+    @test all(
+        e -> e.reason == "plan-time setup",
+        filter(e -> e.func in (:blk_a, :blk_b), StrictMode.exemptions())
+    )
+
+    # A leading guarantee narrows the block: the subject is the LAST positional, which is what
+    # keeps `@strict_exempt :foo` meaning the function `foo` rather than the guarantee `foo`.
+    @strict_exempt :noalloc reason = "a factory must allocate" begin
+        blk_factory(n::Int) = Vector{Float64}(undef, n)
+    end
+    @test !StrictMode._is_exempt(blk_factory)                            # not whole-function
+    @test StrictMode._is_exempt(blk_factory, (Int,), :noalloc)
+    @test !StrictMode._is_exempt(blk_factory, (Int,), :typestable)       # still held to that
+
+    # An `include` exempts what the file defines, found by comparing the module's methods on either
+    # side of the call — so a definition inside a file that file includes is covered too, which an
+    # AST rewrite would have had to chase.
+    dir = mktempdir()
+    write(joinpath(dir, "outer.jl"), "cold_outer(n::Int) = collect(1:n)\ninclude(joinpath(@__DIR__, \"inner.jl\"))\n")
+    write(joinpath(dir, "inner.jl"), "cold_inner(x) = Dict(:k => x)\n")
+    @eval module IncExempt
+        using StrictMode
+        hot_kept(x::Int) = x + 1
+        @strict_exempt reason = "plan-time file" include($(joinpath(dir, "outer.jl")))
+    end
+    @test !StrictMode._is_exempt(IncExempt.hot_kept)
+    @test StrictMode._is_exempt(IncExempt.cold_outer)
+    @test StrictMode._is_exempt(IncExempt.cold_inner)                    # the NESTED include
+
+    # A block with no definitions is a mistake worth naming rather than a silent no-op.
+    @test_throws LoadError @eval @strict_exempt begin
+        x = 1
+    end
+
+    StrictMode.clear_declarations!()
+end
+
+@testitem "@strict_policy scopes by name, so a mixed file needs no submodule" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+
+    # `only` keeps the cold helper out of scope, so the module loads; without it the same module is
+    # rejected. Scoping by NAME rather than by region composes with the census instead of adding a
+    # scope the census does not model.
+    @eval module PolOnly
+        using StrictMode
+        kernel_hot(x::Float64) = x * 2.0
+        plan_cold(n::Int) = n > 0 ? collect(1:n) : "none"
+        @strict_policy :default only = r"^kernel_"
+    end
+    @test PolOnly.kernel_hot(1.0) == 2.0
+
+    @test_throws StrictMode.StrictViolation (@eval module PolNoFilter
+        using StrictMode
+        kernel_hot(x::Float64) = x * 2.0
+        plan_cold(n::Int) = n > 0 ? collect(1:n) : "none"
+        @strict_policy :default
+    end)
+
+    StrictMode.clear_declarations!()
+end

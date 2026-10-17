@@ -68,6 +68,45 @@ everything above it. Submodules inherit a policy by lookup, so one changed in a 
 stale in a child, and a guarantee list may nest — a shared policy can live in one package and be
 named by every module that follows it.
 
+### Opting sections out: a block, a file, or one guarantee
+
+`@strict_policy` opts a module in; `@strict_exempt` now opts sections of it out at the granularity
+the code has.
+
+```julia
+@strict_exempt reason = "plan-time setup" begin      # a region, one marker
+    plan(n::Int) = collect(1:n)
+    build_table(x) = Dict(:a => x)
+end
+
+@strict_exempt :noalloc reason = "a factory must allocate" begin
+    make_buffer(n::Int) = Vector{Float64}(undef, n)  # still held to type stability
+end
+
+@strict_exempt reason = "plan-time file" include("plan.jl")
+```
+
+The subject is the **last** positional argument and anything before it names the guarantees to
+excuse, which is what keeps `@strict_exempt :foo` meaning the function `foo` — a name is spelled
+`:foo` too.
+
+The `include` form calls the file's own `include`, so relative paths resolve as they would have, and
+it finds what to exempt by comparing the module's methods before and after rather than by rewriting
+the file. A nested `include` inside the exempted file is therefore covered as well.
+
+`@strict_policy` takes `only` and `exempt`, scoping the check by function name — a collection, a
+`Regex`, or a predicate, as the module sweeps already took them. That is how one file holds hot
+kernels and cold helpers without a submodule: `@strict_policy :default only = r"^kernel_"`. Scoping
+by name composes with the census, where a region would be a scope the census does not model.
+
+### Two declarations in one block no longer warn about world age
+
+A module's declaration store is created on first use, and a second declaration in the same
+top-level statement read that binding in the world that created it — which Julia 1.12 warns about
+and a later version makes an error. The stores this session has found are now remembered, so a
+reader never touches a binding created in its own world. A `@strict_exempt begin … end` block emits
+one call per definition and hits exactly that.
+
 ### A misspelled guarantee is an error
 
 `register_strict!(f, types; guarantees = (:typestabel,))` was accepted and then checked nothing: the

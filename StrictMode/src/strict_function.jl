@@ -208,12 +208,31 @@ Mark code as cold: setup or plan-time code that is meant to allocate or stay typ
 not held to a guarantee. Inside a strict module every function is checked by default, and you wrap
 only the occasional cold helper in `@strict_exempt` rather than annotating all the hot code.
 
-Three forms:
+The subject is the **last** positional argument, and anything before it names the guarantees to
+excuse. Taking the last rather than the first is what keeps `@strict_exempt :foo` meaning the
+function `foo`: a name is spelled `:foo` too, so a leading guarantee is only unambiguous when a
+subject follows it.
+
+Subjects:
 
 - a **definition** — defines the function and exempts it. A qualified name works, so a method on a
   foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`.
 - a **name** — `@strict_exempt foo` or `@strict_exempt :foo`, exempting every signature of it.
-- either, **narrowed** by `guarantees = (...)`, exempting only those.
+- a **block** — `@strict_exempt begin … end`, exempting every function it defines. One visible
+  marker for a cold region instead of one per definition; each definition still records this line,
+  so a report points at the function and at the region that excused it.
+- an **`include`** — `@strict_exempt include("plan.jl")`, exempting everything that file defines.
+  The file's own `include` is called, so relative paths resolve as they would have, and the
+  definitions are found by comparing the module's methods before and after rather than by rewriting
+  the file — which is also why a nested `include` inside it is covered.
+
+Any subject can be **narrowed** by naming guarantees, positionally or with `guarantees = (...)`:
+
+```julia
+@strict_exempt :noalloc reason = "a factory must allocate" begin
+    make_buffer(n::Int) = Vector{Float64}(undef, n)
+end
+```
 
 `reason = "..."` is carried into the report, where it is the difference between an opt-out a
 reviewer can judge and one they can only wonder about.
@@ -229,13 +248,59 @@ type stability too.
 macro strict_exempt(args...)
     pos, opts = _macro_call(args, (:guarantees, :reason, :types))
     isempty(pos) && throw(
-        ArgumentError("@strict_exempt expects a definition or a function name")
+        ArgumentError("@strict_exempt expects a definition, a function name, or a `begin … end` block")
     )
-    arg = pos[1]
-    gs = get(opts, :guarantees, nothing)
+    # The SUBJECT is the last positional, and anything before it names the guarantees to excuse.
+    # Taking the last rather than the first is what keeps `@strict_exempt :foo` meaning the function
+    # `foo` — a name is spelled `:foo` too, so a leading guarantee is only unambiguous when a
+    # subject follows it.
+    arg = pos[end]
+    gs = length(pos) > 1 ? (length(pos) == 2 ? pos[1] : Expr(:tuple, pos[1:(end - 1)]...)) :
+        get(opts, :guarantees, nothing)
     reason = get(opts, :reason, "")
     types = get(opts, :types, nothing)
     file, line = string(__source__.file), __source__.line
+
+    # A block exempts every definition it contains, which is one visible marker for a cold region
+    # instead of one per function. Each definition still records this line, so a report points at
+    # the function and at the region that excused it.
+    if Meta.isexpr(arg, :block)
+        defs = filter(s -> Meta.isexpr(s, (:function, :(=))), arg.args)
+        isempty(defs) && throw(
+            ArgumentError("@strict_exempt: the block defines no functions to exempt")
+        )
+        names = unique(_exempt_name(_strictdef_sig(d).args[1]) for d in defs)
+        return quote
+            $(esc(arg))
+            $(
+                (
+                    :(
+                        $(_exempt!)(
+                            $(QuoteNode(n)), @__MODULE__;
+                            guarantees = $(esc(gs)), reason = $(esc(reason)),
+                            types = $(esc(types)), file = $file, line = $line
+                        )
+                    ) for n in names
+                )...
+            )
+            nothing
+        end
+    end
+
+    # `@strict_exempt include("plan.jl")` excuses everything that file defines. The file's own
+    # `include` is escaped and called, so relative paths resolve exactly as they would have, and the
+    # definitions are found by comparing the module's methods before and after rather than by
+    # rewriting the file's syntax — which is also what makes a nested `include` inside it work.
+    if Meta.isexpr(arg, :call) && _exempt_name_or_nothing(arg.args[1]) === :include
+        return :(
+            $(_exempt_included)(
+                @__MODULE__, $(esc(arg.args[1])), $(esc.(arg.args[2:end])...);
+                guarantees = $(esc(gs)), reason = $(esc(reason)),
+                file = $file, line = $line
+            )
+        )
+    end
+
     name = _exempt_name(
         Meta.isexpr(arg, (:function, :(=))) ? _strictdef_sig(arg).args[1] :
             (arg isa QuoteNode ? arg.value : arg)
@@ -377,6 +442,7 @@ end
 """
     @strict_policy guarantees
     @strict_policy guarantees check = false
+    @strict_policy guarantees only = r"^kernel_"
 
 Apply `guarantees` to every definition in the enclosing module, and check the ones above this line.
 
@@ -405,6 +471,11 @@ cannot be checked at load (a generic declaration infers to `Any`); declare its i
 An unknown guarantee name is an error here, not a no-op: a misspelled guarantee that was accepted
 would check nothing while reading as though it checked something.
 
+`only` and `exempt` scope the check by function NAME — a collection, a `Regex`, or a predicate, as
+the module sweeps take them. That is how one file holds hot kernels and cold helpers without a
+submodule: `only = r"^kernel_"` checks the kernels and leaves the rest alone. Scoping by name
+composes with the census, where a region would be a scope the census does not model.
+
 `check = false` records the policy without checking, for a module that is checked elsewhere.
 Submodules inherit the policy ([`StrictMode.module_policy`](@ref)), and opting a cold helper out is
 [`@strict_exempt`](@ref).
@@ -413,7 +484,7 @@ Allocation verdicts here only warn — the same rule `@strict_function` follows,
 consumer's own precompile the proofs are not loadable and a structural guess must not break a build.
 """
 macro strict_policy(args...)
-    pos, opts = _macro_call(args, (:check,))
+    pos, opts = _macro_call(args, (:check, :only, :exempt))
     isempty(pos) && throw(ArgumentError("@strict_policy needs a guarantee or a collection of them"))
     check = get(opts, :check, true)
     spec = pos[1]
@@ -422,8 +493,39 @@ macro strict_policy(args...)
         $(_set_module_policy!)(@__MODULE__, _gs)
         $(check) && $(_auto_check_module)(
             @__MODULE__, _gs,
-            $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line))
+            $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line));
+            only = $(esc(get(opts, :only, nothing))), exempt = $(esc(get(opts, :exempt, ())))
         )
         _gs
     end
+end
+
+# The function name an expression refers to, or `nothing` — `_exempt_name` throws instead, and the
+# `include` test needs a question rather than an assertion.
+_exempt_name_or_nothing(x) = try
+    _exempt_name(x)
+catch
+    nothing
+end
+
+# Run `includer(args...)` and exempt every function it defined. The set is read from the module's
+# methods on either side of the call, so a definition inside a file the included file includes is
+# covered too, and no syntax is rewritten.
+function _exempt_included(
+        mod::Module, includer, args...;
+        guarantees = nothing, reason::AbstractString = "",
+        file::AbstractString = "", line::Integer = 0
+    )
+    before = _defined_names(mod)
+    result = includer(args...)
+    for nm in setdiff(_defined_names(mod), before)
+        _exempt!(nm, mod; guarantees, reason, file, line)
+    end
+    return result
+end
+
+# The demangled names of every function the module defines, as the census sees them.
+function _defined_names(mod::Module)
+    ms, _ = module_methods(mod; include_exempt = true)
+    return Set{Symbol}(_demangle(m.name) for m in ms)
 end

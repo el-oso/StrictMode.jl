@@ -18,10 +18,28 @@ const _LOCAL_EXEMPT = :__strict_exempt__
 
 # The store for `mod`, created on first write. It is placed in the package's ROOT module so that
 # finding it later means walking the loaded packages rather than every submodule of each.
+# The stores this session has already found, by `(module, name)`. The binding in the module is what
+# survives into its pkgimage; this table is how a store is found again WITHIN the world that created
+# it, where reading the binding is an access before its definition world — a warning in Julia 1.12
+# and an error later. Two declarations in one `begin … end` block hit exactly that.
+const _STORES = IdDict{Tuple{Module, Symbol}, Any}()
+
+# The store for `mod`, or `nothing` when it has none. Readers go through here so they never read a
+# binding created in their own world either.
+function _store_for(mod::Module, name::Symbol)
+    s = get(_STORES, (mod, name), nothing)
+    isnothing(s) || return s
+    isdefined(mod, name) || return nothing
+    s = getfield(mod, name)
+    _STORES[(mod, name)] = s
+    return s
+end
+
 function _local_store!(mod::Module, name::Symbol, empty)
     root = Base.moduleroot(mod)
-    if isdefined(root, name)
-        store = getfield(root, name)
+    existing = _store_for(root, name)
+    if !isnothing(existing)
+        store = existing
         # A store built by an older StrictMode holds a different type, and pushing into it would
         # fail somewhere far from the cause. Say so here instead.
         store isa typeof(empty) || throw(
@@ -35,6 +53,7 @@ function _local_store!(mod::Module, name::Symbol, empty)
     end
     store = empty
     Core.eval(root, :(const $name = $store))
+    _STORES[(root, name)] = store
     return store
 end
 
@@ -61,8 +80,7 @@ the mutation does not survive the declaring package's next cached load.
 function declarations()
     out = Dict{Any, @NamedTuple{guarantees::Any, source::String}}()
     for m in _store_modules()
-        isdefined(m, _LOCAL_DECLS) || continue
-        d = getfield(m, _LOCAL_DECLS)
+        d = _store_for(m, _LOCAL_DECLS)
         d isa AbstractDict && merge!(out, d)
     end
     merge!(out, STRICT_REGISTRY)      # a direct call wins: it is this session's explicit say
@@ -77,8 +95,7 @@ Every opt-out in scope, from this session and from each loaded package's own `sr
 function exemptions()
     out = Exemption[]
     for m in _store_modules()
-        isdefined(m, _LOCAL_EXEMPT) || continue
-        s = getfield(m, _LOCAL_EXEMPT)
+        s = _store_for(m, _LOCAL_EXEMPT)
         s isa AbstractVector && append!(out, s)
     end
     return append!(out, STRICT_EXEMPT)
@@ -97,8 +114,10 @@ function clear_declarations!()
     empty!(STRICT_REGISTRY)
     empty!(STRICT_EXEMPT)
     for m in _store_modules()
-        isdefined(m, _LOCAL_DECLS) && empty!(getfield(m, _LOCAL_DECLS))
-        isdefined(m, _LOCAL_EXEMPT) && empty!(getfield(m, _LOCAL_EXEMPT))
+        d = _store_for(m, _LOCAL_DECLS)
+        isnothing(d) || empty!(d)
+        s = _store_for(m, _LOCAL_EXEMPT)
+        isnothing(s) || empty!(s)
     end
     return nothing
 end
@@ -507,13 +526,13 @@ end
 # Only a method whose own signature is a dispatch tuple can be checked here — nothing has been
 # called yet at load, so there are no specializations to read, and a generic declaration infers to
 # `Any`. Those are reported by the coverage gate from the test environment instead.
-function _module_load_items(mod::Module, policy)
+function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
     declared = Dict{Any, Any}()
     for ((f, tt), meta) in declarations()
         _mod_sym(f) === nameof(mod) && (declared[(f, tt)] = meta.guarantees)
     end
     items = Any[]
-    ms, _ = module_methods(mod)
+    ms, _ = module_methods(mod; only, exempt)
     for m in ms
         base = Base.unwrap_unionall(m.sig)
         base isa DataType && Base.isdispatchtuple(base) || continue
@@ -532,9 +551,12 @@ end
 #   `policy` is passed in by `@strict_policy`, which has just created the policy binding: reading it
 # back in the same world that defined it is what Julia 1.12's binding semantics warn about and a
 # later version errors on. Callers with no policy of their own resolve it here, a world later.
-function _auto_check_module(mod::Module, policy = module_policy(mod), source::AbstractString = "")
+function _auto_check_module(
+        mod::Module, policy = module_policy(mod), source::AbstractString = "";
+        only = nothing, exempt = ()
+    )
     CHECKS_ENABLED || return nothing
-    fs = _map_findings(_scan_findings, _module_load_items(mod, policy))
+    fs = _map_findings(_scan_findings, _module_load_items(mod, policy; only, exempt))
     # The policy is the requirement here, so its line is what a reader needs; a signature with its
     # own declaration keeps that one, which `_map_findings` has already stamped.
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])

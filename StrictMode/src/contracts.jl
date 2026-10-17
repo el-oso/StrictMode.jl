@@ -105,3 +105,64 @@ macro verify_strict(T, block)
     push!(out, :nothing)
     return Expr(:block, out...)
 end
+
+# --- the TypeContracts verify hook --------------------------------------------------------------
+
+# `@verify T` checks that an implementation has the interface's methods. Where StrictMode is loaded,
+# those same methods are also checked against the module's policy, so a package that already
+# verifies its interfaces does not have to remember a second macro. That is the hole this closes:
+# an opt-in nobody writes is not a guarantee, and a contract is a declaration people already write.
+#
+# It REPORTS, never throws. `@verify` runs at the annotated package's own precompile, where the
+# proving tier is not loadable, so only the value-free scan is available — and its allocation
+# verdicts are structural guesses, measured 8.1% false on a 120-specialization corpus. One of those
+# aborting a consumer's build is issue #18. The proofs gate later, from the test environment, where
+# `test_registered` and `test_coverage` re-check the same signatures.
+#
+# The method is defined only where TypeContracts offers the hook, and the condition tests for the
+# binding rather than for a version: a feature test follows whichever TypeContracts is resolved,
+# including one newer than this package knows about.
+#
+# `result` is annotated because TypeContracts' own no-op fallback is
+# `_verify_hook(::_VerifyHook, ::Module, T::Type, result)`: a method with that exact signature
+# REPLACES the fallback rather than adding to it, and overwriting a method during precompilation is
+# an error — StrictMode would not precompile at all. Narrowing one argument makes this strictly more
+# specific, so both methods exist and dispatch picks this one. The annotation is therefore load-
+# bearing, and the test that asserts the hook fires is what would catch `result` changing shape.
+@static if isdefined(TypeContracts, :_VerifyHook)
+    function TypeContracts._verify_hook(
+            ::TypeContracts._VerifyHook, mod::Module, T::Type, result::NamedTuple
+        )
+        CHECKS_ENABLED || return nothing
+        items = _contract_items(mod, T)
+        isempty(items) && return nothing
+        _run_and_report(
+            _map_findings(_scan_findings, items), :verify, string(T), :warn
+        )
+        return nothing
+    end
+end
+
+# The `(f, argtypes, guarantees)` triples a verified type's contract names. Only a signature that
+# is a dispatch tuple can carry a verdict — a generic one infers to `Any` — and the contract has
+# already resolved `::Self` to this concrete type, which is what makes these checkable at all.
+function _contract_items(mod::Module, @nospecialize(T))
+    entries = try
+        TypeContracts.contract_signatures(mod)
+    catch
+        return Any[]          # a TypeContracts without the enumeration: nothing to add
+    end
+    gs = module_policy(mod)
+    items = Any[]
+    for e in entries
+        (e.T === T && e.mandatory) || continue
+        tt = try
+            Tuple(Base.unwrap_unionall(e.sig).parameters)
+        catch
+            continue
+        end
+        Base.isdispatchtuple(Tuple{tt...}) || continue
+        push!(items, (e.f, tt, gs))
+    end
+    return items
+end

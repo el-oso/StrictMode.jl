@@ -68,8 +68,42 @@ end
 ```
 
 It reads the module's methods rather than rewriting its body, which is why definitions inside an
-`include`d file are covered. `@strict module … end` is the wrapping spelling of the same check, for
-a module you are writing from scratch:
+`include`d file are covered.
+
+### Opting parts of it out
+
+`@strict_policy` opts the whole module **in**; `@strict_exempt` opts sections **out**. The subject
+can be a region or a whole file, and either can be narrowed to one guarantee:
+
+```julia
+@strict_exempt reason = "plan-time setup" begin      # a cold region, one marker
+    plan(n::Int) = collect(1:n)
+    build_table(x) = Dict(:a => x)
+end
+
+@strict_exempt :noalloc reason = "a factory must allocate" begin
+    make_buffer(n::Int) = Vector{Float64}(undef, n)  # still held to type stability
+end
+
+@strict_exempt reason = "plan-time file" include("plan.jl")   # everything that file defines
+```
+
+The `include` form calls the file's own `include`, so relative paths resolve as they would have,
+and it finds the definitions by comparing the module's methods before and after — which is why a
+nested `include` inside `plan.jl` is covered too.
+
+A guarantee named before the subject narrows the exemption. The subject is the **last** positional
+argument, which is what keeps `@strict_exempt :foo` meaning the function `foo`.
+
+Where a file mixes hot and cold code and you would rather not list the cold parts, scope the policy
+by name instead:
+
+```julia
+@strict_policy :default only = r"^kernel_"    # check the kernels, leave the rest alone
+```
+
+`@strict module … end` is the wrapping spelling of the same check, for a module you are writing
+from scratch:
 
 ```julia
 @strict module Kernels        # one declaration disciplines the whole module

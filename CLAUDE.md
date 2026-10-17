@@ -61,7 +61,8 @@ StrictMode/src/
                         declaration infers to `Any`), @strict_stable (per-specialization instead:
                         body moves to a hidden `#f#inner`, the wrapper infers its return type via
                         promote_op so a stable specialization folds the branch away entirely),
-                        @strict_exempt
+                        @strict_exempt (a definition, a name, a `begin … end` block, or an
+                        `include` whose definitions are found by diffing the census), @strict_policy
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
                         StrictMode performance guarantees)
   registry.jl         — @strict_function registry, register_strict!, watch/unwatch, _demangle
@@ -73,6 +74,8 @@ StrictMode/src/
                         module, so a method on a FOREIGN function counts); _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function
                         form; _is_parametric_def keeps a `where` definition out of the registry.
+                        _STORES/_store_for memoize each module's store so a reader never touches a
+                        binding created in its own world (a Julia 1.12 warning, a later error).
                         declarations()/exemptions() union each loaded package's OWN store with this
                         session's; module_policy/_set_module_policy! back @strict_policy, and
                         _auto_check_module checks _module_load_items — the module's METHODS, so an
