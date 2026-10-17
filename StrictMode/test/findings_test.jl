@@ -53,13 +53,13 @@ end
     # The rule it encodes: a check that OBSERVES compiled output gates; one that INFERS something it
     # cannot see reports. Both lists are spelled out here rather than derived, precisely so that
     # moving a guarantee between them has to be a deliberate edit in two places.
-    reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible)
-    # `:noescape` gates although the escape analysis is conservative and so can over-report. Two
-    # reasons it belongs here rather than with the heuristics: nothing is registered by default, so
-    # it only ever fires for a type an author declared scoped, and what it catches is a
-    # use-after-free rather than a slow path — a conservative false positive costs far less than a
-    # missed escape.
-    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted, :noescape)
+    # `:noescape` reports. It cannot see through a callee it did not analyze, and that limit has a
+    # measured consequence rather than a theoretical one: a handle wrapped in a `view` reads as
+    # not-provably-confined even when the view is never used, because the wrapper is scalar-replaced
+    # out of existence while the handle it came from stays marked unconfined. Gating on that would
+    # fail correct code wherever a borrow is wrapped before use, which is the ordinary shape.
+    reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape)
+    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted)
     for g in reports
         @test !StrictMode._guarantee_gates(g)
     end

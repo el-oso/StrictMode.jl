@@ -282,6 +282,12 @@ syntactic check at macro-expansion time, where the end of the block is visible.
 
 Nothing is registered by default, so this passes trivially until a type is declared scoped. Like
 every `@assert_*` macro it expands to the bare call when checks are disabled.
+
+It REPORTS rather than gating, and has no proving counterpart, so treat a failure as a lead to
+check by hand. The reason is measured: a handle wrapped in a `view` reads as not-provably-confined
+even when the view is never used, because the wrapper is scalar-replaced out of existence while the
+handle it came from stays marked unconfined. A bare handle — created in the frame, used there, not
+wrapped — is answered soundly in both directions.
 """
 macro assert_noescape(args...)
     pos, opts = _macro_call(args, (:types,))

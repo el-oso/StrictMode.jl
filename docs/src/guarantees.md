@@ -962,10 +962,19 @@ Registration names the handle's **type**, not the function that produces it. The
 has to run on IR after inlining to mean anything, and a small `borrow!` inlines into its caller,
 taking the callee boundary with it. The type survives that; the boundary does not.
 
-This guarantee gates rather than warns, unlike the allocation heuristics. The analysis is
-conservative and so can over-report, but it only ever fires for a type an author deliberately
-registered, and what it catches is a correctness failure — a conservative false positive costs far
-less than a missed escape.
+### Why it reports rather than gates
+
+It cannot see through a callee it did not analyze, and that limit has a measured consequence. A
+handle wrapped in a `view` reads as not-provably-confined **even when the view is never used**: the
+wrapper is scalar-replaced out of existence, while the handle it was built from stays marked
+unconfined, so a frame that leaks a view and a frame that merely takes one are indistinguishable.
+Neither direction of the analysis separates them — assuming callees are clean misses the real leak
+instead.
+
+Wrapping a borrow before use is ordinary, so gating on that verdict would fail correct code in the
+shape this exists for. It reports instead, and has no proving counterpart: treat a failure as a
+lead to check by hand, not as a fact. What it answers soundly is a BARE handle — created in the
+frame, used there, not wrapped — and for that the verdict is trustworthy in both directions.
 
 ## Promise scope
 

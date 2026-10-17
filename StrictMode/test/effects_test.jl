@@ -419,10 +419,11 @@ end
     @test occursin("cannot decide", fu.reason)
     @test occursin("@inline", fu.suggestion)
 
-    # The macro gates, and clears the case it should.
+    # The macro REPORTS: it returns the call value either way and warns on a failure, so a verdict
+    # it cannot decide soundly (see the `view` case below) never aborts a build.
     @test (@assert_noescape stays(3)) == 4
-    @test_throws StrictMode.StrictViolation (@assert_noescape returns(3))
-    @test_throws "not provably confined" (@assert_noescape stores(3))
+    @test (@test_logs (:warn,) (@assert_noescape returns(3))) isa Handle
+    @test_logs (:warn,) (@assert_noescape stores(3))
 
     empty!(StrictMode._SCOPED_TYPES)     # a global registry: leave it as it was found
     StrictMode.clear_cache!()
@@ -478,6 +479,46 @@ end
     g = verdict((n::Int) -> (v = borrow(Float64, n); SINK[] = v; n), (Int,))
     @test occursin("not provably confined", g.reason)
     @test !occursin("escapes the frame", g.reason)
+
+    empty!(StrictMode._SCOPED_TYPES)
+    StrictMode.clear_cache!()
+end
+
+@testitem ":noescape cannot decide a wrapped handle, which is why it reports" begin
+    using StrictMode
+
+    # The ordinary shape in a workspace library: borrow a fixed-size block, take the corner you
+    # need. The view is a different type carrying the same pointer.
+    struct PtrMat{T} <: AbstractMatrix{T}
+        p::Ptr{T}
+        m::Int
+        n::Int
+    end
+    Base.size(A::PtrMat) = (A.m, A.n)
+    Base.IndexStyle(::Type{<:PtrMat}) = IndexCartesian()
+    Base.@propagate_inbounds Base.getindex(A::PtrMat{T}, i::Int, j::Int) where {T} =
+        unsafe_load(A.p, (j - 1) * A.m + i)
+
+    SINK = Ref{Any}(nothing)
+    register_scoped!(PtrMat)
+    @inline borrow(n::Int) = PtrMat{Float64}(Ptr{Float64}(0), n, n)
+
+    passes(f) = !StrictMode._failed(only(findings(f, (Int,); guarantees = (:noescape,))))
+
+    # A bare handle is answered soundly in both directions.
+    @test passes((n::Int) -> (v = borrow(n); v.m + 1))
+    @test !passes((n::Int) -> (v = borrow(n); SINK[] = v; n))
+
+    # A wrapped handle is not. The view is scalar-replaced out of existence while the handle it was
+    # built from stays marked unconfined, so a frame that merely TAKES a view reports a failure —
+    # with the view never used at all, so this is not about what a callee does with it.
+    @test !passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); 0))
+    @test !passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); size(w, 1)))
+
+    # Which is the whole reason this guarantee reports instead of gating: the verdict above is
+    # indistinguishable from a real leak, so gating would fail correct code wherever a borrow is
+    # wrapped before use.
+    @test !StrictMode._guarantee_gates(:noescape)
 
     empty!(StrictMode._SCOPED_TYPES)
     StrictMode.clear_cache!()

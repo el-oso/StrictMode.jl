@@ -43,7 +43,7 @@ end
 #
 # The proofs gate unconditionally — that is what `StrictModeTest` is.
 _guarantee_gates(kind::Symbol) =
-    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible))
+    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape))
 
 # The macro names for a guarantee, which are NOT derivable from its symbol: only four guarantees have
 # a proving counterpart at all, and `:no_scalar_loops` has none. Interpolating `@$kind` instead sends

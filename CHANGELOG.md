@@ -92,9 +92,14 @@ not inline is a call result, which is a structural fact read from the IR rather 
 it is reported as its own case with the fix named. `Union{}` types a statement whose only outcome
 is a throw and is a subtype of every type, so it is excluded explicitly; a union carries a handle
 if any member does. Nothing is registered by default, so it passes trivially until a type is
-declared scoped. It gates rather than warns: the analysis is conservative and can over-report, but
-it only fires for a type an author registered, and a missed escape costs more than a conservative
-false positive.
+declared scoped. It REPORTS rather than gating, and has no proving counterpart, so treat a failure
+as a lead to check by hand. The reason is measured: a handle wrapped in a `view` reads as
+not-provably-confined even when the view is never used, because the wrapper is scalar-replaced out
+of existence while the handle it was built from stays marked unconfined — so a frame that leaks a
+view and one that merely takes a view are indistinguishable, and neither direction of the analysis
+separates them (assuming callees clean misses the real leak instead). Wrapping a borrow before use
+is ordinary, so gating on that verdict would fail correct code in the shape this exists for. A BARE
+handle — created in the frame, used there, not wrapped — is answered soundly in both directions.
 
 Registration is by **type**, not by the function producing the value, because the analysis must run
 on IR after inlining and a small `borrow!` inlines into its caller — taking the callee boundary with
