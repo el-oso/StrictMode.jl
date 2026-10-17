@@ -342,7 +342,9 @@ x = @strict kernel(a, b)       # use the result while still guaranteeing the fas
 macro strict(args...)
     # `@strict module M … end` marks the whole module (see registry.jl); otherwise it's the
     # per-call guarantee on `f(args...)`.
-    length(args) == 1 && Meta.isexpr(args[1], :module) && return _strict_module(args[1])
+    length(args) == 1 && Meta.isexpr(args[1], :module) && return _strict_module(
+        args[1], "@strict module at " * string(__source__.file) * ":" * string(__source__.line)
+    )
     pos, opts = _macro_call(args, (:types,))
     isempty(pos) && throw(ArgumentError("@strict needs a call expression"))
     return _strict_expr(pos[1]; types = get(opts, :types, nothing))

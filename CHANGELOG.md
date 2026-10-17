@@ -93,6 +93,30 @@ an error naming the replacement rather than a `MethodError`.
 Displaying a findings vector prints the counts and the failures, with the passes collapsed to a
 tally.
 
+### A finding names the rule that required it
+
+```
+[✗ noalloc SM0002] kernel!(Vector{Float64}) — allocates (1 site)
+      required by @strict_policy at src/Kernels.jl:14
+      → allocation in a hot path: preallocate the buffer, use @views for slices …
+```
+
+Only a macro can know that line, because a function cannot see its caller, so
+`@strict_function`, `@strict module` and `@strict_policy` record it and every finding from that
+declaration carries it in a `policy` field, serialized with the rest. A declaration made by a plain
+`register_strict!` call has no line to read and the field is empty — the honest answer rather than a
+guessed one.
+
+### Named policy sets
+
+`@strict_policy :default` is `(:typestable, :noalloc, :noboxing)`, which is also what a module with
+no policy gets, so the name cannot drift from the behavior. `:hot` adds `:vectorized`,
+`:no_scalar_loops` and `:no_spill`; `:all` is every guarantee. A name expands wherever a guarantee
+may be written, so `(:default, :vectorized)` composes rather than replacing.
+
+The previous default was the pair without `:noboxing`. Both report rather than gate, so adding it
+widens what an unmarked strict module warns about without being able to break a build.
+
 ### Every finding carries a diagnostic code
 
 `StrictFinding` has a `code`: a stable name for the KIND of finding, such as `SM0104`. It is keyed

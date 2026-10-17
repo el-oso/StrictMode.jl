@@ -168,6 +168,7 @@ function Base.show(io::IO, ::MIME"text/plain", fs::AbstractVector{StrictFinding}
     for f in Iterators.take(failed, 20)
         print(io, "\n ", f)
         f.file == "" || print(io, "\n     at ", f.file, ":", f.line)
+        f.policy == "" || print(io, "\n     required by ", f.policy)
         f.suggestion == "" || print(io, "\n     → ", f.suggestion)
     end
     length(failed) > 20 && print(io, "\n … and ", length(failed) - 20, " more failing")
@@ -212,6 +213,7 @@ function _fmt_text(io::IO, fs)
         println(io, "  ", f)
         if _failed(f) || f.status === :info
             f.file != "" && println(io, "      at ", f.file, ":", f.line)
+            f.policy != "" && println(io, "      required by ", f.policy)
             f.suggestion != "" && println(io, "      → ", f.suggestion)
         end
     end
@@ -247,7 +249,7 @@ function _json_obj(io::IO, f::StrictFinding)
     pairs = (
         ("module", string(f.mod)), ("function", f.func), ("signature", f.signature),
         ("guarantee", string(f.guarantee)), ("status", string(f.status)),
-        ("tier", string(f.tier)), ("code", string(f.code)),
+        ("tier", string(f.tier)), ("code", string(f.code)), ("policy", f.policy),
         ("file", f.file), ("reason", f.reason), ("suggestion", f.suggestion),
     )
     for (k, v) in pairs

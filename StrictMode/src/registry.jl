@@ -292,22 +292,47 @@ end
 # dropped, and one method that cannot be analyzed leaves the other 299 evaluated.
 function _map_findings(analyze, items)
     out = StrictFinding[]
+    # Read once rather than per item: the union walks every loaded package's store, and a module
+    # sweep runs this for hundreds of signatures.
+    decls = declarations()
     for (f, types, gs) in items
         # A narrowed exemption is honored HERE, at the one funnel both tiers run through, so the
         # scan and the proofs answer alike — the same arrangement `ignore_throw` has. An exempted
         # guarantee is reported as `:info` rather than dropped: an opt-out nobody can see in the
         # output is indistinguishable from a check that was never asked for.
         live, exempt = _split_exempt(f, types, gs)
-        append!(out, exempt)
+        append!(out, _with_policy(exempt, decls, f, types))
         isempty(live) && continue
-        try
-            append!(out, analyze(f, types, live))
+        fs = try
+            analyze(f, types, live)
         catch err
             err isa StrictViolation && rethrow()
-            append!(out, _errored_findings(f, types, live, err))
+            _errored_findings(f, types, live, err)
         end
+        append!(out, _with_policy(fs, decls, f, types))
     end
     return out
+end
+
+# Stamp each finding with the source of the declaration that asked for the guarantee, so a reader
+# can go to the line that made it a requirement instead of searching for it. Only a macro can know
+# that line — a `register_strict!` call is a function and cannot see its caller — so a declaration
+# made directly carries no source and the field stays empty.
+_restamp(x::StrictFinding, source::AbstractString) = StrictFinding(
+    x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason, x.suggestion,
+    x.tier, x.code, String(source)
+)
+
+function _with_policy(fs, decls, @nospecialize(f), @nospecialize(types))
+    isempty(fs) && return fs
+    meta = get(decls, (f, Tuple(types)), nothing)
+    (isnothing(meta) || meta.source == "") && return fs
+    return [
+        StrictFinding(
+            x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason,
+            x.suggestion, x.tier, x.code, meta.source
+        ) for x in fs
+    ]
 end
 
 # `(guarantees still to check, :info findings for the exempted ones)`.
@@ -507,9 +532,12 @@ end
 #   `policy` is passed in by `@strict_policy`, which has just created the policy binding: reading it
 # back in the same world that defined it is what Julia 1.12's binding semantics warn about and a
 # later version errors on. Callers with no policy of their own resolve it here, a world later.
-function _auto_check_module(mod::Module, policy = module_policy(mod))
+function _auto_check_module(mod::Module, policy = module_policy(mod), source::AbstractString = "")
     CHECKS_ENABLED || return nothing
     fs = _map_findings(_scan_findings, _module_load_items(mod, policy))
+    # The policy is the requirement here, so its line is what a reader needs; a signature with its
+    # own declaration keeps that one, which `_map_findings` has already stamped.
+    source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
     # Split on `_guarantee_gates` exactly as `@strict_function` does. This runs at the CONSUMER'S
     # own precompile, where `StrictModeTest` is not loadable, so the allocation verdict here is the
     # value-free scan — measured 8.1% false over a 120-specialization corpus (issue #17). Aborting a
@@ -553,7 +581,7 @@ function _warn_parametric_module(mod, names)
     return nothing
 end
 
-function _maybe_register_stmt(stmt)
+function _maybe_register_stmt(stmt, source::AbstractString = "")
     (Meta.isexpr(stmt, :function) || Meta.isexpr(stmt, :(=))) || return nothing
     # A parametric definition is skipped, not registered. `_strictdef_sig` peels the `where`, so its
     # type variables would be spliced into the module body unbound — and the signature could not be
@@ -570,7 +598,7 @@ function _maybe_register_stmt(stmt)
     fname isa Symbol || return nothing
     argexprs = filter(a -> !Meta.isexpr(a, :parameters), sig.args[2:end])
     argtypes = Expr(:tuple, (_argtype(a) for a in argexprs)...)
-    return :($(register_strict!)($fname, $argtypes; mod = @__MODULE__))
+    return :($(register_strict!)($fname, $argtypes; mod = @__MODULE__, source = $source))
 end
 
 # Is `stmt` a `@strict_exempt …` macrocall (bare or qualified)?
@@ -584,7 +612,7 @@ end
 # Statements to emit inside a `@strict module` for one body statement: plain defs are kept and
 # registered hot; `@strict_exempt …` is inlined (the module doesn't import StrictMode, so we
 # splice the exempt logic with interpolated function values instead of leaving the macrocall).
-function _rewrite_strict_stmt(stmt)
+function _rewrite_strict_stmt(stmt, source::AbstractString = "")
     if _is_strict_exempt_call(stmt)
         inner = stmt.args[end]
         if Meta.isexpr(inner, (:function, :(=)))
@@ -601,11 +629,11 @@ function _rewrite_strict_stmt(stmt)
         name = inner isa QuoteNode ? inner.value : inner
         return name isa Symbol ? Any[:($(_exempt!)($(QuoteNode(name)), @__MODULE__))] : Any[stmt]
     end
-    reg = _maybe_register_stmt(stmt)
+    reg = _maybe_register_stmt(stmt, source)
     return reg === nothing ? Any[stmt] : Any[stmt, reg]
 end
 
-function _strict_module(modexpr::Expr)
+function _strict_module(modexpr::Expr, source::AbstractString = "")
     body = modexpr.args[3]::Expr
     newstmts = Any[]
     skipped = Symbol[]
@@ -614,7 +642,7 @@ function _strict_module(modexpr::Expr)
             nm = _defname(stmt)
             isnothing(nm) || nm in skipped || push!(skipped, nm)
         end
-        append!(newstmts, _rewrite_strict_stmt(stmt))
+        append!(newstmts, _rewrite_strict_stmt(stmt, source))
     end
     isempty(skipped) ||
         push!(newstmts, :($(_warn_parametric_module)($(QuoteNode(modexpr.args[2])), $skipped)))

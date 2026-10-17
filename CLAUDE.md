@@ -84,7 +84,8 @@ StrictMode/src/
                         _compiled_output_finding covers the guarantees read from compiled output
                         (owned/inlined/vectorized/no_scalar_loops/no_spill/trimsafe), so
                         StrictModeTest delegates to it rather than keeping a second copy
-  findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, and `code`),
+  findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, `code`, and
+                        `policy`: the macro line that required the guarantee),
                         format_findings,
                         nfailures, _failed, key (a finding's identity across runs), findings_diff
   explain.jl          — @explain, StrictReport (built on the value-free engine)

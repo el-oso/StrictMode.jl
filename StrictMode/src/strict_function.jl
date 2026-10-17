@@ -43,7 +43,8 @@ _warn_parametric_decl(target) = @warn "@strict_function $target: the signature i
 # Runs at precompile/module-load. Only verifies *concrete* signatures; abstract ones warn once.
 function _verify_strict_def(
         @nospecialize(f), @nospecialize(types::Tuple), target;
-        warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing
+        warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing,
+        source::AbstractString = ""
     )
     Base.isdispatchtuple(Tuple{types...}) || return begin
         # Silent when the caller supplied `signatures =`: they have already answered which concrete
@@ -55,7 +56,7 @@ function _verify_strict_def(
     end
     # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
     # StrictModeTest.test_registered) re-check it.
-    register_strict!(f, types; mod)
+    register_strict!(f, types; mod, source)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
     # No method at all is its own mistake — usually a typo in `signatures = [...]`. Reporting it as
@@ -99,11 +100,12 @@ end
 # `Any[Any]`), so checking it directly would fail every generic function; listing the
 # instantiations that matter keeps the verdict at module load, where it belongs, without that.
 function _verify_strict_signatures(
-        @nospecialize(f), sigs, fname::AbstractString; mod::Union{Nothing, Module} = nothing
+        @nospecialize(f), sigs, fname::AbstractString; mod::Union{Nothing, Module} = nothing,
+        source::AbstractString = ""
     )
     for s in sigs
         types = s isa Tuple ? s : Tuple(s)
-        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod)
+        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source)
     end
     return nothing
 end
@@ -161,6 +163,9 @@ macro strict_function(args...)
     # here without touching the types, and `signatures = [...]` remains the way to name the concrete
     # instantiations a parametric declaration stands for.
     parametric = Meta.isexpr(def.args[1], :where)
+    # Only a macro knows the line that asked for the guarantee, so it travels with the declaration
+    # and a finding can name the requirement rather than only the breach.
+    srcstr = "@strict_function at " * string(__source__.file) * ":" * string(__source__.line)
 
     checked = if parametric && isnothing(sigs)
         quote
@@ -170,18 +175,25 @@ macro strict_function(args...)
     elseif parametric
         quote
             $(esc(def))
-            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__)
+            $(_verify_strict_signatures)(
+                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr
+            )
         end
     elseif isnothing(sigs)
         quote
             $(esc(def))
-            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__)
+            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__, source = $srcstr)
         end
     else
         quote
             $(esc(def))
-            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; warn_abstract = false, mod = @__MODULE__)
-            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__)
+            $(_verify_strict_def)(
+                $(esc(fname)), $argtypes, $target;
+                warn_abstract = false, mod = @__MODULE__, source = $srcstr
+            )
+            $(_verify_strict_signatures)(
+                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr
+            )
         end
     end
     return _gate(checked, esc(def))
@@ -408,7 +420,10 @@ macro strict_policy(args...)
     return quote
         local _gs = $(_check_guarantees)($(esc(spec)))
         $(_set_module_policy!)(@__MODULE__, _gs)
-        $(check) && $(_auto_check_module)(@__MODULE__, _gs)
+        $(check) && $(_auto_check_module)(
+            @__MODULE__, _gs,
+            $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line))
+        )
         _gs
     end
 end

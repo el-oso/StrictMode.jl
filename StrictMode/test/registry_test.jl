@@ -218,3 +218,46 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "a finding names the rule that required the guarantee" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+
+    # Only a macro can know the line that asked for a guarantee — a function cannot see its caller —
+    # so the macros record it and a finding carries it. A reader who can see the rule can narrow it,
+    # turn it off, or exempt the method; one who cannot has to go looking.
+    @strict_function pol_leaky(n::Int) = collect(1:n)
+    fs = StrictMode._findings_all()
+    @test !isempty(fs)
+    @test all(f -> occursin("@strict_function at", f.policy), fs)
+    @test all(f -> occursin("registry_test.jl", f.policy), fs)
+    @test occursin("required by @strict_function", format_findings(fs; format = :text))
+    @test occursin("\"policy\":\"@strict_function", format_findings(fs; format = :json))
+
+    # A declaration made by the plain function carries none, because there is no caller line to
+    # read. An empty field is the honest answer, not a guessed one.
+    StrictMode.clear_declarations!()
+    pol_plain(x::Float64) = x > 0 ? 1 : "s"
+    StrictMode.register_strict!(pol_plain, (Float64,); guarantees = (:typestable,))
+    @test all(f -> f.policy == "", StrictMode._findings_all())
+
+    StrictMode.clear_declarations!()
+end
+
+@testitem "a named policy set is one word for a list" begin
+    using StrictMode
+
+    sets = StrictMode.policy_sets()
+    @test sets[:default] == (:typestable, :noalloc, :noboxing)
+    # The name has to match the behavior: `:default` IS what an unmarked module gets.
+    @test StrictMode.module_policy(Main) == sets[:default]
+    @test issubset(sets[:default], sets[:hot])          # :hot adds to it rather than replacing
+    @test :vectorized in sets[:hot]
+    @test Set(sets[:all]) == Set(StrictMode.guarantee_names())
+
+    # A name expands wherever a guarantee may be written, so it composes with individual ones.
+    @test StrictMode._check_guarantees(:default) == sets[:default]
+    @test Set(StrictMode._check_guarantees((:default, :vectorized))) ==
+        Set((sets[:default]..., :vectorized))
+    @test_throws ArgumentError StrictMode._check_guarantees(:kernel)   # not a set, not a guarantee
+end
