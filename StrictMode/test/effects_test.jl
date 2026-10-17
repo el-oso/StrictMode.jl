@@ -355,3 +355,49 @@ end
     @test all(StrictMode._deadend_mask(always))
     @test isempty(StrictMode._deadend_mask(Any[]))
 end
+
+@testitem ":noescape reports a scoped handle that leaves the frame" begin
+    using StrictMode
+
+    mutable struct Handle            # mutable: really materializes, so there is something to track
+        p::Int
+    end
+    SINK = Ref{Any}(nothing)
+
+    stays(n::Int) = (h = Handle(n); h.p + 1)
+    returns(n::Int) = (h = Handle(n); h)
+    stores(n::Int) = (h = Handle(n); SINK[] = h; n)
+    captures(n::Int) = (h = Handle(n); SINK[] = () -> h.p; n)
+    nohandle(n::Int) = n + 1
+
+    verdict(f) = !StrictMode._failed(only(findings(f, (Int,); guarantees = (:noescape,))))
+
+    # Nothing is registered yet, so the guarantee has nothing to report. Asserting this first keeps
+    # the later failures attributable to the registration rather than to the shape of the code.
+    @test verdict(returns)
+
+    register_scoped!(Handle)
+
+    # The positive controls: a check that only ever reports failures proves nothing about the ones
+    # it clears. `stays` keeps the handle, and `nohandle` never makes one.
+    @test verdict(stays)
+    @test verdict(nohandle)
+
+    # The three ways out of a frame.
+    @test !verdict(returns)
+    @test !verdict(stores)
+    @test !verdict(captures)
+
+    # The escaped type is named, so the finding says which handle left.
+    f = only(findings(returns, (Int,); guarantees = (:noescape,)))
+    @test occursin("Handle", f.reason)
+
+    # The macro gates, and clears the case it should.
+    @test (@assert_noescape stays(3)) == 4
+    @test_throws StrictMode.StrictViolation (@assert_noescape returns(3))
+    @test_throws "scoped value escapes" (@assert_noescape stores(3))
+
+    empty!(StrictMode._SCOPED_TYPES)     # a global registry: leave it as it was found
+    StrictMode.clear_cache!()
+    @test verdict(returns)
+end

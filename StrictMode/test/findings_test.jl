@@ -54,7 +54,12 @@ end
     # cannot see reports. Both lists are spelled out here rather than derived, precisely so that
     # moving a guarantee between them has to be a deliberate edit in two places.
     reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible)
-    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted)
+    # `:noescape` gates although the escape analysis is conservative and so can over-report. Two
+    # reasons it belongs here rather than with the heuristics: nothing is registered by default, so
+    # it only ever fires for a type an author declared scoped, and what it catches is a
+    # use-after-free rather than a slow path — a conservative false positive costs far less than a
+    # missed escape.
+    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted, :noescape)
     for g in reports
         @test !StrictMode._guarantee_gates(g)
     end

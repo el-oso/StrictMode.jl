@@ -226,3 +226,61 @@ macro assert_owned(args...)
     end
     return _gate(checked, esc(call))
 end
+
+function _assert_noescape(
+        target, @nospecialize(f), @nospecialize(types::Tuple);
+        gates::Bool = _guarantee_gates(:noescape)
+    )
+    leaks = _escaping_scoped(Tuple{typeof(f), types...})
+    isempty(leaks) && return nothing
+    _fail(
+        :noescape, target,
+        "a scoped value escapes the frame: " * join(leaks, ", ") *
+            " — it is returned, stored to a global or a field, or captured by a closure, and it " *
+            "is valid only inside the frame that obtained it. Return a copy, or restructure so " *
+            "the handle stays inside the scope that owns it.";
+        gates = gates
+    )
+    return nothing
+end
+
+"""
+    @assert_noescape f(args...)
+    @assert_noescape f(args...) types=(T1, T2, …)
+
+Fail unless no value of a type registered with [`register_scoped!`](@ref) escapes the frame of
+`f(args...)`.
+
+For a handle whose validity is bounded by a scope — a borrow from an arena, a pointer into a slab,
+a token for a held lock — escape is a use-after-free rather than a slow path. The compiler's own
+escape analysis answers it; this is the way to ask.
+
+```julia
+register_scoped!(ArenaHandle)
+
+@assert_noescape compute!(arena, A, b)     # passes: the handle stays inside
+@assert_noescape leak(arena)               # fails: it is returned
+```
+
+Catches the value **leaving the frame**: returned, stored to a global or a field, or captured by a
+closure. It does **not** catch a handle that stays in the frame and is used after its scope has
+ended, which is not an escape — the analysis will correctly call that clean. Rejecting it needs a
+syntactic check at macro-expansion time, where the end of the block is visible.
+
+Nothing is registered by default, so this passes trivially until a type is declared scoped. Like
+every `@assert_*` macro it expands to the bare call when checks are disabled.
+"""
+macro assert_noescape(args...)
+    pos, opts = _macro_call(args, (:types,))
+    isempty(pos) && throw(ArgumentError("@assert_noescape needs a call expression"))
+    call = pos[1]
+    target = string(call)
+    p = _call_parts(call; types = get(opts, :types, nothing))
+    checked = quote
+        $(p.binds...)
+        local _val = $(p.litcall)
+        $(_guarded_check(p, :($(_assert_noescape)($target, $(p.checkfn), $(p.types)))))
+        _val
+    end
+    return _gate(checked, esc(call))
+end

@@ -116,6 +116,8 @@ every other guarantee.
 Untrusted
 unsafe_trust
 trust_boundary!
+@assert_noescape
+register_scoped!
 @assert_trusted
 ```
 

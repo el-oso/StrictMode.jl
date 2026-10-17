@@ -68,6 +68,33 @@ everything above it. Submodules inherit a policy by lookup, so one changed in a 
 stale in a child, and a guarantee list may nest — a shared policy can live in one package and be
 named by every module that follows it.
 
+### `:noescape` — a handle that must not leave its scope
+
+Some values are valid only inside the frame that obtained them: a borrow from an arena, a pointer
+into a slab, a token for a held lock. If one leaves, the result is a use-after-free rather than a
+slow path. The escape analysis that `:noalloc` already runs answers this; what was missing was a
+way to ask it.
+
+```julia
+register_scoped!(ArenaHandle)
+@assert_noescape compute!(arena, A, b)
+```
+
+Catches the value being returned, stored to a global or a field, or captured by a closure, and
+names the type that left. Nothing is registered by default, so it passes trivially until a type is
+declared scoped. It gates rather than warns: the analysis is conservative and can over-report, but
+it only fires for a type an author registered, and a missed escape costs more than a conservative
+false positive.
+
+Registration is by **type**, not by the function producing the value, because the analysis must run
+on IR after inlining and a small `borrow!` inlines into its caller — taking the callee boundary with
+it. The type survives that.
+
+It does not cover a handle that stays in the frame and is used after its scope ends. That is not an
+escape, and the analysis correctly calls it clean; rejecting it needs a syntactic check where the
+end of the block is visible. The halves are complementary, and this closes the one where the value
+leaves.
+
 ### The escape analysis had stopped running
 
 `:noalloc` suppresses a finding where LLVM would elide an allocation that never escapes its

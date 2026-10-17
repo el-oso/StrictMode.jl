@@ -866,3 +866,90 @@ function effect_holds(eff, sym::Symbol)
     sym === :nonoverlayed && return Core.Compiler.is_nonoverlayed(eff)
     throw(ArgumentError("unknown effect :$sym; expected :nothrow, :effect_free, :terminates, :consistent, or :nonoverlayed"))
 end
+
+# --- scoped values: a value that must not leave the frame that obtained it ----------------------
+
+# A borrow handle, a lock token, a pointer into a slab: a value that is valid only inside the frame
+# that obtained it, and whose escape is a use-after-free rather than a slow path. The compiler
+# already answers this question — the escape analysis above runs for allocation suppression — so
+# what is missing is a way to ASK it.
+#
+# Registration is by TYPE, not by the function that produces the value. The analysis must run on IR
+# after inlining to be meaningful, and a small `borrow!` inlines into its caller, taking the callee
+# boundary with it. The handle's type survives that, so a type is the thing still identifiable at
+# the point the question can be answered.
+const _SCOPED_TYPES = Any[]
+const _SCOPED_LOCK = ReentrantLock()
+
+"""
+    register_scoped!(T::Type) -> T
+
+Declare that a value of type `T` must not escape the frame that obtains it, so `:noescape` reports
+one that does.
+
+For a handle whose validity is bounded by a scope — a borrow from an arena, a pointer into a slab,
+a token for a held lock — escape is a use-after-free, not a performance problem. Register the type,
+then assert it where the handle is obtained:
+
+```julia
+register_scoped!(ArenaHandle)
+@assert_noescape compute!(arena, A, b)
+```
+
+Covers the value **leaving the frame**: returned, stored to a global or a field, or captured by a
+closure. Each is reported with the type that escaped.
+
+It does **not** cover a handle that stays inside the frame and is used after its scope has ended —
+that is not an escape, and the compiler's analysis will correctly call it clean. Rejecting that
+needs the syntactic check a scope macro can do at expansion time, where the end of the block is
+visible. The two cover different halves and neither subsumes the other.
+
+Registration is by type because the analysis runs on IR after inlining, where a small accessor has
+been inlined into its caller and the callee boundary no longer exists. The type does.
+
+See also [`@assert_noescape`](@ref), [`register_alloc_barrier!`](@ref).
+"""
+function register_scoped!(@nospecialize(T::Type))
+    @lock _SCOPED_LOCK begin
+        any(S -> S === T, _SCOPED_TYPES) || push!(_SCOPED_TYPES, T)
+    end
+    clear_cache!()
+    return T
+end
+
+function _is_scoped_type(@nospecialize(T))
+    T isa Type || return false
+    @lock _SCOPED_LOCK for S in _SCOPED_TYPES
+        T <: S && return true
+    end
+    return false
+end
+
+"""
+    _escaping_scoped(sig) -> Vector{String}
+
+The registered scoped types that escape the frame `sig` names, as strings. Empty means none did,
+which is also the answer when no type is registered.
+
+Every statement is considered, not only `:new`: after inlining a handle may arrive as a `:new` in
+this frame or as the result of a call that did not inline, and both carry the type.
+"""
+function _escaping_scoped(@nospecialize(sig))
+    isempty(_SCOPED_TYPES) && return String[]
+    EA = Core.Compiler.EscapeAnalysis
+    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
+    isempty(irs) && throw(ArgumentError("no IR for $sig"))
+    ir = first(irs)[1]
+    st = EA.analyze_escapes(
+        ir, length(ir.argtypes), Core.Compiler.SimpleInferenceLattice.instance, Returns(false)
+    )
+    bad = String[]
+    for i in eachindex(ir.stmts.type)
+        T = Core.Compiler.widenconst(ir.stmts.type[i])
+        _is_scoped_type(T) || continue
+        EA.has_no_escape(st[Core.SSAValue(i)]) && continue
+        s = string(T)
+        s in bad || push!(bad, s)
+    end
+    return bad
+end

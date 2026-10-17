@@ -917,6 +917,46 @@ The idea is the Linux kernel's `__user` annotation: a pointer from userspace get
 it. The kernel's marker disappears unless a separate checker is run, which is why it so often
 isn't. `Untrusted` is a real type, so it holds either way.
 
+## `@assert_noescape` — a handle that must not leave its scope
+
+Some values are valid only inside the frame that obtained them: a borrow from an arena, a pointer
+into a slab, a token for a held lock. If one leaves, the result is a use-after-free rather than a
+slow path. The compiler's own escape analysis answers this question, and `:noescape` is how to ask
+it.
+
+Declare the type, then assert the function:
+
+```julia
+register_scoped!(ArenaHandle)
+
+@assert_noescape compute!(arena, A, b)     # passes: the handle stays inside
+@assert_noescape leak(arena)               # fails: it is returned
+```
+
+Nothing is registered by default, so the guarantee passes trivially until a type is declared
+scoped. The finding names the type that left.
+
+### What it covers, and the half it does not
+
+It catches the value **leaving the frame** — returned, stored to a global or a field, or captured
+by a closure. All three are escapes and all three are reported.
+
+It does **not** catch a handle that stays inside the frame and is used after its scope has ended.
+That is not an escape, and the analysis will correctly call it clean. Rejecting that needs a
+syntactic check at macro-expansion time, where the end of the block is visible. The two cover
+different halves and neither subsumes the other, so a package with a scope macro should keep both.
+
+### Why registration is by type
+
+Registration names the handle's **type**, not the function that produces it. The escape analysis
+has to run on IR after inlining to mean anything, and a small `borrow!` inlines into its caller,
+taking the callee boundary with it. The type survives that; the boundary does not.
+
+This guarantee gates rather than warns, unlike the allocation heuristics. The analysis is
+conservative and so can over-report, but it only ever fires for a type an author deliberately
+registered, and what it catches is a correctness failure — a conservative false positive costs far
+less than a missed escape.
+
 ## Promise scope
 
 StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**

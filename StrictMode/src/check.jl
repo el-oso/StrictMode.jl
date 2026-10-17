@@ -30,7 +30,7 @@ _mkfinding(
 
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
-    :no_scalar_loops, :no_spill, :trim_compatible, :trusted,
+    :no_scalar_loops, :no_spill, :trim_compatible, :trusted, :noescape,
 )
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
@@ -165,6 +165,19 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :noboxing
             fail = sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))
+        elseif g === :noescape
+            leaks = _escaping_scoped(Tuple{typeof(f), types...})
+            push!(
+                out, _mkfinding(
+                    md, fn, sg, g, !isempty(leaks),
+                    isempty(leaks) ? "no scoped value escapes the frame" :
+                        "a scoped value escapes the frame: " * join(leaks, ", ") *
+                        " — it is returned, stored, or captured, and is valid only here",
+                    "", 0,
+                    isempty(leaks) ? "" :
+                        "return a copy, or restructure so the handle stays inside the scope that owns it"
+                )
+            )
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try
