@@ -289,3 +289,42 @@ end
     StrictMode.clear_declarations!()
     empty!(StrictMode._LAST_AUDIT)
 end
+
+@testitem "a baseline of accepted findings gates on what is new" begin
+    using StrictMode
+
+    # The documented workflow: record what is accepted today, then fail only on what a later edit
+    # adds. The selection must be passed on every run — `audit` with none reports on the
+    # declaration registry alone, which for an undeclared package is nothing at all, so a baseline
+    # recorded without it would gate on an empty set and never fire.
+    module Adopting
+        good(x::Float64) = x * 2.0
+    end
+    Adopting.good(1.0)
+
+    bl = tempname() * ".bin"
+    try
+        @test length(audit(Adopting)) == 0                      # nothing declared…
+        @test length(audit(Adopting; sweep = true)) > 0          # …but something compiled
+
+        audit_changed(Adopting; baseline = bl, update = true, sweep = true)
+        d = audit_changed(Adopting; baseline = bl, sweep = true)
+        @test isempty(d.introduced)                             # the accepted set is quiet
+
+        @eval Adopting begin
+            bad(x::Float64)::Float64 = (y = Ref{Any}(x); y[] * 2.0)
+        end
+        Adopting.bad(1.0)
+
+        d2 = audit_changed(Adopting; baseline = bl, sweep = true)
+        @test !isempty(d2.introduced)                           # the new method is reported
+        @test all(f -> occursin("bad", f.func), d2.introduced)  # and only the new one
+
+        # Reading does not rewrite the baseline, so the same edit keeps failing until it is fixed
+        # or accepted.
+        d3 = audit_changed(Adopting; baseline = bl, sweep = true)
+        @test length(d3.introduced) == length(d2.introduced)
+    finally
+        rm(bl; force = true)
+    end
+end

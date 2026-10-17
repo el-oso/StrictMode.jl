@@ -51,6 +51,50 @@ julia --project=test -e 'using MyPkg, StrictMode, StrictModeTest; test_compiled(
 - `format_findings(fs; format)` renders `:json`, `:jsonlines`, `:github`, or `:text`.
 - [`nfailures`](@ref)`(fs)` gives the count programmatically.
 
+## A baseline of accepted findings
+
+A package that adopts StrictMode partway through its life usually starts with findings it is not
+going to fix today. Reporting all of them on every run is unreadable, and the thing you actually
+want to know is whether *this* edit made anything worse. Record the accepted set once, then compare
+against it:
+
+```julia
+using MyPkg, StrictMode
+
+# once: everything currently reported becomes the accepted baseline
+audit_changed(MyPkg; baseline = "test/strict_baseline.bin", update = true, sweep = true)
+```
+
+```julia
+# thereafter, in the suite: anything NEW fails, the accepted set does not
+d = audit_changed(MyPkg; baseline = "test/strict_baseline.bin", sweep = true)
+isempty(d.introduced) || error(
+    sprint(io -> format_findings(io, d.introduced; format = :text))
+)
+```
+
+Pass the same selection on every run — `sweep = true` here, which checks the concrete signatures the
+package actually compiled. `audit_changed` forwards its keywords to [`audit`](@ref), and `audit`
+with no selection reports on the declaration registry alone: for a package with no declarations yet
+that is zero findings, so a baseline built without `sweep` records nothing and the gate never fires.
+
+`audit_changed` returns `(; fixed, introduced, changed, unchanged)`, keyed per
+`(module, function, signature, guarantee)`, so a finding keeps its identity across runs even as its
+text changes. `introduced` is the gate; `fixed` is what to delete from the baseline once you are
+sure, by re-running with `update = true`.
+
+Without `baseline` it compares against the previous run **in this session**, which is the form for a
+Revise loop: edit, re-run, see what your edit moved rather than the whole report.
+
+This is the same shape as a hand-maintained baseline file — a text list of accepted violations that
+a lint fails against when a new one appears — with the library's own findings in place of the text,
+and identity that survives a reworded message.
+
+!!! note
+    `audit_changed` reads StrictMode's own engine, whose allocation verdicts are structural
+    guesses, so a baseline built from it records *reports* rather than proofs. Gate the properties
+    you care about with `StrictModeTest`, and use the baseline to stop the report drifting upward.
+
 ## The JSON schema
 
 Each finding is one object (here pretty-printed):
