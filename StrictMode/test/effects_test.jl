@@ -392,6 +392,33 @@ end
     f = only(findings(returns, (Int,); guarantees = (:noescape,)))
     @test occursin("Handle", f.reason)
 
+    # An isbits, pointer-backed handle is the shape this exists for — a borrow from an arena is a
+    # `Ptr` plus dimensions, passed by value — so it gets its own cases rather than resting on the
+    # mutable fixture above.
+    struct PtrMat
+        p::Ptr{Float64}
+        m::Int
+    end
+    register_scoped!(PtrMat)
+    @inline mkptr(n::Int) = PtrMat(Ptr{Float64}(0), n)
+    retain(x) = (SINK[] = x; nothing)
+
+    @test verdict((n::Int) -> (v = mkptr(n); v.m + 1))          # control: stays inside
+    @test !verdict((n::Int) -> (retain(mkptr(n)); nothing))      # handed to a retaining callee
+    @test !verdict((n::Int) -> (v = mkptr(n); SINK[] = v; n))
+    @test !verdict((n::Int) -> (v = mkptr(n); () -> v))
+
+    # A handle from a producer that did NOT inline arrives as a call result, and the escape state of
+    # a call result comes from the conservative cache callback rather than from analysis. That is
+    # not an escape and must not be reported as one; it is also not a pass. The frame fails with a
+    # reason that says which, so "could not decide" never reads as "is fine".
+    @noinline mkptr_ni(n::Int) = PtrMat(Ptr{Float64}(0), n)
+    stays_ni = (n::Int) -> (v = mkptr_ni(n); v.m + 1)
+    fu = only(findings(stays_ni, (Int,); guarantees = (:noescape,)))
+    @test StrictMode._failed(fu)
+    @test occursin("cannot decide", fu.reason)
+    @test occursin("@inline", fu.suggestion)
+
     # The macro gates, and clears the case it should.
     @test (@assert_noescape stays(3)) == 4
     @test_throws StrictMode.StrictViolation (@assert_noescape returns(3))

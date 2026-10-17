@@ -899,6 +899,11 @@ register_scoped!(ArenaHandle)
 Covers the value **leaving the frame**: returned, stored to a global or a field, or captured by a
 closure. Each is reported with the type that escaped.
 
+Only a handle CREATED in the frame carries a verdict. The escape state of a call result is assumed
+rather than computed, so a handle from a producer that did not inline reads as escaping whatever it
+does; that is reported as undecided rather than as an escape, naming the fix. An `@inline`
+accessor, the usual shape for a borrow, gives a real verdict.
+
 It does **not** cover a handle that stays inside the frame and is used after its scope has ended —
 that is not an escape, and the compiler's analysis will correctly call it clean. Rejecting that
 needs the syntactic check a scope macro can do at expansion time, where the end of the block is
@@ -926,16 +931,19 @@ function _is_scoped_type(@nospecialize(T))
 end
 
 """
-    _escaping_scoped(sig) -> Vector{String}
+    _escaping_scoped(sig) -> (; escaped, undetermined)
 
-The registered scoped types that escape the frame `sig` names, as strings. Empty means none did,
-which is also the answer when no type is registered.
+The registered scoped types that escape the frame `sig` names, and the ones whose fate this cannot
+decide. Both empty means nothing escaped, which is also the answer when no type is registered.
 
-Every statement is considered, not only `:new`: after inlining a handle may arrive as a `:new` in
-this frame or as the result of a call that did not inline, and both carry the type.
+Only a `:new` carries a verdict. The escape state of a value returned by a call comes from the
+conservative cache callback, which assumes an uncached callee escapes its arguments — so a handle
+from a producer that did not inline reads as escaping whatever it does, and reporting that as an
+escape is a false positive. Those land in `undetermined` instead: a frame whose handle is created
+elsewhere has to be asked about where the handle is created.
 """
 function _escaping_scoped(@nospecialize(sig))
-    isempty(_SCOPED_TYPES) && return String[]
+    isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
     irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
@@ -944,12 +952,19 @@ function _escaping_scoped(@nospecialize(sig))
         ir, length(ir.argtypes), Core.Compiler.SimpleInferenceLattice.instance, Returns(false)
     )
     bad = String[]
+    undet = String[]
     for i in eachindex(ir.stmts.type)
         T = Core.Compiler.widenconst(ir.stmts.type[i])
         _is_scoped_type(T) || continue
-        EA.has_no_escape(st[Core.SSAValue(i)]) && continue
-        s = string(T)
-        s in bad || push!(bad, s)
+        s = ir.stmts.stmt[i]
+        s isa Expr || continue        # an SSAValue alias of a statement already considered
+        name = string(T)
+        if s.head === :new
+            EA.has_no_escape(st[Core.SSAValue(i)]) && continue
+            name in bad || push!(bad, name)
+        elseif s.head === :invoke || s.head === :call
+            name in undet || push!(undet, name)
+        end
     end
-    return bad
+    return (; escaped = bad, undetermined = undet)
 end

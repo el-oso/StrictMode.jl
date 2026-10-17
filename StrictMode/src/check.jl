@@ -166,16 +166,23 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             fail = sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))
         elseif g === :noescape
-            leaks = _escaping_scoped(Tuple{typeof(f), types...})
+            r = _escaping_scoped(Tuple{typeof(f), types...})
+            reason = !isempty(r.escaped) ?
+                "a scoped value escapes the frame: " * join(r.escaped, ", ") *
+                " — it is returned, stored, or captured, and is valid only here" :
+                !isempty(r.undetermined) ?
+                "cannot decide whether a scoped value escapes: " * join(r.undetermined, ", ") *
+                " arrives from a call that did not inline, and the escape state of a call result " *
+                "is assumed rather than computed" :
+                "no scoped value escapes the frame"
             push!(
                 out, _mkfinding(
-                    md, fn, sg, g, !isempty(leaks),
-                    isempty(leaks) ? "no scoped value escapes the frame" :
-                        "a scoped value escapes the frame: " * join(leaks, ", ") *
-                        " — it is returned, stored, or captured, and is valid only here",
-                    "", 0,
-                    isempty(leaks) ? "" :
-                        "return a copy, or restructure so the handle stays inside the scope that owns it"
+                    md, fn, sg, g,
+                    !(isempty(r.escaped) && isempty(r.undetermined)), reason, "", 0,
+                    !isempty(r.escaped) ?
+                        "return a copy, or restructure so the handle stays inside the scope that owns it" :
+                        isempty(r.undetermined) ? "" :
+                        "mark the function that produces the handle `@inline`, or assert this where the handle is created"
                 )
             )
         elseif g === :trim_compatible

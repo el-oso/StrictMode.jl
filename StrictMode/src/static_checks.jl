@@ -231,16 +231,27 @@ function _assert_noescape(
         target, @nospecialize(f), @nospecialize(types::Tuple);
         gates::Bool = _guarantee_gates(:noescape)
     )
-    leaks = _escaping_scoped(Tuple{typeof(f), types...})
-    isempty(leaks) && return nothing
-    _fail(
-        :noescape, target,
-        "a scoped value escapes the frame: " * join(leaks, ", ") *
-            " — it is returned, stored to a global or a field, or captured by a closure, and it " *
-            "is valid only inside the frame that obtained it. Return a copy, or restructure so " *
-            "the handle stays inside the scope that owns it.";
-        gates = gates
-    )
+    r = _escaping_scoped(Tuple{typeof(f), types...})
+    if !isempty(r.escaped)
+        _fail(
+            :noescape, target,
+            "a scoped value escapes the frame: " * join(r.escaped, ", ") *
+                " — it is returned, stored to a global or a field, or captured by a closure, and " *
+                "it is valid only inside the frame that obtained it. Return a copy, or " *
+                "restructure so the handle stays inside the scope that owns it.";
+            gates = gates
+        )
+    elseif !isempty(r.undetermined)
+        _fail(
+            :noescape, target,
+            "cannot decide whether a scoped value escapes: " * join(r.undetermined, ", ") *
+                " arrives from a call that did not inline. The escape state of a call result is " *
+                "assumed, not computed, so reporting it either way would be a guess. Mark the " *
+                "function that produces the handle `@inline`, or assert this where the handle " *
+                "is created.";
+            gates = gates
+        )
+    end
     return nothing
 end
 

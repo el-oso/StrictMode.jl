@@ -936,6 +936,16 @@ register_scoped!(ArenaHandle)
 Nothing is registered by default, so the guarantee passes trivially until a type is declared
 scoped. The finding names the type that left.
 
+### What it can decide
+
+Only a handle CREATED in the frame carries a verdict. The escape state of a value returned by a
+call is assumed rather than computed — the analysis treats an uncached callee as escaping its
+arguments — so a handle from a producer that did not inline reads as escaping whatever it does.
+Reporting that as an escape would be a false positive, and reporting it as clean would be worse, so
+it is reported as undecided, naming the fix: mark the producer `@inline`, or assert the guarantee
+where the handle is created. An `@inline` accessor, the usual shape for a borrow, gives a real
+verdict.
+
 ### What it covers, and the half it does not
 
 It catches the value **leaving the frame** — returned, stored to a global or a field, or captured

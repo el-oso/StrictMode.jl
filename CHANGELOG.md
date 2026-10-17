@@ -81,7 +81,14 @@ register_scoped!(ArenaHandle)
 ```
 
 Catches the value being returned, stored to a global or a field, or captured by a closure, and
-names the type that left. Nothing is registered by default, so it passes trivially until a type is
+names the type that left. Measured on the shape it exists for — an isbits, pointer-backed handle
+passed by value — with controls on both sides: a frame that keeps its handle and a frame that never
+makes one both pass.
+
+Only a handle CREATED in the frame carries a verdict. The escape state of a call result is assumed
+rather than computed, so a handle from a producer that did not inline reads as escaping whatever it
+does. That case is reported as UNDECIDED, naming the fix, because a false positive there would
+mislead as much as a false pass. Nothing is registered by default, so it passes trivially until a type is
 declared scoped. It gates rather than warns: the analysis is conservative and can over-report, but
 it only fires for a type an author registered, and a missed escape costs more than a conservative
 false positive.
