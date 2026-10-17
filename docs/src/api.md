@@ -197,6 +197,7 @@ audit
 inline_suggestions
 static_ownership_suggestions
 StrictFinding
+StrictMode.Exemption
 format_findings
 nfailures
 StrictMode.key
@@ -206,6 +207,8 @@ StrictMode.explain
 StrictMode.codes
 StrictMode.module_methods
 StrictMode.module_policy
+StrictMode.policy_sets
+StrictMode.guarantee_names
 StrictMode.clear_declarations!
 StrictMode.declarations
 StrictMode.exemptions

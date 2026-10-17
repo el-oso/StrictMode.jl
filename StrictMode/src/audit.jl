@@ -48,8 +48,8 @@ and use its `test_*` drivers, which run the proofs.
   noisier, so scope it with `only` / `exempt`.
 
 [`format_findings`](@ref) renders a result as `:json`, `:jsonlines`, `:github`, or `:text`. Each
-JSON finding carries `guarantee`, `status`, `tier`, `file`, `line`, `reason`, and an actionable
-`suggestion`.
+JSON finding carries `guarantee`, `status`, `tier`, `code`, `policy`, `file`, `line`, `reason` and
+an actionable `suggestion`.
 
 `require` (Module target only) adds the **coverage gate**: a failing finding
 (`guarantee = :coverage`) for anything that is neither declared

@@ -63,6 +63,8 @@ Each finding is one object (here pretty-printed):
   "guarantee": "noboxing",
   "status": "fail",
   "tier": "report",
+  "code": "SM0003",
+  "policy": "@strict_policy at src/Kernels.jl:14",
   "file": "kernels.jl",
   "line": 42,
   "reason": "boxing / dynamic dispatch",
