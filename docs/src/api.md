@@ -201,6 +201,7 @@ format_findings
 nfailures
 StrictMode.key
 StrictMode.findings_diff
+audit_changed
 StrictMode.explain
 StrictMode.codes
 StrictMode.module_methods

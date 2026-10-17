@@ -26,6 +26,10 @@ rendering runs past 100 kB. A session that formats on every call pushes that thr
 tool-result channel that then truncates it, and the useful work — `filter`, `nfailures`,
 [`findings_diff`](@ref) — happens on the value either way.
 
+For a loop, [`audit_changed`](@ref) reports what MOVED rather than everything that is wrong:
+`audit_changed(MyPkg)` against the previous run in this session, or
+`audit_changed(MyPkg; baseline = "strict.bin")` against a saved one another session can also read.
+
 **It is a discovery tool, not a gate.** Its verdicts come from StrictMode's value-free engine,
 whose allocation findings are structural guesses — a tool that reports is allowed to be wrong, a
 tool that gates is not. To gate, add `StrictModeTest` to the test environment and call

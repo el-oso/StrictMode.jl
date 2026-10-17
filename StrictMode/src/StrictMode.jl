@@ -52,7 +52,7 @@ export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export @golden
 export StrictViolation, StrictReport, StrictFinding
-export findings, audit, format_findings, findings_diff, nfailures, watch, unwatch
+export findings, audit, audit_changed, format_findings, findings_diff, nfailures, watch, unwatch
 export inline_suggestions, migration_report
 export static_ownership_suggestions
 export dispatch_report, DispatchReport, dispatch_suggestions

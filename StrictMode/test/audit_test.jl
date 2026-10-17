@@ -233,3 +233,59 @@ end
     @test StrictMode.key(only(d2.unchanged)) ==
         (nameof(@__MODULE__), "bad3", "(Vector{Float64})", :typestable)
 end
+
+@testitem "audit_changed reports what moved, in-session and against a file" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    empty!(StrictMode._LAST_AUDIT)
+
+    bad_ch(x::Vector{Float64}) = sum(abs, x) > 0 ? [1.0] : 2.0
+    good_ch(x::Float64) = x * 2.0
+    StrictMode.register_strict!(good_ch, (Float64,); guarantees = (:typestable,))
+
+    # Nothing failing yet, so nothing has moved.
+    d = audit_changed(:registered)
+    @test isempty(d.introduced) && isempty(d.fixed) && isempty(d.changed)
+
+    # A new failing signature is `introduced`, and only that one — the point of the diff is to
+    # answer "what moved" rather than "what is wrong".
+    StrictMode.register_strict!(bad_ch, (Vector{Float64},); guarantees = (:typestable,))
+    d = audit_changed(:registered)
+    @test [f.func for f in d.introduced] == ["bad_ch"]
+    @test isempty(d.fixed)
+
+    # Asking again moves nothing: the baseline was replaced by the previous run.
+    d = audit_changed(:registered)
+    @test isempty(d.introduced) && isempty(d.fixed)
+    @test [f.func for f in d.unchanged] == ["bad_ch"]
+
+    # Dropping it reports it as fixed.
+    StrictMode.clear_declarations!()
+    StrictMode.register_strict!(good_ch, (Float64,); guarantees = (:typestable,))
+    d = audit_changed(:registered)
+    @test [f.func for f in d.fixed] == ["bad_ch"]
+
+    # A file baseline outlives the process, which is what lets another session diff against it.
+    # `update` must be asked for: a run that silently rewrote the file could not be compared twice.
+    mktempdir() do dir
+        path = joinpath(dir, "base.bin")
+        StrictMode.clear_declarations!()
+        StrictMode.register_strict!(bad_ch, (Vector{Float64},); guarantees = (:typestable,))
+
+        d = @test_logs (:info,) match_mode = :any audit_changed(:registered; baseline = path)
+        @test [f.func for f in d.introduced] == ["bad_ch"]   # a missing baseline: everything is new
+        @test !isfile(path)                                   # …and nothing was written
+
+        audit_changed(:registered; baseline = path, update = true)
+        @test isfile(path)
+        d = audit_changed(:registered; baseline = path)
+        @test isempty(d.introduced) && [f.func for f in d.unchanged] == ["bad_ch"]
+
+        # A file that is not a baseline is reported, not read as an empty one.
+        write(path, "not a baseline")
+        @test_throws ArgumentError audit_changed(:registered; baseline = path)
+    end
+
+    StrictMode.clear_declarations!()
+    empty!(StrictMode._LAST_AUDIT)
+end

@@ -160,3 +160,90 @@ function _audit(
     end
     return fs
 end
+
+# --- incremental reporting: what changed since the last run ------------------------------------
+
+# The previous result per target, for the in-session comparison. A baseline FILE is the other half:
+# this one is gone when the process is, while a file outlives it and can be read by another session
+# or a CI job.
+const _LAST_AUDIT = Dict{Any, Vector{StrictFinding}}()
+
+"""
+    audit_changed(target = :registered; baseline = nothing, update = isnothing(baseline), kwargs...)
+        -> (; fixed, introduced, changed, unchanged)
+
+Run [`audit`](@ref) and report what moved since the last run, rather than everything that is wrong.
+Each field is a `Vector{StrictFinding}`; `kwargs` are `audit`'s.
+
+Comparison is by [`key`](@ref) — `(mod, func, signature, guarantee)` — so a finding survives edits
+to the code it is about, and a changed `reason` for the same key is `changed` rather than one
+`fixed` plus one `introduced`.
+
+Two baselines, and they answer different questions:
+
+- **in this session** (`baseline = nothing`, the default): compared against this target's previous
+  `audit_changed` run, which is kept in memory and replaced each time. The edit-check-fix loop.
+- **a file** (`baseline = "path"`): compared against a saved run, which outlives the process, so
+  another session or a CI job can diff against yours. Written only when you ask — pass
+  `update = true` to replace it with this run. A path that does not exist yet reports everything as
+  `introduced`, which is what a first run should say.
+
+```julia
+d = audit_changed(MyPkg; sweep = true)              # since my last run here
+isempty(d.introduced) || print(format_findings(d.introduced; format = :text))
+
+audit_changed(MyPkg; baseline = "strict.bin", update = true)   # record the baseline
+audit_changed(MyPkg; baseline = "strict.bin")                  # …and diff against it later
+```
+
+A baseline file is a machine artifact, written with `Serialization`: it round-trips a finding
+exactly, including the fields a text format would flatten. It is therefore readable only by a
+StrictMode that still has the same `StrictFinding`, and a stale one is reported rather than
+silently treated as empty. For something durable and human-readable, write
+`format_findings(fs; format = :jsonlines)` yourself.
+"""
+function audit_changed(
+        target = :registered;
+        baseline::Union{Nothing, AbstractString} = nothing,
+        update::Bool = isnothing(baseline),
+        kwargs...
+    )
+    new = audit(target; kwargs...)
+    old = isnothing(baseline) ? get(_LAST_AUDIT, target, StrictFinding[]) :
+        _read_baseline(baseline)
+    d = findings_diff(old, new)
+    if update
+        isnothing(baseline) ? (_LAST_AUDIT[target] = new) : _write_baseline(baseline, new)
+    end
+    return d
+end
+
+function _read_baseline(path::AbstractString)
+    isfile(path) || begin
+        @info "StrictMode.audit_changed: no baseline at `$path` yet, so every finding is new. " *
+            "Pass `update = true` to write this run as the baseline."
+        return StrictFinding[]
+    end
+    fs = try
+        deserialize(path)
+    catch err
+        throw(
+            ArgumentError(
+                "could not read the baseline at `$path`: $(sprint(showerror, err)). A baseline is " *
+                    "written by `Serialization` and is readable only by a StrictMode with the same " *
+                    "`StrictFinding`; delete it and write a new one with `update = true`."
+            )
+        )
+    end
+    fs isa Vector{StrictFinding} || throw(
+        ArgumentError("`$path` holds a $(typeof(fs)), not a baseline of findings.")
+    )
+    return fs
+end
+
+function _write_baseline(path::AbstractString, fs::Vector{StrictFinding})
+    dir = dirname(path)
+    isempty(dir) || isdir(dir) || mkpath(dir)
+    serialize(path, fs)
+    return nothing
+end

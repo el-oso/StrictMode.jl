@@ -78,7 +78,9 @@ StrictMode/src/
                         _auto_check_module checks _module_load_items — the module's METHODS, so an
                         include'd definition is covered where a body rewrite could not see it
   audit.jl            — audit (the reporting entry point; no exit status, never throws, and no
-                        rendering: it returns the findings and format_findings renders them)
+                        rendering: it returns the findings and format_findings renders them).
+                        audit_changed diffs a run against the previous one — _LAST_AUDIT in this
+                        session, or a Serialization baseline FILE another session can read
   check.jl            — findings/_findings_fast/_compiled_output_finding — the interference-proof
                         core every guarantee funnels through: no macro parsing, no execution.
                         _compiled_output_finding covers the guarantees read from compiled output

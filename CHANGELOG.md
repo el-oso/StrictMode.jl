@@ -163,6 +163,32 @@ StrictModeTest's AllocCheck/JET/TrimCheck. Both tiers build the same record, so 
 `:jsonlines` file — read by another process, or another session — had no way to tell a guess from a
 proof. It is in the JSON output.
 
+### `audit_changed` — what moved, not everything that is wrong
+
+```julia
+d = audit_changed(MyPkg; sweep = true)      # since the last run in this session
+print(format_findings(d.introduced; format = :text))
+
+audit_changed(MyPkg; baseline = "strict.bin", update = true)   # record a baseline
+audit_changed(MyPkg; baseline = "strict.bin")                  # …diff against it, from anywhere
+```
+
+It returns `(; fixed, introduced, changed, unchanged)`, compared by `StrictMode.key` so a finding
+survives edits to the code it is about and a new `reason` for the same key reads as `changed`
+rather than one `fixed` plus one `introduced`.
+
+Two baselines, because they answer different questions. The in-session one is kept in memory and
+replaced each run — the edit-check-fix loop. A file outlives the process, so another session or a CI
+job can diff against yours; it is written only when `update = true` is passed, since a run that
+silently rewrote it could not be compared twice. A path that does not exist yet reports everything
+as `introduced`, which is what a first run should say, and a file that is not a baseline is reported
+rather than read as an empty one.
+
+A baseline file is a machine artifact written with `Serialization`, so it round-trips a finding
+exactly — including the fields a text format flattens — and is readable only by a StrictMode with
+the same `StrictFinding`. For something durable and human-readable, write
+`format_findings(fs; format = :jsonlines)`.
+
 ### Findings have identity, and two runs can be compared
 
 `StrictMode.key(f)` is `(mod, func, signature, guarantee)`, which survives edits to the code the
