@@ -107,8 +107,15 @@ end
         caller()
     end
     @test @allocated(caller()) == 0                          # steady state: nothing
+    # `:noboxing` and `:noalloc` answer different questions, and this accessor separates them: the
+    # `IdDict` probe allocates on the first call, and nothing is boxed. AllocCheck reports
+    # `jl_eqtable_get`, `jl_eqtable_put`, `jl_idtable_rehash` and a `Vector{Int64}` here — runtime
+    # calls and a typed allocation, no `DynamicDispatch` — so a `:noboxing` PASS is correct from
+    # both engines, while `:noalloc` fails in both.
     @test all(f -> f.status === :pass, findings(caller, (); guarantees = (:noboxing,)))
-    @test any(f -> f.status === :fail, proof_findings(caller, (); guarantees = (:noboxing,)))
+    @test all(f -> f.status === :pass, proof_findings(caller, (); guarantees = (:noboxing,)))
+    @test any(f -> f.status === :fail, findings(caller, (); guarantees = (:noalloc,)))
+    @test any(f -> f.status === :fail, proof_findings(caller, (); guarantees = (:noalloc,)))
 end
 
 @testitem ":noboxing permits a typed allocation — the heuristic over-flags one, the proof does not" begin

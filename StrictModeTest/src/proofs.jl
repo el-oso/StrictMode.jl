@@ -89,8 +89,22 @@ end
 # instances attributed to the guard frame, not to the call it guards.
 const _GUARD_FRAME = :_strict_scan
 
-_is_guard_alloc(@nospecialize(inst)) =
-    hasproperty(inst, :fname) && Symbol(getproperty(inst, :fname)) === _GUARD_FRAME
+# An AllocCheck instance either names its frame directly or carries the backtrace it was found in;
+# both are read, so the filter does not depend on which shape a given AllocCheck release reports.
+# Only the guard's own allocations pass through `_strict_scan` — the guarded kernel's do not — so
+# this cannot hide a finding in the kernel.
+function _is_guard_alloc(@nospecialize(inst))
+    hasproperty(inst, :fname) && Symbol(getproperty(inst, :fname)) === _GUARD_FRAME && return true
+    hasproperty(inst, :backtrace) || return false
+    for fr in inst.backtrace
+        fr isa Base.StackTraces.StackFrame || continue
+        fr.func === _GUARD_FRAME && return true
+        li = fr.linfo
+        li isa Core.MethodInstance && li.def isa Method && li.def.name === _GUARD_FRAME &&
+            return true
+    end
+    return false
+end
 
 function _is_guard_report(@nospecialize(rep))
     hasproperty(rep, :vst) || return false
@@ -108,8 +122,32 @@ end
 _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) =
     AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw())
 
-_raw_allocs(@nospecialize(f), @nospecialize(types)) =
-    filter(!_is_guard_alloc, _raw_allocs_unfiltered(f, types))
+function _raw_allocs(@nospecialize(f), @nospecialize(types))
+    all = _raw_allocs_unfiltered(f, types)
+    kept = filter(!_is_guard_alloc, all)
+    # AllocCheck's backtrace walk stops at the first instruction reached from several call sites,
+    # recording a `"multiple call sites"` frame instead. An instance that ends there cannot be
+    # attributed to the guard frame or to the kernel, and the guard branch builds diagnostic strings
+    # through exactly such shared helpers. Saying so is the difference between a verdict a reader
+    # can act on and one that blames the kernel for StrictMode's own code.
+    if length(kept) < length(all) && any(_is_unattributed, kept)
+        n = count(_is_unattributed, kept)
+        @warn "StrictModeTest: `$(StrictMode._func_name(f))` contains a StrictMode guard, and " *
+            "AllocCheck could not attribute $n of its $(length(kept)) remaining allocation(s) to " *
+            "a single call site. Those may belong to the guard rather than to the code it guards. " *
+            "Prove the guarded call directly (`test_signatures([(inner, types)])`) for a verdict " *
+            "that is only about your kernel." maxlog = 1
+    end
+    return kept
+end
+
+# Does this instance's attribution stop at AllocCheck's shared-call-site marker?
+_is_unattributed(@nospecialize(inst)) =
+    hasproperty(inst, :backtrace) &&
+    any(
+    fr -> fr isa Base.StackTraces.StackFrame && fr.func === Symbol("multiple call sites"),
+    inst.backtrace
+)
 
 # Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
 # uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
@@ -122,6 +160,13 @@ function _is_boxing(@nospecialize(inst))
         return occursin("box", lowercase(n)) || occursin("get_nth_field", n)
     end
     inst isa AllocCheck.AllocationSite && return inst.type === Core.Box   # captured-variable box
+    # An instance shape this does not know is not evidence of anything, and answering "not boxing"
+    # for it would make `:noboxing` go quiet on a whole class of allocation after an AllocCheck
+    # release renames or adds one. Say so once; the verdict stays the conservative `false` so a
+    # changed name cannot invent failures either.
+    @warn "StrictModeTest: AllocCheck reported a $(typeof(inst)), which the boxing classifier " *
+        "does not recognize — `:noboxing` cannot speak for it, and `:noalloc` still counts it. " *
+        "If AllocCheck added or renamed an instance type, `_is_boxing` needs it." maxlog = 1
     return false
 end
 

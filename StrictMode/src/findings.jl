@@ -17,6 +17,11 @@ Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:nobo
   carrying the error text, never `:pass`: "could not check" and "is fine" must not render the same.
 - `:info` — advisory, never a failure ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)).
 
+`policy` names where the requirement was written — the `@strict_policy` or `@strict_function` line
+that asked for this guarantee — and is empty for a declaration made by a plain `register_strict!`
+call, which is a function and cannot see its caller. A reader who can see the rule can narrow it,
+turn it off, or exempt the method; one who cannot has to go looking for it.
+
 `tier` says how much a `:fail` is worth, and it is a field because a finding outlives the session
 that made it: `:report` is StrictMode's value-free engine, whose allocation verdicts are structural
 guesses that nothing gates on, and `:proof` is `StrictModeTest`'s AllocCheck/JET/TrimCheck, which
@@ -38,6 +43,7 @@ struct StrictFinding
     suggestion::String
     tier::Symbol
     code::Symbol
+    policy::String
 end
 
 # The reporting tier and the guarantee's own code are the defaults, so the shorter forms keep their
@@ -46,7 +52,13 @@ end
 StrictFinding(mod, func, signature, guarantee, status, file, line, reason, suggestion, tier) =
     StrictFinding(
     mod, func, signature, guarantee, status, file, line, reason, suggestion, tier,
-    _code(guarantee)
+    _code(guarantee), ""
+)
+
+StrictFinding(
+    mod, func, signature, guarantee, status, file, line, reason, suggestion, tier, code
+) = StrictFinding(
+    mod, func, signature, guarantee, status, file, line, reason, suggestion, tier, code, ""
 )
 
 StrictFinding(mod, func, signature, guarantee, status, file, line, reason, suggestion) =

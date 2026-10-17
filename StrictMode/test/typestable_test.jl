@@ -55,8 +55,11 @@ end
     # asserts the call was silent, which is what "passes" has to mean here.
     @test isnothing(@test_logs StrictMode._typestable_fast("stable_caller", stable_caller, ()))
     @test all(f -> f.status === :pass, findings(stable_caller, (); guarantees = (:typestable,)))
-    # ...but the helper DOES box at runtime, so the full-depth guarantees still catch it.
-    @test any(f -> f.status === :fail, proof_findings(stable_caller, (); guarantees = (:noboxing,)))
+    # ...but the helper DOES allocate, so the full-depth guarantee still catches it. `:noalloc`, not
+    # `:noboxing`: AllocCheck resolves the `get!` dispatch and reports the `IdDict` runtime calls
+    # plus a typed `Vector{Int64}`, none of which is boxing. The point stands either way — a
+    # depth-0 guarantee passes where a full-depth one fails.
+    @test any(f -> f.status === :fail, proof_findings(stable_caller, (); guarantees = (:noalloc,)))
     # And a DIRECT dynamic dispatch (F38's shape) is still caught at this level.
     struct _CB
         f::Function

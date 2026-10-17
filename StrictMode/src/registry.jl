@@ -2,7 +2,7 @@
 # `(f, types)` here; `audit` renders findings for them, `StrictModeTest`'s `test_*` drivers gate on
 # the same lists, and `_auto_check_module` is the automatic-at-load hook.
 
-const STRICT_REGISTRY = Dict{Any, @NamedTuple{guarantees::Any}}()
+const STRICT_REGISTRY = Dict{Any, @NamedTuple{guarantees::Any, source::String}}()
 
 # A declaration written during a package's own precompile cannot live in this Dict: StrictMode is
 # already loaded from its own pkgimage then, and a cross-package mutation of it is discarded when
@@ -59,7 +59,7 @@ its precompile cannot be stored in StrictMode — StrictMode is loaded from its 
 the mutation does not survive the declaring package's next cached load.
 """
 function declarations()
-    out = Dict{Any, @NamedTuple{guarantees::Any}}()
+    out = Dict{Any, @NamedTuple{guarantees::Any, source::String}}()
     for m in _store_modules()
         isdefined(m, _LOCAL_DECLS) || continue
         d = getfield(m, _LOCAL_DECLS)
@@ -116,7 +116,8 @@ cached load — see [`StrictMode.declarations`](@ref).
 """
 function register_strict!(
         @nospecialize(f), @nospecialize(types);
-        guarantees = (:typestable, :noalloc), mod::Union{Nothing, Module} = nothing
+        guarantees = (:typestable, :noalloc), mod::Union{Nothing, Module} = nothing,
+        source::AbstractString = ""
     )
     gs = _check_guarantees(guarantees)
     tt = Tuple(types)
@@ -130,8 +131,8 @@ function register_strict!(
         return nothing
     end
     store = isnothing(mod) ? STRICT_REGISTRY :
-        _local_store!(mod, _LOCAL_DECLS, Dict{Any, @NamedTuple{guarantees::Any}}())
-    store[(f, tt)] = (; guarantees = gs)
+        _local_store!(mod, _LOCAL_DECLS, Dict{Any, @NamedTuple{guarantees::Any, source::String}}())
+    store[(f, tt)] = (; guarantees = gs, source = String(source))
     return nothing
 end
 
@@ -156,11 +157,16 @@ end
 function _flatten_guarantees!(out::Vector{Symbol}, spec, depth::Int)
     depth > 8 && throw(ArgumentError("guarantees: nested too deeply ($depth levels)"))
     if spec isa Symbol
+        # A named set expands here, so a name composes with anything else a caller wrote:
+        # `(:default, :vectorized)` adds one guarantee to the set rather than replacing it.
+        haskey(_POLICY_SETS, spec) &&
+            return _flatten_guarantees!(out, _POLICY_SETS[spec], depth + 1)
         spec in _GUARANTEES || throw(
             ArgumentError(
-                "unknown guarantee :$spec; expected one of $(_GUARANTEES). " *
-                    "A guarantee that is not one of these is never checked, so it is rejected here " *
-                    "rather than silently doing nothing."
+                "unknown guarantee :$spec; expected one of $(_GUARANTEES), or a named set " *
+                    "$(Tuple(sort(collect(keys(_POLICY_SETS))))). A guarantee that is not one of " *
+                    "these is never checked, so it is rejected here rather than silently doing " *
+                    "nothing."
             )
         )
         spec in out || push!(out, spec)
@@ -414,7 +420,29 @@ end
 # module into strict mode affordable on every load; the proofs run from the test environment, where
 # `StrictModeTest` is loadable and this module's own precompile is not happening.
 const _LOCAL_POLICY = :__strict_policy__
-const _DEFAULT_POLICY = (:typestable, :noalloc)
+# Named policy sets, so a module says one word instead of restating a list. A set is spelled with
+# the name it means: `:default` IS what a module gets with no policy at all, because a name that
+# does not match the behavior is worse than no name.
+#
+# `:default` reports rather than gates throughout (`_guarantee_gates` in report.jl), which is what
+# makes it safe to be the default: a structural guess must not break a consumer's build.
+const _POLICY_SETS = Dict{Symbol, Tuple{Vararg{Symbol}}}(
+    :default => (:typestable, :noalloc, :noboxing),
+    :hot => (:typestable, :noalloc, :noboxing, :vectorized, :no_scalar_loops, :no_spill),
+    :all => _GUARANTEES,
+)
+
+const _DEFAULT_POLICY = _POLICY_SETS[:default]
+
+"""
+    StrictMode.policy_sets() -> Dict{Symbol, Tuple}
+
+The named guarantee sets [`@strict_policy`](@ref) accepts, such as `:default`, `:hot` and `:all`.
+
+A name may be mixed with individual guarantees and with other names — the spec is flattened — so
+`(:default, :vectorized)` and `:hot` are both spellable.
+"""
+policy_sets() = _POLICY_SETS
 
 # The policy binding is created in `mod` itself, not in its root: a package and a submodule of it
 # may hold different policies, and `module_policy` resolves inheritance by walking up from the

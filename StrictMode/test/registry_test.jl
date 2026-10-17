@@ -182,7 +182,7 @@ end
     end
     @test StrictMode.module_policy(_PolParent) == (:typestable, :noalloc)
     @test StrictMode.module_policy(_PolParent._PolChild) == (:typestable, :noalloc)
-    @test StrictMode.module_policy(@__MODULE__) == (:typestable, :noalloc)   # the default
+    @test StrictMode.module_policy(@__MODULE__) == StrictMode.policy_sets()[:default]   # unset → :default
 
     # Nesting is flattened, so a shared policy can be spliced in from elsewhere.
     @eval module _PolNest
