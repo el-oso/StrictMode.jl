@@ -117,6 +117,26 @@ calling anything). An agent that wants those checks calls them directly and read
 but every field is public and named, so `getproperty`/`propertynames` is enough for a script to
 consume programmatically.
 
+## Findings as a table
+
+A findings vector is already a table, with no dependency and nothing to enable. `StrictFinding` is
+flat — only `String`, `Symbol` and `Int` fields — which is the shape Tables.jl consumes through its
+iterable-of-rows fallback, so the columns are the field names:
+
+```julia
+using DataFrames
+df = DataFrame(audit(MyPkg; sweep = true))          # 12 columns, one row per finding
+sort!(df, :guarantee)
+
+using CSV
+CSV.write("findings.csv", filter(f -> f.status === :fail, audit(MyPkg)))
+```
+
+`Tables.rowtable` and `Tables.columntable` work the same way. What is *not* declared is
+`Tables.istable`, which is `false`, and `Tables.schema`, which is `nothing` — so a consumer that
+checks `istable` before converting, or wants a typed schema to preallocate columns, is not served.
+Neither DataFrames nor CSV does either of those, which is why this needs no extension.
+
 ## `:github` format for CI
 
 ```julia

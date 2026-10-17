@@ -22,7 +22,7 @@ discovery entry point for an agent or a dev loop:
 
 ```julia
 fs = audit(MyPkg; sweep = true)        # the findings, as data
-filter(StrictMode._failed, fs)         # narrow before reading anything
+filter(f -> f.status === :fail, fs)   # narrow before reading anything
 ```
 
 It returns the value and prints nothing. To render, pass it to [`format_findings`](@ref) — one
