@@ -261,3 +261,42 @@ end
         Set((sets[:default]..., :vectorized))
     @test_throws ArgumentError StrictMode._check_guarantees(:kernel)   # not a set, not a guarantee
 end
+
+@testitem "a narrower declaration satisfies coverage without an exemption" begin
+    using StrictMode
+
+    # An allocator under a declaration that does not claim `:noalloc`. Nothing is excused, because
+    # nothing was claimed — and the coverage gate asks whether a declaration EXISTS, not whether it
+    # names any particular guarantee. This is the route for a pool that allocates by design.
+    module Owned
+        mutable struct WS
+            buf::Vector{Float64}
+        end
+        const POOL = WS(Float64[])
+        grow!(p::WS, n::Int) = (length(p.buf) < n && (p.buf = Vector{Float64}(undef, n)); p.buf)
+        function driver!(C::Matrix{Float64}, n::Int)
+            s = grow!(POOL, n)
+            for i in 1:n
+                s[i] = i
+            end
+            C[1, 1] = s[n]
+            return C
+        end
+    end
+
+    StrictMode.register_strict!(
+        Owned.driver!, (Matrix{Float64}, Int);
+        guarantees = (:typestable, :noboxing), mod = Owned
+    )
+    StrictMode.register_strict!(
+        Owned.grow!, (Owned.WS, Int);
+        guarantees = (:typestable, :noboxing), mod = Owned
+    )
+    Owned.driver!(zeros(2, 2), 8)         # compile, so the census has a signature to find
+
+    @test isempty(StrictMode.exemptions())
+    cov = StrictMode.audit(Owned; require = :all, guarantees = (:typestable, :noboxing))
+    @test !any(f -> StrictMode._failed(f) && occursin("declar", lowercase(f.reason)), cov)
+
+    StrictMode.clear_declarations!()
+end

@@ -70,6 +70,31 @@ end
 It reads the module's methods rather than rewriting its body, which is why definitions inside an
 `include`d file are covered.
 
+### Declaring a narrower set, rather than excusing a guarantee
+
+An exemption is for a method that sits under a policy claiming something it cannot deliver. When
+you control the declaration, there is a better move: declare what is true and leave the rest
+unclaimed.
+
+```julia
+# the pool allocates by design; what it guarantees is stability and no boxing
+register_strict!(solve!, (Workspace, Matrix{Float64}, Vector{Float64});
+                 guarantees = (:typestable, :noboxing))
+@test_steady_state solve!(ws, A, b)      # and the property it really has, measured
+```
+
+Nothing is excused here, because `:noalloc` was never claimed. The coverage gate is satisfied all
+the same: **it requires that a declaration exist, not that the declaration include any particular
+guarantee.** It asks whether somebody stated what this method promises.
+
+Prefer this where you can. An exemption records that a check was switched off, and a reviewer has
+to decide whether that was reasonable; a narrower declaration records what the method actually
+promises, and the guarantees it does name are still enforced. For an allocator that difference is
+the whole point — `:typestable` is what lets its callers be fast, and it stays on either way.
+
+Reach for `@strict_exempt` when the declaration is not yours to narrow: a module-wide
+`@strict_policy`, or a cold region you would rather mark in place than enumerate.
+
 ### Opting parts of it out
 
 `@strict_policy` opts the whole module **in**; `@strict_exempt` opts sections **out**. The subject
