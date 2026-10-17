@@ -33,13 +33,13 @@ end
 
 @testitem "@strict_function verifies (does not skip) a ::Type{T} argument signature (F37)" begin
     using StrictMode
-    empty!(StrictMode.registered_strict())
+    StrictMode.clear_declarations!()
     # `Type{Float64}` is a fully-specified dispatch signature, not a non-concrete one — it used to
     # be silently skipped (isconcretetype(Type{Float64}) == false) even though it's checkable. (A
     # `where {T}`-generic argument is checked separately below: the macro no longer evaluates the
     # declared types when the signature is parametric.)
     @strict_function typed_clean(::Type{Float64}, n::Int) = n + 1
-    @test !isempty(StrictMode.registered_strict())
+    @test !isempty(StrictMode.declarations())
     @test typed_clean(Float64, 3) == 4
 end
 

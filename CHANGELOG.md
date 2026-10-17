@@ -1,5 +1,174 @@
 # Changelog
 
+## 0.5.0
+
+Breaking. An opt-in check that can be forgotten is not a guarantee, so a missing declaration now
+fails instead of passing quietly, and `audit` hands back findings instead of printing them.
+
+### A parametric definition no longer breaks `@strict module`
+
+`h(x::T) where {T<:Real} = …` aborted the module load with `UndefVarError: T`: the registration
+the macro emits named the signature's type variables, which have no meaning outside the method.
+Such a definition is now skipped — its signature could never be a dispatch tuple, which is all the
+registry can check — and one warning per module names the definitions left unchecked and how to
+check them (`signatures = [...]`, or `@strict_stable`).
+
+### The coverage gate is default-deny, over methods
+
+`audit(mod; require = :all)` and `StrictModeTest.test_coverage(mod)` fail for every method a module
+defines that no declaration speaks for and no exempt covers. `require = :public` keeps its narrower
+meaning: exported and `public` functions only.
+
+`StrictMode.module_methods(mod)` is the census behind it. It reads the global method table rather
+than the module's bindings, so a method the package defines on a *foreign* function — `Base.size`,
+`Base.getindex`, `Base.show` — is counted. Those are frequently a package's hottest methods and no
+walk over its own names can see them: measured on StrictMode, 476 methods against a binding walk's
+457, 13 of them on foreign functions. Keyword wrappers, closures and default constructors are not
+counted, and an `:info` finding reports how many were left out.
+
+Coverage is asked per **signature**, not per method. A method that has compiled concrete signatures
+is covered only when every one of them is declared: `gen(x::T) where {T<:Real}` called with
+`Float64` and `Int32` has two, and declaring one leaves the other reported, because nothing checked
+it. A method nothing has compiled has no signature to name, so there the gate asks only whether
+some declaration speaks for it.
+
+The gate reports whether a declaration exists, which is a fact. Whether the guarantees hold is
+still `test_registered`'s job, and that needs a signature naming concrete types — 79 of
+StrictMode's own 476 methods have one of their own, and the rest are generic.
+
+### A declaration survives the declaring package's cached load
+
+`@strict_function` in a package's `src/` runs at that package's own precompile, and the
+`register_strict!` insert went into StrictMode — which is already loaded from its own pkgimage by
+then, so the mutation was discarded on the package's next cached load. A consumer's test process
+therefore saw no declarations however many its source carried, `test_registered` re-proved nothing,
+and the new coverage gate called a fully annotated package undeclared.
+
+A declaration now lives in the module that made it, as a `const` of the package, so it is
+serialized into that package's own pkgimage. `StrictMode.declarations()` and
+`StrictMode.exemptions()` are the unioned views every driver reads: each loaded package's own, plus
+whatever this session registered directly. `registered_strict()` / `exempt_strict()` now mean "this
+session's", and `StrictMode.clear_declarations!()` empties every store, which is what a test needs
+for isolation.
+
+Measured on the `test/consumer` fixture after a cached load: `registered_strict()` is empty,
+`declarations()` carries ConsumerPkg's two, and `test_registered` reports `ConsumerPkg: 2`.
+
+### `@strict_policy`, and a module check that sees through `include`
+
+`@strict module … end` rewrote the statements of the module body, so a definition inside an
+`include`d file was never registered and never checked — which is nearly all of a real package. The
+load check now reads the module's **methods** instead, so those definitions are covered. The check
+can only evaluate a method whose own signature is concrete; the rest are the coverage gate's job
+from the test environment.
+
+`@strict_policy (:typestable, :noalloc)` declares the same thing without wrapping the `module`
+keyword, so adopting it does not mean restructuring a package's main file. Place it last to check
+everything above it. Submodules inherit a policy by lookup, so one changed in a parent is never
+stale in a child, and a guarantee list may nest — a shared policy can live in one package and be
+named by every module that follows it.
+
+### A misspelled guarantee is an error
+
+`register_strict!(f, types; guarantees = (:typestabel,))` was accepted and then checked nothing: the
+driver never saw the name, so the suite stayed green while the guarantee the author asked for was
+never applied. Unknown names are now rejected where they are written, and
+`StrictMode.guarantee_names()` lists the valid ones.
+
+### `audit` returns findings; rendering is a separate step
+
+`audit` and `proof_audit` no longer take `format` or `io`. They return the
+`Vector{StrictFinding}`, and `format_findings` renders it:
+
+```julia
+fs = audit(MyPkg; sweep = true)
+print(format_findings(fs; format = :json))
+```
+
+A module sweep reaches several hundred findings, whose `:json` rendering runs past 100 kB — pushed
+through a log or a tool-result channel on every call, it is truncated before it is read, while
+`filter`, `nfailures` and `findings_diff` all work on the value. Passing either keyword now raises
+an error naming the replacement rather than a `MethodError`.
+
+Displaying a findings vector prints the counts and the failures, with the passes collapsed to a
+tally.
+
+### Every finding carries a diagnostic code
+
+`StrictFinding` has a `code`: a stable name for the KIND of finding, such as `SM0104`. It is keyed
+on `(guarantee, cause)` rather than on the reason text, because a reason is assembled at the call
+site and two reports of one problem do not read alike, while the pair is fixed. Where the cause is
+recognized, the code names it:
+
+```
+[✗ typestable SM0104] bad(Vector{AbstractFloat}) — return type is not concrete (inference)
+```
+
+`StrictMode.explain("SM0104")` prints what the code means, the same fix the finding carries, and
+what the verdict is worth. `StrictMode.codes()` lists all of them. A published code is permanent: a
+kind that goes away leaves a gap in the table rather than freeing its number, so a saved report and
+a link to one stay valid.
+
+### An exemption is a record, not a name
+
+`@strict_exempt` now records a signature, the guarantees it covers, a reason and its own source
+location, instead of a bare function name. Three things follow.
+
+It can be narrowed: `@strict_exempt plan guarantees = (:noalloc,) reason = "builds the plan once"`
+excuses the allocation and still holds `plan` to type stability. An exempted guarantee is reported
+as `:info` carrying the reason rather than dropped, because an opt-out nobody can see in the output
+is indistinguishable from a check that was never asked for.
+
+It can name a method on a **foreign** function: `@strict_exempt Base.length(::Foo) = 1`. That
+spelling used to raise `unsupported definition`, which left the methods the census counts with no
+way out.
+
+And it can be retired. `StrictModeTest.test_exemptions(mod)` reports an exemption whose guarantee
+the **proofs** now satisfy — code that was fixed while the opt-out stayed. Findings are `:info` and
+never failures: an exemption is a deliberate human statement, and a red test for tidy-up work is a
+new reason to switch the gate off. It lives in the proving tier because only a proof may say this;
+the value-free scan is wrong in both directions on allocation, so acting on its opinion would
+delete an exemption the proofs then fail.
+
+`exempt_strict()` and `StrictMode.exemptions()` now return `Vector{Exemption}`.
+
+### A finding says which engine produced it
+
+`StrictFinding` carries `tier`: `:report` for StrictMode's value-free scan, `:proof` for
+StrictModeTest's AllocCheck/JET/TrimCheck. Both tiers build the same record, so a saved
+`:jsonlines` file — read by another process, or another session — had no way to tell a guess from a
+proof. It is in the JSON output.
+
+### Findings have identity, and two runs can be compared
+
+`StrictMode.key(f)` is `(mod, func, signature, guarantee)`, which survives edits to the code the
+finding is about. `findings_diff(old, new)` returns `(; fixed, introduced, changed, unchanged)`,
+so one session can hand another a baseline as `:jsonlines` and compare against it.
+
+### A cached verdict notices when a callee changes
+
+The findings cache keys on the checked method, which an edit one level down leaves identical — the
+`Method` object and its `primary_world` are untouched — so a caller kept a `:pass` after its callee
+started allocating. Measured before the fix: cached `:pass`, uncached `:fail`, for the same code.
+
+Julia does record it, on the compiled code rather than on the method: when a callee changes, the
+caller's `CodeInstance` has its `max_world` capped. Each entry now holds the instances its verdict
+was read from and is dropped when one of them is invalidated. Measured: the same callee edit now
+gives `:fail` from the cache, and holding the validation costs nothing — a warm whole-package
+re-audit measured 477.8 ms without the check and 474.8 ms with it.
+
+A method that has never been compiled has no instance to watch, and only there is
+`clear_cache!()` still needed. Its docstring says so.
+
+### A trim verdict names the rejected site again
+
+The verdict was read from the verifier's printed output, and that printer reaches into
+`Base.Compiler.TrimVerifier` internals which do not all exist on every supported Julia — on 1.13
+it raised, the text came back empty, and every rejection collapsed to "verifier output not
+recognized" with no site. The verdict is now read from the error objects themselves: the rejected
+statement, its line, and the caller chain up to the signature under test.
+
+
 ## 0.4.11
 
 ### The heuristic trim note stays out of precompile output

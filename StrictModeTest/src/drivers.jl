@@ -100,11 +100,9 @@ function's defining module. Unscoped, the reported count is broken down per modu
 one is visible rather than silent.
 
 It reports how many signatures it proved, because the registry is populated at *declaration* time
-and an implausibly small count is the signal that something did not register. In particular,
-`@strict_function` runs at its own module's precompile, and that cross-package `Dict` insert does
-not survive a cached pkgimage load — so a consumer's test process can see an empty registry however
-many declarations its `src/` carries. [`test_signatures`](@ref) and [`test_compiled`](@ref)
-enumerate directly and are unaffected.
+and an implausibly small count is the signal that something did not register. A declaration made in
+a package's own `src/` is stored in that package, so it survives the package's cached load and is
+counted here; one made by a direct `register_strict!` call belongs to the session that made it.
 """
 function test_registered(; guarantees = nothing, modules = nothing)
     StrictMode.assert_enabled()
@@ -142,11 +140,10 @@ proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing
     StrictMode._findings_compiled(_proof_findings, mod; guarantees, only, exempt)
 
 """
-    proof_audit(target = :registered; format = :json, io = stdout, guarantees = nothing,
-                sweep = false, require = nothing, only = nothing, exempt = ())
-        -> Vector{StrictFinding}
+    proof_audit(target = :registered; guarantees = nothing, sweep = false,
+                require = nothing, only = nothing, exempt = ()) -> Vector{StrictFinding}
 
-[`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, same formats, same
+[`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, and the same
 `Vector{StrictFinding}` back, and it likewise **never throws and never sets an exit status**. The
 only difference is the engine — AllocCheck, JET and TrimCheck instead of the value-free scan.
 
@@ -160,9 +157,151 @@ scope a module sweep with `only`/`exempt` rather than pointing it at everything.
 
 ```julia
 using MyPkg, StrictMode, StrictModeTest
-fs = proof_audit(MyPkg; sweep = true, format = :json, exempt = r"^_plan")
+fs = proof_audit(MyPkg; sweep = true, exempt = r"^_plan")
 nfailures(fs)        # proved failures, not guesses
 ```
 """
 proof_audit(target = :registered; kwargs...) =
     StrictMode._audit(_proof_findings, "proof_audit", target; kwargs...)
+
+"""
+    test_coverage(mod::Module; require = :all, only = nothing, exempt = ())
+        -> Vector{StrictFinding}
+
+Assert that every signature `mod` defines and has compiled is either **declared** or **visibly
+exempt**, and throw a `StrictMode.StrictViolation` naming each one that is neither.
+
+A method that has compiled concrete signatures needs every one of them declared: a declaration
+names a signature, so declaring `f(Float64)` says nothing about an `f(Int32)` that reached the same
+body. A method nothing has compiled yet has no signature to name, and there this asks only whether
+some declaration speaks for it.
+
+This is the gate for the thing the other drivers cannot see. `test_registered` re-proves what was
+declared and `test_compiled` proves what ran; neither notices a method that was never brought under
+StrictMode at all. Here a missing declaration is a failure, so forgetting one is a red test rather
+than a silent pass.
+
+Its verdicts are facts, not inferences — a declaration either names a signature this method would
+be dispatched for, or it does not — which is why this gates where StrictMode's allocation verdicts
+only report.
+
+`require = :all` counts every method, including those on foreign functions (`Base.size`,
+`Base.getindex`); `:public` counts only exported/`public` functions. Scope with `only`/`exempt`
+exactly as the other drivers do.
+
+```julia
+# in runtests.jl, next to the drivers that prove the guarantees
+StrictMode.register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:noalloc,))
+test_registered()                       # …the declared guarantees hold
+test_coverage(MyPkg; exempt = r"^_plan")   # …and nothing is undeclared
+```
+
+!!! note
+    A declaration made by `@strict_function` inside a package's `src/` counts here: it is stored in
+    that package, so it survives the cached load this gate runs after. A package that annotates its
+    source is therefore not told its own methods are undeclared.
+"""
+function test_coverage(mod::Module; require::Symbol = :all, only = nothing, exempt = ())
+    fs = require === :all ? StrictMode._coverage_all_findings(mod; only, exempt) :
+        require === :public ? StrictMode._coverage_findings(mod; only, exempt) :
+        throw(ArgumentError("test_coverage: require must be :all or :public, got $(require)"))
+    failed = filter(StrictMode._failed, fs)
+    isempty(failed) && return fs
+    msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
+    throw(StrictMode.StrictViolation(:test_coverage, string(nameof(mod)), msg))
+end
+
+"""
+    test_exemptions(mod::Module; only = nothing) -> Vector{StrictFinding}
+
+Report the exemptions in `mod` that the **proofs** now find unnecessary: code marked cold that
+satisfies the guarantee it was excused from.
+
+An exemption is forever unless something looks at it. Code gets fixed, a buffer gets preallocated,
+and the opt-out stays — so the guarantee is off for a function that would now pass. This is the
+counterpart of declaring: `test_coverage` finds what nobody declared, and this finds what nobody
+un-excused.
+
+Findings are `:info` and **never failures**, so this never fails a build. Two reasons: an exemption
+is a human's deliberate statement and removing it is their call, and a red test for tidy-up work is
+a new reason to switch the gate off.
+
+It lives here, in the proving tier, because only a proof may say this. StrictMode's value-free scan
+is wrong in both directions on allocation, so "the scan no longer sees a problem" is a guess; acting
+on it would delete an exemption the proofs then fail. Each exemption is checked by AllocCheck, JET
+and TrimCheck, on the signatures the exemption covers.
+
+An exemption that names no signature is checked against every concrete signature the function has
+compiled; one that names a signature is checked against that one. A function with nothing compiled
+cannot be judged and is reported as such.
+"""
+function test_exemptions(mod::Module; only = nothing)
+    out = StrictMode.StrictFinding[]
+    for e in StrictMode.exemptions()
+        _name_hit(only, e.func) || continue
+        for (f, tt) in _exempt_signatures(mod, e)
+            gs = isnothing(e.guarantees) ? StrictMode._DEFAULT_POLICY : e.guarantees
+            sg = StrictMode._sig_string(tt)
+            fs = try
+                proof_findings(f, tt; guarantees = gs)
+            catch err
+                # Not swallowed: an exemption the proofs could not evaluate is a third answer, and
+                # reporting nothing would read as "still needed" without having checked.
+                push!(
+                    out, StrictMode.StrictFinding(
+                        nameof(mod), string(e.func), sg, :exemption, :info, e.file, e.line,
+                        "could not check whether this exemption is still needed: " *
+                            sprint(showerror, err),
+                        "Prove the signature directly with `test_signatures([($(e.func), $sg)])` " *
+                            "to decide whether the opt-out is doing anything.", :proof
+                    )
+                )
+                continue
+            end
+            all(x -> x.status === :pass, fs) || continue
+            push!(
+                out, StrictMode.StrictFinding(
+                    nameof(mod), string(e.func), sg, :exemption, :info, e.file, e.line,
+                    "exemption is no longer needed: $(sg) satisfies $(join(gs, ", "))" *
+                        (e.reason == "" ? "" : " (recorded reason: $(e.reason))"),
+                    "the proofs pass for this signature, so the opt-out now hides nothing — " *
+                        "remove `@strict_exempt $(e.func)` to hold it to the guarantee again.",
+                    :proof
+                )
+            )
+        end
+    end
+    return out
+end
+
+# `only` filters by the exemption's function NAME, since that is all an exemption carries — the
+# shared `_name_matcher` builds a predicate over functions instead.
+_name_hit(spec, name::Symbol) =
+    isnothing(spec) ? true :
+    spec isa Regex ? occursin(spec, string(name)) :
+    spec isa Function ? spec(name) :
+    name in Set{Symbol}(x isa Symbol ? x : nameof(x) for x in spec)
+
+# The signatures an exemption should be judged on: the one it names, or every concrete signature the
+# function has compiled.
+function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
+    out = Tuple{Any, Tuple}[]
+    ms, _ = StrictMode.module_methods(mod; include_exempt = true)   # the subject IS the exempt code
+    for m in ms
+        StrictMode._demangle(m.name) === e.func || continue
+        ft = StrictMode._method_function(m)
+        f = try
+            ft.instance
+        catch
+            continue
+        end
+        if isnothing(e.types)
+            for tt in StrictMode._method_signatures(m)
+                push!(out, (f, Tuple(tt)))
+            end
+        else
+            push!(out, (f, e.types))
+        end
+    end
+    return out
+end

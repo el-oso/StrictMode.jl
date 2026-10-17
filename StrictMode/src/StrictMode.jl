@@ -47,12 +47,12 @@ export @assert_no_spill, spill_report, SpillReport
 export @assert_memsafe, memsafe_report, MemsafeReport
 export @assert_mca, mca_report, McaReport, mca_available
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
-export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt
+export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt, @strict_policy
 export @strict_contract, @verify_strict, @explain
 export @unroll, staticval
 export @golden
 export StrictViolation, StrictReport, StrictFinding
-export findings, audit, format_findings, nfailures, watch, unwatch
+export findings, audit, format_findings, findings_diff, nfailures, watch, unwatch
 export inline_suggestions, migration_report
 export static_ownership_suggestions
 export dispatch_report, DispatchReport, dispatch_suggestions
@@ -80,6 +80,7 @@ include("trusted.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("findings.jl")
+include("codes.jl")
 include("cache.jl")
 include("check.jl")
 include("memsafe.jl")

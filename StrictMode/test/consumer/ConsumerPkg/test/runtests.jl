@@ -10,19 +10,28 @@ using ConsumerPkg, StrictMode, StrictModeTest, Test
     ConsumerPkg.leaky(4)
     @test @allocated(ConsumerPkg.leaky(4)) > 0
 
-    # `@strict_function` registers at the DEFINING package's precompile. Whether that registration
-    # survives into this process is the open question tracked as "the registry leg of checked
-    # twice" — so this asserts what is true either way rather than pinning the bug's current side.
-    reg = StrictMode.registered_strict()
-    n_consumer = count(k -> StrictMode._mod_sym(k[1]) === :ConsumerPkg, keys(reg))
+    # `@strict_function` declares at the DEFINING package's precompile, and the declaration is
+    # stored in ConsumerPkg itself — which is why it is still here after this process loaded
+    # ConsumerPkg from its pkgimage. Stored in StrictMode instead, it would be gone: StrictMode is
+    # loaded from its own cache by then, so the mutation does not survive.
+    @test isempty(StrictMode.registered_strict())      # nothing registered in THIS session
+    d = StrictMode.declarations()
+    @test count(k -> StrictMode._mod_sym(k[1]) === :ConsumerPkg, keys(d)) == 2
 
-    if n_consumer > 0
-        # Registration survived: the proof tier re-checks the same declarations and DOES fail,
-        # where the precompile-time scan only warned.
-        @test_throws StrictViolation test_registered(; modules = [ConsumerPkg])
-    else
-        @test_logs (:warn, r"registry is EMPTY") match_mode = :any test_registered(; modules = [ConsumerPkg])
-    end
+    # The proof tier re-checks those declarations and DOES fail, where the precompile-time scan
+    # only warned.
+    @test_throws StrictViolation test_registered(; modules = [ConsumerPkg])
+
+    # And the coverage gate counts them as declared: a package that annotates its `src/` must not
+    # be told its own methods are undeclared.
+    ConsumerPkg.clean(1.0)
+    cov = audit(ConsumerPkg; require = :all)
+    undeclared = Set(
+        f.func * f.signature for f in cov
+            if f.guarantee === :coverage && StrictMode._failed(f)
+    )
+    @test !("clean(Float64)" in undeclared)
+    @test !("leaky(Int64)" in undeclared)
 
     # The path that does not depend on the registry surviving: name the signatures directly.
     @test_throws StrictViolation test_signatures(

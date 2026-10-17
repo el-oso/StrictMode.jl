@@ -1,6 +1,6 @@
 @testitem "register_strict! + the registry sweep aggregate findings" begin
     using StrictMode, StrictModeTest
-    empty!(StrictMode.registered_strict())
+    StrictMode.clear_declarations!()
     clean(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
     boxy(t::Tuple{Int, Float64, Float32}) = (
         s = 0.0; for i in 1:3
@@ -10,7 +10,7 @@
 
     StrictMode.register_strict!(clean, (NTuple{3, Float64}, NTuple{3, Float64}))
     StrictMode.register_strict!(boxy, (Tuple{Int, Float64, Float32},))
-    @test length(StrictMode.registered_strict()) == 2
+    @test length(StrictMode.declarations()) == 2
 
     fs = StrictMode._findings_all()
     @test StrictMode.nfailures(fs) ≥ 1                 # boxy allocates
@@ -19,10 +19,10 @@ end
 
 @testitem "register_strict! skips non-concrete signatures" begin
     using StrictMode
-    empty!(StrictMode.registered_strict())
+    StrictMode.clear_declarations!()
     g(x::Number) = x + one(x)
     StrictMode.register_strict!(g, (Number,))           # abstract → skipped with a warning
-    @test isempty(StrictMode.registered_strict())
+    @test isempty(StrictMode.declarations())
 end
 
 @testitem "@strict module rewrites the body to register its methods" begin
@@ -44,7 +44,7 @@ end
 
 @testitem "_auto_check_module raises on a violation (the load-time gate)" begin
     using StrictMode
-    empty!(StrictMode.registered_strict())
+    StrictMode.clear_declarations!()
     unstable(x::Int) = x > 0 ? 1 : "negative"
     StrictMode.register_strict!(unstable, (Int,); guarantees = (:typestable,))
     @test_throws StrictViolation StrictMode._auto_check_module(@__MODULE__)
@@ -55,10 +55,10 @@ end
     # `isconcretetype(Type{Float64})` is `false` (a real Julia quirk) even though `Type{Float64}`
     # is a fully-specified, singleton dispatch signature — `all(isconcretetype, tt)` would treat
     # every `::Type{T}`-argument function as "non-concrete" and silently skip it.
-    empty!(StrictMode.registered_strict())
+    StrictMode.clear_declarations!()
     typed_alloc(::Type{T}, n::Int) where {T} = Vector{T}(undef, n)
     StrictMode.register_strict!(typed_alloc, (Type{Float64}, Int))
-    @test length(StrictMode.registered_strict()) == 1
+    @test length(StrictMode.declarations()) == 1
 end
 
 @testitem "the compiled sweep reaches a ::Type{T}-argument specialization (F37)" begin
@@ -90,19 +90,131 @@ end
     @test any(f -> f.func == "f" && f.status === :pass, fs)
 end
 
-@testitem "an empty registry warns loudly instead of reporting a silent green" begin
+@testitem "no declarations in scope warns loudly instead of reporting a silent green" begin
     using StrictMode, StrictModeTest
-    # The registry is a plain Dict populated at declaration time, and `@strict_function` runs at its
-    # own module's precompile — a cross-package mutation that is DISCARDED on a cached pkgimage
-    # load. So a consumer's test process sees an empty registry however many declarations its src/
-    # carries, and a registry sweep would then return zero findings and pass: a green that proves
-    # nothing. That must be audible from both tiers.
-    old = copy(StrictMode.STRICT_REGISTRY)
+    # A sweep over nothing returns zero findings and passes, which renders exactly like a sweep that
+    # proved everything. That is the failure this package exists to remove, so both tiers say it out
+    # loud. `clear_declarations!` empties every store, not just the one this session registered into
+    # — a sibling test item's declarations live in this worker's `Main` and would otherwise count.
+    StrictMode.clear_declarations!()
+    @test isempty(@test_logs (:warn,) match_mode = :any StrictMode._findings_all())
+    @test isempty(@test_logs (:warn,) match_mode = :any test_registered())
+    StrictMode.clear_declarations!()
+end
+
+@testitem "@strict module keeps parametric definitions loadable" begin
+    using StrictMode
+
+    # A `where` method is ordinary Julia. The registry cannot check it — its signature is never a
+    # dispatch tuple — but the module must still load, and the skip must be named once.
+    @test_logs (:warn,) match_mode = :any (
+        @eval @strict module _SMParam
+        h(x::T) where {T <: Real} = x * 2
+        g(x::T) where {T} = x
+        k(v::Vector{T}) where {T <: Real} = sum(v)
+        m(x::T, y::S) where {T, S} = (x, y)
+        # The `where` binds to the return type in `n(x::T)::T where {T}`, so the long form is the
+        # only spelling that annotates a parametric return.
+        function n(x::T)::T where {T <: Real}
+            return x * 2
+        end
+        hot(x::Int) = x + 1                      # concrete: still registered
+        end
+    )
+
+    @test _SMParam.h(2.0) == 4.0
+    @test _SMParam.k([1.0, 2.0]) == 3.0
+    @test _SMParam.n(3.0) == 6.0
+
+    # The concrete definition registered; no parametric one did.
+    names = Set(String(StrictMode._demangle(nameof(f))) for (f, _) in keys(StrictMode.declarations()))
+    @test "hot" in names
+    @test isempty(intersect(names, Set(["h", "g", "k", "m", "n"])))
+end
+
+@testitem "the load check reads the module's methods, so include'd definitions are covered" begin
+    using StrictMode
+
+    # The hole a statement rewrite leaves: `include(path)` is one statement, and the definitions
+    # inside it are never seen by a macro that rewrites the module body.
+    path, io = mktemp()
+    write(io, "inc_unstable(x::Int) = x > 0 ? 1 : \"a string\"\n")   # heap-allocating union
+    close(io)
+
+    StrictMode.clear_declarations!()
     try
-        empty!(StrictMode.STRICT_REGISTRY)
-        @test isempty(@test_logs (:warn,) match_mode = :any StrictMode._findings_all())
-        @test isempty(@test_logs (:warn,) match_mode = :any test_registered())
+        @test_throws StrictMode.StrictViolation (
+            @eval @strict module _IncHole
+            inline_ok(x::Int) = x + 1
+            include($path)
+            end
+        )
+
+        # …and the clean case still loads, so the check is not simply rejecting everything.
+        path2, io2 = mktemp()
+        write(io2, "inc_ok(x::Int) = x + 1\n")
+        close(io2)
+        try
+            @eval @strict module _IncClean
+            inline_ok(x::Int) = x + 1
+            include($path2)
+            end
+            @test Base.@invokelatest(_IncClean.inc_ok(1)) == 2
+        finally
+            rm(path2; force = true)
+        end
     finally
-        merge!(StrictMode.STRICT_REGISTRY, old)
+        rm(path; force = true)
+        StrictMode.clear_declarations!()
     end
+end
+
+@testitem "@strict_policy declares a module policy without wrapping `module`" begin
+    using StrictMode
+
+    StrictMode.clear_declarations!()
+
+    # The policy is recorded, and submodules inherit it by lookup rather than by copy.
+    @eval module _PolParent
+    using StrictMode
+    @strict_policy (:typestable, :noalloc) check = false
+    module _PolChild end
+    end
+    @test StrictMode.module_policy(_PolParent) == (:typestable, :noalloc)
+    @test StrictMode.module_policy(_PolParent._PolChild) == (:typestable, :noalloc)
+    @test StrictMode.module_policy(@__MODULE__) == (:typestable, :noalloc)   # the default
+
+    # Nesting is flattened, so a shared policy can be spliced in from elsewhere.
+    @eval module _PolNest
+    using StrictMode
+    @strict_policy (:typestable, (:noalloc, :noboxing)) check = false
+    end
+    @test StrictMode.module_policy(_PolNest) == (:typestable, :noalloc, :noboxing)
+
+    # A misspelled guarantee is an error, not a no-op: it would otherwise check nothing while
+    # reading as though it checked something.
+    @test_throws ArgumentError (
+        @eval module _PolTypo
+        using StrictMode
+        @strict_policy (:typestabel,) check = false
+        end
+    )
+
+    StrictMode.clear_declarations!()
+end
+
+@testitem "a declaration names only guarantees that exist" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    f(x::Int) = x + 1
+
+    @test_throws ArgumentError StrictMode.register_strict!(f, (Int,); guarantees = (:typestabel,))
+    @test isempty(StrictMode.declarations())           # nothing was recorded
+
+    # Nested collections are accepted and flattened; duplicates collapse.
+    StrictMode.register_strict!(f, (Int,); guarantees = (:typestable, (:typestable, :noalloc)))
+    @test only(values(StrictMode.declarations())).guarantees == (:typestable, :noalloc)
+    @test :typestable in StrictMode.guarantee_names()
+
+    StrictMode.clear_declarations!()
 end

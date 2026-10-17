@@ -68,16 +68,33 @@ StrictMode/src/
                         (kwsorter name stripping), and the ITEM BUILDERS both tiers share:
                         _registry_items/_compiled_items/_map_findings/_run_and_report. The
                         reporting drivers _findings_all/_findings_compiled are here too;
-                        StrictModeTest's test_registered/test_compiled reuse the same item lists
-  audit.jl            — audit (the reporting entry point; no exit status, never throws)
+                        StrictModeTest's test_registered/test_compiled reuse the same item lists.
+                        module_methods is the CENSUS (Base.visit(Core.methodtable) filtered by
+                        module, so a method on a FOREIGN function counts); _coverage_all_findings
+                        is default-deny over it, _coverage_findings the narrower public-function
+                        form; _is_parametric_def keeps a `where` definition out of the registry.
+                        declarations()/exemptions() union each loaded package's OWN store with this
+                        session's; module_policy/_set_module_policy! back @strict_policy, and
+                        _auto_check_module checks _module_load_items — the module's METHODS, so an
+                        include'd definition is covered where a body rewrite could not see it
+  audit.jl            — audit (the reporting entry point; no exit status, never throws, and no
+                        rendering: it returns the findings and format_findings renders them)
   check.jl            — findings/_findings_fast/_compiled_output_finding — the interference-proof
                         core every guarantee funnels through: no macro parsing, no execution.
                         _compiled_output_finding covers the guarantees read from compiled output
                         (owned/inlined/vectorized/no_scalar_loops/no_spill/trimsafe), so
                         StrictModeTest delegates to it rather than keeping a second copy
-  findings.jl         — StrictFinding struct, format_findings, nfailures, _failed
+  findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, and `code`),
+                        format_findings,
+                        nfailures, _failed, key (a finding's identity across runs), findings_diff
   explain.jl          — @explain, StrictReport (built on the value-free engine)
-  cache.jl            — (method, world, signature, guarantees) → findings cache
+  codes.jl            — the diagnostic codes: _CODES keyed on (guarantee, cause) — NEVER on the
+                        reason text, which is assembled per call site — plus explain(code)/codes().
+                        A published code is permanent; a retired kind leaves a gap
+  cache.jl            — (method, world, signature, guarantees) → findings cache. Each entry also
+                        holds the CodeInstances its verdict was read from (_watch_instances): the
+                        key cannot see an edit to a CALLEE, but Julia caps those instances'
+                        max_world when one changes, so a stale entry is dropped on lookup
   report.jl           — StrictViolation exception, _fail, _guarantee_gates (which guarantees
                         THROW from StrictMode and which only WARN — observation vs. inference)
   backend.jl          — the llvm-mca seam ONLY (`_be_mca_*`, mca_available). The analysis tier is
@@ -126,8 +143,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
   src/macros.jl       — @test_noalloc/@test_noboxing/@test_typestable/@test_trim_compatible.
                         Deliberately NOT wrapped in _gate: a gate that compiles itself away under
                         a preference is a gate that can vanish silently
-  src/drivers.jl      — test_signatures/test_compiled/test_registered; each collects every failure
-                        and raises ONCE, so one unanalyzable method leaves the rest evaluated
+  src/drivers.jl      — test_signatures/test_compiled/test_registered/test_coverage (the last one
+                        gates on UNdeclared methods, the hole the others cannot see); each collects
+                        every failure and raises ONCE, so one unanalyzable method leaves the rest
+                        evaluated
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
                         which is why it lives here)
   test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is
@@ -205,6 +224,14 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   `@strict_function`/`@strict module` run at the annotated module's own precompile, where
   `StrictModeTest` is not loadable, so the suite re-proves those signatures via
   `test_registered()`/`test_signatures` at runtime instead.
+- **A declaration lives in the module that made it, not in StrictMode.** `register_strict!(f, types;
+  mod)` and `_exempt!(name, mod)` write to a `const __strict_declarations__` / `__strict_exempt__` in
+  `Base.moduleroot(mod)`, and every driver reads `declarations()` / `exemptions()`, which union those
+  with this session's `STRICT_REGISTRY` / `STRICT_EXEMPT`. Do NOT route the macros back through the
+  global Dicts: StrictMode is already loaded from its own pkgimage when a consumer precompiles, so a
+  cross-package insert there is discarded on the consumer's next cached load, and the consumer's test
+  process then sees an empty registry however much its `src/` declares — which makes a default-deny
+  coverage gate call the whole package undeclared. `test/consumer` pins this.
 - **`_guarantee_gates` (report.jl) decides throw-vs-warn, per guarantee.** A check that OBSERVES
   compiled output gates (`:typestable`'s return-type layer, `:memsafe`, `:vectorized`, `:no_spill`,
   `:inlined`, `:owned`, `:trusted`). A check that INFERS something it cannot see reports:

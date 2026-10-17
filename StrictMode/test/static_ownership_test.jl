@@ -121,7 +121,7 @@ end
     StaticOwnershipDemo.get_ws(Float64)                # hot path: dispatch, no lookup
     StaticOwnershipDemo.get_ws(BigFloat)                # rare path: sanctioned Dict fallback
 
-    fs = audit(StaticOwnershipDemo; static_ownership_suggest = true, format = :text, io = devnull)
+    fs = audit(StaticOwnershipDemo; static_ownership_suggest = true)
     @test count(x -> x.guarantee === :static_ownership, fs) == 1   # only the fallback, not the dispatch methods
     @test any(x -> x.guarantee === :static_ownership && x.status === :info && occursin("BigFloat", x.signature), fs)
     @test nfailures(fs) == 0                          # info findings never fail the audit

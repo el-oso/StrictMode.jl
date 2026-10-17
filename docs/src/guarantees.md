@@ -714,7 +714,7 @@ end
 Workspaces.get_ws(Float64)
 Workspaces.get_ws(BigFloat)   # exercises the sanctioned fallback
 
-fs = audit(Workspaces; static_ownership_suggest = true, format = :text)
+fs = audit(Workspaces; static_ownership_suggest = true)
 nfailures(fs)   # 0 — only the fallback is flagged, and an advisory finding never fails a sweep
 ```
 

@@ -1,20 +1,30 @@
 # Agentic feedback
 
 [`audit`](@ref) is StrictMode's one-shot, structured reporting path — the same checks as
-everywhere else, returned as a `Vector{StrictFinding}` and optionally formatted as JSON, GitHub
-annotations, or plain text. It never throws on a violation; it writes the findings and returns
-them, so an AI agent or CI script can act on them programmatically.
+everywhere else, returned as a `Vector{StrictFinding}`. It never throws on a violation and prints
+nothing, so an agent or a CI script filters and renders what it needs.
 
 ## `audit`
 
 ```@example agents
 using StrictMode
-fs = audit(:registered; format = :json, io = devnull)   # returns Vector{StrictFinding}
-nfailures(fs)                                            # 0 = clean
+fs = audit(:registered)      # returns Vector{StrictFinding}, prints nothing
+nfailures(fs)                # 0 = clean
 ```
 
-`audit` never throws on a violation and never sets an exit status. It writes the findings out and
-returns them, the same `Vector{StrictFinding}` you get from [`findings`](@ref).
+`audit` never throws on a violation and never sets an exit status. It returns the findings, the
+same `Vector{StrictFinding}` you get from [`findings`](@ref), and leaves rendering to
+[`format_findings`](@ref):
+
+```julia
+print(format_findings(fs; format = :json))              # the whole list
+print(format_findings(fs; format = :text, only_failures = true))
+```
+
+Why the two steps are separate: a module sweep can reach several hundred findings, whose `:json`
+rendering runs past 100 kB. A session that formats on every call pushes that through a log or a
+tool-result channel that then truncates it, and the useful work — `filter`, `nfailures`,
+[`findings_diff`](@ref) — happens on the value either way.
 
 **It is a discovery tool, not a gate.** Its verdicts come from StrictMode's value-free engine,
 whose allocation findings are structural guesses — a tool that reports is allowed to be wrong, a
@@ -24,7 +34,7 @@ and TrimCheck and throw a `StrictViolation` collecting every failure.
 
 ```bash
 # report — for an agent's edit→check→fix loop
-julia --project -e 'using MyPkg, StrictMode; audit(MyPkg; format = :json)'
+julia --project -e 'using MyPkg, StrictMode; print(format_findings(audit(MyPkg); format = :json))'
 
 # gate — for CI
 julia --project=test -e 'using MyPkg, StrictMode, StrictModeTest; test_compiled(MyPkg)'
@@ -34,7 +44,7 @@ julia --project=test -e 'using MyPkg, StrictMode, StrictModeTest; test_compiled(
   *declared* functions by default; add `sweep = true` to also sweep everything it compiled).
 - A whole-module sweep can be noisy when hot and cold code mix — scope it with `only` / `exempt`
   (functions or name `Symbol`s), e.g. `audit(MyPkg; sweep = true, exempt = [:_plan_helper])`.
-- `format` is `:json`, `:jsonlines`, `:github`, or `:text`.
+- `format_findings(fs; format)` renders `:json`, `:jsonlines`, `:github`, or `:text`.
 - [`nfailures`](@ref)`(fs)` gives the count programmatically.
 
 ## The JSON schema
@@ -48,6 +58,7 @@ Each finding is one object (here pretty-printed):
   "signature": "(Tuple{Int64, Float64, Float32})",
   "guarantee": "noboxing",
   "status": "fail",
+  "tier": "report",
   "file": "kernels.jl",
   "line": 42,
   "reason": "boxing / dynamic dispatch",
@@ -69,9 +80,13 @@ advisory passes also emit `dispatch` (on by default), `coverage`, `inline_sugges
 A guarantee the analysis could not evaluate is `fail`, carrying the error text in `reason` — "could
 not check" and "is fine" must not render the same.
 
-**A `fail` is worth what the package behind it is worth, and no field tells you that.** `audit`'s
-`noalloc` and `noboxing` verdicts come from the scan, which reads typed IR and still sees
-allocations LLVM later deletes.
+**`tier` says what a `fail` is worth.** `report` is `audit`'s value-free scan; `proof` is
+`StrictModeTest`'s AllocCheck/JET/TrimCheck, through `proof_audit` or a `test_*` driver. The two
+build the same record, so a saved `:jsonlines` file read by another process — or another session —
+has no other way to tell a guess from a proof.
+
+A `report`-tier `noalloc` or `noboxing` verdict comes from the scan, which reads typed IR and still
+sees allocations LLVM later deletes.
 
 Both directions have been measured over 120 compiled specializations from two real packages, with
 AllocCheck as the oracle. On that corpus the scan currently agrees on all 120. Earlier releases did
@@ -101,7 +116,7 @@ consume programmatically.
 ## `:github` format for CI
 
 ```julia
-audit(MyPkg; format = :github)
+print(format_findings(audit(MyPkg); format = :github))
 # ::error file=kernels.jl,line=42::StrictMode @noboxing dot3(…) — boxing / dynamic dispatch
 ```
 
@@ -117,7 +132,7 @@ julia --project=test -e 'using MyPkg, StrictMode, StrictModeTest; test_compiled(
 ```
 
 A thrown `StrictViolation` fails the run and names every failing signature at once. For GitHub
-Actions annotations on a *reporting* pass, `audit(MyPkg; format = :github)` emits them inline.
+Actions annotations on a *reporting* pass, `format_findings(audit(MyPkg); format = :github)` emits them inline.
 
 Guard the whole thing with [`assert_enabled`](@ref) as the first line of your strictmode test
 or audit script. With checks disabled every `@assert_*` expands to the bare call and the run

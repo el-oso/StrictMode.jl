@@ -6,6 +6,12 @@
 
 using StrictMode: StrictFinding, StrictViolation
 
+# Every verdict reached in this package is a proof, so it is built through these two rather than
+# StrictMode's constructors directly: the `tier` a reader needs in order to tell a proof from the
+# reporting engine's guess is then impossible to omit at a new call site.
+_mkproof(args...; kwargs...) = StrictMode._mkfinding(args...; tier = :proof, kwargs...)
+_unproven(args...; kwargs...) = StrictMode._unevaluated(args...; tier = :proof, kwargs...)
+
 """
     AnalysisError <: Exception
 
@@ -590,6 +596,77 @@ Split out from `_trim_validate` so the classification can be tested against hand
 `TrimVerificationErrors` values — provoking a warnings-only raise from a real signature is not
 something a test can arrange deterministically.
 """
+# Where a method is defined. Used for the frames above the failing one: their call lines would need
+# the caller's optimized IR decompressed, and the API for that differs between supported Julias.
+function _ci_location(ci)
+    mi = ci isa Core.CodeInstance ? ci.def : nothing
+    m = mi isa Core.MethodInstance ? mi.def : nothing
+    return m isa Method ? (string(m.file), Int(m.line)) : ("", 0)
+end
+
+# Every frame between the rejected statement and the signature under test, innermost first. The
+# innermost is the statement's own line; the rest are their methods' locations. `parents` maps a
+# `CodeInstance` to the `(caller, statement)` that reached it.
+function _trim_error_frames(desc, parents)
+    frames = Tuple{String, Int}[]
+    try
+        for li in Base.IRShow.buildLineInfoNode(desc.codeinfo.debuginfo, nothing, desc.stmtidx)
+            push!(frames, (string(li.file), Int(li.line)))
+        end
+    catch
+    end
+    ci = desc.codeinst
+    # A cycle in the map would otherwise walk forever; no real call chain is this deep.
+    for _ in 1:32
+        p = get(parents, ci, nothing)
+        isnothing(p) && break
+        ci = first(p)
+        loc = _ci_location(ci)
+        first(loc) == "" || push!(frames, loc)
+    end
+    return frames
+end
+
+# The statement a rejection is about, as source-like text: the verifier's own description (
+# "unresolved call", "dynamic dispatch") followed by the statement it rejected.
+function _trim_statement(desc)
+    stmt = try
+        first(sprint(show, desc.codeinfo.code[desc.stmtidx]), 160)
+    catch
+        ""
+    end
+    d = string(desc.desc)
+    return isempty(stmt) ? d : d * ": " * stmt
+end
+
+# `(findings, sites)` read from the error objects, or `nothing` when none of them carry the fields
+# this reads — in which case the caller falls back to parsing the printed dump.
+#
+# `sites` names the OUTERMOST frame: the construct usually lives in a dependency, and a verdict
+# pointing at the signature under test cannot say so, while a rewrite there would not change it.
+# The whole path is kept, never its basename, for the same reason.
+function _trim_sites(real, parents)
+    findings = String[]
+    sites = Tuple{String, Int}[]
+    seen = Set{Tuple{String, String, Int}}()
+    for (_, desc) in real
+        hasproperty(desc, :codeinfo) && hasproperty(desc, :stmtidx) || continue
+        frames = _trim_error_frames(desc, parents)
+        stmt = _trim_statement(desc)
+        file, line = isempty(frames) ? ("", 0) : last(frames)
+        (stmt, file, line) in seen && continue
+        push!(seen, (stmt, file, line))
+        push!(findings, file == "" ? stmt : stmt * "  [" * file * ":" * string(line) * "]")
+        file == "" || push!(sites, (file, line))
+    end
+    isempty(findings) && return nothing
+    if length(findings) > 8
+        extra = length(findings) - 8
+        findings = vcat(findings[1:8], ["… (+$extra more call site(s))"])
+    end
+    return (findings, sites)
+end
+
 function _trim_verdict(err)
     real = filter(p -> !first(p), err.errors)
     nwarn = length(err.errors) - length(real)
@@ -598,9 +675,14 @@ function _trim_verdict(err)
             "signature and no errors — juliac's own gate accepts that, so this is a PASS." maxlog = 3
         return (true, String[], Tuple{String, Int}[])
     end
-    # Route the verifier output through TypeContracts' `TrimDiagnostics` — the same parser
-    # `explain_trim` uses — for deduplicated, source-mapped sites (statement + user frame), instead
-    # of hand-filtering the raw dump. Re-wrap so only the real errors reach the parser; otherwise a
+    # The error objects carry the statement and the caller chain, so the verdict is read from them
+    # directly. Rendering them to text first and parsing that back costs the information this needs
+    # and depends on a printer that reaches into `Base.Compiler.TrimVerifier` internals, which do
+    # not all exist on every supported Julia.
+    structural = _trim_sites(real, err.parents)
+    isnothing(structural) || return (false, structural[1], structural[2])
+    # Fallback for an error shape this does not recognize: TypeContracts' parser over the printed
+    # dump, the same one `explain_trim` uses. Re-wrap so only the real errors reach it; otherwise a
     # warning's call site would be reported as a failing one.
     errs = try
         TrimCheck.TrimVerificationErrors(real, err.parents)
@@ -683,18 +765,18 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
     end
     out = StrictFinding[]
     for g in guarantees
-        shared = StrictMode._compiled_output_finding(g, f, types, md, fn, sg)
+        shared = StrictMode._compiled_output_finding(g, f, types, md, fn, sg; tier = :proof)
         if !isnothing(shared)
             push!(out, shared)
         elseif g === :typestable
             push!(out, _typestable_finding(target, f, types, md, fn, sg))
         elseif g === :noalloc
             if isnothing(allocs)
-                push!(out, StrictMode._unevaluated(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
+                push!(out, _unproven(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
             else
                 file, line = _first_loc(allocs, false)
                 push!(
-                    out, StrictMode._mkfinding(
+                    out, _mkproof(
                         md, fn, sg, g, !isempty(allocs),
                         "allocates ($(length(allocs)) site(s))", file, line
                     )
@@ -702,12 +784,12 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             end
         elseif g === :noboxing
             if isnothing(allocs)
-                push!(out, StrictMode._unevaluated(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
+                push!(out, _unproven(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
             else
                 boxing = filter(_is_boxing, allocs)
                 file, line = _first_loc(allocs, true)
                 push!(
-                    out, StrictMode._mkfinding(
+                    out, _mkproof(
                         md, fn, sg, g, !isempty(boxing), "boxing / dynamic dispatch", file, line
                     )
                 )
@@ -725,7 +807,7 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             file = isempty(sites) ? (isnothing(m) ? "" : string(m.file)) : sites[1][1]
             line = isempty(sites) ? (isnothing(m) ? 0 : Int(m.line)) : sites[1][2]
             push!(
-                out, StrictMode._mkfinding(
+                out, _mkproof(
                     md, fn, sg, g, !passed, _trim_reason(oracle, fnds), file, line
                 )
             )
@@ -746,9 +828,10 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
         cause = StrictMode._instability_cause(f, types)
         reason = "return type $rt is not concrete (inference)"
         isnothing(cause) || (reason *= " — " * StrictMode._cause_reason(cause...))
-        return StrictMode._mkfinding(
+        return _mkproof(
             md, fn, sg, :typestable, true, reason, "", 0,
-            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1])
+            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1]);
+            cause = isnothing(cause) ? nothing : cause[1]
         )
     end
     # An optimization-failure report says one frame produced no optimized IR (typically a recursive
@@ -783,9 +866,10 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
         )
         reason = "internal instability / runtime dispatch (" * join(parts, " | ") * ")"
         isnothing(cause) || (reason *= " — " * StrictMode._cause_reason(cause...))
-        return StrictMode._mkfinding(
+        return _mkproof(
             md, fn, sg, :typestable, true, reason, "", 0,
-            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1])
+            isnothing(cause) ? "" : StrictMode._cause_suggestion(cause[1]);
+            cause = isnothing(cause) ? nothing : cause[1]
         )
     end
     # F39. JET cannot see this class at all: a union-typed local that boxes a member on the way in is
@@ -793,7 +877,7 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
     # would be WEAKER than the scan it is supposed to settle — `@assert_typestable` catches it and
     # `@test_typestable` would wave it through.
     unionphi = StrictMode._alloc_signals(f, types; depth = 0).unionphi
-    return StrictMode._mkfinding(
+    return _mkproof(
         md, fn, sg, :typestable, unionphi,
         "a union-typed local carries a member that must be boxed to flow through it " *
             "(concrete return, and invisible to JET)", "", 0

@@ -10,16 +10,21 @@ A single guarantee result for one `(function, signature)`. Flat and serializable
 record feeds the human (`:text`) and agent (`:json`) reporting paths.
 
 Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/
-`:inlined`/…), `status`, `file`, `line`, `reason`, `suggestion`.
+`:inlined`/…), `status`, `file`, `line`, `reason`, `suggestion`, `tier`.
 
 `status` is one of:
 - `:pass` / `:fail` — a verdict to act on. A guarantee the analysis could not evaluate is `:fail`
   carrying the error text, never `:pass`: "could not check" and "is fine" must not render the same.
 - `:info` — advisory, never a failure ([`inline_suggestions`](@ref)/[`static_ownership_suggestions`](@ref)).
 
-How much a `:fail` is worth is a property of where it came from, not a field: StrictMode's findings
-are a value-free engine's verdicts and nothing gates on them, while `StrictModeTest`'s are proofs
-and its drivers do gate.
+`tier` says how much a `:fail` is worth, and it is a field because a finding outlives the session
+that made it: `:report` is StrictMode's value-free engine, whose allocation verdicts are structural
+guesses that nothing gates on, and `:proof` is `StrictModeTest`'s AllocCheck/JET/TrimCheck, which
+its drivers do gate. A saved `:jsonlines` file read by another process, or by another session, has
+no other way to tell a guess from a proof.
+
+[`key`](@ref) is the identity of a finding across runs, and [`findings_diff`](@ref) compares two
+runs by it.
 """
 struct StrictFinding
     mod::Symbol
@@ -31,7 +36,21 @@ struct StrictFinding
     line::Int
     reason::String
     suggestion::String
+    tier::Symbol
+    code::Symbol
 end
+
+# The reporting tier and the guarantee's own code are the defaults, so the shorter forms keep their
+# meaning: every construction site inside StrictMode is a value-free verdict, and a site that has
+# narrowed the cause passes the cause's code instead (see `StrictMode._code`).
+StrictFinding(mod, func, signature, guarantee, status, file, line, reason, suggestion, tier) =
+    StrictFinding(
+    mod, func, signature, guarantee, status, file, line, reason, suggestion, tier,
+    _code(guarantee)
+)
+
+StrictFinding(mod, func, signature, guarantee, status, file, line, reason, suggestion) =
+    StrictFinding(mod, func, signature, guarantee, status, file, line, reason, suggestion, :report)
 
 # Actionable fix hint per guarantee — the structured equivalent of what `@explain` tells a human.
 # A `:typestable` suggestion narrowed to the declaration that caused the instability. The numbers
@@ -71,11 +90,76 @@ The number of failing findings in a `Vector{StrictFinding}` (as returned by [`fi
 """
 nfailures(fs::AbstractVector{StrictFinding}) = count(_failed, fs)
 
+"""
+    StrictMode.key(f::StrictFinding) -> Tuple{Symbol, String, String, Symbol}
+
+The identity of a finding across runs: `(mod, func, signature, guarantee)`. It survives an edit to
+the code the finding is about, which is what makes two runs comparable — `reason` and `line` do not,
+and are the thing a comparison reports as changed.
+
+`file`/`line` cannot serve: a `:typestable` finding carries no location at all, and a `:noalloc`
+finding carries the allocation *site*, which moves when the body does.
+"""
+key(f::StrictFinding) = (f.mod, f.func, f.signature, f.guarantee)
+
+"""
+    StrictMode.findings_diff(old, new) -> (; fixed, introduced, changed, unchanged)
+
+Compare two runs by [`key`](@ref). `fixed` are findings that failed in `old` and do not in `new`,
+`introduced` the reverse, `changed` those failing in both with a different `reason`, and `unchanged`
+the rest of the shared failures. Each field is a `Vector{StrictFinding}` taken from `new`, except
+`fixed`, which can only come from `old`.
+
+Two sessions can share a baseline this way: write one run with
+`format_findings(fs; format = :jsonlines)` and compare the next against it.
+"""
+function findings_diff(old::AbstractVector{StrictFinding}, new::AbstractVector{StrictFinding})
+    oldfail = Dict(key(f) => f for f in old if _failed(f))
+    newfail = Dict(key(f) => f for f in new if _failed(f))
+    fixed = [f for (k, f) in oldfail if !haskey(newfail, k)]
+    introduced = [f for (k, f) in newfail if !haskey(oldfail, k)]
+    changed = StrictFinding[]
+    unchanged = StrictFinding[]
+    for (k, f) in newfail
+        haskey(oldfail, k) || continue
+        push!(oldfail[k].reason == f.reason ? unchanged : changed, f)
+    end
+    return (; fixed, introduced, changed, unchanged)
+end
+
 # Single-line REPL display.
 function Base.show(io::IO, f::StrictFinding)
     mark = f.status === :fail ? "✗" : f.status === :pass ? "✓" : "•"
-    print(io, "[", mark, " ", f.guarantee, "] ", f.func, f.signature)
+    print(io, "[", mark, " ", f.guarantee)
+    # The code only earns its space where there is something to look up.
+    f.status === :pass || print(io, " ", f.code)
+    print(io, "] ", f.func, f.signature)
     f.status !== :pass && f.reason != "" && print(io, " — ", f.reason)
+    return nothing
+end
+
+# Multi-line display for a list of findings. This is the whole rendering a caller sees when a
+# driver's return value is displayed — a REPL, a log, or an agent reading a tool result — so it
+# leads with the counts and the failures, and collapses the passes to a tally. A 400-finding sweep
+# printed in full buries the handful of lines that matter.
+function Base.show(io::IO, ::MIME"text/plain", fs::AbstractVector{StrictFinding})
+    if isempty(fs)
+        print(io, "0 StrictMode findings")
+        return nothing
+    end
+    failed = filter(_failed, fs)
+    info = filter(f -> f.status === :info, fs)
+    npass = length(fs) - length(failed) - length(info)
+    print(io, length(fs), "-element Vector{StrictFinding}: ", length(failed), " failing")
+    isempty(info) || print(io, ", ", length(info), " informational")
+    iszero(npass) || print(io, ", ", npass, " passing")
+    for f in Iterators.take(failed, 20)
+        print(io, "\n ", f)
+        f.file == "" || print(io, "\n     at ", f.file, ":", f.line)
+        f.suggestion == "" || print(io, "\n     → ", f.suggestion)
+    end
+    length(failed) > 20 && print(io, "\n … and ", length(failed) - 20, " more failing")
+    isempty(failed) || print(io, "\n(format_findings(fs; format = :json) for the whole list)")
     return nothing
 end
 
@@ -151,6 +235,7 @@ function _json_obj(io::IO, f::StrictFinding)
     pairs = (
         ("module", string(f.mod)), ("function", f.func), ("signature", f.signature),
         ("guarantee", string(f.guarantee)), ("status", string(f.status)),
+        ("tier", string(f.tier)), ("code", string(f.code)),
         ("file", f.file), ("reason", f.reason), ("suggestion", f.suggestion),
     )
     for (k, v) in pairs

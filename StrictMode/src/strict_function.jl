@@ -41,7 +41,10 @@ _warn_parametric_decl(target) = @warn "@strict_function $target: the signature i
     "every specialization as it compiles."
 
 # Runs at precompile/module-load. Only verifies *concrete* signatures; abstract ones warn once.
-function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), target; warn_abstract::Bool = true)
+function _verify_strict_def(
+        @nospecialize(f), @nospecialize(types::Tuple), target;
+        warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing
+    )
     Base.isdispatchtuple(Tuple{types...}) || return begin
         # Silent when the caller supplied `signatures =`: they have already answered which concrete
         # instantiations this declaration stands for, so the declaration being abstract is expected.
@@ -52,7 +55,7 @@ function _verify_strict_def(@nospecialize(f), @nospecialize(types::Tuple), targe
     end
     # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
     # StrictModeTest.test_registered) re-check it.
-    register_strict!(f, types)
+    register_strict!(f, types; mod)
     # Type stability: the return type for this signature must be concrete.
     rts = Base.return_types(f, Tuple{types...})
     # No method at all is its own mistake — usually a typo in `signatures = [...]`. Reporting it as
@@ -95,10 +98,12 @@ end
 # cannot name. A generic declaration infers to `Any` (`return_types(pick, Tuple{Tuple,Int})` is
 # `Any[Any]`), so checking it directly would fail every generic function; listing the
 # instantiations that matter keeps the verdict at module load, where it belongs, without that.
-function _verify_strict_signatures(@nospecialize(f), sigs, fname::AbstractString)
+function _verify_strict_signatures(
+        @nospecialize(f), sigs, fname::AbstractString; mod::Union{Nothing, Module} = nothing
+    )
     for s in sigs
         types = s isa Tuple ? s : Tuple(s)
-        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")")
+        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod)
     end
     return nothing
 end
@@ -165,18 +170,18 @@ macro strict_function(args...)
     elseif parametric
         quote
             $(esc(def))
-            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)))
+            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__)
         end
     elseif isnothing(sigs)
         quote
             $(esc(def))
-            $(_verify_strict_def)($(esc(fname)), $argtypes, $target)
+            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__)
         end
     else
         quote
             $(esc(def))
-            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; warn_abstract = false)
-            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)))
+            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; warn_abstract = false, mod = @__MODULE__)
+            $(_verify_strict_signatures)($(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__)
         end
     end
     return _gate(checked, esc(def))
@@ -185,31 +190,71 @@ end
 """
     @strict_exempt f(x::T, ...) = ...
     @strict_exempt name
+    @strict_exempt name guarantees = (:noalloc,) reason = "builds the plan once"
 
-Mark a function as cold: setup or plan-time code that's meant to allocate or stay type-flexible,
-and should be exempt from StrictMode's checks. Inside a
-`@strict module` every function is checked by default, and you wrap only the occasional cold helper
-in `@strict_exempt`, rather than annotating all the hot code.
+Mark code as cold: setup or plan-time code that is meant to allocate or stay type-flexible, and is
+not held to a guarantee. Inside a strict module every function is checked by default, and you wrap
+only the occasional cold helper in `@strict_exempt` rather than annotating all the hot code.
 
-The definition form defines the function and records its name as exempt; the name form
-(`@strict_exempt foo` or `@strict_exempt :foo`) just records the name. Exempt functions are skipped
-by `audit`, the whole-module load check, and `StrictModeTest`'s `test_registered`/`test_compiled`
-gates. It's never gated itself; the exemption always applies.
+Three forms:
+
+- a **definition** — defines the function and exempts it. A qualified name works, so a method on a
+  foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`.
+- a **name** — `@strict_exempt foo` or `@strict_exempt :foo`, exempting every signature of it.
+- either, **narrowed** by `guarantees = (...)`, exempting only those.
+
+`reason = "..."` is carried into the report, where it is the difference between an opt-out a
+reviewer can judge and one they can only wonder about.
+
+An exemption records where it is written, so a report can point at the line. Exempt code is skipped
+by `audit`, the whole-module load check, the coverage gate, and `StrictModeTest`'s
+`test_registered`/`test_compiled`. The macro is never gated itself; the exemption always applies.
+
+A narrowed exemption silences only what it names. It does not make the function count as covered
+for any other guarantee, which is what keeps `guarantees = (:noalloc,)` from quietly turning off
+type stability too.
 """
-macro strict_exempt(arg)
-    if Meta.isexpr(arg, (:function, :(=)))
-        sig = _strictdef_sig(arg)
-        fname = sig.args[1]
-        fname isa Symbol || throw(ArgumentError("@strict_exempt: unsupported definition $arg"))
-        return quote
-            $(esc(arg))
-            $(_exempt!)($(QuoteNode(fname)))
-            $(esc(fname))
-        end
+macro strict_exempt(args...)
+    pos, opts = _macro_call(args, (:guarantees, :reason, :types))
+    isempty(pos) && throw(
+        ArgumentError("@strict_exempt expects a definition or a function name")
+    )
+    arg = pos[1]
+    gs = get(opts, :guarantees, nothing)
+    reason = get(opts, :reason, "")
+    types = get(opts, :types, nothing)
+    file, line = string(__source__.file), __source__.line
+    name = _exempt_name(
+        Meta.isexpr(arg, (:function, :(=))) ? _strictdef_sig(arg).args[1] :
+            (arg isa QuoteNode ? arg.value : arg)
+    )
+    record = :(
+        $(_exempt!)(
+            $(QuoteNode(name)), @__MODULE__;
+            guarantees = $(esc(gs)), reason = $(esc(reason)), types = $(esc(types)),
+            file = $file, line = $line
+        )
+    )
+    Meta.isexpr(arg, (:function, :(=))) || return record
+    return quote
+        $(esc(arg))
+        $record
+        nothing
     end
-    name = arg isa QuoteNode ? arg.value : arg
-    name isa Symbol || throw(ArgumentError("@strict_exempt expects a definition or a function name, got $arg"))
-    return :($(_exempt!)($(QuoteNode(name))))
+end
+
+# The bare name a definition or reference carries. A qualified one (`Base.length`) keeps its last
+# component: exemptions are matched by the demangled function name, and that is what `nameof` gives
+# for a method on a foreign function too.
+function _exempt_name(x)
+    x isa Symbol && return x
+    Meta.isexpr(x, :.) && x.args[end] isa QuoteNode && return x.args[end].value::Symbol
+    throw(
+        ArgumentError(
+            "@strict_exempt: expected a function name, got `$x`. A definition and a plain or " *
+                "qualified name are accepted (`foo`, `:foo`, `Base.length(::Foo) = 1`)."
+        )
+    )
 end
 
 # --- `@strict_stable` -----------------------------------------------------------------------------
@@ -315,4 +360,55 @@ macro strict_stable(def)
     )
 
     return _gate(esc(Expr(:block, innerdef, wrapper, fname)), esc(def))
+end
+
+"""
+    @strict_policy guarantees
+    @strict_policy guarantees check = false
+
+Apply `guarantees` to every definition in the enclosing module, and check the ones above this line.
+
+It is the non-wrapping spelling of `@strict module … end`: a package's `module` line comes from its
+own file and need not be restructured to adopt StrictMode. Place it **last** in the module to check
+everything, which is where `@strict module` effectively puts its check.
+
+`guarantees` is a `Symbol` or a collection of them, nested collections allowed, so a shared policy
+can live in one place and be named by each module that follows it:
+
+```julia
+module Kernels
+using StrictMode
+include("a.jl")
+include("b.jl")
+@strict_policy (:typestable, :noalloc)     # or: @strict_policy MyOrgBase.KERNEL_POLICY
+end
+```
+
+Every definition the module made is checked, **including those in `include`d files** — the check
+reads the module's methods, not the text of its body. A method whose own signature is not concrete
+cannot be checked at load (a generic declaration infers to `Any`); declare its instantiations with
+[`@strict_function`](@ref)'s `signatures = [...]`, or gate on them from the test environment with
+`StrictModeTest.test_coverage`.
+
+An unknown guarantee name is an error here, not a no-op: a misspelled guarantee that was accepted
+would check nothing while reading as though it checked something.
+
+`check = false` records the policy without checking, for a module that is checked elsewhere.
+Submodules inherit the policy ([`StrictMode.module_policy`](@ref)), and opting a cold helper out is
+[`@strict_exempt`](@ref).
+
+Allocation verdicts here only warn — the same rule `@strict_function` follows, because at a
+consumer's own precompile the proofs are not loadable and a structural guess must not break a build.
+"""
+macro strict_policy(args...)
+    pos, opts = _macro_call(args, (:check,))
+    isempty(pos) && throw(ArgumentError("@strict_policy needs a guarantee or a collection of them"))
+    check = get(opts, :check, true)
+    spec = pos[1]
+    return quote
+        local _gs = $(_check_guarantees)($(esc(spec)))
+        $(_set_module_policy!)(@__MODULE__, _gs)
+        $(check) && $(_auto_check_module)(@__MODULE__, _gs)
+        _gs
+    end
 end

@@ -56,11 +56,10 @@ end
     @test any(f -> f.func == "cold" && StrictMode._failed(f), fs)
     @test any(f -> f.func == "hot" && f.status === :pass, fs)
 
-    buf = IOBuffer()
-    fa = proof_audit(ProofAuditDemo; sweep = true, guarantees = (:noboxing,), format = :json, io = buf)
+    fa = proof_audit(ProofAuditDemo; sweep = true, guarantees = (:noboxing,))
     @test fa isa Vector{StrictMode.StrictFinding}
     @test StrictMode.nfailures(fa) >= 1
-    @test occursin("\"status\":\"fail\"", String(take!(buf)))
+    @test occursin("\"status\":\"fail\"", format_findings(fa; format = :json))
 end
 
 @testitem "proof_audit really is the PROOF, not the scan" begin
@@ -76,4 +75,65 @@ end
     absc(1)
     @test StrictMode._failed(only(StrictMode.findings(absc, (Int,); guarantees = (:noboxing,))))
     @test only(proof_findings(absc, (Int,); guarantees = (:noboxing,))).status === :pass
+end
+
+@testitem "test_coverage gates on undeclared methods" begin
+    using StrictMode, StrictModeTest
+
+    module CovGate
+    kernel(x::Int) = x + 1
+    helper(x::Int) = x * 2
+    end
+
+    StrictMode.clear_declarations!()
+
+    # Undeclared: the gate raises and names what is missing.
+    err = try
+        test_coverage(CovGate)
+        nothing
+    catch e
+        e
+    end
+    @test err isa StrictMode.StrictViolation
+    @test occursin("kernel", err.details) && occursin("helper", err.details)
+
+    # Declared and exempted: the gate passes.
+    StrictMode.register_strict!(CovGate.kernel, (Int,); guarantees = (:typestable,))
+    StrictMode._exempt!(:helper)
+    fs = test_coverage(CovGate)
+    @test isempty(filter(StrictMode._failed, fs))
+
+    @test_throws ArgumentError test_coverage(CovGate; require = :exported)
+
+    StrictMode.clear_declarations!()
+end
+
+@testitem "test_exemptions reports an opt-out the proofs no longer need" begin
+    using StrictMode, StrictModeTest
+
+    module RetireEx
+    using StrictMode
+    clean(x::Float64) = x * 2.0          # satisfies :noalloc and :typestable
+    dirty(n::Int) = collect(1:n)         # really does allocate
+    end
+
+    StrictMode.clear_declarations!()
+    RetireEx.clean(1.0)
+    RetireEx.dirty(2)
+
+    # Both marked cold. One of them did not need to be.
+    StrictMode._exempt!(:clean; reason = "assumed hot-path-irrelevant")
+    StrictMode._exempt!(:dirty; reason = "allocates on purpose")
+
+    fs = test_exemptions(RetireEx)
+    names = Set(f.func for f in fs)
+    @test "clean" in names            # the proofs pass, so the opt-out hides nothing
+    @test !("dirty" in names)         # still needed, so not reported
+
+    # Advice, never a failure: tidy-up work must not be able to fail a build.
+    @test all(f -> f.status === :info, fs)
+    @test StrictMode.nfailures(fs) == 0
+    @test all(f -> f.tier === :proof, fs)   # only a proof may say this
+
+    StrictMode.clear_declarations!()
 end

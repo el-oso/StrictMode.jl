@@ -97,7 +97,7 @@ end
     InlineDemo.hot([1.0, 2.0, 3.0])                  # warm a concrete specialization
 
     fs = audit(
-        InlineDemo; inline_suggest = true, format = :text, io = devnull,
+        InlineDemo; inline_suggest = true,
         only = r"hot|leaf"
     )
     @test any(x -> x.guarantee === :inline_suggestion && occursin("leaf", x.reason), fs)

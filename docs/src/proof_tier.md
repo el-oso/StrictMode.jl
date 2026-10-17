@@ -29,8 +29,9 @@ The macro you write picks the engine. There is no mode to switch.
 | `findings(f, types)` | `test_signatures(pairs)` |
 | `audit(mod; sweep = true)` | `test_compiled(mod)` |
 | — | `proof_findings(f, types)` / `proof_findings(mod)` — proved, as data |
-| — | `proof_audit(mod)` — proved, as data, formatted |
+| — | `proof_audit(mod)` — proved, as data |
 | — | `test_registered()` |
+| `audit(mod; require = :all)` | `test_coverage(mod)` — every method declared or visibly exempt |
 
 ```@meta
 CurrentModule = StrictModeTest
@@ -57,6 +58,7 @@ StrictModeTest.StrictModeTest
 test_signatures
 test_compiled
 test_registered
+test_coverage
 ```
 
 ### Proofs as data

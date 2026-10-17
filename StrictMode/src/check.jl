@@ -17,11 +17,15 @@ end
 # A guarantee the analysis could not evaluate. `:fail`, never `:pass`: "I could not check this" and
 # "this is fine" must not render the same, which is how a crashed AllocCheck/JET run reported
 # success for every method in a sweep.
-_unevaluated(md, fn, sg, g, why) = StrictFinding(md, fn, sg, g, :fail, "", 0, why, _suggestion(g))
+_unevaluated(md, fn, sg, g, why; tier::Symbol = :report) =
+    StrictFinding(md, fn, sg, g, :fail, "", 0, why, _suggestion(g), tier, :SM0203)
 
-_mkfinding(md, fn, sg, g, fail::Bool, reason, file, line, suggestion = "") = StrictFinding(
+_mkfinding(
+    md, fn, sg, g, fail::Bool, reason, file, line, suggestion = "";
+    tier::Symbol = :report, cause::Union{Nothing, Symbol} = nothing
+) = StrictFinding(
     md, fn, sg, g, fail ? :fail : :pass, file, line, fail ? reason : "",
-    fail ? (isempty(suggestion) ? _suggestion(g) : suggestion) : ""
+    fail ? (isempty(suggestion) ? _suggestion(g) : suggestion) : "", tier, _code(g, cause)
 )
 
 const _GUARANTEES = (
@@ -32,20 +36,23 @@ const _GUARANTEES = (
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
 # same answer whichever tier asks, so `StrictModeTest` delegates here for these instead of keeping
 # a second copy. Returns `nothing` for a guarantee this does not cover.
-function _compiled_output_finding(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
+function _compiled_output_finding(
+        g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg;
+        tier::Symbol = :report
+    )
     if g === :owned
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
-        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line)
+        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
-        return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0)
+        return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0; tier)
     elseif g === :vectorized
-        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0)
+        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0; tier)
     elseif g === :no_scalar_loops
-        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0)
+        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
     elseif g === :no_spill
         r = spill_report(f, types)
-        return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0)
+        return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0; tier)
     elseif g === :trusted
         # No proving counterpart: the scan reads a call on a type inference has already fixed, so
         # there is nothing a backend could add. Both tiers therefore answer from here.
@@ -74,14 +81,20 @@ function findings(
     if !isnothing(key)
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
         if !isnothing(cached)
-            @lock _CACHE_LOCK (_CACHE_HITS[] += 1)
-            return copy(cached)
+            fs, watched = cached
+            # The key cannot see an edit to a CALLEE; the compiled code the verdict was read from
+            # can. A hit whose instances have been invalidated is dropped rather than handed back.
+            if _instances_valid(watched)
+                @lock _CACHE_LOCK (_CACHE_HITS[] += 1)
+                return copy(fs)
+            end
+            @lock _CACHE_LOCK delete!(_CACHE, key)
         end
     end
     fs = _findings_uncached(f, types, guarantees)
     if !isnothing(key)
         @lock _CACHE_LOCK begin
-            _CACHE[key] = fs
+            _CACHE[key] = (fs, _watch_instances(f, types))
             _CACHE_MISSES[] += 1
         end
     end
@@ -139,7 +152,13 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             # says what to edit rather than only that the body is unstable.
             cause = fail ? _instability_cause(f, types) : nothing
             reason = isnothing(cause) ? base : base * " — " * _cause_reason(cause...)
-            push!(out, _mkfinding(md, fn, sg, g, fail, reason, "", 0, isnothing(cause) ? "" : _cause_suggestion(cause[1])))
+            push!(
+                out, _mkfinding(
+                    md, fn, sg, g, fail, reason, "", 0,
+                    isnothing(cause) ? "" : _cause_suggestion(cause[1]);
+                    cause = isnothing(cause) ? nothing : cause[1]
+                )
+            )
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))

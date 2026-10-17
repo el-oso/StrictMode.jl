@@ -195,7 +195,7 @@ Inlining is a heuristic: a tiny callee LLVM still inlines despite a Julia-IR `:i
 so treat a suggestion as a prompt to *benchmark*, not a verdict.
 
 ```julia
-audit(MyPkg; inline_suggest = true, format = :text)          # whole-package, incl. suggestions
+audit(MyPkg; inline_suggest = true)          # whole-package, incl. suggestions
 inline_suggestions(my_caller, (Vector{Float64},))            # one function's non-inlined callees
 ```
 """

@@ -209,12 +209,12 @@ end
     )
     end
     Dyn.total(Dyn.S[Dyn.A(1.0)])
-    fs = audit(Dyn; sweep = true, io = devnull)                     # on by default
+    fs = audit(Dyn; sweep = true)                     # on by default
     ds = filter(f -> f.guarantee === :dispatch, fs)
     @test !isempty(ds)
     # Advisory only: a dispatch finding never counts as a failure.
     @test all(f -> f.status === :info, ds)
     @test !any(StrictMode._failed, ds)
     # And it can be turned off, for a sweep that does not want the extra typed-IR read.
-    @test isempty(filter(f -> f.guarantee === :dispatch, audit(Dyn; sweep = true, dispatch_suggest = false, io = devnull)))
+    @test isempty(filter(f -> f.guarantee === :dispatch, audit(Dyn; sweep = true, dispatch_suggest = false)))
 end

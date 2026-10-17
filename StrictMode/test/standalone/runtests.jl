@@ -81,7 +81,7 @@ using Test
         @test only(fs).status === :fail
         @test nfailures(fs) == 1
         fsw = audit(
-            StrictMode; sweep = true, guarantees = (:typestable,), format = :text, io = devnull
+            StrictMode; sweep = true, guarantees = (:typestable,)
         )
         @test fsw isa Vector
     end

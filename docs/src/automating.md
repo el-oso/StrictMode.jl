@@ -7,11 +7,12 @@ covers the higher-level options. Quick reference for which to reach for:
 |---|---|
 | Check one call at a call site | `@assert_*` / `@strict` / `@kernel` |
 | Check one function against its declared types | `@strict_function` |
-| Mark a whole module strict | `@strict module … end` |
+| Mark a whole module strict | `@strict_policy` (or `@strict module … end`) |
 | Programmatically report on `(f, types)` | `findings` |
 | Programmatically **gate** on `(f, types)` | `StrictModeTest.test_signatures` |
 | Whole-package report | `audit` |
 | Whole-package CI gate | `StrictModeTest.test_compiled` / `test_registered` |
+| Fail on anything UNdeclared | `StrictModeTest.test_coverage` |
 | Live feedback while editing | `watch` + Revise |
 
 (For wiring `audit` into an AI agent or CI pipeline, see [Agentic feedback](agents.md).)
@@ -49,9 +50,26 @@ test_signatures([
 
 ## Strict by default — one switch, not per-function
 
-You shouldn't have to annotate every function by hand. `@strict module … end` makes the whole
-module strict on its own: every definition is checked by default, and you opt the occasional cold
-helper out with [`@strict_exempt`](@ref).
+You should not have to annotate every function by hand. `@strict_policy` makes the whole module
+strict on its own: every definition is checked by default, and you opt the occasional cold helper
+out with [`@strict_exempt`](@ref).
+
+```julia
+module Kernels
+using StrictMode
+
+include("dot.jl")      # covered: the check reads this module's METHODS, not its body text
+include("saxpy.jl")    # covered
+
+@strict_exempt plan(n::Int) = collect(1:n)   # cold setup code — intentionally allocates
+
+@strict_policy (:typestable, :noalloc)      # last, so everything above it is checked
+end
+```
+
+It reads the module's methods rather than rewriting its body, which is why definitions inside an
+`include`d file are covered. `@strict module … end` is the wrapping spelling of the same check, for
+a module you are writing from scratch:
 
 ```julia
 @strict module Kernels        # one declaration disciplines the whole module
@@ -102,23 +120,61 @@ test_compiled(MyPkg; guarantees = (:noalloc, :noboxing))          # prove and ga
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
 best-effort and defensive. In return, it needs no marks at all.
 
-## The coverage gate — `audit(mod; require = :public)`
+## The coverage gate — default-deny
 
-The drivers above check what was *declared* (registry) or what *ran* (sweep) — neither notices
-a new public function that was never brought under StrictMode at all. The coverage gate closes
-that hole: it fails (one `guarantee = :coverage` finding, `status = :fail`) for every
-exported/`public` function of the module that is neither registered nor exempted.
+The drivers above check what was *declared* (registry) or what *ran* (sweep) — neither notices a
+method that was never brought under StrictMode at all. That is the hole an opt-in leaves: a
+missing declaration and a deliberate exemption read exactly the same. The coverage gate closes it
+by making absence a failure.
 
 ```julia
-# in your test suite: registration is the manifest, the gate enforces completeness
+# in your test suite: declarations are the manifest, the gate enforces completeness
 StrictMode.register_strict!(MyPkg.kernel!, (Vector{Float64},); guarantees = (:typestable, :noalloc))
-test_registered()                                 # the declared guarantees hold…
-@test nfailures(audit(MyPkg; require = :public)) == 0   # …and nothing public is undeclared
+test_registered()                     # the declared guarantees hold…
+test_coverage(MyPkg)                  # …and nothing is undeclared
 ```
 
-A new public function now cannot ship silently unchecked: either it gets registered with its
-guarantees, or it is opted out **visibly** (`@strict_exempt` / the `exempt` kwarg) where a
-reviewer can see it. Scope with `only`/`exempt` exactly as in the sweep above.
+`audit(mod; require = :all)` reports the same thing without raising.
+
+Two scopes:
+
+| | counts |
+|---|---|
+| `require = :public` | undeclared exported/`public` **functions** |
+| `require = :all` | undeclared **methods**, foreign-function methods included |
+
+`:all` reads the global method table rather than the module's names, so a `Base.size` or
+`Base.getindex` method the package defines is counted — those are frequently its hottest code, and
+no walk over the module's own bindings can see them. Measured on StrictMode itself: 476 methods,
+of which a binding walk finds 457, and 13 of the ones it reports belong to foreign functions.
+
+Keyword wrappers, closures and default constructors are not counted — none of them is a method a
+declaration could name — and one `:info` finding reports how many were left out, so the gate
+cannot quietly narrow its own scope.
+
+A new method now cannot ship silently unchecked: either it is declared with its guarantees, or it
+is opted out **visibly** (`@strict_exempt` / the `exempt` kwarg) where a reviewer can see it.
+
+### What counts as covered
+
+A declaration names a **signature**, and a guarantee can only be checked for a signature that
+names concrete types — a generic definition infers to `Any`. So the gate asks per signature, not
+per method:
+
+- A method that has compiled concrete signatures is covered only when **every one of them** is
+  declared. `gen(x::T) where {T<:Real}` called with `Float64` and `Int32` has two; declaring
+  `(Float64,)` leaves `(Int32)` reported, because nothing checked it.
+- A method nothing has compiled yet has no signature to name, so the gate falls back to asking
+  whether any declaration speaks for the method at all.
+
+Coverage therefore follows what actually ran. A signature that appears for the first time in a
+later run is reported then — which is the point: it was not checked before either.
+
+!!! note
+    The gate reports whether a declaration *exists*. Whether the guarantees then *hold* is
+    `test_registered`'s job. Measured on StrictMode: 79 of its 476 methods have a dispatch-tuple
+    signature of their own; the rest are generic and need their instantiations listed
+    (`signatures = [(T1, …), …]`) to be proved as well as counted.
 
 ## Live feedback with Revise — `watch`
 

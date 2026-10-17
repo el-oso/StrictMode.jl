@@ -52,9 +52,27 @@ end
     dot3(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
     rr = register_report(dot3, (NTuple{3, Float64}, NTuple{3, Float64}))
     @test rr isa StrictMode.RegisterReport
-    @test rr.vec_regs_total == 0 || rr.vec_regs_total == 32   # either no zmm or AVX-512
-    @test rr.vec_regs_used >= 0
+    @test iszero(rr.vec_regs_total) || rr.vec_regs_total == 32   # either no zmm or AVX-512
     @test rr.vec_spills >= 0
+
+    # A positive control, because a count cannot be negative and `used >= 0` therefore passes even
+    # when nothing was read: a vectorized loop must report registers in USE. `dot3` is the wrong
+    # subject for that — measured here, it uses no vector registers at all (total 0, used 0), while
+    # this loop reports 5 of 32. On a target with no vector registers both are 0, and the two
+    # branches keep the assertion honest either way.
+    function _axpy!(y::Vector{Float64}, a::Float64, x::Vector{Float64})
+        @inbounds @simd for i in eachindex(y, x)
+            y[i] += a * x[i]
+        end
+        return y
+    end
+    _axpy!(zeros(8), 2.0, ones(8))
+    vr = register_report(_axpy!, (Vector{Float64}, Float64, Vector{Float64}))
+    if vr.vec_regs_total > 0
+        @test vr.vec_regs_used > 0
+    else
+        @test iszero(vr.vec_regs_used)
+    end
     @test rr.vec_regs_used <= rr.vec_regs_total || rr.vec_regs_total == 0
     # show must not error
     @test sprint(show, rr) isa String

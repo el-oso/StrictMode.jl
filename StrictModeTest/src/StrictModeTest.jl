@@ -42,7 +42,7 @@ using Serialization: serialize, deserialize   # issue #19: patched trim verifica
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible
 export @test_strict, @test_kernel
-export test_signatures, test_compiled, test_registered
+export test_signatures, test_compiled, test_registered, test_coverage, test_exemptions
 export proof_audit
 export proof_findings, AnalysisError
 export ignore_barrier, set_ignore_barrier!

@@ -24,3 +24,34 @@ end
     clear_cache!()
     @test cache_stats().entries == 0
 end
+
+@testitem "a cached verdict is invalidated when a CALLEE changes" begin
+    using StrictMode
+
+    # The cache key names the checked method, which an edit one level down leaves identical: the
+    # `Method` object and its `primary_world` are untouched. Before, that returned a stale `:pass`
+    # for a caller whose callee had started allocating — a cache that lies in the quiet direction.
+    cb_callee(x::Int) = x + 1
+    cb_caller(x::Int) = cb_callee(x) * 2
+    cb_caller(1)
+    StrictMode.clear_cache!()
+
+    @test only(StrictMode.findings(cb_caller, (Int,); guarantees = (:noalloc,))).status === :pass
+    before = StrictMode.cache_stats()
+    @test only(StrictMode.findings(cb_caller, (Int,); guarantees = (:noalloc,))).status === :pass
+    @test StrictMode.cache_stats().hits == before.hits + 1      # caching still works
+
+    @eval cb_callee(x::Int) = [x][1] + 1                        # only the callee changes
+    Base.@invokelatest cb_caller(1)
+    cached = only(Base.@invokelatest StrictMode.findings(cb_caller, (Int,); guarantees = (:noalloc,)))
+
+    StrictMode.clear_cache!()
+    fresh = only(Base.@invokelatest StrictMode.findings(cb_caller, (Int,); guarantees = (:noalloc,)))
+
+    # The cached answer must agree with the uncached one. Asserting agreement rather than `:fail`
+    # keeps the test honest if the scan's verdict for this shape ever changes.
+    @test cached.status === fresh.status
+    @test cached.status === :fail
+
+    StrictMode.clear_cache!()
+end

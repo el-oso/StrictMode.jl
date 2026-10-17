@@ -170,6 +170,7 @@ cost of failing later than load.
 @strict_function
 @strict_stable
 @strict_exempt
+@strict_policy
 ```
 
 ## Automation
@@ -198,6 +199,15 @@ static_ownership_suggestions
 StrictFinding
 format_findings
 nfailures
+StrictMode.key
+StrictMode.findings_diff
+StrictMode.explain
+StrictMode.codes
+StrictMode.module_methods
+StrictMode.module_policy
+StrictMode.clear_declarations!
+StrictMode.declarations
+StrictMode.exemptions
 ```
 
 

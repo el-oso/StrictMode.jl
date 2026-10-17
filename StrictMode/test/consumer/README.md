@@ -22,11 +22,12 @@ What it pins:
 1. `@strict_function` on an allocating body **warns and lets the module load**. A structural guess
    must not be able to break a consumer's precompile, and the proof is unreachable there.
 2. `test_signatures` on that same signature, from the test environment, **throws**.
-3. Whether the registration survives into the test process. It currently does **not** — a
-   `register_strict!` insert executed at ConsumerPkg's precompile is discarded when the module loads
-   from its cached pkgimage, so `registered_strict()` is empty there. The test asserts the loud
-   empty-registry warning in that case rather than pinning the bug's current side, so it stays
-   correct if the registry leg is ever fixed.
+3. That the declarations survive into the test process. They are stored in ConsumerPkg itself, so
+   they are serialized into its pkgimage and read back after a cached load; held in StrictMode
+   instead they would be gone, because StrictMode is loaded from its own cache before ConsumerPkg's
+   precompile runs. The test asserts both halves: `registered_strict()` (this session) is empty
+   while `declarations()` carries ConsumerPkg's two, `test_registered` re-proves them and throws,
+   and the coverage gate does not report a package's annotated methods as undeclared.
 
 ## Two builds
 
