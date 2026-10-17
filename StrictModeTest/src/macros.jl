@@ -138,3 +138,102 @@ AllocCheck's proof for the allocation half and JET's for the stability half.
 macro test_kernel(args...)
     return _test_macro_expr(:kernel, (:typestable, :noalloc, :vectorized), "@test_kernel", args)
 end
+
+# --- the measured steady state --------------------------------------------------------------
+
+# Allocation that stops after a bounded number of calls is not a property of the code: a pool that
+# grows to a high-water mark allocates again whenever the mark moves, so an all-paths proof must
+# report the growth path forever and `:noalloc` can never pass. The claim such code really makes is
+# about the CALL SEQUENCE — "warm it, and from then on it allocates nothing" — and that is settled
+# by measuring, not by inference. So this is a value-based check like `memsafe_report`, deliberately
+# outside the value-free `findings`/`audit` pipeline.
+function _check_steady_state(
+        kind::Symbol, target, @nospecialize(thunk), warmups::Int, repeats::Int, fresh_task::Bool
+    )
+    warmups >= 1 || throw(ArgumentError("$kind: warmups must be at least 1, got $warmups"))
+    repeats >= 1 || throw(ArgumentError("$kind: repeats must be at least 1, got $repeats"))
+    for _ in 1:warmups
+        thunk()
+    end
+    # A per-task initializer is alloc-free only for the task that already paid for it, so measuring
+    # on the warming task would pass it. Measuring on a fresh one asks the question the caller
+    # means: does a NEW caller allocate?
+    measure() = @allocated thunk()
+    bytes = if fresh_task
+        t = Task(() -> measure())
+        schedule(t)
+        fetch(t)
+    else
+        measure()
+    end
+    for _ in 2:repeats
+        b = fresh_task ? fetch(schedule(Task(() -> measure()))) : measure()
+        bytes = max(bytes, b)
+    end
+    iszero(bytes) && return nothing
+    throw(
+        StrictMode.StrictViolation(
+            kind, target,
+            "allocated $bytes byte(s) after $warmups warmup call(s)" *
+                (fresh_task ? ", measured on a fresh task" : "") *
+                ".\n  This is a MEASUREMENT of the calls that ran, not a proof over every path: " *
+                "it says the warmed call allocates nothing, and says nothing about an argument " *
+                "shape it was not given.\n  A pool that is still growing needs more warmups; one " *
+                "that allocates per task fails here with `fresh_task = true` and passes without it."
+        )
+    )
+end
+
+"""
+    @test_steady_state f(args...)
+    @test_steady_state f(args...) warmups = 3 repeats = 2 fresh_task = true
+
+Fail unless `f(args...)` allocates **nothing once warmed**: the call is made `warmups` times, then
+measured, and anything above zero bytes raises a `StrictMode.StrictViolation`.
+
+This is the check for code [`@test_noalloc`](@ref) can never pass and should not: a workspace pool
+that allocates whenever it grows to a new high-water mark, an arena that folds slabs, any buffer
+that reaches a steady state after a bounded number of calls. `:noalloc` asks whether allocation is
+*possible on any path*, and for such code it always is, so an all-paths proof must report the growth
+path forever. The property the code actually has is about the **call sequence** — warm it and it
+stops allocating — which is settled by measuring.
+
+So this is a measurement, and the distinction matters when you read a pass:
+
+- It covers **the calls that ran**, not every path. It says nothing about an argument shape it was
+  not given, where `@test_noalloc` would have.
+- It is the counterpart to an exemption, not a replacement for one. Mark the function
+  `@strict_exempt :noalloc reason = "…"` so the allocation is excused where a reader can see it,
+  then assert the real property here.
+
+`fresh_task = true` measures on a newly scheduled task. Use it to tell a **pool** from a **per-task
+initializer**: a pool that has reached its high-water mark allocates nothing for any caller and
+passes either way, while a `OncePerTask` accessor passes on the warming task and fails on a fresh
+one, because every new task pays again. That is the difference between "bounded" and "once per
+task", and it is only visible by choosing which task does the measuring.
+
+`repeats` measures more than once and keeps the largest, for a pool whose growth is uneven.
+
+```julia
+ws = Workspace()
+@test_steady_state solve!(ws, A, b)                      # warmed, then zero
+@test_steady_state scratch(ws) fresh_task = true         # fails if it is per-task
+```
+
+Each argument is evaluated once, before the warmup calls, so the same values are reused throughout.
+"""
+macro test_steady_state(args...)
+    pos, opts = StrictMode._macro_call(args, (:warmups, :repeats, :fresh_task))
+    isempty(pos) && throw(ArgumentError("@test_steady_state needs a call expression"))
+    call = pos[1]
+    p = StrictMode._call_parts(call)
+    return quote
+        $(p.binds...)
+        $(_check_steady_state)(
+            :test_steady_state, $(string(call)), $(p.thunk),
+            $(esc(get(opts, :warmups, 2))), $(esc(get(opts, :repeats, 1))),
+            $(esc(get(opts, :fresh_task, false)))
+        )
+        $(p.litcall)
+    end
+end

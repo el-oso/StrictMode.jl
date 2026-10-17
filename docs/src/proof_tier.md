@@ -28,6 +28,7 @@ The macro you write picks the engine. There is no mode to switch.
 | `@kernel f(x)` | `@test_kernel f(x)` |
 | `findings(f, types)` | `test_signatures(pairs)` |
 | `audit(mod; sweep = true)` | `test_compiled(mod)` |
+| — | `@test_steady_state f(x)` — allocation that STOPS once warmed, measured |
 | — | `proof_findings(f, types)` / `proof_findings(mod)` — proved, as data |
 | — | `proof_audit(mod)` — proved, as data |
 | — | `test_registered()` |
@@ -49,6 +50,7 @@ StrictModeTest.StrictModeTest
 @test_noboxing
 @test_typestable
 @test_trim_compatible
+@test_steady_state
 @test_strict
 @test_kernel
 ```

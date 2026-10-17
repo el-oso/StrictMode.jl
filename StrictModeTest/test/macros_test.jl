@@ -35,3 +35,40 @@ end
     end
     @test err.kind === :strict
 end
+
+@testitem "@test_steady_state measures what :noalloc cannot express" begin
+    using StrictMode, StrictModeTest
+
+    # A pool that grows to a high-water mark: the growth path exists forever, so an all-paths proof
+    # must report it. The property the code really has is about the call sequence.
+    mutable struct Pool
+        buf::Vector{Float64}
+    end
+    pool = Pool(Float64[])
+    function use_pool!(p::Pool, n::Int)
+        length(p.buf) < n && (p.buf = Vector{Float64}(undef, n))
+        @inbounds for i in 1:n
+            p.buf[i] = i
+        end
+        return n
+    end
+
+    @test_throws StrictMode.StrictViolation (@test_noalloc use_pool!(pool, 8))
+    @test (@test_steady_state use_pool!(pool, 8)) == 8          # warmed, then zero
+    @test (@test_steady_state use_pool!(pool, 8) fresh_task = true) == 8   # any caller
+
+    # A per-task initializer is alloc-free only for the task that paid. Measuring on a fresh task
+    # asks the question a caller means, and is what tells "bounded" from "once per task".
+    taskws = Base.OncePerTask{Vector{Float64}}(() -> zeros(64))
+    touch_ws() = length(taskws())
+    @test (@test_steady_state touch_ws()) == 64                  # warmed on this task
+    @test_throws StrictMode.StrictViolation (@test_steady_state touch_ws() fresh_task = true)
+
+    # Something that allocates every single call fails however long it is warmed.
+    always(n::Int) = length(collect(1:n))
+    @test_throws StrictMode.StrictViolation (@test_steady_state always(4) warmups = 5)
+
+    # Bad knobs are rejected rather than silently meaning something else.
+    @test_throws ArgumentError (@test_steady_state use_pool!(pool, 8) warmups = 0)
+    @test_throws ArgumentError (@test_steady_state use_pool!(pool, 8) repeats = 0)
+end

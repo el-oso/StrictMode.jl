@@ -68,6 +68,33 @@ everything above it. Submodules inherit a policy by lookup, so one changed in a 
 stale in a child, and a guarantee list may nest — a shared policy can live in one package and be
 named by every module that follows it.
 
+### `@test_steady_state` — allocation that stops once warmed
+
+`:noalloc` asks whether allocation is possible on any path, so a workspace pool that allocates
+whenever it grows to a new high-water mark can never pass it, and should not: the growth path exists
+forever. The property such code really has is about the **call sequence** — warm it and it stops
+allocating — which is settled by measuring rather than by inference.
+
+```julia
+@test_steady_state solve!(ws, A, b)                 # warmed, then zero bytes
+@test_steady_state scratch(ws) fresh_task = true    # fails if it is per-task
+```
+
+`fresh_task = true` measures on a newly scheduled task, which is what separates a **pool** from a
+**per-task initializer**: a pool at its high-water mark allocates nothing for any caller and passes
+either way, while a `OncePerTask` accessor passes on the warming task and fails on a fresh one,
+because every new task pays again.
+
+It is a measurement, not a proof, and the docstring says so where it matters: it covers the calls
+that ran and says nothing about an argument shape it was not given. It is the counterpart to an
+exemption rather than a replacement — mark the function `@strict_exempt :noalloc reason = "…"` so
+the allocation is excused where a reader can see it, then assert the real property here.
+
+For a package whose buffers grow to a high-water mark, that pair is the expected spelling rather
+than an exception: measured on a downstream library, six registered allocation barriers covered only
+three test items, every failure a high-water mark at Julia's own array allocation, reached from
+three unrelated entry points.
+
 ### Opting sections out: a block, a file, or one guarantee
 
 `@strict_policy` opts a module in; `@strict_exempt` now opts sections of it out at the granularity
