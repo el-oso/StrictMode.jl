@@ -129,7 +129,7 @@ either answer and attributed the miss to a moved internal, which is how a fixabl
 hidden behind a documented degradation. If a future Julia moves this out of reach, that is a red
 build and a decision to make.
 
-### `@test_steady_state` — allocation that stops once warmed
+### Allocation that stops once warmed: a gate and a report
 
 `:noalloc` asks whether allocation is possible on any path, so a workspace pool that allocates
 whenever it grows to a new high-water mark can never pass it, and should not: the growth path exists
@@ -150,6 +150,13 @@ It is a measurement, not a proof, and the docstring says so where it matters: it
 that ran and says nothing about an argument shape it was not given. It is the counterpart to an
 exemption rather than a replacement — mark the function `@strict_exempt :noalloc reason = "…"` so
 the allocation is excused where a reader can see it, then assert the real property here.
+
+`steady_state_report(f, args...)` is the development-time counterpart: it measures the same thing,
+returns a `SteadyStateReport` and never raises, for use from a probe or a REPL session. Like
+`memsafe_report` and `mca_report` it takes VALUES and runs the call, so it sits outside the
+value-free `findings`/`audit` pipeline. There is deliberately no `@assert_steady_state`: an
+`@assert_*` macro is backed by the value-free scan, and this property needs real arguments and two
+actual calls, which at a `src` call site would mean real work on every call.
 
 For a package whose buffers grow to a high-water mark, that pair is the expected spelling rather
 than an exception: measured on a downstream library, six registered allocation barriers covered only

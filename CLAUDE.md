@@ -117,6 +117,11 @@ StrictMode/src/
                         in-process probe cannot observe a read overrun. _guarded_args shares one
                         buffer between aliased argument positions; _unguarded_args names what the
                         harness could not cover)
+  steady.jl           — steady_state_report/SteadyStateReport (dev-time measurement of allocation
+                        that STOPS once warmed, for a pool climbing to a high-water mark. Takes
+                        VALUES and runs the call, so it sits outside the value-free findings/audit
+                        pipeline — same species as memsafe_report/mca_report. The gating form is
+                        StrictModeTest.@test_steady_state; this one never raises)
   mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
                         throughput/IPC estimate, informational only — never fails without an
                         explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the

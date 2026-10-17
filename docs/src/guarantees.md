@@ -783,6 +783,31 @@ there is a `Dict`, or the hybrid fallback shape in Example 2. Static ownership i
 a `Dict`" — it's "the hot, statically-known associations belong in the method table, where the
 compiler can see them."
 
+### Dev-time feedback: `steady_state_report`
+
+`@test_steady_state` gates in the test suite. For the same property while you are editing, there is
+a report:
+
+```julia
+ws = Workspace()
+steady_state_report(solve!, ws, A, b)                  # SteadyStateReport: steady
+steady_state_report(scratch, ws; fresh_task = true)    # a per-task initializer shows up here
+```
+
+It returns what it measured and never raises. Like [`memsafe_report`](@ref) and
+[`mca_report`](@ref) it takes **values** and runs the call, so it sits outside the value-free
+`findings`/`audit` pipeline and does not belong at a `src` call site — put it in a probe, a dogfood
+block, or a REPL session.
+
+There is deliberately no `@assert_steady_state`. Every `@assert_*` macro is a call-site annotation
+backed by the value-free scan, and this property cannot be settled that way: it needs real argument
+values and has to run the call twice, which at a `src` call site would mean real work on every
+call.
+
+A `steady` report covers the calls that ran, so choose the shapes you measure the way you would
+choose benchmark sizes — a later call with a larger problem allocates again and is outside what the
+measurement says.
+
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
 Every guarantee above is about **speed** — allocation, boxing, dispatch.

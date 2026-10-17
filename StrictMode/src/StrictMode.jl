@@ -46,6 +46,7 @@ export @assert_vectorized, @assert_no_scalar_loops, @assert_effects, @assert_tri
 export @assert_no_spill, spill_report, SpillReport
 export @assert_memsafe, memsafe_report, MemsafeReport
 export @assert_mca, mca_report, McaReport, mca_available
+export steady_state_report, SteadyStateReport
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt, @strict_policy
 export @strict_contract, @verify_strict, @explain
@@ -86,6 +87,7 @@ include("cache.jl")
 include("check.jl")
 include("memsafe.jl")
 include("mca.jl")
+include("steady.jl")
 include("registry.jl")
 include("dispatch.jl")
 include("audit.jl")

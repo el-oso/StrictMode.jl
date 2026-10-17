@@ -95,6 +95,8 @@ rejects the ones the caller can materialize. See the docstring for the full scop
 @assert_memsafe
 memsafe_report
 MemsafeReport
+steady_state_report
+SteadyStateReport
 ```
 
 ## Trusted data
