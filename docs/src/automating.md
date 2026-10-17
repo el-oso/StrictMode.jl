@@ -81,8 +81,8 @@ can be a region or a whole file, and either can be narrowed to one guarantee:
     build_table(x) = Dict(:a => x)
 end
 
-@strict_exempt :noalloc reason = "a factory must allocate" begin
-    make_buffer(n::Int) = Vector{Float64}(undef, n)  # still held to type stability
+@strict_exempt :noalloc reason = "allocates the workspace once" begin
+    make_workspace(n::Int) = Workspace(Vector{Float64}(undef, n))
 end
 
 @strict_exempt reason = "plan-time file" include("plan.jl")   # everything that file defines
@@ -94,6 +94,13 @@ nested `include` inside `plan.jl` is covered too.
 
 A guarantee named before the subject narrows the exemption. The subject is the **last** positional
 argument, which is what keeps `@strict_exempt :foo` meaning the function `foo`.
+
+Naming one guarantee rather than exempting the function is the right tool for a workspace or arena
+allocator, not merely a tidier one. It has to allocate, so `:noalloc` must go — but its concrete
+return type is the whole reason its callers can be fast, and `:typestable` stays on to protect it.
+Measured on two allocators that are both excused for allocating: one that picks its element type
+from a VALUE still fails `:typestable`, because callers would get a `Union` and dispatch on it,
+while a concretely typed one passes. A whole-function exemption hides exactly that.
 
 Where a file mixes hot and cold code and you would rather not list the cold parts, scope the policy
 by name instead:

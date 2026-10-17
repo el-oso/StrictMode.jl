@@ -229,10 +229,14 @@ Subjects:
 Any subject can be **narrowed** by naming guarantees, positionally or with `guarantees = (...)`:
 
 ```julia
-@strict_exempt :noalloc reason = "a factory must allocate" begin
-    make_buffer(n::Int) = Vector{Float64}(undef, n)
+@strict_exempt :noalloc reason = "allocates the workspace once" begin
+    make_workspace(n::Int) = Workspace(Vector{Float64}(undef, n))
 end
 ```
+
+A workspace or arena allocator is the case this exists for: it has to allocate, so `:noalloc` must
+go, while its concrete return type is the whole reason its callers can be fast and `:typestable`
+stays on to protect it. Exempting the function instead would hide exactly that.
 
 `reason = "..."` is carried into the report, where it is the difference between an opt-out a
 reviewer can judge and one they can only wonder about.

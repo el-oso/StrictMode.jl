@@ -178,3 +178,37 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "a narrowed exemption protects a workspace allocator's return type" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+
+    struct WsOk
+        buf::Vector{Float64}
+    end
+    struct WsF32
+        buf::Vector{Float32}
+    end
+
+    # Both allocators must allocate, so both are excused for it. The concrete return type is the
+    # whole reason their callers can be fast, so `:typestable` stays on — and catches the one that
+    # picks its element type from a VALUE, whose callers would get a `Union` and dispatch on it.
+    # Exempting the function outright would hide exactly that.
+    @strict_exempt :noalloc reason = "allocates the workspace once" begin
+        ws_good(n::Int) = WsOk(Vector{Float64}(undef, n))
+        ws_sloppy(n::Int) = n > 8 ? WsOk(zeros(n)) : WsF32(zeros(Float32, n))
+    end
+    StrictMode.register_strict!(ws_good, (Int,); guarantees = (:typestable, :noalloc))
+    StrictMode.register_strict!(ws_sloppy, (Int,); guarantees = (:typestable, :noalloc))
+
+    fs = StrictMode._findings_all()
+    noalloc = filter(f -> f.guarantee === :noalloc, fs)
+    @test length(noalloc) == 2
+    @test all(f -> f.status === :info, noalloc)                      # excused, and visibly so
+    @test all(f -> occursin("allocates the workspace once", f.reason), noalloc)
+
+    @test only(f for f in fs if f.guarantee === :typestable && f.func == "ws_good").status === :pass
+    @test only(f for f in fs if f.guarantee === :typestable && f.func == "ws_sloppy").status === :fail
+
+    StrictMode.clear_declarations!()
+end
