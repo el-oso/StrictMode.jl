@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 ### `:typestable` accepts a constant-type and an always-throwing return
 
