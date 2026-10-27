@@ -109,3 +109,30 @@ end
     @test occursin("String", msg)                        # …and the analyzed signature
     @test occursin("@generated", msg)                    # points at the likely cause and the fix
 end
+
+@testitem ":typestable accepts a constant-type and an always-throwing return (issue #36)" begin
+    using StrictMode
+    status(f, types) = only(StrictMode.findings(f, types; guarantees = (:typestable,))).status
+
+    # A `Type{T}` return is one compile-time constant, and a method that always throws returns no
+    # value at all. `isconcretetype` rejects both, which gated adopters of `@strict_policy` on
+    # ordinary trait and argument-error helpers.
+    kind36(::Nothing) = Float32
+    eltype36(::Type{Int}) = Int
+    need36(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    @test status(kind36, (Nothing,)) === :pass
+    @test status(eltype36, (Type{Int},)) === :pass
+    @test status(need36, (Nothing, Symbol)) === :pass
+
+    # The acceptance is of a FIXED type, not of type-valued returns in general: a return that
+    # varies between types is the instability this guarantee exists to catch.
+    varying36(x::Int) = x > 0 ? Real : Integer
+    boxed36(x::Int) = x > 0 ? "s" : 1
+    @test status(varying36, (Int,)) === :fail
+    @test status(boxed36, (Int,)) === :fail
+
+    # `Type{<:Real}` is a UnionAll: not a single instance, so not a constant.
+    @test !StrictMode._is_typestable_return(Type{<:Real})
+    @test StrictMode._is_typestable_return(Type{Float32})
+    @test StrictMode._is_typestable_return(Union{})
+end

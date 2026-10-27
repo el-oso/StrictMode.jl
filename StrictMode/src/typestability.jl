@@ -4,7 +4,15 @@
 # JET's optimization analysis is the proof and lives in `StrictModeTest`'s `@test_typestable`.
 
 # Union{T,Nothing} and other small isbits unions don't box; treat as type-stable (F21).
-_is_typestable_return(@nospecialize(T)) = isconcretetype(T) || Base.isbitsunion(T)
+#
+# `Union{}` is the inferred return of a method that always throws: it never returns a value, so
+# there is none to be unstable. A `Type{Float32}` return has exactly one instance, fixed at compile
+# time — nothing is boxed and nothing dispatches on it. `isconcretetype` says false to both, which
+# is the right answer to a different question. `Type{<:Real}` is a `UnionAll`, not a `DataType`, and
+# stays excluded; so does a `Type{T}` still carrying a free type variable. See #36.
+_is_typestable_return(@nospecialize(T)) =
+    isconcretetype(T) || Base.isbitsunion(T) || T === Union{} ||
+    (T isa DataType && T <: Type && !Base.has_free_typevars(T))
 
 # Cheap return-type check: the inferred return type must be a single concrete type. Also checks
 # the IR boxing signal (F38): a concrete return can hide internal runtime dispatch — the same

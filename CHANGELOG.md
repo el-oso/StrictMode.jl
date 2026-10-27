@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### `:typestable` accepts a constant-type and an always-throwing return
+
+A method inferred to return `Type{Float32}` returns one compile-time constant, and a method
+inferred `Union{}` always throws, so it returns nothing at all. Neither is a type instability, but
+`isconcretetype` says false to both, and the return-type layer gates — so `@strict_policy :default`
+failed to precompile a module holding ordinary trait helpers (`eltype(::Type{S}) = Int`,
+`weight_eltype(::F32Format) = Float32`) or an argument-error helper that only throws.
+
+Both now pass. A type-valued return that VARIES still fails: `x > 0 ? Real : Integer` infers
+`Union{Type{Integer}, Type{Real}}`, which is the instability the guarantee exists to catch. Issue
+#36.
+
 ## 0.5.0
 
 Breaking. An opt-in check that can be forgotten is not a guarantee, so a missing declaration now
