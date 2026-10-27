@@ -14,6 +14,20 @@ Both now pass. A type-valued return that VARIES still fails: `x > 0 ? Real : Int
 `Union{Type{Integer}, Type{Real}}`, which is the instability the guarantee exists to catch. Issue
 #36.
 
+### An exemption covers the closures the exempted function defines
+
+A closure is a method of its own with a mangled name, so `@strict_exempt :noalloc path` left
+`#path##0` — the `() -> joinpath(...)` inside `path` — reported anyway. Name matching demangles the
+closure form alongside the kwsorter one, so a declaration, an exemption and an `only`/`exempt`
+filter all reach the closures a function defines.
+
+### A documented definition keeps its docstring under the macros
+
+`@doc` can only document a bare definition, and `@strict_function`, `@strict_stable` and both
+definition forms of `@strict_exempt` expand to a block — so a docstring in front of one aborted the
+load with `cannot document the following expression`. Each marks the definition it emits, and the
+docstring lands on it.
+
 ## 0.5.0
 
 Breaking. An opt-in check that can be forgotten is not a guarantee, so a missing declaration now

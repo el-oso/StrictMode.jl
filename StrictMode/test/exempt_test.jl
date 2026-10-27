@@ -212,3 +212,48 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "an exemption covers the closures the exempted function defines" begin
+    using StrictMode
+    # A closure is a separate method with a mangled name (`#path##0`), so a name exemption that
+    # did not demangle it left the allocation it was written to excuse reported anyway.
+    mktemp() do path, io
+        write(
+            io, """
+            module ClosureExempt
+            using StrictMode
+            confpath() = get(() -> joinpath(homedir(), "a", "b.toml"), ENV, "CLOSURE_EXEMPT_PATH")
+            @strict_exempt :noalloc confpath reason = "builds a path"
+            @strict_policy :default
+            end
+            """
+        )
+        close(io)
+        @test_logs include(path)          # no warning: the closure answers to confpath's exemption
+    end
+
+    @test StrictMode._demangle(Symbol("#confpath##0")) === :confpath   # closure
+    @test StrictMode._demangle(Symbol("#confpath#12")) === :confpath   # kwsorter
+    @test StrictMode._demangle(Symbol("#confpath#inner")) === :confpath  # @strict_stable body
+    @test StrictMode._demangle(:confpath) === :confpath
+end
+
+@testitem "a macro that emits a definition keeps its docstring" begin
+    using StrictMode
+    # `@doc` can only document a bare definition. A macro expanding to a block must mark which
+    # subexpression carries the docstring, or the definition cannot be documented at all.
+    load(name, line) = include_string(
+        Main, "module $name\nusing StrictMode\n\"Doc of it.\"\n$line\nend", "docstring_test"
+    )
+    cases = (
+        ("DocEx1", "@strict_exempt :noalloc reason = \"r\" d1() = [1]", :d1),
+        ("DocEx2", "@strict_function d2(x::Int) = x + 1", :d2),
+        ("DocEx3", "@strict_stable d3(x::Int) = x + 1", :d3),
+        ("DocEx4", "@strict_exempt :noalloc reason = \"r\" begin\n d4() = [1]\nend", :d4),
+    )
+    for (name, line, fname) in cases
+        mod = load(name, line)
+        doc = string(Base.Docs.doc(Base.Docs.Binding(mod, fname)))
+        @test occursin("Doc of it.", doc)
+    end
+end

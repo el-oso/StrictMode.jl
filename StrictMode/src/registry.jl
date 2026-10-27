@@ -694,8 +694,11 @@ _asname(x) = x isa Symbol ? x : nameof(x)
 # their base name — a user who exempts `:foo` means `foo(...; kw...)` too (its kwsorter is `#foo#NN`).
 function _demangle(nm::Symbol)
     s = String(nm)
-    # `#f#NN` is Julia's kwsorter mangling; `#f#inner` is `@strict_stable`'s hidden body.
-    m = match(r"^#(.+)#(?:\d+|inner)$", s)
+    # `#f#NN` is Julia's kwsorter mangling, `#f##NN` a closure defined inside `f`, and `#f#inner`
+    # `@strict_stable`'s hidden body. All three are part of `f`'s implementation and answer to `f`'s
+    # declarations and exemptions, so all three demangle to it. The name may not itself contain `#`:
+    # a greedy match leaves the closure form as `f#`, which no exemption spells.
+    m = match(r"^#([^#]+)#*(?:\d+|inner)$", s)
     return m === nothing ? nm : Symbol(m.captures[1]::AbstractString)
 end
 

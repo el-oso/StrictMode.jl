@@ -169,24 +169,24 @@ macro strict_function(args...)
 
     checked = if parametric && isnothing(sigs)
         quote
-            $(esc(def))
+            Base.@__doc__ $(esc(def))
             $(_warn_parametric_decl)($target)
         end
     elseif parametric
         quote
-            $(esc(def))
+            Base.@__doc__ $(esc(def))
             $(_verify_strict_signatures)(
                 $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr
             )
         end
     elseif isnothing(sigs)
         quote
-            $(esc(def))
+            Base.@__doc__ $(esc(def))
             $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__, source = $srcstr)
         end
     else
         quote
-            $(esc(def))
+            Base.@__doc__ $(esc(def))
             $(_verify_strict_def)(
                 $(esc(fname)), $argtypes, $target;
                 warn_abstract = false, mod = @__MODULE__, source = $srcstr
@@ -274,8 +274,17 @@ macro strict_exempt(args...)
             ArgumentError("@strict_exempt: the block defines no functions to exempt")
         )
         names = unique(_exempt_name(_strictdef_sig(d).args[1]) for d in defs)
+        # Each definition is marked, so a docstring in front of the block reaches all of them;
+        # `@doc` cannot document the block this expands to otherwise.
+        marked = Expr(
+            :block,
+            (
+                Meta.isexpr(s, (:function, :(=))) ? :(Base.@__doc__ $s) : s
+                    for s in arg.args
+            )...,
+        )
         return quote
-            $(esc(arg))
+            $(esc(marked))
             $(
                 (
                     :(
@@ -318,7 +327,7 @@ macro strict_exempt(args...)
     )
     Meta.isexpr(arg, (:function, :(=))) || return record
     return quote
-        $(esc(arg))
+        Base.@__doc__ $(esc(arg))
         $record
         nothing
     end
@@ -440,7 +449,10 @@ macro strict_stable(def)
         Expr(:call, inner, argnames...),
     )
 
-    return _gate(esc(Expr(:block, innerdef, wrapper, fname)), esc(def))
+    # The wrapper is the method a caller sees, so it is the one a docstring belongs to.
+    return _gate(
+        esc(Expr(:block, innerdef, :(Base.@__doc__ $wrapper), fname)), esc(def)
+    )
 end
 
 """
