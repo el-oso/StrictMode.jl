@@ -138,9 +138,9 @@ end
     write(joinpath(dir, "outer.jl"), "cold_outer(n::Int) = collect(1:n)\ninclude(joinpath(@__DIR__, \"inner.jl\"))\n")
     write(joinpath(dir, "inner.jl"), "cold_inner(x) = Dict(:k => x)\n")
     @eval module IncExempt
-        using StrictMode
-        hot_kept(x::Int) = x + 1
-        @strict_exempt reason = "plan-time file" include($(joinpath(dir, "outer.jl")))
+    using StrictMode
+    hot_kept(x::Int) = x + 1
+    @strict_exempt reason = "plan-time file" include($(joinpath(dir, "outer.jl")))
     end
     @test !StrictMode._is_exempt(IncExempt.hot_kept)
     @test StrictMode._is_exempt(IncExempt.cold_outer)
@@ -162,19 +162,21 @@ end
     # rejected. Scoping by NAME rather than by region composes with the census instead of adding a
     # scope the census does not model.
     @eval module PolOnly
-        using StrictMode
-        kernel_hot(x::Float64) = x * 2.0
-        plan_cold(n::Int) = n > 0 ? collect(1:n) : "none"
-        @strict_policy :default only = r"^kernel_"
+    using StrictMode
+    kernel_hot(x::Float64) = x * 2.0
+    plan_cold(n::Int) = n > 0 ? collect(1:n) : "none"
+    @strict_policy :default only = r"^kernel_"
     end
     @test PolOnly.kernel_hot(1.0) == 2.0
 
-    @test_throws StrictMode.StrictViolation (@eval module PolNoFilter
+    @test_throws StrictMode.StrictViolation (
+        @eval module PolNoFilter
         using StrictMode
         kernel_hot(x::Float64) = x * 2.0
         plan_cold(n::Int) = n > 0 ? collect(1:n) : "none"
         @strict_policy :default
-    end)
+        end
+    )
 
     StrictMode.clear_declarations!()
 end
@@ -229,7 +231,12 @@ end
             """
         )
         close(io)
-        @test_logs include(path)          # no warning: the closure answers to confpath's exemption
+        logs, _ = Test.collect_test_logs() do
+            include(path)
+        end
+        # Only `:noalloc` was excused, and only that guarantee may fall silent: what else the
+        # closure trips is platform-dependent (`joinpath(homedir(), …)` boxes on Windows).
+        @test !occursin("noalloc", join(string(r.message) for r in logs))
     end
 
     @test StrictMode._demangle(Symbol("#confpath##0")) === :confpath   # closure
