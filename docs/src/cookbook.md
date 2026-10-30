@@ -18,6 +18,11 @@ nothing for a shipped application.
 | **A `@generated`/SIMD kernel that must vectorize and stay on the fast path** | silent ~100× regression from boxing, or vectorization silently disabled — easy to miss during exploration | `@kernel` (bundles `@assert_noalloc` + `@assert_vectorized` + `@assert_typestable`; makes the boxing check reflexive) |
 | **A function that must *never* regress** | a future edit reintroduces a trap | `@strict_function` (return type checked at load; allocation re-proved by `test_registered()`) |
 | **An interface whose implementations must be fast** | a new impl is correct but slow | `@strict_contract` + `@verify_strict` |
+| **A mutating kernel handed overlapping arrays** (`mul!(A, A, B)`, a destination aliased by a `view` of an input) | the answer depends on the order elements happen to be visited, so it changes with a loop order, a blocking or a Julia version | `@assert_noalias` (checks the call that runs, with `Base.mightalias`) |
+| **A pause in an allocation-free hot path** (another thread allocates; the collector stops the world) | latency spikes with 0 B/call — `@test_noalloc` passes and the tail is long anyway | `gc_pause_report` / `StrictModeTest.@test_no_gc_pause` |
+| **A `MethodError` on a branch no test takes** (a rare path whose call has no matching method) | nothing, until a user reaches it in production | `StrictModeTest.test_calls` (JET call analysis; the optimization proofs are blind to it) |
+| **A layer reaching where it should not** (a kernel extending an application function, or reading another layer's private name) | compiles and works, then the dependency direction quietly inverts | `StrictModeTest.test_layers` over a declared graph |
+| **Load time or first-call time creeping up** | users wait before anything runs; nothing in the IR predicts it | `latency_report` / `StrictModeTest.test_latency`; `bench/invalidations.jl` for the cause |
 
 Every `@assert_*` above comes from `StrictMode` and reports. Where you want the same property to
 fail CI, write the `@test_*` macro of the same name from

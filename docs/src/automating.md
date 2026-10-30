@@ -13,6 +13,9 @@ covers the higher-level options. Quick reference for which to reach for:
 | Whole-package report | `audit` |
 | Whole-package CI gate | `StrictModeTest.test_compiled` / `test_registered` |
 | Fail on anything UNdeclared | `StrictModeTest.test_coverage` |
+| Fail on a call that cannot resolve | `StrictModeTest.test_calls` |
+| Hold a declared layer graph | `StrictModeTest.test_layers` |
+| Hold a load-time / first-call budget | `StrictModeTest.test_latency` |
 | Live feedback while editing | `watch` + Revise |
 
 (For wiring `audit` into an AI agent or CI pipeline, see [Agentic feedback](agents.md).)
