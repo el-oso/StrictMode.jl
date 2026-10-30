@@ -23,6 +23,7 @@ nothing for a shipped application.
 | **A `MethodError` on a branch no test takes** (a rare path whose call has no matching method) | nothing, until a user reaches it in production | `StrictModeTest.test_calls` (JET call analysis; the optimization proofs are blind to it) |
 | **A layer reaching where it should not** (a kernel extending an application function, or reading another layer's private name) | compiles and works, then the dependency direction quietly inverts | `StrictModeTest.test_layers` over a declared graph |
 | **Load time or first-call time creeping up** | users wait before anything runs; nothing in the IR predicts it | `latency_report` / `StrictModeTest.test_latency`; `bench/invalidations.jl` for the cause |
+| **An unsafe construct creeping into a layer that must not have one** (`ccall`, `pointer`, an `unsafe_*` call) | compiles and passes; the memory-safety argument for the layer quietly stops holding | `unsafe_report` / `StrictModeTest.test_no_unsafe` (per-construct `allow` list) |
 
 Every `@assert_*` above comes from `StrictMode` and reports. Where you want the same property to
 fail CI, write the `@test_*` macro of the same name from

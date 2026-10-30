@@ -883,6 +883,40 @@ half here reuses that package rather than re-implementing it.
 A module absent from the graph is not judged, so the graph is also the opt-in, and a submodule
 answers to the layer it sits beneath.
 
+## `test_no_unsafe` — a fence a module declares
+
+Rust spells this `#![forbid(unsafe_code)]`. Julia cannot: `ccall` and `unsafe_load` are ordinary
+calls any module may make, and the language is right not to forbid them. So a module that must stay
+inside the guarantees declares it, and the scan reports every method that leaves them.
+
+```julia
+unsafe_report(MyKernels)                             # the escapes, as findings
+test_no_unsafe(MyKernels)                            # …and fail if there are any
+test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, the rest held
+```
+
+It looks for `ccall`, `pointer`, and any function whose name begins with `unsafe_`. `allow` is per
+construct, so excusing a pointer read still holds a `ccall` elsewhere — a deliberate escape ends up
+recorded where the policy is written rather than silently tolerated.
+
+### Why it reads unoptimized IR
+
+An `@inline` helper around a pointer load inlines into its caller. Measured on exactly that shape: a
+scan of **optimized** IR finds the pointer load in the innocent caller's body, so it would report a
+method that contains no unsafe code of its own while the method that actually wrote it looks clean.
+The unoptimized scan names the helper. The same reasoning governs
+[`@assert_trusted`](@ref) and the static-ownership sweep.
+
+A `ccall` lowers its arguments through `cconvert` and `unsafe_convert`. Those *are* the `ccall`, not
+two further things to fix, so they are suppressed beside it.
+
+### What it does not cover
+
+`@inbounds`. It leaves no node in lowered or typed IR on Julia 1.12 or 1.13 — it is carried in
+per-statement flags, which are undocumented internals that move between versions. A check for it
+belongs to code review or a source-level grep, which is where this repository's own guidance already
+puts the decision. A test pins the absence, so nobody comes to rely on coverage that is not there.
+
 ## `test_latency` — the time paid before the call runs
 
 Every guarantee above is about the code a call runs. Load time, and the compile tax on the first

@@ -126,6 +126,7 @@ trust_boundary!
 register_scoped!
 @assert_noalias
 @assert_trusted
+unsafe_report
 ```
 
 ## Dynamic dispatch

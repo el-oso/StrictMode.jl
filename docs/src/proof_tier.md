@@ -38,6 +38,7 @@ The macro you write picks the engine. There is no mode to switch.
 | — | `test_calls(mod)` — every reachable call resolves, including on a branch no test takes |
 | — | `test_layers(L => (deps…), …)` — a declared layer graph holds, both ways |
 | — | `test_latency(pkg)` — load time and first-call time, measured in a fresh process |
+| — | `test_no_unsafe(mod)` — no `ccall`, `pointer` or `unsafe_*`, with a named allow list |
 
 ```@meta
 CurrentModule = StrictModeTest
@@ -71,6 +72,7 @@ test_exemptions
 test_calls
 test_layers
 test_latency
+test_no_unsafe
 ```
 
 ### Proofs as data

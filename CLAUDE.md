@@ -134,6 +134,14 @@ StrictMode/src/
                         creates the collections it counts. Every Base.GC_Num counter is PROCESS-wide
                         (so is @allocated, measurably), which is why the field is `process_bytes`
                         and not the call's own allocation. Gating form: StrictModeTest.@test_no_gc_pause
+  unsafefence.jl      — unsafe_report (the Julia form of Rust's #![forbid(unsafe_code)]): every
+                        method calling ccall, pointer, or an unsafe_* function, with a PER-CONSTRUCT
+                        `allow` list. UNOPTIMIZED IR, and that is load-bearing — an @inline helper
+                        around a pointer load inlines, so an optimized scan blames the innocent
+                        caller and clears the method that wrote it (measured). A :foreigncall
+                        suppresses cconvert/unsafe_convert, which are its own lowering, not two more
+                        defects. @inbounds is NOT covered and cannot be: it leaves no IR node on
+                        1.12/1.13, only statement flags. Gating form: StrictModeTest.test_no_unsafe
   latency.jl          — latency_report/LatencyReport (load time + first-call time). Both are
                         properties of a COLD process, so every number comes from a child that
                         inherits this session's active project; nothing in typed IR predicts them.

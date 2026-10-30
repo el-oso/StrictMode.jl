@@ -16,6 +16,7 @@ covers the higher-level options. Quick reference for which to reach for:
 | Fail on a call that cannot resolve | `StrictModeTest.test_calls` |
 | Hold a declared layer graph | `StrictModeTest.test_layers` |
 | Hold a load-time / first-call budget | `StrictModeTest.test_latency` |
+| Forbid unsafe constructs in a module | `StrictModeTest.test_no_unsafe` |
 | Live feedback while editing | `watch` + Revise |
 
 (For wiring `audit` into an AI agent or CI pipeline, see [Agentic feedback](agents.md).)

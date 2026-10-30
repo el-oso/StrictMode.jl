@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### `unsafe_report` and `test_no_unsafe` — a fence a layer declares
+
+The Julia form of Rust's `#![forbid(unsafe_code)]`. A module that must stay inside the language's
+guarantees says so, and every method that leaves them is reported: a `ccall`, a `pointer`, or any
+function whose name begins with `unsafe_`. Julia cannot enforce this on its own, since those are
+ordinary calls any module may make.
+
+`allow = (:unsafe_load,)` excuses one construct and holds the rest, so a deliberate escape is
+recorded where the policy is written instead of tolerated silently.
+
+The scan reads **unoptimized** typed IR, and that is load-bearing. An `@inline` helper around a
+pointer load inlines into its caller, so an optimized scan reports a method containing no unsafe
+code of its own while the method that wrote it looks clean. Measured on exactly that shape: the
+unoptimized scan names the helper, and the optimized IR of the caller does contain the pointer load.
+
+A `ccall` lowers its arguments through `cconvert` and `unsafe_convert`; those are the `ccall`, not
+two further things to fix, so they are suppressed beside it.
+
+**`@inbounds` is not covered.** It leaves no node in lowered or typed IR on Julia 1.12 or 1.13 — it
+rides in per-statement flags — so the check belongs to code review or a source grep, which is where
+the repository's own guidance already puts it. A test pins the absence so nobody comes to rely on it.
+
 ## 0.5.2
 
 ### `test_layers` — a declared layer graph, checked both ways

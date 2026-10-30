@@ -445,3 +445,33 @@ function test_latency(
         )
     )
 end
+
+"""
+    test_no_unsafe(mod::Module; only = nothing, exempt = (), allow = ()) -> Vector{StrictFinding}
+
+Prove that no method in `mod` leaves Julia's safety guarantees, and throw a
+`StrictMode.StrictViolation` naming every one that does.
+
+The Julia form of Rust's `#![forbid(unsafe_code)]`. A module that must stay inside the language
+declares it by calling this; `ccall`, `pointer`, and any function whose name begins with `unsafe_`
+are what it looks for. Julia cannot enforce this on its own, since those are ordinary calls that any
+module may make.
+
+`allow` names the constructs this module may use anyway, so a deliberate, reviewed escape is
+recorded where the policy is written rather than silently tolerated:
+
+```julia
+test_no_unsafe(MyKernels)                            # no escapes at all
+test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, everything else held
+```
+
+`@inbounds` is not covered. It leaves no node in lowered or typed IR on Julia 1.12 and 1.13 — it
+rides in per-statement flags — so the check belongs to code review or a source grep. See
+[`StrictMode.unsafe_report`](@ref), the scan this gates, for the rest of the scope.
+"""
+function test_no_unsafe(mod::Module; only = nothing, exempt = (), allow = ())
+    fs = StrictMode.unsafe_report(mod; only, exempt, allow)
+    isempty(fs) && return fs
+    msg = sprint(io -> StrictMode.format_findings(io, fs; format = :text))
+    throw(StrictMode.StrictViolation(:test_no_unsafe, string(nameof(mod)), msg))
+end
