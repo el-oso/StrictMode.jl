@@ -852,6 +852,57 @@ A *static* proof that every thread is allocation-free inside a declared window i
 from a package: it would need the whole program, and Julia has no construct that names such a
 window. This gates a measurement of it instead, and says so.
 
+## `test_layers` — a declared direction of dependency
+
+Julia has no orphan rule, and should not: extending `Base.show` for your own type is how the
+ecosystem composes. What the language cannot know is a project's intended **direction of
+dependency** — that the kernel layer must not reach up into the application layer, that two sibling
+layers must not extend each other. Declare it and `StrictModeTest.test_layers` checks it.
+
+```julia
+test_layers(
+    App    => (Engine, Kernel),
+    Engine => (Kernel,),
+    Kernel => (),
+)
+```
+
+Two independent rules. **Extension follows the declaration**: a method may only extend a function
+owned by a layer its own layer declared. **No layer reads another layer's implementation**: a
+qualified access to a name the owning layer does not mark `public` or `export` is a violation
+whichever way the declaration points, because a public name is the interface and anything else
+cannot be changed without breaking the reader.
+
+Only the declared modules are judged, and that is what keeps the check usable. Measured on
+StrictMode itself, the underlying analysis returns 66 improper accesses — essentially all of them
+deliberate reads of `Base` and `Core` internals that this package exists to perform. None is a
+layer violation, because `Base` and `Core` are not layers. For that wider question use
+`ExplicitImports.check_all_qualified_accesses_are_public` and its siblings directly; the access
+half here reuses that package rather than re-implementing it.
+
+A module absent from the graph is not judged, so the graph is also the opt-in, and a submodule
+answers to the layer it sits beneath.
+
+## `test_latency` — the time paid before the call runs
+
+Every guarantee above is about the code a call runs. Load time, and the compile tax on the first
+call of a signature, are paid before that — and both are properties of a **cold process**, so a
+warmed session cannot measure them and nothing in typed IR predicts them.
+
+```julia
+latency_report(:MyPkg; calls = ["MyPkg.solve!(ws, b)"])     # measure, never raises
+test_latency(:MyPkg; max_load_ms = 400)                     # a pinned host, a real budget
+```
+
+The measurement runs in a child that inherits the active project, so what it reports is the
+environment under test. The precompile cache is built first by default, since a load time that
+halves on a rerun is not a budget.
+
+**Both budgets are opt-in.** A wall-clock threshold depends on the machine: the same package loads
+at different speeds on a laptop, a shared runner and a pinned host, so a default would fail honest
+code on a slow box and pass a regression on a fast one. With no budget given, `test_latency`
+measures and returns — use it that way to record the numbers before choosing them.
+
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
 Every guarantee above is about **speed** — allocation, boxing, dispatch.

@@ -99,6 +99,8 @@ steady_state_report
 SteadyStateReport
 gc_pause_report
 GcPauseReport
+latency_report
+LatencyReport
 ```
 
 ## Trusted data

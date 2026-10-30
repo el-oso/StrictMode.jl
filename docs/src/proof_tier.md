@@ -36,6 +36,8 @@ The macro you write picks the engine. There is no mode to switch.
 | `audit(mod; require = :all)` | `test_coverage(mod)` — every method declared or visibly exempt |
 | — | `test_exemptions(mod)` — an opt-out the proofs no longer need |
 | — | `test_calls(mod)` — every reachable call resolves, including on a branch no test takes |
+| — | `test_layers(L => (deps…), …)` — a declared layer graph holds, both ways |
+| — | `test_latency(pkg)` — load time and first-call time, measured in a fresh process |
 
 ```@meta
 CurrentModule = StrictModeTest
@@ -67,6 +69,8 @@ test_registered
 test_coverage
 test_exemptions
 test_calls
+test_layers
+test_latency
 ```
 
 ### Proofs as data

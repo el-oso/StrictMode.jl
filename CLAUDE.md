@@ -134,6 +134,13 @@ StrictMode/src/
                         creates the collections it counts. Every Base.GC_Num counter is PROCESS-wide
                         (so is @allocated, measurably), which is why the field is `process_bytes`
                         and not the call's own allocation. Gating form: StrictModeTest.@test_no_gc_pause
+  latency.jl          — latency_report/LatencyReport (load time + first-call time). Both are
+                        properties of a COLD process, so every number comes from a child that
+                        inherits this session's active project; nothing in typed IR predicts them.
+                        The child reports by line and keys times by INDEX, never by the call's text,
+                        which is the caller's and may hold a quote or a newline. Gating form:
+                        StrictModeTest.test_latency, whose budgets are opt-in because a wall-clock
+                        threshold belongs to one host
   mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
                         throughput/IPC estimate, informational only — never fails without an
                         explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the
@@ -179,6 +186,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         output and not actionable. :calls is NOT in _GUARANTEES (no sweep-side
                         scan), so only/exempt BY NAME is the escape hatch for a guard inference
                         cannot follow
+  src/layers.jl       — test_layers over a DECLARED layer graph: a method may only extend a function
+                        owned by a layer its own layer declared (Julia has no orphan rule, and the
+                        intended direction of dependency is a declaration, not a language fact), and
+                        no layer may read a non-public name of another. Only modules IN THE GRAPH are
+                        judged — StrictMode's own 66 improper accesses are deliberate Base/Core reads,
+                        and judging those would bury the layer findings. The access half calls
+                        ExplicitImports; do not re-implement it. Paths come from
+                        pathof(moduleroot(layer)), since a submodule has no pathof of its own
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
                         which is why it lives here)
   test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is

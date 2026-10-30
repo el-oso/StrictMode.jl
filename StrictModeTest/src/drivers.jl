@@ -385,3 +385,63 @@ function test_calls(mod::Module; only = nothing, exempt = ())
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
     throw(StrictMode.StrictViolation(:test_calls, string(nameof(mod)), msg))
 end
+
+"""
+    test_latency(pkg::Symbol; calls = String[], max_load_ms = nothing,
+                 max_first_call_ms = nothing, precompile = true) -> LatencyReport
+
+Measure load time and first-call time for `pkg` in a fresh child process, and throw a
+`StrictMode.StrictViolation` if a stated budget is exceeded.
+
+This is the axis none of the guarantees reach. They are all about the code a call runs; this is
+about the time paid before it runs — the load, and the compile tax on the first call of a
+signature. Both are properties of a cold process, so only a child can measure them.
+
+**Both budgets are opt-in, and deliberately so.** A wall-clock threshold depends on the machine:
+the same package loads at different speeds on a laptop, a shared runner and a pinned host, so a
+default would fail honest code on a slow box and pass a regression on a fast one. State a budget
+only where the host is pinned. With neither budget given this measures and returns, and nothing can
+fail — use it that way to record the numbers before choosing them.
+
+```julia
+test_latency(:MyPkg)                                      # measure, never fail
+test_latency(:MyPkg; max_load_ms = 400)                   # a pinned host, a real budget
+test_latency(:MyPkg; calls = ["MyPkg.solve!(ws, b)"], max_first_call_ms = 2_000)
+```
+
+`calls` are strings of Julia code run in the child after the package loads; write them fully
+qualified. `max_first_call_ms` applies to each call separately, and the failure names the one that
+missed. `precompile = false` skips building the cache first, for a suite that already loaded the
+package — see [`StrictMode.latency_report`](@ref) for what that costs and what the report then
+claims.
+"""
+function test_latency(
+        pkg::Symbol; calls::AbstractVector{<:AbstractString} = String[],
+        max_load_ms = nothing, max_first_call_ms = nothing, precompile::Bool = true
+    )
+    r = StrictMode.latency_report(pkg; calls, precompile)
+    over = String[]
+    isnothing(max_load_ms) || r.load_ms <= max_load_ms ||
+        push!(over, "load took $(round(r.load_ms; digits = 1)) ms against a budget of $max_load_ms ms")
+    if !isnothing(max_first_call_ms)
+        for (call, ms) in r.first_call_ms
+            ms <= max_first_call_ms ||
+                push!(over, "the first `$call` took $(round(ms; digits = 1)) ms against a budget of $max_first_call_ms ms")
+        end
+    end
+    isempty(over) && return r
+    throw(
+        StrictMode.StrictViolation(
+            :test_latency, String(pkg),
+            join(over, "; ") * ".\n  Measured in a fresh process on this machine: load time and " *
+                "first-call time are properties of a cold start, so these numbers do not transfer " *
+                "between hosts. A budget belongs to the host that set it.\n  " *
+                (
+                r.precompiled ? "The precompile cache was built first, so the load time is a " *
+                    "warm-cache load." :
+                    "The precompile cache was NOT built by this call, so the load time may include " *
+                    "building it — work a second run would not repeat."
+            )
+        )
+    )
+end

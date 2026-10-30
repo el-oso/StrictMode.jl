@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### `test_layers` — a declared layer graph, checked both ways
+
+Julia has no orphan rule, and should not: extending `Base.show` for your own type is how the
+ecosystem composes. What the language cannot know is a project's intended direction of dependency.
+`StrictModeTest.test_layers(App => (Engine, Kernel), Engine => (Kernel,), Kernel => ())` declares
+it and checks two things: a method may only extend a function owned by a layer its own layer
+declared, and no layer may read a name another layer does not mark `public` or `export`.
+
+Only the declared modules are judged, which is what keeps it usable. Measured on StrictMode itself,
+the underlying analysis returns 66 improper accesses, essentially all deliberate reads of `Base` and
+`Core` internals that this package exists to perform; none of them is a layer violation, because
+`Base` and `Core` are not layers. For that wider question, call
+`ExplicitImports.check_all_qualified_accesses_are_public` and its siblings directly.
+
+The access half reuses ExplicitImports rather than re-implementing it. The extension half reads the
+method census, so it sees a method on a foreign function even though its name is bound elsewhere.
+
+### `latency_report` and `test_latency` — the time paid before the call runs
+
+Every guarantee here is about the code a call runs. Load time and the compile tax on a signature's
+first call are properties of a cold process, so a warmed session cannot measure them and nothing in
+typed IR predicts them. `latency_report(:MyPkg; calls = ["MyPkg.solve!(ws, b)"])` measures both in
+a fresh child, which inherits the active project so it measures the environment under test.
+
+`StrictModeTest.test_latency` gates, and **both budgets are opt-in**. A wall-clock threshold
+depends on the machine: the same package loads at different speeds on a laptop, a shared runner and
+a pinned host, so a default would fail honest code on a slow box and pass a regression on a fast
+one. With no budget given it measures and returns.
+
+The precompile cache is built first by default, so the load time is a warm-cache load rather than a
+compilation; `precompile = false` skips that child for a caller that already knows the cache is
+warm, and the report then says so rather than claiming a cache state it did not establish.
+
 ### `test_calls` — every reachable call resolves
 
 The optimization proofs read optimized IR and answer performance questions: does this dispatch at
