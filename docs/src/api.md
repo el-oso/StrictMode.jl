@@ -206,6 +206,9 @@ One-shot, structured reporting for AI agents and the dev loop. See
 audit
 inline_suggestions
 static_ownership_suggestions
+bang_report
+specialization_report
+throw_report
 StrictFinding
 StrictMode.Exemption
 format_findings

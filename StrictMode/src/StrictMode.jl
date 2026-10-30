@@ -60,7 +60,8 @@ export inline_suggestions, migration_report
 export static_ownership_suggestions
 export dispatch_report, DispatchReport, dispatch_suggestions
 export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
-export unsafe_report
+export unsafe_report, throw_report
+export bang_report, specialization_report
 export @assert_noescape, register_scoped!
 export @assert_noalias
 export clear_cache!, cache_stats
@@ -81,9 +82,11 @@ include("trimsafe.jl")
 include("explain.jl")
 include("idioms.jl")
 include("inlining.jl")
+include("lints.jl")
 include("static_ownership.jl")
 include("trusted.jl")
 include("unsafefence.jl")
+include("throws.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("findings.jl")

@@ -39,6 +39,9 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:inline_suggestion, nothing) => :SM0302,
     (:static_ownership, nothing) => :SM0303,
     (:advisory, nothing) => :SM0304,
+    (:bang, nothing) => :SM0305,
+    (:specialization, nothing) => :SM0306,
+    (:throws, nothing) => :SM0307,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -74,6 +77,9 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0302 => "the callee might be worth `@inline`",
     :SM0303 => "a type- or symbol-keyed registry lookup could be static ownership instead",
     :SM0304 => "an advisory pass could not be computed for this signature",
+    :SM0305 => "the method's name and its mutation disagree: a `!` that writes nothing, or a write with no `!`",
+    :SM0306 => "the method carries more compiled specializations, or deeper type parameters, than the limit asked for",
+    :SM0307 => "the exceptions the method's own body raises, which its callees' are not",
 )
 
 # The code for a verdict, or `nothing` when the kind is not in the table. A guarantee with a known

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Three advisory sweeps: `bang_report`, `specialization_report`, `throw_report`
+
+All three return `:info` findings and none has a gating counterpart, because none states a property
+the compiler can confirm. A naming convention is a convention, a specialization count is high in
+exactly the code where Julia is working as intended, and an exception list is a description rather
+than a promise.
+
+**`bang_report`** finds a method name and its mutation disagreeing: a `!` whose method writes no
+argument, or a write with no `!`. It reuses the taint scan behind `@assert_concurrency_safe`, asking
+it once per argument. The two directions are not equally reliable, and the findings say so: a write
+without a `!` was *found* in the IR, while a `!` that writes nothing may simply mutate through a
+callee the scan could not follow.
+
+**`specialization_report`** reports methods carrying more compiled specializations, or deeper nested
+type parameters, than the limits given. Both are compile-time pressure, and the suggestion says
+plainly that a high count can be correct — it tells you where the time goes, not that anything is
+wrong.
+
+**`throw_report`** lists the exception types a body raises **itself**, not what its callees raise.
+That scope is the design: `v[1]` raises `BoundsError` from inside `getindex`, arithmetic raises from
+promotion, and nearly any call can raise `OutOfMemoryError`, so a transitive catalog converges on
+"nearly everything" for nearly every function. What an author can act on and document is the set
+their own code constructs. A test pins the exclusion.
+
 ### `unsafe_report` and `test_no_unsafe` — a fence a layer declares
 
 The Julia form of Rust's `#![forbid(unsafe_code)]`. A module that must stay inside the language's

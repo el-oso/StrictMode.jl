@@ -134,6 +134,19 @@ StrictMode/src/
                         creates the collections it counts. Every Base.GC_Num counter is PROCESS-wide
                         (so is @allocated, measurably), which is why the field is `process_bytes`
                         and not the call's own allocation. Gating form: StrictModeTest.@test_no_gc_pause
+  lints.jl            — bang_report (a `!` name and its mutation disagreeing; reuses
+                        concurrency_findings' taint scan, asked once per argument — the "writes
+                        without a !" direction is FOUND, the "! that writes nothing" direction is a
+                        lead, since mutation through an unfollowable callee reads as none) and
+                        specialization_report (compiled-specialization count + type-parameter depth
+                        against caller-given limits). Both :info with NO gating counterpart: a
+                        convention is a convention, and a high specialization count is usually Julia
+                        working as intended
+  throws.jl           — throw_report: the exception types a body raises ITSELF, read from its own
+                        typed IR. Deliberately NOT transitive — `v[1]` raises BoundsError inside
+                        getindex and nearly any call can raise OutOfMemoryError, so "everything
+                        reachable" converges on "nearly everything" and says nothing. A test pins
+                        the exclusion
   unsafefence.jl      — unsafe_report (the Julia form of Rust's #![forbid(unsafe_code)]): every
                         method calling ccall, pointer, or an unsafe_* function, with a PER-CONSTRUCT
                         `allow` list. UNOPTIMIZED IR, and that is load-bearing — an @inline helper
