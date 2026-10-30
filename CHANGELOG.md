@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### `test_calls` — every reachable call resolves
+
+The optimization proofs read optimized IR and answer performance questions: does this dispatch at
+run time, does it allocate. A call that cannot resolve at all is invisible to them. Measured on
+`rare(x::Int) = x > 1000 ? x + "oops" : x + 1`, `report_opt` finds nothing while `report_call`
+finds the missing `+(::Int64, ::String)` — so a `MethodError` on a branch no test happens to take
+passed every gate in the package.
+
+`StrictModeTest.test_calls(mod)` sweeps the module's compiled signatures through JET's call
+analysis, confined to that module with `target_modules`, and raises once with every finding.
+`only` and `exempt` filter by function name.
+
+Two report kinds are gated: `MethodErrorReport` and `UndefVarErrorReport`. The rest are dropped
+because they are not actionable. Over StrictMode's own 569 compiled signatures there were 373
+non-boolean-condition reports — nearly all a `Missing` from union-splitting a `Vector{Any}` that
+never holds one — against 3 distinct method-error sites; and an uncaught-exception report fires on
+a method every path of which throws, which is a deliberate error helper rather than a defect.
+
 ### `gc_pause_report` and `@test_no_gc_pause` — no collection runs while the call does
 
 Allocation-freedom is necessary and not sufficient. Julia's collector stops the world, so a kernel

@@ -305,3 +305,83 @@ function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
     end
     return out
 end
+
+# A call that cannot resolve is not a performance defect, so none of the guarantees cover it and it
+# has no entry in `StrictMode.guarantee_names()`. It is its own sweep, like `test_coverage`: the
+# filters are by NAME, which is also the escape hatch when inference cannot follow a guard.
+function _call_findings(mod::Module; only = nothing, exempt = ())
+    out = StrictMode.StrictFinding[]
+    for (f, tt, _) in StrictMode._compiled_items(mod; guarantees = (:typestable,), only, exempt)
+        types = Tuple(tt)
+        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
+        reps = _call_reports("test_calls", f, types, mod)
+        if isempty(reps)
+            push!(out, StrictMode._mkfinding(md, fn, sg, :calls, false, "", "", 0; tier = :proof))
+            continue
+        end
+        for rep in reps
+            m = try
+                first(methods(f, types))
+            catch
+                nothing
+            end
+            file = m isa Method ? string(m.file) : ""
+            line = m isa Method ? Int(m.line) : 0
+            push!(
+                out,
+                StrictMode._mkfinding(
+                    md, fn, sg, :calls, true, sprint(show, rep), file, line,
+                    "a call on this path cannot resolve, so reaching it raises rather than " *
+                        "returning. Fix the call, or — when a guard makes the path unreachable " *
+                        "and inference cannot prove it — exclude the function by name with " *
+                        "`exempt = (:$fn,)` and say why in a comment.";
+                    tier = :proof
+                )
+            )
+        end
+    end
+    return out
+end
+
+"""
+    test_calls(mod::Module; only = nothing, exempt = ()) -> Vector{StrictFinding}
+
+Prove that every call reachable from `mod`'s compiled signatures resolves, and throw a
+`StrictMode.StrictViolation` collecting every one that does not.
+
+This is the hole the other gates cannot see. [`@test_typestable`](@ref) and the allocation proofs
+read **optimized** IR and answer performance questions — does this dispatch at run time, does it
+allocate. A call that cannot resolve at all is invisible to them: a `MethodError` on a branch no
+test happens to take passes every one. JET's call analysis (`report_call`) finds it before the
+branch is ever reached, which is the closest Julia analogue of a compiler that checks every line of
+every build.
+
+Two report kinds are gated, `MethodErrorReport` and `UndefVarErrorReport` — a call with no matching
+method, and a name that is not defined. The others are deliberately dropped. Over StrictMode's own
+569 compiled signatures there were 373 non-boolean-condition reports, nearly all a `Missing` from
+union-splitting a `Vector{Any}` that never holds one, against 3 distinct method errors; and an
+uncaught-exception report fires on any function that validates its arguments and throws, which is
+correct code. A gate whose output is mostly noise is a gate that gets switched off.
+
+Scope is the same as [`test_compiled`](@ref): the signatures that have actually **compiled**, so
+warm the kernels first. `only` and `exempt` filter by function name.
+
+```julia
+test_calls(MyPkg)                                   # every compiled signature
+test_calls(MyPkg; only = r"^kernel_")               # just the hot ones
+test_calls(MyPkg; exempt = (:read_config,))         # a guard inference cannot follow
+```
+
+A failure can be a false positive, and the shape is specific: a guard that makes the bad path
+unreachable, written where inference cannot carry the refinement to the call. `isnothing(ref[]) &&
+(ref[] = build())` followed by a second load of `ref[]` is the common one — the check narrows the
+first load, not the second, so the value stays `Union{Nothing,T}` and every use of it reports.
+Binding the load to a local once fixes both the report and the type instability behind it.
+"""
+function test_calls(mod::Module; only = nothing, exempt = ())
+    fs = _call_findings(mod; only, exempt)
+    failed = filter(StrictMode._failed, fs)
+    isempty(failed) && return fs
+    msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
+    throw(StrictMode.StrictViolation(:test_calls, string(nameof(mod)), msg))
+end

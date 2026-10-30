@@ -171,7 +171,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
   src/drivers.jl      — test_signatures/test_compiled/test_registered/test_coverage (the last one
                         gates on UNdeclared methods, the hole the others cannot see); each collects
                         every failure and raises ONCE, so one unanalyzable method leaves the rest
-                        evaluated
+                        evaluated. test_calls gates on whether a call RESOLVES at all: report_opt
+                        answers a performance question and is silent on a MethodError sitting on a
+                        cold branch, so report_call (via proofs.jl's _call_reports) is the only
+                        thing here that sees it. Only :MethodErrorReport/:UndefVarErrorReport are
+                        gated — measured on StrictMode itself, the other kinds are ~98% of the
+                        output and not actionable. :calls is NOT in _GUARANTEES (no sweep-side
+                        scan), so only/exempt BY NAME is the escape hatch for a guard inference
+                        cannot follow
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
                         which is why it lives here)
   test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is

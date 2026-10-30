@@ -35,6 +35,7 @@ The macro you write picks the engine. There is no mode to switch.
 | — | `test_registered()` |
 | `audit(mod; require = :all)` | `test_coverage(mod)` — every method declared or visibly exempt |
 | — | `test_exemptions(mod)` — an opt-out the proofs no longer need |
+| — | `test_calls(mod)` — every reachable call resolves, including on a branch no test takes |
 
 ```@meta
 CurrentModule = StrictModeTest
@@ -65,6 +66,7 @@ test_compiled
 test_registered
 test_coverage
 test_exemptions
+test_calls
 ```
 
 ### Proofs as data

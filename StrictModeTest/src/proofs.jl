@@ -279,6 +279,41 @@ function _opt_reports(target::AbstractString, @nospecialize(f), @nospecialize(ty
     end
 end
 
+# ── JET call analysis ────────────────────────────────────────────────────────────────────────────
+
+# `report_opt` answers "does this dispatch at run time", which is a performance question. It is
+# silent on a call that cannot resolve AT ALL: a `MethodError` on a branch no test happens to take
+# passes every gate here. Measured on `rare(x::Int) = x > 1000 ? x + "oops" : x + 1`, `report_opt`
+# finds nothing and `report_call` finds the missing `+(::Int64, ::String)`.
+#
+# Only two report kinds are kept, because the rest are not actionable on real code. Measured over
+# StrictMode's own 569 compiled signatures: 373 `NonBooleanCondErrorReport`s, nearly all of them a
+# `Missing` arising from union-splitting a `Vector{Any}` that never holds one, against 3 distinct
+# `MethodErrorReport` sites. A check whose output is 98% noise is a check nobody reads.
+#
+# `UncaughtExceptionReport` is excluded because it fires on a method every path of which throws —
+# a deliberate error helper, not a defect. `:typestable` already accepts `Union{}` as the inferred
+# return of exactly such a method, for the same reason (see #36), and `ignore_throw` already says
+# throw paths do not count.
+const _CALL_REPORT_KINDS = (:MethodErrorReport, :UndefVarErrorReport)
+
+_is_call_defect(@nospecialize(rep)) = nameof(typeof(rep)) in _CALL_REPORT_KINDS
+
+# `target_modules` confines the analysis to the module under test. Without it a call into Base
+# reports Base's own union-split branches, which the caller cannot act on and did not write.
+function _call_reports(
+        target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple), mod::Module
+    )
+    try
+        return filter(
+            _is_call_defect,
+            JET.get_reports(JET.report_call(f, types; target_modules = (mod,)))
+        )
+    catch err
+        throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
+    end
+end
+
 # ── TrimCheck ────────────────────────────────────────────────────────────────────────────────────
 
 # juliac includes two patch files into the target before trim inference
