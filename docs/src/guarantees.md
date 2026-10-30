@@ -903,6 +903,29 @@ at different speeds on a laptop, a shared runner and a pinned host, so a default
 code on a slow box and pass a regression on a fast one. With no budget given, `test_latency`
 measures and returns — use it that way to record the numbers before choosing them.
 
+### The cause, when the numbers move
+
+`test_latency` measures what a user of *your* package feels. **Invalidations are paid by downstream
+code**: your package can load quickly and still discard precompiled `Base` or dependency code that
+a consumer then rebuilds, and no measurement of your package alone can see that.
+
+That probe lives in `StrictMode/bench/invalidations.jl` rather than in `StrictModeTest`:
+
+```console
+julia --project=bench bench/invalidations.jl        # report
+julia --project=bench bench/invalidations.jl 20     # …and exit non-zero above 20
+```
+
+It is a script and not a gate because the analysis needs SnoopCompile, which pulls in 61 packages —
+nearly all of them for flame graphs and LLVM snooping that this never calls. Julia cannot load part
+of a package, so making it a `StrictModeTest` dependency would put all 61 in every consumer's test
+environment. Copy the script into your own `bench/` environment to run it on your package.
+
+Run on StrictMode it reports **11** invalidations, attributed to inserting
+`Dates.is_valid_toml_value` — a stdlib interaction reached through `TOML`, not StrictMode's own
+code. That attribution is the point: a count alone tells you something regressed, and the tree tells
+you where to look.
+
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
 Every guarantee above is about **speed** — allocation, boxing, dispatch.

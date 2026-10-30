@@ -35,6 +35,25 @@ The precompile cache is built first by default, so the load time is a warm-cache
 compilation; `precompile = false` skips that child for a caller that already knows the cache is
 warm, and the report then says so rather than claiming a cache state it did not establish.
 
+### `bench/invalidations.jl` — the cause, as a script rather than a gate
+
+`test_latency` measures what a user of your package feels. Invalidations are paid by **downstream**
+code: a package can load quickly and still discard precompiled `Base` or dependency code that a
+consumer rebuilds, which no measurement of that package alone can see.
+`julia --project=bench bench/invalidations.jl [limit]` reports the count with its attribution, and
+exits non-zero above a limit.
+
+It is a script because the analysis needs SnoopCompile, which pulls in 61 packages — nearly all for
+flame graphs and LLVM snooping it never calls — and Julia cannot load part of a package, so making
+it a `StrictModeTest` dependency would put all 61 in every consumer's test environment.
+
+It uses SnoopCompile's own `uinvalidated` rather than counting the raw log, which would be wrong:
+`@snoop_invalidations` returns a flat interleaved sequence, and a true count has to drop the entries
+tagged `invalidate_mt_cache` (a transient dispatch-cache clear, no compiled code lost),
+`verify_methods` (superseded but still reachable through `invoke`), and `Core.Compiler`'s internals.
+A naive count reports 32 for StrictMode where the answer is **11**, attributed to inserting
+`Dates.is_valid_toml_value` — a stdlib interaction reached through `TOML`, not StrictMode's own code.
+
 ### `test_calls` — every reachable call resolves
 
 The optimization proofs read optimized IR and answer performance questions: does this dispatch at
