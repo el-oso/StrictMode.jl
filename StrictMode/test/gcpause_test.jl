@@ -26,12 +26,40 @@ end
     @test occursin("PAUSED", sprint(show, r))
 end
 
-@testitem "gc_pause_report sees a collection another thread caused" begin
+@testitem "gc_pause_report records a collection the measured call did not cause" begin
     using StrictMode
 
-    # The reason this check exists: the collector stops the world, so an allocation-free call is
-    # paused by an allocating neighbor, and no analysis of the call can see the cause. The kernel
-    # below is the same in both measurements — only the neighbor changes.
+    # The reason this check exists: the collector stops the world, so a call that allocates nothing
+    # is still paused by work it does not contain, and no analysis of the call can see the cause.
+    #
+    # The collection is requested rather than waited for. An allocating neighbor trips the
+    # collector's heuristic when it happens to, and a window of a few milliseconds either catches
+    # that or does not — a test built on it measures the scheduler. Here another task collects on
+    # demand, so the window provably contains a collection the measured call did not cause. The
+    # handshake blocks the measuring task, so the other task runs even on one thread.
+    n = 4
+    go = Channel{Nothing}(1)
+    done = Channel{Nothing}(1)
+    collector = Threads.@spawn for _ in 1:(n + 1)      # one warmup call, then n measured
+        take!(go)
+        GC.gc(false)
+        put!(done, nothing)
+    end
+    paused() = (put!(go, nothing); take!(done))
+
+    r = gc_pause_report(paused; samples = n, warmups = 1)
+    wait(collector)
+    @test r.collections >= n
+    @test !StrictMode.gc_free(r)
+    @test r.gc_ns > 0
+end
+
+@testitem "gc_pause_report is undisturbed by a neighbor that allocates nothing" begin
+    using StrictMode
+
+    # The control the verdict depends on: a second thread that is busy but allocation-free gives
+    # the collector nothing to do, so an allocation-free call must still report no pause. Without
+    # this, "no pause" could just mean the measurement is insensitive to other threads.
     if Threads.nthreads() < 2
         @test_skip false
     else
@@ -40,31 +68,21 @@ end
                 acc += sqrt(i)
             end; acc
         )
-
-        function with_neighbor(allocating::Bool)
-            stop = Threads.Atomic{Bool}(false)
-            t = Threads.@spawn begin
-                acc = 0.0
-                while !stop[]
-                    acc += allocating ? sum(rand(20_000)) : 1.0
-                end
-                acc
+        stop = Threads.Atomic{Bool}(false)
+        busy = Threads.@spawn begin
+            acc = 0.0
+            while !stop[]
+                acc += 1.0
             end
-            try
-                sleep(0.05)
-                return gc_pause_report(clean_kernel; samples = 400)
-            finally
-                stop[] = true
-                wait(t)
-            end
+            acc
         end
-
-        # Control: a busy neighbor that allocates nothing must not disturb the verdict.
-        @test StrictMode.gc_free(with_neighbor(false))
-        # The case: the same kernel, a neighbor that allocates.
-        noisy = with_neighbor(true)
-        @test noisy.collections > 0
-        @test !StrictMode.gc_free(noisy)
+        try
+            sleep(0.05)
+            @test StrictMode.gc_free(gc_pause_report(clean_kernel; samples = 200))
+        finally
+            stop[] = true
+            wait(busy)
+        end
     end
 end
 
@@ -110,32 +128,32 @@ end
 
     # Every counter in `Base.GC_Num` is process-wide. That is deliberate here — it sizes the
     # pressure the rest of the process put on the collector — but it must not be read as the call's
-    # own allocation, and `@allocated` is no better: it reports a neighbor's bytes too.
-    if Threads.nthreads() < 2
-        @test_skip false
-    else
-        clean_kernel() = (
-            acc = 0.0; for i in 1:2000
-                acc += sqrt(i)
-            end; acc
-        )
-        @test iszero(@allocated clean_kernel())            # ground truth, measured alone
+    # own allocation, and `@allocated` is no better: given a neighbor it reports the neighbor's
+    # bytes for a call that allocates none.
+    #
+    # The neighbor allocates on request, so the window provably overlaps allocation this call did
+    # not perform; the handshake blocks the measuring task, so it runs on one thread too.
+    clean_kernel() = (
+        acc = 0.0; for i in 1:2000
+            acc += sqrt(i)
+        end; acc
+    )
+    clean_kernel()
+    @test iszero(@allocated clean_kernel())                # ground truth, measured alone
 
-        stop = Threads.Atomic{Bool}(false)
-        t = Threads.@spawn (
-            while !stop[]
-                sum(rand(20_000))
-            end
-        )
-        try
-            sleep(0.05)
-            r = gc_pause_report(clean_kernel; samples = 200)
-            @test r.process_bytes > 0                      # …yet the window records bytes
-        finally
-            stop[] = true
-            wait(t)
-        end
+    n = 4
+    go = Channel{Nothing}(1)
+    done = Channel{Nothing}(1)
+    neighbor = Threads.@spawn for _ in 1:(n + 1)
+        take!(go)
+        sum(rand(20_000))                                  # ~160 KB, charged to this task
+        put!(done, nothing)
     end
+    with_neighbor() = (put!(go, nothing); clean_kernel(); take!(done))
+
+    r = gc_pause_report(with_neighbor; samples = n, warmups = 1)
+    wait(neighbor)
+    @test r.process_bytes > 0                              # …yet the window records bytes
 end
 
 @testitem "gc_pause_report rejects a measurement it cannot make" begin
