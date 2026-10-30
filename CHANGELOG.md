@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### `gc_quiet_report` and `@test_gc_quiet` — no collection runs while the call does
+
+Allocation-freedom is necessary and not sufficient. Julia's collector stops the world, so a kernel
+`@test_noalloc` proves allocates nothing is still paused at a safepoint by an allocating neighbor,
+and no analysis of the kernel can see the cause — it is not in the kernel.
+
+`gc_quiet_report(f, args...)` warms the call, runs it `samples` times, and reports whether a
+collection landed inside a call, plus the per-call distribution: median, q99, max, and how many
+calls took more than `slow_factor` times the median. It never raises.
+`StrictModeTest.@test_gc_quiet` is the gating form, with `max_collections = 0` by default and an
+optional `max_q99_ms` latency budget.
+
+The sampling window allocates nothing, so the harness does not create the collections it counts;
+it costs about 140 ns per sample.
+
+`process_bytes` is the allocation recorded while the worst call ran, in the whole process rather
+than in the call: Julia's allocation counters are global, and `@allocated` reports a neighbor's
+bytes too. It sizes the collector pressure the rest of the process contributed; `@test_noalloc`
+remains the answer to what the call itself allocates.
+
+A static proof that every thread is allocation-free inside a declared window is not reachable from
+a package. This measures it and says so.
+
 ### `@assert_noalias` — a written argument must not overlap a read one
 
 A kernel that writes one argument while reading another assumes the two are distinct; when they

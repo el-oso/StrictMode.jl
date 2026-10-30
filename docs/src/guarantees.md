@@ -808,6 +808,50 @@ A `steady` report covers the calls that ran, so choose the shapes you measure th
 choose benchmark sizes — a later call with a larger problem allocates again and is outside what the
 measurement says.
 
+## `@test_gc_quiet` — no collection runs while the call does
+
+Allocation-freedom is necessary and not sufficient. Julia's collector stops the world: when any
+thread triggers a collection, every other thread is paused at its next safepoint, however clean its
+own code is. So a kernel that `@test_noalloc` proves allocates nothing is still stopped by an
+allocating neighbor, and no analysis of the kernel can see why — the cause is not in the kernel.
+
+Measured, because there is nothing else to do. The call is warmed, then run `samples` times, and
+the collector's own counters say whether a collection landed inside a call.
+
+```julia
+@test_gc_quiet gemm!(C, A, B)                                   # no collection in the window
+@test_gc_quiet gemm!(C, A, B) samples = 2000 max_q99_ms = 1.0   # and a tail-latency budget
+
+gc_quiet_report(gemm!, C, A, B)                                 # the full distribution, never raises
+```
+
+`max_collections = 0` is the default, because that is what "quiet" means. `max_q99_ms` adds a
+latency budget on top; leave it unset and only the collection count is gated, which is the half
+that does not depend on the machine.
+
+### What the report shows
+
+The verdict alone cannot be acted on, so [`GcQuietReport`](@ref) carries the per-call distribution
+— median, q99, max, and how many calls ran more than `slow_factor` times the median. A quiet region
+has a q99 close to its median; a region interrupted by collections has a long tail, and that shape
+is the signal.
+
+`process_bytes` is the allocation recorded while the worst call ran, in the **whole process**.
+Julia's allocation counters are global, so a thread the call never touches contributes to them.
+That is deliberate here — it sizes the pressure the rest of the process put on the collector — but
+it is not the call's own allocation. Neither is `@allocated`, which reports a neighbor's bytes too;
+`@test_noalloc` is what answers that question, because it reads the code rather than a counter.
+
+### What it cannot promise
+
+It covers the calls that ran, in the process they ran in, under whatever else that process was
+doing. A quiet result on an idle machine says nothing about a busy one, so measure under the load
+the kernel will actually meet. It also cannot cover a thread that stayed idle during the window.
+
+A *static* proof that every thread is allocation-free inside a declared window is not reachable
+from a package: it would need the whole program, and Julia has no construct that names such a
+window. This gates a measurement of it instead, and says so.
+
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
 Every guarantee above is about **speed** — allocation, boxing, dispatch.

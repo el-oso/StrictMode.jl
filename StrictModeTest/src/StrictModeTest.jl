@@ -41,6 +41,7 @@ using PrecompileTools: @setup_workload, @compile_workload
 using Serialization: serialize, deserialize   # issue #19: patched trim verification runs in a child
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible, @test_steady_state
+export @test_gc_quiet
 export @test_strict, @test_kernel
 export test_signatures, test_compiled, test_registered, test_coverage, test_exemptions
 export proof_audit

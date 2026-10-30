@@ -29,6 +29,7 @@ The macro you write picks the engine. There is no mode to switch.
 | `findings(f, types)` | `test_signatures(pairs)` |
 | `audit(mod; sweep = true)` | `test_compiled(mod)` |
 | — | `@test_steady_state f(x)` — allocation that STOPS once warmed, measured |
+| — | `@test_gc_quiet f(x)` — no collection runs while the call does, measured |
 | — | `proof_findings(f, types)` / `proof_findings(mod)` — proved, as data |
 | — | `proof_audit(mod)` — proved, as data |
 | — | `test_registered()` |
@@ -51,6 +52,7 @@ StrictModeTest.StrictModeTest
 @test_typestable
 @test_trim_compatible
 @test_steady_state
+@test_gc_quiet
 @test_strict
 @test_kernel
 ```

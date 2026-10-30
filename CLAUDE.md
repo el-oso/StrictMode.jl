@@ -126,6 +126,14 @@ StrictMode/src/
                         VALUES and runs the call, so it sits outside the value-free findings/audit
                         pipeline — same species as memsafe_report/mca_report. The gating form is
                         StrictModeTest.@test_steady_state; this one never raises)
+  gcquiet.jl          — gc_quiet_report/GcQuietReport (whether a GC ran while the call did, plus the
+                        per-call pause distribution). The axis the allocation guarantees cannot
+                        cover: the collector stops the world, so an allocation-free kernel is paused
+                        by an ALLOCATING NEIGHBOR, and the cause is not in the analyzed code.
+                        _gc_quiet_samples! must stay allocation-free — a harness that allocates
+                        creates the collections it counts. Every Base.GC_Num counter is PROCESS-wide
+                        (so is @allocated, measurably), which is why the field is `process_bytes`
+                        and not the call's own allocation. Gating form: StrictModeTest.@test_gc_quiet
   mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
                         throughput/IPC estimate, informational only — never fails without an
                         explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the
@@ -155,7 +163,9 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         names which, because a stock rejection is not a juliac rejection.
                         _trim_child_modules resolves what the child must load — the METHOD's module
                         and each argument type's, not parentmodule(f)
-  src/macros.jl       — @test_noalloc/@test_noboxing/@test_typestable/@test_trim_compatible.
+  src/macros.jl       — @test_noalloc/@test_noboxing/@test_typestable/@test_trim_compatible,
+                        @test_steady_state/@test_gc_quiet (the two MEASURED gates — they take values
+                        and run the call, and need no analysis backend at all).
                         Deliberately NOT wrapped in _gate: a gate that compiles itself away under
                         a preference is a gate that can vanish silently
   src/drivers.jl      — test_signatures/test_compiled/test_registered/test_coverage (the last one

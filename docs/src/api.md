@@ -97,6 +97,8 @@ memsafe_report
 MemsafeReport
 steady_state_report
 SteadyStateReport
+gc_quiet_report
+GcQuietReport
 ```
 
 ## Trusted data
