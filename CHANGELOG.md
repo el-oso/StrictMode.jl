@@ -2,16 +2,16 @@
 
 ## Unreleased
 
-### `gc_quiet_report` and `@test_gc_quiet` — no collection runs while the call does
+### `gc_pause_report` and `@test_no_gc_pause` — no collection runs while the call does
 
 Allocation-freedom is necessary and not sufficient. Julia's collector stops the world, so a kernel
 `@test_noalloc` proves allocates nothing is still paused at a safepoint by an allocating neighbor,
 and no analysis of the kernel can see the cause — it is not in the kernel.
 
-`gc_quiet_report(f, args...)` warms the call, runs it `samples` times, and reports whether a
+`gc_pause_report(f, args...)` warms the call, runs it `samples` times, and reports whether a
 collection landed inside a call, plus the per-call distribution: median, q99, max, and how many
 calls took more than `slow_factor` times the median. It never raises.
-`StrictModeTest.@test_gc_quiet` is the gating form, with `max_collections = 0` by default and an
+`StrictModeTest.@test_no_gc_pause` is the gating form, with `max_collections = 0` by default and an
 optional `max_q99_ms` latency budget.
 
 The sampling window allocates nothing, so the harness does not create the collections it counts;

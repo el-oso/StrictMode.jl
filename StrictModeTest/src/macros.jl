@@ -241,13 +241,13 @@ end
 # A pause budget is a measurement, so it belongs in the gating tier beside `@test_steady_state`
 # rather than at a `src` call site. It needs no analysis backend: the question is what the process
 # did while the call ran, and only running it answers that.
-function _check_gc_quiet(
+function _check_no_gc_pause(
         kind::Symbol, target, @nospecialize(thunk), samples::Int, warmups::Int,
         max_collections::Int, max_q99_ms, slow_factor::Real
     )
     max_collections >= 0 ||
         throw(ArgumentError("$kind: max_collections must be at least 0, got $max_collections"))
-    r = StrictMode.gc_quiet_report(thunk; samples, warmups, slow_factor)
+    r = StrictMode.gc_pause_report(thunk; samples, warmups, slow_factor)
     over_q99 = !isnothing(max_q99_ms) && r.q99_ns > max_q99_ms * 1.0e6
     r.collections <= max_collections && !over_q99 && return r
     why = if over_q99 && r.collections > max_collections
@@ -275,8 +275,8 @@ function _check_gc_quiet(
 end
 
 """
-    @test_gc_quiet f(args...)
-    @test_gc_quiet f(args...) samples = 1000 max_collections = 0 max_q99_ms = 1.0
+    @test_no_gc_pause f(args...)
+    @test_no_gc_pause f(args...) samples = 1000 max_collections = 0 max_q99_ms = 1.0
 
 Fail unless no garbage collection runs while `f(args...)` does.
 
@@ -287,34 +287,34 @@ analysis of the kernel can see the cause, because the cause is not in the kernel
 
 Measured, not proven. The call is warmed, then run `samples` times, and the collector's own
 counters say whether a collection landed inside a call. `max_collections = 0` is the default
-because that is what "quiet" means; raise it for a process you know is doing other work.
+because that is what the name asserts; raise it for a process you know is doing other work.
 
 `max_q99_ms` adds a latency budget on top: the 99th-percentile call must come in under it. Leave it
 unset and only the collection count is gated, which is the deterministic half — a wall-clock
 threshold depends on the machine, so state it only where you know the machine.
 
 ```julia
-@test_gc_quiet gemm!(C, A, B)                                   # no collection in the window
-@test_gc_quiet gemm!(C, A, B) samples = 2000 max_q99_ms = 1.0   # and a tail-latency budget
+@test_no_gc_pause gemm!(C, A, B)                                   # no collection in the window
+@test_no_gc_pause gemm!(C, A, B) samples = 2000 max_q99_ms = 1.0   # and a tail-latency budget
 ```
 
 A failure names the budget it missed and reports the distribution, because the number you need in
 order to act — how long the worst calls took — is not in the verdict. For the non-gating form, and
-for the full report at the REPL, use [`StrictMode.gc_quiet_report`](@ref).
+for the full report at the REPL, use [`StrictMode.gc_pause_report`](@ref).
 
 Each argument is evaluated once, before the warmup calls, so the same values are reused throughout.
 """
-macro test_gc_quiet(args...)
+macro test_no_gc_pause(args...)
     pos, opts = StrictMode._macro_call(
         args, (:samples, :warmups, :max_collections, :max_q99_ms, :slow_factor)
     )
-    isempty(pos) && throw(ArgumentError("@test_gc_quiet needs a call expression"))
+    isempty(pos) && throw(ArgumentError("@test_no_gc_pause needs a call expression"))
     call = pos[1]
     p = StrictMode._call_parts(call)
     return quote
         $(p.binds...)
-        $(_check_gc_quiet)(
-            :test_gc_quiet, $(string(call)), $(p.thunk),
+        $(_check_no_gc_pause)(
+            :test_no_gc_pause, $(string(call)), $(p.thunk),
             $(esc(get(opts, :samples, 100))), $(esc(get(opts, :warmups, 2))),
             $(esc(get(opts, :max_collections, 0))), $(esc(get(opts, :max_q99_ms, nothing))),
             $(esc(get(opts, :slow_factor, 2.0)))

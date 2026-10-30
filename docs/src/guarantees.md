@@ -808,7 +808,7 @@ A `steady` report covers the calls that ran, so choose the shapes you measure th
 choose benchmark sizes — a later call with a larger problem allocates again and is outside what the
 measurement says.
 
-## `@test_gc_quiet` — no collection runs while the call does
+## `@test_no_gc_pause` — no collection runs while the call does
 
 Allocation-freedom is necessary and not sufficient. Julia's collector stops the world: when any
 thread triggers a collection, every other thread is paused at its next safepoint, however clean its
@@ -819,20 +819,20 @@ Measured, because there is nothing else to do. The call is warmed, then run `sam
 the collector's own counters say whether a collection landed inside a call.
 
 ```julia
-@test_gc_quiet gemm!(C, A, B)                                   # no collection in the window
-@test_gc_quiet gemm!(C, A, B) samples = 2000 max_q99_ms = 1.0   # and a tail-latency budget
+@test_no_gc_pause gemm!(C, A, B)                                   # no collection in the window
+@test_no_gc_pause gemm!(C, A, B) samples = 2000 max_q99_ms = 1.0   # and a tail-latency budget
 
-gc_quiet_report(gemm!, C, A, B)                                 # the full distribution, never raises
+gc_pause_report(gemm!, C, A, B)                                 # the full distribution, never raises
 ```
 
-`max_collections = 0` is the default, because that is what "quiet" means. `max_q99_ms` adds a
+`max_collections = 0` is the default, because that is what the name asserts. `max_q99_ms` adds a
 latency budget on top; leave it unset and only the collection count is gated, which is the half
 that does not depend on the machine.
 
 ### What the report shows
 
-The verdict alone cannot be acted on, so [`GcQuietReport`](@ref) carries the per-call distribution
-— median, q99, max, and how many calls ran more than `slow_factor` times the median. A quiet region
+The verdict alone cannot be acted on, so [`GcPauseReport`](@ref) carries the per-call distribution
+— median, q99, max, and how many calls ran more than `slow_factor` times the median. An uninterrupted region
 has a q99 close to its median; a region interrupted by collections has a long tail, and that shape
 is the signal.
 
@@ -845,7 +845,7 @@ it is not the call's own allocation. Neither is `@allocated`, which reports a ne
 ### What it cannot promise
 
 It covers the calls that ran, in the process they ran in, under whatever else that process was
-doing. A quiet result on an idle machine says nothing about a busy one, so measure under the load
+doing. A run with no pauses on an idle machine says nothing about a busy one, so measure under the load
 the kernel will actually meet. It also cannot cover a thread that stayed idle during the window.
 
 A *static* proof that every thread is allocation-free inside a declared window is not reachable
