@@ -910,12 +910,24 @@ The unoptimized scan names the helper. The same reasoning governs
 A `ccall` lowers its arguments through `cconvert` and `unsafe_convert`. Those *are* the `ccall`, not
 two further things to fix, so they are suppressed beside it.
 
-### What it does not cover
+### `@inbounds`
 
-`@inbounds`. It leaves no node in lowered or typed IR on Julia 1.12 or 1.13 — it is carried in
-per-statement flags, which are undocumented internals that move between versions. A check for it
-belongs to code review or a source-level grep, which is where this repository's own guidance already
-puts the decision. A test pins the absence, so nobody comes to rely on coverage that is not there.
+Reported as `:inbounds`. It is the one construct in this scan that trades a thrown `BoundsError` for
+silent undefined behavior, so a module declaring itself free of unsafe code wants it named.
+
+It leaves no statement in lowered or typed IR — it is carried in the per-statement `ssaflags` — so it
+is read from there rather than from the statement list. An explicit `@inbounds` sets the flag; a
+plain index, `@simd`, `@fastmath`, `@boundscheck`, a comprehension and a broadcast do not.
+
+A `Base.@propagate_inbounds` method is clean on its own, and the finding lands on the caller that
+wrote `@inbounds` — the method that made the claim is the method that answers for it.
+
+```julia
+unsafe_report(MyKernels; allow = (:inbounds,))   # the annotations are proved and tested
+```
+
+Use that `allow` only where the in-range property holds for a reason you can state, and the suite
+runs under `--check-bounds=yes` so every annotation is neutralized and a stray index raises.
 
 ## `test_latency` — the time paid before the call runs
 

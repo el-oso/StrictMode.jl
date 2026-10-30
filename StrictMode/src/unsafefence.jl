@@ -15,7 +15,16 @@ const _UNSAFE_NAMES = (:pointer, :pointer_from_objref)
 # line per `ccall` that tells the reader nothing the `ccall` finding did not.
 const _CCALL_GLUE = (:cconvert, :unsafe_convert)
 
+# `@inbounds` reaches typed IR as a per-statement flag, not as a statement of its own, so it is read
+# from `ssaflags` rather than from `ci.code`. The reference is direct, like `_max_methods`' use of
+# `InferenceParams`: a Julia that renames the flag must fail loudly here rather than let the scan
+# report a module using `@inbounds` as clean.
+const _IR_FLAG_INBOUNDS = Base.Compiler.IR_FLAG_INBOUNDS
+
 _is_unsafe_name(nm::Symbol) = nm in _UNSAFE_NAMES || startswith(String(nm), "unsafe_")
+
+# `allow` names constructs by bare `Symbol`, but a reader looks for the macro they wrote.
+_render_construct(nm::Symbol) = nm === :inbounds ? "`@inbounds`" : "`" * String(nm) * "`"
 
 # The unsafe constructs in one method's body, as a sorted, deduplicated list of names. `ccall`
 # stands for a `:foreigncall` statement, which is what a `ccall` becomes.
@@ -34,6 +43,10 @@ function _unsafe_constructs(m::Method)
     for pair in cis
         ci = pair isa Pair ? pair.first : pair
         ci isa Core.CodeInfo || continue
+        # One finding per method, so the span an `@inbounds` block covers does not matter: a bare
+        # `@inbounds a[i]` flags one statement and `@inbounds for …` flags most of the loop, and
+        # both mean the same thing about this method.
+        any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
         for st in ci.code
             st isa Expr || continue
             if st.head === :foreigncall
@@ -61,7 +74,8 @@ end
     unsafe_report(mod::Module; only = nothing, exempt = (), allow = ()) -> Vector{StrictFinding}
 
 Every method in `mod` that leaves Julia's safety guarantees: one `:fail` finding per method that
-calls `ccall`, `pointer`, or a function whose name begins with `unsafe_`.
+calls `ccall`, `pointer`, or a function whose name begins with `unsafe_`, or that writes
+`@inbounds`.
 
 This is the scan behind `StrictModeTest.test_no_unsafe`, and the Julia form of Rust's
 `#![forbid(unsafe_code)]`. The language cannot enforce it — `ccall` and `unsafe_load` are ordinary
@@ -78,11 +92,14 @@ unsafe_report(MyKernels)                            # every escape, as findings
 unsafe_report(MyKernels; allow = (:unsafe_load,))   # one reviewed construct excused
 ```
 
-**`@inbounds` is not covered, and cannot be from here.** It leaves no node in either lowered or
-typed IR on Julia 1.12 and 1.13 — it is carried in per-statement flags, which are undocumented
-internals that move between versions. A check for it belongs to code review or a source-level grep,
-which is also where `@inbounds` is decided: see the repository's own guidance that a new one in a
-diff is a review matter.
+**`@inbounds` is reported as `:inbounds`.** It leaves no statement in lowered or typed IR — it is
+carried in the per-statement `ssaflags` — so it is read from there and not from the statement list.
+It belongs in this report because it is the one construct here that trades a thrown `BoundsError`
+for silent undefined behavior; `allow = (:inbounds,)` excuses it where the in-range property is
+proved and tested.
+
+A `Base.@propagate_inbounds` method is clean on its own, and the finding lands on the caller that
+wrote `@inbounds`, which is the method that made the claim.
 
 Read from unoptimized IR on purpose. A small wrapper around a pointer load inlines under
 optimization, so its `unsafe_load` would surface in an innocent caller and vanish from the method
@@ -97,7 +114,7 @@ function unsafe_report(mod::Module; only = nothing, exempt = (), allow = ())
         isempty(found) && continue
         reported = filter(n -> !(n in allowed), found)
         isempty(reported) && continue
-        names = join(("`" * String(n) * "`" for n in reported), ", ")
+        names = join((_render_construct(n) for n in reported), ", ")
         push!(
             out,
             _mkfinding(

@@ -465,9 +465,9 @@ test_no_unsafe(MyKernels)                            # no escapes at all
 test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, everything else held
 ```
 
-`@inbounds` is not covered. It leaves no node in lowered or typed IR on Julia 1.12 and 1.13 — it
-rides in per-statement flags — so the check belongs to code review or a source grep. See
-[`StrictMode.unsafe_report`](@ref), the scan this gates, for the rest of the scope.
+`@inbounds` is covered too, as `:inbounds`, and `allow = (:inbounds,)` excuses it where the in-range
+property is proved and tested. See [`StrictMode.unsafe_report`](@ref), the scan this gates, for the
+rest of the scope.
 """
 function test_no_unsafe(mod::Module; only = nothing, exempt = (), allow = ())
     fs = StrictMode.unsafe_report(mod; only, exempt, allow)

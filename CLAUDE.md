@@ -153,8 +153,10 @@ StrictMode/src/
                         around a pointer load inlines, so an optimized scan blames the innocent
                         caller and clears the method that wrote it (measured). A :foreigncall
                         suppresses cconvert/unsafe_convert, which are its own lowering, not two more
-                        defects. @inbounds is NOT covered and cannot be: it leaves no IR node on
-                        1.12/1.13, only statement flags. Gating form: StrictModeTest.test_no_unsafe
+                        defects. @inbounds is covered as :inbounds, read from ci.ssaflags via
+                        _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
+                        @propagate_inbounds method is clean and the caller that wrote @inbounds
+                        carries the finding. Gating form: StrictModeTest.test_no_unsafe
   latency.jl          — latency_report/LatencyReport (load time + first-call time). Both are
                         properties of a COLD process, so every number comes from a child that
                         inherits this session's active project; nothing in typed IR predicts them.

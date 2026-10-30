@@ -61,17 +61,46 @@ end
     @test only(unsafe_report(FenceAllow; exempt = (:load,))).func == "raw"
 end
 
-@testitem "unsafe_report does not claim to cover @inbounds" begin
+@testitem "unsafe_report covers @inbounds, read from the statement flags" begin
     using StrictMode
 
-    # `@inbounds` leaves no node in lowered or typed IR: it rides in per-statement flags. The scan
-    # therefore cannot see it, and this pins that rather than leaving a reader to assume coverage —
-    # the docstring says so, and a future editor must not quietly rely on it.
     module FenceInbounds
+    Base.@propagate_inbounds prop(a::Vector{Float64}, i::Int) = a[i]
     elided(v::Vector{Float64}) = @inbounds v[1]
+    block(v::Vector{Float64}) = (
+        s = 0.0; @inbounds for i in eachindex(v)
+            s += v[i]
+        end; s
+    )
+    viacaller(a::Vector{Float64}, i::Int) = @inbounds prop(a, i)
+    clean(v::Vector{Float64}) = sum(v)
+    simd(v::Vector{Float64}) = (
+        s = 0.0; @simd for i in eachindex(v)
+            s += v[i]
+        end; s
+    )
     end
-    @test isempty(unsafe_report(FenceInbounds))
+    F = FenceInbounds
+    F.prop([1.0], 1); F.elided([1.0]); F.block([1.0]); F.viacaller([1.0], 1); F.clean([1.0]); F.simd([1.0])
 
-    lowered = first(Base.code_lowered(FenceInbounds.elided, (Vector{Float64},)))
+    # The three methods that wrote `@inbounds`, and only those. A `@propagate_inbounds` method makes
+    # no claim of its own, so the finding belongs to the caller that did; `@simd` sets no flag.
+    @test Set(f.func for f in unsafe_report(F)) == Set(["elided", "block", "viacaller"])
+    @test all(f -> f.status === :fail, unsafe_report(F))
+    @test occursin("`@inbounds`", only(filter(f -> f.func == "elided", unsafe_report(F))).reason)
+    @test isempty(unsafe_report(F; allow = (:inbounds,)))
+
+    # Why it is read from `ssaflags`: no statement survives to match on. This is the fact the scan
+    # depends on, and it is also what makes an optimized read useless here.
+    tt = (Vector{Float64},)
+    lowered = first(Base.code_lowered(F.elided, tt))
     @test !any(st -> st isa Expr && st.head in (:inbounds, :boundscheck), lowered.code)
+
+    # `IR_FLAG_INBOUNDS` is a compiler internal, so its identity is pinned rather than assumed.
+    flags(ci) = findall(fl -> !iszero(fl & StrictMode._IR_FLAG_INBOUNDS), ci.ssaflags)
+    @test StrictMode._IR_FLAG_INBOUNDS === UInt32(1)
+    @test !isempty(flags(Base.code_typed(F.elided, tt; optimize = false)[1][1]))
+    @test isempty(flags(Base.code_typed(F.clean, tt; optimize = false)[1][1]))
+    # Inlining consumes the flag, which is why the scan must stay on unoptimized IR.
+    @test isempty(flags(Base.code_typed(F.elided, tt; optimize = true)[1][1]))
 end

@@ -44,9 +44,16 @@ unoptimized scan names the helper, and the optimized IR of the caller does conta
 A `ccall` lowers its arguments through `cconvert` and `unsafe_convert`; those are the `ccall`, not
 two further things to fix, so they are suppressed beside it.
 
-**`@inbounds` is not covered.** It leaves no node in lowered or typed IR on Julia 1.12 or 1.13 — it
-rides in per-statement flags — so the check belongs to code review or a source grep, which is where
-the repository's own guidance already puts it. A test pins the absence so nobody comes to rely on it.
+**`@inbounds` is reported as `:inbounds`.** It is the one construct here that trades a thrown
+`BoundsError` for silent undefined behavior, so a module that forbids unsafe code wants it named.
+It leaves no statement in lowered or typed IR on Julia 1.12 or 1.13 — it is carried in the
+per-statement `ssaflags` — so it is read from there. Measured on both versions: an explicit
+`@inbounds` sets the flag, while a plain index, `@simd`, `@fastmath`, `@boundscheck`, a
+comprehension, a broadcast and a `Base.@propagate_inbounds` method set nothing. The finding lands on
+the method that wrote `@inbounds`, not on the `@propagate_inbounds` callee it calls, and
+`allow = (:inbounds,)` excuses it where the in-range property is proved and tested.
+
+Optimization consumes the flag, which is the same reason the rest of this scan reads unoptimized IR.
 
 ## 0.5.2
 
