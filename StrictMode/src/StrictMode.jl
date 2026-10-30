@@ -59,6 +59,7 @@ export static_ownership_suggestions
 export dispatch_report, DispatchReport, dispatch_suggestions
 export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export @assert_noescape, register_scoped!
+export @assert_noalias
 export clear_cache!, cache_stats
 export enable_checks!, disable_checks!, checks_enabled, assert_enabled, proofs_loaded
 export banner_enabled

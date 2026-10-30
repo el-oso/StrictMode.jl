@@ -120,6 +120,7 @@ unsafe_trust
 trust_boundary!
 @assert_noescape
 register_scoped!
+@assert_noalias
 @assert_trusted
 ```
 

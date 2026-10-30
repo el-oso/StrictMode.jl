@@ -1001,15 +1001,70 @@ shape this exists for. It reports instead, and has no proving counterpart: treat
 lead to check by hand, not as a fact. What it answers soundly is a BARE handle — created in the
 frame, used there, not wrapped — and for that the verdict is trustworthy in both directions.
 
+## `@assert_noalias` — a written argument must not overlap a read one
+
+A kernel that writes one argument while reading another is written on the assumption that the two
+are distinct. When they overlap, the answer depends on the order the elements happen to be visited,
+so the same call can give a different result under another loop order, another blocking, or another
+Julia version. `LinearAlgebra.mul!` states this as a documented precondition; most hand-written
+kernels carry it silently.
+
+```julia
+A = rand(8, 8); C = similar(A)
+
+@assert_noalias mul!(C, A, A)              # ok: A may alias itself, only C is written
+@assert_noalias mul!(A, A, A)              # fails: the destination is also an input
+@assert_noalias mul!(C, A, view(C, :, 1))  # fails: the view reads what C writes
+
+@assert_noalias mutates=(1, 2) swap!(x, y) # neither the name nor one position is enough
+```
+
+### It reads values, not a signature
+
+This is the only check here that does. Whether two arrays overlap is a property of the arrays, not
+of their types, so there is nothing for the value-free engine to answer. `:noalias` is therefore
+absent from [`StrictMode.guarantee_names`](@ref): it cannot be swept by [`audit`](@ref) or declared
+on a [`@strict_function`](@ref), and a declaration naming it is rejected rather than silently
+skipped.
+
+The oracle is `Base.mightalias` — Julia's own predicate, the one `Base.unalias` uses to decide
+whether to copy. It resolves wrappers to the memory underneath, so a `view`, a `reshape` and a
+`reinterpret` of a buffer are all compared against the buffer rather than by wrapper type. Disjoint
+slices of one workspace are accepted, which matters: a blocked kernel carving tiles out of shared
+scratch is the normal case, and a predicate that compared only the parent would reject every one of
+them.
+
+### Which arguments count as written
+
+From the name: a trailing `!` means argument 1, Julia's convention. Anything else must say so with
+`mutates = (…)`. A call that gives neither is **rejected**, not passed — "nothing is written" would
+compare no pair and accept every call, and a check that cannot fail is worse than no check. Where
+the callee is written as a plain name the rejection happens at macro expansion, before the call
+runs.
+
+### What it cannot promise
+
+Overlap is checked for the call that runs, not for every call the method could receive. So this
+narrows the property one site at a time; it does not prove it once for all callers. Rust decides
+the same question at compile time for every caller, through borrow checking. Julia has no construct
+that can, which is why this is a run-time assertion that compiles away rather than a static
+guarantee — and why [`@assert_noescape`](@ref), which answers the *confinement* half of the same
+question, is a separate check.
+
+A call that satisfies the assertion allocates nothing and costs about 2 ns per pair, so it is
+affordable on a hot path. At a call site whose arguments infer to `Any` — a non-`const` global —
+the argument tuple is heap-allocated by the call itself, before any check sees it.
+
 ## Promise scope
 
 StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**
 (where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), **register pressure**
 (via [`@assert_no_spill`](@ref)), **static-binary (`juliac --trim`) compatibility** (via
 [`@assert_trim_compatible`](@ref)), **owned scratch** (via [`@assert_owned`](@ref)), **validated
-foreign data** (via [`@assert_trusted`](@ref)), and, deterministically rather than flakily,
-**out-of-bounds array access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property
-is explicitly out of scope: **bit-reproducibility**.
+foreign data** (via [`@assert_trusted`](@ref)), **argument separation at a call site** (via
+[`@assert_noalias`](@ref)), and, deterministically rather than flakily, **out-of-bounds array
+access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is explicitly out of
+scope: **bit-reproducibility**.
 
 SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction —
 how four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler

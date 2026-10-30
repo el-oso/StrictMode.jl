@@ -26,7 +26,11 @@ StrictMode/src/
                         (whether an environment this session loads from names StrictMode — the
                         reporting banner's audience test, written to stay trim-clean because
                         __init__ is a juliac root, issue #28)
-  static_checks.jl    — @assert_noalloc, @assert_noboxing, @assert_owned
+  static_checks.jl    — @assert_noalloc, @assert_noboxing, @assert_owned, @assert_noescape
+                        (register_scoped! types, via the compiler's escape analysis), @assert_noalias
+                        (Base.mightalias between the written arguments and the read ones — the only
+                        check here that reads VALUES, so :noalias is deliberately NOT in _GUARANTEES:
+                        no sweep has values to give it)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
   effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned),

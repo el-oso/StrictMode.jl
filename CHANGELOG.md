@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### `@assert_noalias` — a written argument must not overlap a read one
+
+A kernel that writes one argument while reading another assumes the two are distinct; when they
+overlap, the result depends on the order the elements happen to be visited. `@assert_noalias`
+checks that at the call site with `Base.mightalias`, Julia's own predicate, and compiles away with
+every other `@assert_*` macro when checks are off.
+
+It is the only check that reads **values** rather than a signature, since whether two arrays
+overlap is not a property of their types. So `:noalias` is not in `StrictMode.guarantee_names()`:
+it cannot be swept by `audit` or declared on a `@strict_function`, and a declaration naming it is
+rejected rather than skipped.
+
+Which arguments are written comes from the name — a trailing `!` means argument 1 — and anything
+else must say so with `mutates = (…)`. A call that gives neither is rejected, at macro expansion
+where the callee is a plain name: "nothing is written" would compare no pair and pass every call.
+
+Disjoint slices of one workspace are accepted, so a blocked kernel carving tiles out of shared
+scratch is not reported. A satisfied assertion allocates nothing and costs about 2 ns per pair.
+
 ## 0.5.1
 
 ### `:typestable` accepts a constant-type and an always-throwing return
