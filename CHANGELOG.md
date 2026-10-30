@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2
 
 ### `test_layers` — a declared layer graph, checked both ways
 
