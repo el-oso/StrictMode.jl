@@ -116,11 +116,18 @@ end
 
     # A harness that allocates inside the window creates the collections it is counting, so the
     # measurement would report its own noise. The sample buffer is built before the window opens.
+    #
+    # Asked of the sampling function's own IR, not with `@allocated`: that reads a process-wide
+    # counter, so a neighbor thread's bytes would land in the answer — which is the very confusion
+    # `process_bytes` exists to name, and it would be odd to rest this test on it.
+    # The buffer and the thunk are arguments, so the analyzed signature is concrete: closing over
+    # non-`const` globals would box them at the call site before the window opens, and the scan
+    # would report that — the call site's cost, not the harness's.
     noop() = nothing
-    times = Vector{UInt64}(undef, 500)
-    sample() = StrictMode._gc_pause_samples!(times, noop, ())
-    sample()
-    @test iszero(@allocated sample())
+    sample(buf, f) = StrictMode._gc_pause_samples!(buf, f, ())
+    fs = findings(sample, (Vector{UInt64}, typeof(noop)); guarantees = (:noalloc, :noboxing))
+    @test !isempty(fs)
+    @test all(f -> f.status === :pass, fs)
 end
 
 @testitem "gc_pause_report's process_bytes counts the process, not the call" begin
@@ -139,7 +146,10 @@ end
         end; acc
     )
     clean_kernel()
-    @test iszero(@allocated clean_kernel())                # ground truth, measured alone
+    # Ground truth from the scan, which reads this function's IR. `@allocated` cannot establish it
+    # here: it is process-wide, so with the neighbor below running it reports the neighbor's bytes
+    # for a kernel that allocates none — exactly the reading `process_bytes` is named to prevent.
+    @test all(f -> f.status === :pass, findings(clean_kernel, (); guarantees = (:noalloc,)))
 
     n = 4
     go = Channel{Nothing}(1)

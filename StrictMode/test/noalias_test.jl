@@ -81,21 +81,23 @@ end
     # body — so an assertion about allocation-freedom would destroy the property it asserts
     # (issue #29). The scan must return before building anything.
     #
-    # Measured in a function, where the argument types are known. At a call site whose arguments
-    # infer to `Any` — a non-`const` global — the argument tuple is heap-allocated by the call
-    # itself, before this check sees it, and no check written here can avoid that.
-    function cost()
-        a = zeros(64)
-        b = ones(64)
-        bare() = copyto!(a, b)
-        checked() = @assert_noalias copyto!(a, b)
-        bare(); checked()                                 # warm both specializations
-        return (@allocated(bare()), @allocated(checked()))
-    end
-    cost()
-    bare_bytes, checked_bytes = cost()
-    @test checked_bytes == bare_bytes
-    @test iszero(checked_bytes)
+    # Asked of the check itself, with StrictMode's own `:noalloc` scan rather than `@allocated`.
+    # `@allocated` reads a process-wide counter, so a neighbor thread's bytes land in its answer
+    # for a call that allocates none — measured, 4.8 MB for a `mul!` whose true figure is zero.
+    # The scan reads this function's IR, so no other thread can move the verdict.
+    # The arrays are arguments, so the analyzed signature is concrete. Closing over a non-`const`
+    # global instead would have the call site box the argument tuple before the check sees it, and
+    # the scan would report that correctly — it is the call site's cost, not the check's.
+    check(x, y) = StrictMode._assert_noalias("t", copyto!, (x, y); mutates = (1,))
+    fs = findings(check, (Vector{Float64}, Vector{Float64}); guarantees = (:noalloc, :noboxing))
+    @test !isempty(fs)
+    @test all(f -> f.status === :pass, fs)
+
+    # `@test_noalloc` cannot state this property for any `@assert_*` in the package, which is why
+    # it is not used here: every check funnels through `_fail`, and `_fail` may warn and return
+    # instead of throwing, so its message-building path is not throw-only and an all-paths proof
+    # must count it. `ignore_throw` is what discounts that path, and the scan above honors it.
+    @test StrictMode.ignore_throw()
 end
 
 @testitem "@assert_noalias is a value-taking check, so no sweep can declare it" begin

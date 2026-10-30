@@ -523,3 +523,30 @@ end
     empty!(StrictMode._SCOPED_TYPES)
     StrictMode.clear_cache!()
 end
+
+@testitem "the ssa-use memo does not leak a Union into the scan's callees" begin
+    using StrictMode
+
+    # `isnothing(ref[]) ? (ref[] = build()) : ref[]` narrows the FIRST load of the `Ref` and not the
+    # second, so the closure's return type keeps the memo's `Union{Nothing, …}`. That union reaches
+    # `_ccall_ref_only` and `_new_allocates`, and Julia then compiles a `Nothing` specialization of
+    # each whose only possible act is to throw on `uses[i]`. Both branches are asserted to stop it.
+    @test only(Base.return_types(StrictMode._ssa_uses, (Core.CodeInfo,))) === StrictMode._SSAUses
+    @test isconcretetype(StrictMode._SSAUses)
+
+    # Run the scan on shapes that reach the `:new` path, which is the only reader of the memo, then
+    # check what the callees were specialized for. A `Nothing` among them is the instability.
+    mkvec_memo(n::Int) = Vector{Float64}(undef, n)
+    pair_memo(a::Float64, b::Float64) = (a, b)
+    for (f, tt) in ((mkvec_memo, (Int,)), (pair_memo, (Float64, Float64)))
+        StrictMode._alloc_signals(f, tt)
+    end
+    for (fn, argpos) in ((StrictMode._ccall_ref_only, 3), (StrictMode._new_allocates, 4))
+        seen = Any[]
+        for m in methods(fn), mi in StrictMode._specializations(m)
+            push!(seen, mi.specTypes.parameters[argpos])
+        end
+        @test !isempty(seen)
+        @test !(Nothing in seen)
+    end
+end

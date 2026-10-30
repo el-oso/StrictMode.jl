@@ -602,7 +602,9 @@ function _store_slot_type(ci, @nospecialize(sig), @nospecialize(callee), st::Exp
 end
 
 # For each SSA value, the (statement, argument position) pairs that read it.
-function _ssa_uses(ci)
+const _SSAUses = Vector{Vector{Tuple{Int, Int}}}
+
+function _ssa_uses(ci)::_SSAUses
     uses = [Tuple{Int, Int}[] for _ in eachindex(ci.code)]
     for (j, st) in enumerate(ci.code)
         vals = st isa Expr ? st.args :
@@ -725,8 +727,13 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
     dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
     # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
-    usememo = Ref{Union{Nothing, Vector{Vector{Tuple{Int, Int}}}}}(nothing)
-    ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci)) : usememo[]
+    # Both branches are asserted, like `newsdead` above. Without it the memo's `Union{Nothing, …}`
+    # is the closure's return type: the `isnothing` check narrows the FIRST load of the `Ref`, and
+    # the else branch is a second, separate load that inference cannot narrow. That union reaches
+    # `_ccall_ref_only` and `_new_allocates`, which then compile a `Nothing` specialization whose
+    # only possible act is to throw on `uses[i]`.
+    usememo = Ref{Union{Nothing, _SSAUses}}(nothing)
+    ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci))::_SSAUses : usememo[]::_SSAUses
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if abscontainer === nothing && _abstract_container(T)
