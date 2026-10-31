@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0
+## 0.5.4
 
 ### Fixed: `test_layers`' private-access rule skipped submodules of one package
 
