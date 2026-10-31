@@ -92,15 +92,31 @@ A missing key records the run and returns, so adding this to a suite cannot fail
 added. `tolerance` allows a stated amount of growth, `update = true` accepts growth that is
 intended, and a method the baseline does not name has nothing to regress against.
 
-### Fixed: `StrictModeTest`'s own suite resolved StrictMode from the registry
+### Fixed: the suite ran with `@inbounds` live on Julia 1.13, and three items never ran at all
 
-`StrictModeTest/test/Project.toml` carried no `[sources]` entry, so activating that environment
-directly resolved StrictMode from the General registry rather than the sibling checkout, and the
-suite then proved things about a published StrictMode instead of the one under development. It now
-names the path, as `StrictMode/test/Project.toml` already did.
+`Pkg.test()` forces `--check-bounds=yes` through Julia 1.12 and inherits the caller's setting from
+1.13 on. CI relied on it supplying the flag, so on the `Julia 1` job every `@inbounds` in the tested
+code was live — the one configuration that flag exists to rule out. It is now passed explicitly.
 
-A test environment cannot be made a workspace member instead: Pkg injects the package under test
-into it at test time, which a static workspace resolution cannot express.
+The same two settings decide whether the items that assert on the *shape* of compiled output have a
+subject at all. Those items ask the compiled output directly and skip when it is not there, and a
+skip counts as green, so the gap was silent. Measured spill lines for the register-starved kernel:
+
+| flags | 1.12.7 | 1.13.3 |
+| --- | --- | --- |
+| none | 410 | 410 |
+| `--check-bounds=yes` | 0 | 918 |
+| `--code-coverage=user` | 0 | 0 |
+| both | 0 | 245 |
+
+Coverage suppresses auto-vectorization on both versions, and forced bounds checks suppress it on
+1.12, so `scalar_fp_loops`, `@assert_no_spill`'s failing paths and `@strict_stable`'s line-count
+assertion had never been exercised in CI.
+
+Rather than make those items tolerate the flags, CI now runs the suite a second time with coverage
+off and bounds at `auto`. Two findings are expected to stay broken in that pass: one real
+`@test_broken` for the `:trusted` blind spot, and the live `llvm-mca` path, whose 680MiB weak
+dependency is deliberately absent. Every other skip was a configuration artifact and is gone.
 
 ## 0.5.2
 

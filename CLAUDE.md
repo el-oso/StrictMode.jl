@@ -265,10 +265,29 @@ generate different code: five vectorization-shape tests only fail under forced b
 is how they stayed invisible in CI. The compat floor is 1.12 and `+release` tracks the current
 release, so name the floor explicitly with `+1.12` rather than through a channel that moves.
 
+**Pass `--check-bounds` explicitly; Pkg does not supply it on 1.13.** Pkg forces
+`--check-bounds=yes` through 1.12 and inherits the caller's setting from 1.13 on, so a bare
+`Pkg.test()` on 1.13 leaves every `@inbounds` in the tested code live.
+
+**The suite needs TWO passes, and CI runs both.** Bounds-check insertion and coverage
+instrumentation reshape generated code, and the items asserting on its SHAPE
+(`scalar_fp_loops`, `@assert_no_spill`'s failing paths, `@strict_stable`'s line count) ask the
+compiled output directly and SKIP where the flags erased their subject — a skip that counts as
+green. Measured: a `@simd` loop does not vectorize under coverage on either version, nor under
+forced bounds checks on 1.12. So one pass neutralizes `@inbounds` and the other leaves codegen
+alone; only the `:trusted` `@test_broken` and the absent llvm-mca dep stay broken in the second.
+
 ```bash
-julia --project=StrictMode -e 'import Pkg; Pkg.test()'          # the default channel
-julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test()'    # the compat floor
+# safety: every @inbounds neutralized. 6 broken on 1.12, 2 on 1.13.
+julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
+julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
+
+# codegen: the compiled-output items actually run. 2 broken on both versions.
+julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
+julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
 ```
+
+`julia_args` overrides Pkg's own forcing on 1.12, so the second form really does reach `auto`.
 
 The test `Project.toml` depends on `StrictModeTest`, which supplies the AllocCheck/JET/TrimCheck
 proofs; checks are on by default, so it carries no preference block. `StrictModeTest` has its own

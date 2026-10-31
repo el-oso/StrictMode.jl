@@ -39,12 +39,19 @@
     const KERNEL_TYPES = (Vector{Float64}, Vector{Float64}, Vector{Float64})
 
     # Whether the starved kernel spills is a property of the configuration, not of the checker: both
-    # forced bounds checks and coverage instrumentation reshape the loop until 80 accumulators no
-    # longer exhaust the register file. Measured on 1.12 and 1.13 alike — 410 spill lines with
-    # neither flag, 918 under `--check-bounds=yes`, 0 under `--code-coverage=user`, which is how CI
-    # runs the suite. So the guard asks for the spill directly rather than for a flag believed to
-    # imply one; a flag proxy was already wrong once, when Pkg stopped forcing bounds checks in 1.13
-    # and these items ran on CI for the first time.
+    # forced bounds checks and coverage instrumentation reshape the loop, and far enough that 80
+    # accumulators no longer exhaust the register file. The two versions do NOT agree about it, so
+    # no flag predicts the answer — measured spill lines for this kernel:
+    #
+    #   flags                                   1.12.7   1.13.3
+    #   none                                       410      410
+    #   --check-bounds=yes                           0      918
+    #   --code-coverage=user                         0        0
+    #   --check-bounds=yes --code-coverage=user      0      245
+    #
+    # So the guard asks for the spill directly rather than for a flag believed to imply one; a flag
+    # proxy was already wrong once. CI runs the suite a second time with coverage off and bounds at
+    # auto, which is the pass where these items are expected to run.
     spills_observable() =
         Sys.ARCH === :x86_64 && StrictMode.spill_report(spilly_accum_kernel!, KERNEL_TYPES).vec_spills > 0
 end

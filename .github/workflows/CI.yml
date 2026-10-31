@@ -28,12 +28,39 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
-      # `Pkg.test()`, NOT `runtests.jl` directly: it builds the proper test environment and forces
-      # `--check-bounds=yes`, which changes codegen. Running the file directly leaves bounds checking
-      # at `auto` and silently skips that whole configuration — it is how five vectorization-shape
-      # failures stayed invisible here. checks_enabled defaults to true, so the failing-path items
-      # actually exercise the guarantees, and StrictModeTest refuses to load if that is not so.
-      - run: julia --project=StrictMode -e 'import Pkg; Pkg.test(; coverage = true)'
+      # `Pkg.test()`, NOT `runtests.jl` directly: it builds the proper test environment.
+      #
+      # `--check-bounds=yes` is passed EXPLICITLY. Pkg forces it through Julia 1.12 and does not on
+      # 1.13, where it inherits the caller's setting instead — so relying on Pkg to supply it left
+      # every `@inbounds` in the tested code live on the `1` job, which is the configuration this
+      # flag exists to rule out. A safety net does not rest on another tool's default.
+      #
+      # checks_enabled defaults to true, so the failing-path items actually exercise the guarantees,
+      # and StrictModeTest refuses to load if that is not so.
+      - name: Suite with bounds checks forced
+        run: julia --project=StrictMode -e 'import Pkg; Pkg.test(; coverage = true, julia_args = ["--check-bounds=yes"])'
+        env:
+          JULIA_NUM_THREADS: 2
+      # The same suite with codegen left alone, and the only configuration in which the
+      # compiled-output items can run at all.
+      #
+      # Bounds-check insertion and coverage instrumentation both reshape generated code, and the
+      # items that assert on its SHAPE guard themselves by asking the compiled output directly —
+      # so where the flags erase their subject they skip, and a skip counts as green. Measured on
+      # the step above: a `@simd` loop does not vectorize under coverage on either version, nor
+      # under forced bounds checks on 1.12, which left `scalar_fp_loops` and the `@assert_no_spill`
+      # failing paths never once exercised here.
+      #
+      # So those items are not made to tolerate the flags; they are given a run without them. Only
+      # two findings are expected to stay broken in this pass — one real `@test_broken` for the
+      # `:trusted` blind spot, and the live `llvm-mca` path, whose 680MiB weak dependency is
+      # deliberately absent.
+      #
+      # Linux only, both versions: the two differ here (1.12 does not vectorize a bounds-checked
+      # loop and 1.13 does), so each is worth a pass, while a third operating system is not.
+      - name: Suite with codegen unperturbed (no coverage, bounds auto)
+        if: matrix.os == 'ubuntu-latest'
+        run: julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
         env:
           JULIA_NUM_THREADS: 2
       # The split's premise, and the ONLY place it can be checked: StrictMode with no
@@ -52,11 +79,14 @@ jobs:
       # StrictModeTest's own suite: the proof primitives (allocation classification, ignore_throw,
       # the JET and TrimCheck drivers) and the @test_* / test_* gating surface. StrictMode cannot test
       # these: it does not depend on AllocCheck, JET, or TrimCheck at all.
-      # The root `[workspace]` resolves the sibling, so nothing wires it up here and no path source
-      # belongs in StrictModeTest's own Project.toml: that file is registered, and a path source has
-      # no meaning once the package is installed from General.
+      # The root `[workspace]` resolves the sibling, so nothing wires it up here. No path source
+      # belongs in StrictModeTest's Project.toml OR in its test/Project.toml: both ship in the
+      # registry tarball, where a relative path to a sibling StrictMode names nothing and
+      # resolution fails for every consumer. `Pkg.test()` carries the path from the workspace
+      # manifest, and a stale manifest — not a missing source — is what makes a direct activation
+      # of test/ resolve something else.
       - name: StrictModeTest suite
-        run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test()'
+        run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
       # The consumer layout, end to end: StrictMode in a package's own Project.toml with
       # @strict_function in its src/, StrictModeTest only in its test/. Needs a real precompile of a
       # second package, so it is its own step rather than part of the main suite. It is the only
