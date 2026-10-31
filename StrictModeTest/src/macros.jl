@@ -152,36 +152,30 @@ function _check_steady_state(
     )
     warmups >= 1 || throw(ArgumentError("$kind: warmups must be at least 1, got $warmups"))
     repeats >= 1 || throw(ArgumentError("$kind: repeats must be at least 1, got $repeats"))
-    for _ in 1:warmups
-        thunk()
-    end
-    # A per-task initializer is alloc-free only for the task that already paid for it, so measuring
-    # on the warming task would pass it. Measuring on a fresh one asks the question the caller
-    # means: does a NEW caller allocate?
-    measure() = @allocated thunk()
-    bytes = if fresh_task
-        t = Task(() -> measure())
-        schedule(t)
-        fetch(t)
+    # One measurement, two tiers: the reporting form is the implementation, and this adds only the
+    # raise. A per-task initializer is alloc-free for the task that already paid for it, which is
+    # why `fresh_task` asks the question the caller means — does a NEW caller allocate?
+    r = StrictMode.steady_state_report(thunk; warmups, repeats, fresh_task)
+    StrictMode.steady(r) && return nothing
+    on_task = fresh_task ? ", measured on a fresh task" : ""
+    # An unattributable figure is a failure, not a quiet pass: "could not measure" and "is fine"
+    # must never read alike.
+    reason = if StrictMode.inconclusive(r)
+        "could not measure this call's own allocation: it read $(r.bytes) byte(s)$on_task, but an " *
+            "allocation-free control window of the same duration recorded $(r.noise) byte(s) of " *
+            "its own.\n  `@allocated` counts allocation for the whole PROCESS, so a task running " *
+            "beside the measurement lands in the figure — this session has $(r.nthreads) " *
+            "thread(s).\n  Measure on a quiet process. A figure that cannot be attributed is not " *
+            "a pass."
     else
-        measure()
+        "allocated $(r.bytes) byte(s) after $warmups warmup call(s)$on_task, with an " *
+            "allocation-free control window recording nothing, so the figure is this call's " *
+            "own.\n  This is a MEASUREMENT of the calls that ran, not a proof over every path: " *
+            "it says the warmed call allocates nothing, and says nothing about an argument " *
+            "shape it was not given.\n  A pool that is still growing needs more warmups; one " *
+            "that allocates per task fails here with `fresh_task = true` and passes without it."
     end
-    for _ in 2:repeats
-        b = fresh_task ? fetch(schedule(Task(() -> measure()))) : measure()
-        bytes = max(bytes, b)
-    end
-    iszero(bytes) && return nothing
-    throw(
-        StrictMode.StrictViolation(
-            kind, target,
-            "allocated $bytes byte(s) after $warmups warmup call(s)" *
-                (fresh_task ? ", measured on a fresh task" : "") *
-                ".\n  This is a MEASUREMENT of the calls that ran, not a proof over every path: " *
-                "it says the warmed call allocates nothing, and says nothing about an argument " *
-                "shape it was not given.\n  A pool that is still growing needs more warmups; one " *
-                "that allocates per task fails here with `fresh_task = true` and passes without it."
-        )
-    )
+    throw(StrictMode.StrictViolation(kind, target, reason))
 end
 
 """

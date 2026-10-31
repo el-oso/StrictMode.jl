@@ -125,7 +125,17 @@ StrictMode/src/
                         that STOPS once warmed, for a pool climbing to a high-water mark. Takes
                         VALUES and runs the call, so it sits outside the value-free findings/audit
                         pipeline — same species as memsafe_report/mca_report. The gating form is
-                        StrictModeTest.@test_steady_state; this one never raises)
+                        StrictModeTest.@test_steady_state; this one never raises.
+                        THREE verdicts, because @allocated is PROCESS-wide and Julia has no per-task
+                        allocation counter (Task tracks only time). A positive figure is followed by
+                        _control_bytes, an allocation-free _spin window of the same duration:
+                        whatever THAT records was allocated by something else, so the verdict is
+                        `inconclusive` rather than a count, and @test_steady_state fails on it. A
+                        ZERO needs no control — noise can only add — so `steady` holds however busy
+                        the process is. Measured: one neighbor task charges 2120 bytes to a clean
+                        call, 3MB over a 2ms window. Do NOT try to separate noise by aggregating
+                        repeats (min-of-K, or two batches agreeing): a periodic neighbor gives the
+                        SAME figure every batch, measured, so agreement proves nothing)
   gcpause.jl          — gc_pause_report/GcPauseReport (whether a GC ran while the call did, plus the
                         per-call pause distribution). The axis the allocation guarantees cannot
                         cover: the collector stops the world, so an allocation-free kernel is paused

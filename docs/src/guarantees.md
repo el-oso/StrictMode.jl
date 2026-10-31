@@ -808,6 +808,24 @@ A `steady` report covers the calls that ran, so choose the shapes you measure th
 choose benchmark sizes — a later call with a larger problem allocates again and is outside what the
 measurement says.
 
+**A positive figure is checked against a control before it is believed.** `@allocated` counts
+allocation for the whole **process**, not for the measured call, so a task running beside the
+measurement is charged to the kernel. Measured here: one task allocating in a loop put 2,120 bytes
+— and over a 2 ms window, 3 MB — onto a call that allocates nothing. So whenever the figure is
+positive, an allocation-free window of the same duration is measured too; anything *it* records was
+allocated by something else, and the verdict is then `inconclusive` rather than a count:
+
+```julia
+r = steady_state_report(solve!, ws, A, b)
+StrictMode.steady(r)         # allocated nothing
+StrictMode.inconclusive(r)   # something else in the process was allocating; nothing is attributable
+```
+
+`@test_steady_state` **fails** on an inconclusive measurement: "could not measure" and "is fine"
+must never read alike. A zero needs no control — another task's allocation can only add to the
+figure, so `steady` is trustworthy however busy the session is. Julia has no per-task allocation
+counter, so a quiet process is the only way to get an attributable positive number.
+
 ## `@test_no_gc_pause` — no collection runs while the call does
 
 Allocation-freedom is necessary and not sufficient. Julia's collector stops the world: when any

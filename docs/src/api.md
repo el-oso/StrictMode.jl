@@ -97,6 +97,8 @@ memsafe_report
 MemsafeReport
 steady_state_report
 SteadyStateReport
+StrictMode.steady
+StrictMode.inconclusive
 gc_pause_report
 GcPauseReport
 latency_report
