@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.3
 
 ### Three advisory sweeps: `bang_report`, `specialization_report`, `throw_report`
 
@@ -54,6 +54,53 @@ the method that wrote `@inbounds`, not on the `@propagate_inbounds` callee it ca
 `allow = (:inbounds,)` excuses it where the in-range property is proved and tested.
 
 Optimization consumes the flag, which is the same reason the rest of this scan reads unoptimized IR.
+
+### `steady_state_report` can report `inconclusive`, and `@test_steady_state` fails on it
+
+`@allocated` counts allocation for the whole **process**, not for the call it wraps, and Julia has
+no per-task allocation counter — a `Task` records only time. So a task allocating beside the
+measurement is charged to the kernel. Measured here: one neighbor task allocating in a loop put
+2,120 bytes onto a call that allocates nothing, and 3 MB onto a 2 ms one.
+
+A positive figure is now followed by an allocation-free control window of the same duration.
+Whatever *that* window records was allocated by something else, so the report is `inconclusive`
+rather than a count of this call's allocation, and `@test_steady_state` fails on it — "could not
+measure" and "is fine" must never read alike. `SteadyStateReport` carries the control's figure as
+`noise` and the session's `Threads.nthreads()`; the predicates are `StrictMode.steady` and
+`StrictMode.inconclusive`.
+
+A zero reading needs no control and takes none: another task's allocation can only add to a
+process-wide figure, so a `steady` verdict holds however busy the session is.
+
+Aggregating repeats cannot separate the two. A periodic neighbor contributes the *same* figure to
+every batch — measured, 2,120 bytes twice — so neither a minimum across samples nor two batches
+agreeing says anything about whose allocation was counted.
+
+### `test_specializations` — the growth of a specialization count, against a baseline
+
+`specialization_report` is `:info` and has no absolute limit to offer, because a kernel specialized
+on twenty element types is Julia producing fast code. What can be gated is the **change**: a method
+that compiled twelve specializations last release and forty now is a compile-time regression someone
+can act on.
+
+The baseline is a `Serialization` file keyed on `(Julia version, workload)`. The version, because
+inference and codegen decide how many specializations exist. The workload, because the count is what
+has compiled in **this session** — the same call placed after a full suite sees more than one placed
+at the top of it, so those are two measurements and must never be compared with each other.
+
+A missing key records the run and returns, so adding this to a suite cannot fail on the day it is
+added. `tolerance` allows a stated amount of growth, `update = true` accepts growth that is
+intended, and a method the baseline does not name has nothing to regress against.
+
+### Fixed: `StrictModeTest`'s own suite resolved StrictMode from the registry
+
+`StrictModeTest/test/Project.toml` carried no `[sources]` entry, so activating that environment
+directly resolved StrictMode from the General registry rather than the sibling checkout, and the
+suite then proved things about a published StrictMode instead of the one under development. It now
+names the path, as `StrictMode/test/Project.toml` already did.
+
+A test environment cannot be made a workspace member instead: Pkg injects the package under test
+into it at test time, which a static workspace resolution cannot express.
 
 ## 0.5.2
 

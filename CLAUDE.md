@@ -262,10 +262,12 @@ the file you touched rather than trusting this list; it has drifted before (veri
 `Pkg.test()` from the MAIN environment — not `test/runtests.jl` directly. Running the file directly
 leaves bounds checking at `auto`, whereas `Pkg.test()` forces `--check-bounds=yes`, and the two
 generate different code: five vectorization-shape tests only fail under forced bounds checks, which
-is how they stayed invisible in CI. `+release` selects 1.12 when 1.13 is the juliaup default.
+is how they stayed invisible in CI. The compat floor is 1.12 and `+release` tracks the current
+release, so name the floor explicitly with `+1.12` rather than through a channel that moves.
 
 ```bash
-julia +release --project=StrictMode -e 'import Pkg; Pkg.test()'
+julia --project=StrictMode -e 'import Pkg; Pkg.test()'          # the default channel
+julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test()'    # the compat floor
 ```
 
 The test `Project.toml` depends on `StrictModeTest`, which supplies the AllocCheck/JET/TrimCheck
