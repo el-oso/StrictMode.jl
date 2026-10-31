@@ -174,6 +174,11 @@ StrictMode/src/
                         which is the caller's and may hold a quote or a newline. Gating form:
                         StrictModeTest.test_latency, whose budgets are opt-in because a wall-clock
                         threshold belongs to one host
+  test/mca_live.jl    — the live llvm-mca assertions, shared by mca_test.jl's live item and
+                        test/mca_live_runner.jl so the two cannot drift. LLVM_full_jll is ~680MiB
+                        and is a dep of NO environment here, so mca_available() is false everywhere
+                        and that item skips: CI builds a throwaway env that adds the weak dep and
+                        runs the runner, which is the only place mca_report actually executes
   mca.jl              — @assert_mca, mca_report/McaReport (issue #16 Tier 2: llvm-mca-backed
                         throughput/IPC estimate, informational only — never fails without an
                         explicit max_rthroughput=/min_ipc= bound). _sanitize_asm_for_mca (drops the

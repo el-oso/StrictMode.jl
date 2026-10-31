@@ -151,30 +151,13 @@ end
 @testitem "live: mca_report on a real vectorized kernel (only runs when LLVM_full_jll is loaded)" begin
     using StrictMode
     if StrictMode.mca_available()
-        function dotk(a::Vector{Float64}, b::Vector{Float64})
-            s = 0.0
-            @inbounds @simd for i in eachindex(a, b)
-                s += a[i] * b[i]
-            end
-            return s
-        end
-        r = mca_report(dotk, (Vector{Float64}, Vector{Float64}))
-        @test r.iterations > 0
-        @test !isnan(r.ipc)
-        @test r.block_rthroughput > 0
-
-        # always passes with no bounds
-        val = @assert_mca dotk(rand(8), rand(8))
-        @test val isa Float64
-
-        # an impossible bound throws
-        @test_throws StrictViolation (@assert_mca min_ipc = 1.0e6 dotk(rand(8), rand(8)))
-
-        # unrecognized mcpu falls back to generic rather than erroring
-        r2 = mca_report(dotk, (Vector{Float64}, Vector{Float64}); mcpu = "definitely_not_a_real_cpu")
-        @test r2.mcpu == "generic"
-        @test r2.mcpu_fellback
+        include(joinpath(@__DIR__, "mca_live.jl"))
+        mca_live_checks()
     else
-        @test_skip false   # LLVM_full_jll (680MiB) is intentionally not a test dependency
+        # `LLVM_full_jll` is ~680MiB and is not a dependency of any environment in this repo, so
+        # this is the normal outcome here. The assertions are not lost to it: CI builds a throwaway
+        # environment that installs the weak dependency and runs `mca_live_runner.jl`, which calls
+        # the same `mca_live_checks` this branch would have.
+        @test_skip false
     end
 end

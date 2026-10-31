@@ -92,6 +92,18 @@ A missing key records the run and returns, so adding this to a suite cannot fail
 added. `tolerance` allows a stated amount of growth, `update = true` accepts growth that is
 intended, and a method the baseline does not name has nothing to regress against.
 
+### The `llvm-mca` path is tested
+
+`mca_report` shells out to `llvm-mca`, which ships inside `LLVM_full_jll` — a ~680MiB weak
+dependency that no environment in this repository installs, on purpose. So `mca_available()` was
+false everywhere, the live item skipped everywhere, and the feature was untested rather than merely
+unexercised.
+
+CI now builds a throwaway environment that adds the weak dependency and runs the live assertions.
+They live in one file that both entry points call, so the skipping item and the CI run cannot drift
+apart. Nothing in a committed `Project.toml` names `LLVM_full_jll`, so no checkout pulls 680MiB by
+instantiating something.
+
 ### Fixed: the suite ran with `@inbounds` live on Julia 1.13, and three items never ran at all
 
 `Pkg.test()` forces `--check-bounds=yes` through Julia 1.12 and inherits the caller's setting from

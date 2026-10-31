@@ -63,6 +63,20 @@ jobs:
         run: julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
         env:
           JULIA_NUM_THREADS: 2
+      # `mca_report` is the one feature nothing else here runs. `llvm-mca` ships inside
+      # `LLVM_full_jll`, a ~680MiB weak dependency that no environment in this repo installs, so
+      # `mca_available()` is false everywhere and the live item skips — leaving the feature untested
+      # rather than merely unexercised.
+      #
+      # The environment is built here instead of committed, because a tracked `[deps]` naming
+      # `LLVM_full_jll` would pull 680MiB into any checkout that instantiated it. Linux only: one
+      # platform is enough to prove the CLI glue works, and this is the largest download in the run.
+      - name: llvm-mca live path
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p "$RUNNER_TEMP/mcaenv"
+          julia --project="$RUNNER_TEMP/mcaenv" -e 'using Pkg; Pkg.develop(path = "StrictMode"); Pkg.add("LLVM_full_jll")'
+          julia --project="$RUNNER_TEMP/mcaenv" StrictMode/test/mca_live_runner.jl
       # The split's premise, and the ONLY place it can be checked: StrictMode with no
       # proofs installed. Every item in test/ runs with StrictModeTest loaded, so none of them can
       # catch a guarantee that has re-acquired a hard AllocCheck/JET/TrimCheck dependency — which
