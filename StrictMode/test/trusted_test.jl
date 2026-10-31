@@ -82,7 +82,20 @@ end
     fi = only(findings(TrustedFixtures.peek_length, (Int,); guarantees = (:trusted,)))
     @test StrictMode._failed(fi)
 
-    # Blind spot: an `Any`-typed payload carries no `Untrusted` for inference to match on.
+    # Blind spot, and it stays one: an `Any`-typed payload carries no `Untrusted` for inference to
+    # match on, so the scan has nothing to key off.
+    #
+    # The obvious widening — flag every deref whose object type cannot be PROVED not to be an
+    # `Untrusted`, i.e. `typeintersect(T, Untrusted) !== Union{}` — is sound and useless. Measured
+    # over StrictMode itself, which contains no `Untrusted` at all: 51 of 340 methods and 130 sites,
+    # led by `_stmt_arg_type` (12) and `_unopt_arg_type` (10), all of them ordinary `getfield` calls
+    # on `Any`. A finding on 15% of a package's methods buries the real ones, the same reason
+    # `test_layers` declines to judge StrictMode's own Base reads.
+    #
+    # Nor can it be closed at the type level: Julia has no private field, so `getfield` reaches an
+    # `Untrusted` payload by name or by index whatever the struct does. `Untrusted` is a dispatch
+    # barrier, and erasing the type erases the barrier. `@test_broken` rather than a deletion — if a
+    # future Julia makes this knowable, this reports an unexpected pass and the gap closes.
     @test_broken StrictMode._failed(
         only(findings(TrustedFixtures.erased, (Vector{Any},); guarantees = (:trusted,)))
     )
