@@ -174,4 +174,70 @@ end
     end
     @test pool_balance_report(balanced!, (Channel{Int},)).balanced
     @test !pool_balance_report(leaky!, (Channel{Int},)).balanced
+
+    # A signature with no IR to read counts nothing, and a count of nothing balances — so a
+    # returned verdict would be indistinguishable from a real one. "Nothing to count" and
+    # "counted, and they match" must not render alike, so this raises, as the other two checks in
+    # this file do.
+    @test_throws StrictMode._UnanalyzableSignature pool_balance_report(balanced!, (String,))
+    @test_throws "could not analyze" pool_balance_report(balanced!, (String,))
+    @test_throws "UNKNOWN, not satisfied" pool_balance_report(balanced!, (String,))
+end
+
+@testitem "taint flows through a struct built from a shared argument" begin
+    using StrictMode
+
+    # `:new` builds every wrapper — a struct, and a closure's captures — and a scan reading only
+    # `:call`/`:invoke` statements loses the shared object the moment it is wrapped.
+    #
+    # `@noinline` is what makes this bite, and it is the only shape that distinguishes the two
+    # behaviors. An INLINABLE wrapper is caught either way: inlining rewrites the store to go
+    # straight through the argument, so the wrapper never stands between them. Measured, findings
+    # for the same write: inlinable 1 and 1, `@noinline` 0 without `:new` taint and 1 with it.
+    struct Holder
+        buf::Vector{Float64}
+    end
+    @noinline poke!(h::Holder) = (h.buf[1] += 1.0; h)
+    wrapped!(buf::Vector{Float64}) = poke!(Holder(buf))
+    direct!(buf::Vector{Float64}) = (buf[1] += 1.0; buf)
+    readonly(buf::Vector{Float64}) = @inbounds buf[1] + 1.0
+
+    wrapped!(zeros(2)); direct!(zeros(2)); readonly(zeros(2))
+
+    # The `:invoke` of `poke!` carries `%new(Holder, _2)`, so the shared argument is only reachable
+    # if the `:new` passed its taint on.
+    @test !isempty(StrictMode.concurrency_findings(wrapped!, (Vector{Float64},)))
+    @test !isempty(StrictMode.concurrency_findings(direct!, (Vector{Float64},)))
+    # …and the wrapper does not make a read look like a write.
+    @test isempty(StrictMode.concurrency_findings(readonly, (Vector{Float64},)))
+end
+
+@testitem "a task's write to a captured buffer is a write" begin
+    using StrictMode
+
+    # `Threads.@spawn` lowers to a closure built by `:new` and handed to `jl_new_task`. The body
+    # runs as a method of its own, so a scan that follows only calls never enters it and the write
+    # reads as no write at all — the plan looks read-only while a task is mutating it.
+    function racy!(buf::Vector{Float64})
+        t = Threads.@spawn (buf[1] += 1.0)
+        wait(t)
+        return buf
+    end
+    # Reading the capture is not writing it, and a task-local buffer is nobody else's business.
+    reader(buf::Vector{Float64}) = fetch(Threads.@spawn sum(buf))
+    function private!(buf::Vector{Float64})
+        n = length(buf)
+        return fetch(Threads.@spawn (local v = zeros(n); v[1] += 1.0; v[1]))
+    end
+
+    racy!(zeros(2)); reader(zeros(2)); private!(zeros(2))
+
+    viols = StrictMode.concurrency_findings(racy!, (Vector{Float64},))
+    @test !isempty(viols)
+    # The report says HOW it got there, because a write inside a task is a different problem from
+    # the same write in the caller's own body.
+    @test any(v -> occursin("task closure", v.message), viols)
+
+    @test isempty(StrictMode.concurrency_findings(reader, (Vector{Float64},)))
+    @test isempty(StrictMode.concurrency_findings(private!, (Vector{Float64},)))
 end

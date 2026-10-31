@@ -199,6 +199,29 @@ function _taint_scan_ci(
             elseif st isa Core.ReturnNode
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) && (returns_tainted = true)
                 continue
+            elseif Meta.isexpr(st, :new)
+                # A struct built from a tainted value carries the taint. Without this the scan
+                # stops at every wrapper: `Threads.@spawn` captures its closed-over variables as
+                # fields of a closure struct, so a task writing a captured buffer reads as no write
+                # at all. `args[1]` is the type; the rest are the field values.
+                any(a -> _op_tainted(a, tset, targs), @view st.args[2:end]) && settaint(true)
+                continue
+            elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task
+                # `Threads.@spawn` and `Threads.@threads` lower to a closure built by `:new` and
+                # handed to `jl_new_task`; `Task(f)` reaches the same call. The body runs elsewhere,
+                # so following it is the only way to see what the task writes.
+                #
+                # The ccall arguments begin at index 6 — after the function spec, return type,
+                # argument-type `svec`, the required-argument count and the convention. The first
+                # of them is the task's function.
+                for a in @view st.args[6:end]
+                    _op_tainted(a, tset, targs) || continue
+                    _recurse_task_body(
+                        _operand_type(a, types), chain, depth, max_depth, memo, out, seen, fr
+                    )
+                    break
+                end
+                continue
             end
 
             (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) || continue
@@ -279,6 +302,76 @@ function _store_msg(nm::Symbol, isinvoke::Bool, dataargs, targs)
         return "writes field `$(fld === nothing ? "?" : fld)` of $where (`setfield!`) — the plan is mutated during apply"
     end
     return "stores into a buffer reachable from the plan (`$nm`) — a heap write the plan can observe"
+end
+
+# The inferred type of an operand, when the scan can know one. A closure arrives as the result of
+# `:new`, so for that operand this is the closure's own concrete type.
+function _operand_type(@nospecialize(a), types)
+    a isa Core.SSAValue || return nothing
+    (1 <= a.id <= length(types)) || return nothing
+    T = types[a.id]
+    return (T isa DataType && isconcretetype(T)) ? T : nothing
+end
+
+# A task's body is a method of its own, reached through `jl_new_task` rather than through a call, so
+# the main scan never enters it and a write to a captured buffer reads as no write at all.
+#
+# Scanned with the CLOSURE ITSELF tainted: a capture is read as `getfield(self, …)` and
+# `_PROJECT_OPS` carries the taint on from there, so every captured value counts as plan-reachable.
+# That is field-insensitive, like the rest of this scan — a task that captures both a shared buffer
+# and a private one is reported for writing either. Anything it cannot resolve is RECORDED rather
+# than skipped: a task body that could not be read is not a task body that writes nothing.
+function _recurse_task_body(
+        @nospecialize(T), chain::Vector{String}, depth::Int, max_depth::Int,
+        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
+    )
+    held = "spawns a task holding a plan-reachable value"
+    if isnothing(T)
+        _record!(
+            out, seen, chain,
+            "$held whose closure type could not be resolved — not followed; flagged conservatively",
+            caller
+        )
+        return nothing
+    end
+    key = (T, :task)
+    haskey(memo, key) && return nothing
+    memo[key] = false
+    if depth >= max_depth
+        _record!(
+            out, seen, chain,
+            "$held at recursion depth $depth (≥ max_depth=$max_depth) — not followed; flagged " *
+                "conservatively", caller
+        )
+        return nothing
+    end
+    cts = try
+        Base.code_typed_by_type(Tuple{T}; optimize = true)
+    catch err
+        _record!(
+            out, seen, chain,
+            "$held whose body could not be analyzed ($(sprint(showerror, err))) — flagged " *
+                "conservatively", caller
+        )
+        return nothing
+    end
+    if isempty(cts)
+        _record!(
+            out, seen, chain, "$held whose body has no typed IR — flagged conservatively", caller
+        )
+        return nothing
+    end
+    fr = try
+        m = which(Tuple{T})
+        _Frame("task closure", string(m.file), Int(m.line))
+    catch
+        caller
+    end
+    _taint_scan_ci(
+        cts[1].first, Set{Int}(1), vcat(chain, "task closure"), fr, depth + 1, max_depth,
+        memo, out, seen
+    )
+    return nothing
 end
 
 function _recurse(
@@ -565,14 +658,22 @@ Count acquire-like (`take!`/`acquire`/`lock`) vs release-like (`put!`/`release`/
 count*, not a per-path match, so it cannot detect a `put!` skipped on an error branch (wrap the
 acquire/release in `try/finally` and assert balance at runtime for that). Use it as a smoke test
 for a forgotten release.
+
+A signature whose IR cannot be read raises `_UnanalyzableSignature` rather than returning a count
+of zero, which `balanced` would have reported as true: "nothing to count" and "counted, and they
+match" must not render alike. The other two checks in this file raise for the same reason.
 """
 function pool_balance_report(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
         Base.code_typed(f, types; optimize = false)   # keep source-level `take!`/`put!` names
-    catch
-        return (; takes = 0, puts = 0, balanced = true)
+    catch err
+        throw(_UnanalyzableSignature(:pool_balanced, f, types, sprint(showerror, err)))
     end
-    isempty(cts) && return (; takes = 0, puts = 0, balanced = true)
+    isempty(cts) && throw(
+        _UnanalyzableSignature(
+            :pool_balanced, f, types, "no typed IR for this signature, so nothing was counted."
+        )
+    )
     code = cts[1].first.code
     takes = 0; puts = 0
     for st0 in code

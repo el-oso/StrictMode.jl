@@ -58,7 +58,20 @@ function _latency_child_script(pkg::Symbol, calls::Vector{String})
     for (i, c) in enumerate(calls)
         # The call is timed by index, not by its text: the text is the caller's and may hold a
         # space, a quote, or anything else that would not survive a line-oriented protocol.
-        push!(lines, "t$i = @elapsed ($c)")
+        #
+        # `@eval` inside the timed region is what makes this a FIRST-call measurement. A top-level
+        # statement is compiled before it runs, and the call sitting inside it is specialized as
+        # part of that compilation — so a bare `@elapsed (call)` starts its clock after the work it
+        # means to measure is already done. Measured on a function with a 4000-statement body:
+        # `@elapsed (call)` reports 0.03 ms for the first call and 0.02 ms for the second, while
+        # `@elapsed @eval (call)` reports 1791.8 ms and 0.45 ms. Without this, `max_first_call_ms`
+        # can never catch a regression.
+        #
+        # `@eval` charges its own parse and lower to every call: 0.45 ms for a plain call in the
+        # measurement above, but ~20 ms for an expression that CONSTRUCTS a closure, because each
+        # evaluation builds a fresh anonymous function and specializes it again. A `calls` entry
+        # holding a `->` therefore reports a compile on every repetition, not only the first.
+        push!(lines, "t$i = @elapsed @eval ($c)")
         push!(lines, "println(\"STRICTMODE_LATENCY call$i \", t$i)")
     end
     push!(lines, "flush(stdout)")
@@ -92,6 +105,15 @@ Building it costs a child process of its own — about twenty seconds for a pack
 Pass `precompile = false` where the caller already knows the cache is warm, such as a test suite
 that has just loaded the package it is measuring. The report then says `precompiled = false`,
 because what it can state is that *this* call did not build the cache, not that nobody did.
+
+Each `calls` entry is timed around an `@eval`, so the first-call number really does include that
+call's compilation — a plain `@elapsed` would not, since a top-level statement is compiled before
+it runs. Two consequences for how to write one:
+
+- `@eval` adds its own parse and lower to every entry, 0.45 ms for a plain call.
+- An entry that **builds a closure** (`"f(x -> 2x, v)"`) specializes a fresh anonymous function on
+  every evaluation, so it measures a compile each time rather than only the first — about 20 ms in
+  the case measured. Name the function instead (`"f(double, v)"`) to time a first call.
 
 The child inherits this session's active project, so what is measured is the environment under
 test. The numbers are machine-specific and do not transfer between hosts — gate on them only where

@@ -42,6 +42,8 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:bang, nothing) => :SM0305,
     (:specialization, nothing) => :SM0306,
     (:throws, nothing) => :SM0307,
+    (:alias_guard, nothing) => :SM0308,
+    (:resource, nothing) => :SM0309,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -80,6 +82,8 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0305 => "the method's name and its mutation disagree: a `!` that writes nothing, or a write with no `!`",
     :SM0306 => "the method carries more compiled specializations, or deeper type parameters, than the limit asked for",
     :SM0307 => "the exceptions the method's own body raises, which its callees' are not",
+    :SM0308 => "the method mutates and takes arguments that could overlap, and never asks whether they do",
+    :SM0309 => "a registered resource, or a value borrowed from one, outlives the scope that owns it",
 )
 
 # The code for a verdict, or `nothing` when the kind is not in the table. A guarantee with a known

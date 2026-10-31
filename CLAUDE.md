@@ -59,7 +59,18 @@ StrictMode/src/
                         with no checker at all; the scan covers what the language cannot, reading
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller
-  concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
+  concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
+                        The taint scan crosses TWO boundaries the statement loop would otherwise
+                        drop: Expr(:new) passes taint to the struct built from a tainted value (an
+                        INLINABLE wrapper is caught anyway, since inlining routes the store back
+                        through the argument — only a @noinline one needs this), and a
+                        :foreigncall to jl_new_task follows the task's closure body via
+                        code_typed_by_type with the CLOSURE ITSELF tainted, since a capture reads
+                        as getfield(self, …) and _PROJECT_OPS carries it on. Field-insensitive, so
+                        a task writing a disjoint slice of a captured output still reports — a
+                        partition is a property of values. Anything unresolvable is RECORDED, never
+                        skipped. pool_balance_report RAISES _UnanalyzableSignature when it cannot
+                        read a signature, because a count of nothing balances
   strict_function.jl  — @strict_function (load-time enforcement; `signatures = [...]` verifies
                         concrete instantiations a generic declaration cannot name, since such a
                         declaration infers to `Any`), @strict_stable (per-specialization instead:
@@ -159,7 +170,21 @@ StrictMode/src/
                         specialization_report (compiled-specialization count + type-parameter depth
                         against caller-given limits). Both :info with NO gating counterpart: a
                         convention is a convention, and a high specialization count is usually Julia
-                        working as intended
+                        working as intended. alias_guard_report is the third: a `!` method taking
+                        two or more possibly-overlapping array arguments whose body never NAMES
+                        overlap (mightalias/unalias/dataids, or `===` BETWEEN TWO ARGUMENTS — bare
+                        `===` matches the `=== nothing` of every for-loop's iteration protocol and
+                        marked every looping method as guarded, measured). Value-free, so it sweeps
+                        where :noalias cannot; :info because a guard inside an unfollowed callee
+                        reads as absent. Judged on m.sig, so an uncalled method is still covered
+  resources.jl        — resource_leak_report: where a register_scoped! type, or a value projected
+                        out of one, outlives its owner — RETURNED, STORED into a container that is
+                        not itself scoped, or CAPTURED BY A TASK (same jl_new_task crossing the
+                        concurrency scan uses). Deliberately NOT release-on-all-paths: that needs
+                        post-dominance over the exception CFG and a `close` in a helper defeats it.
+                        The complement of @assert_noescape, which proves confinement for a handle
+                        CREATED in the frame and says nothing about one arriving as an argument.
+                        :info, and judged on COMPILED signatures, so warm the kernels first
   throws.jl           — throw_report: the exception types a body raises ITSELF, read from its own
                         typed IR. Deliberately NOT transitive — `v[1]` raises BoundsError inside
                         getindex and nearly any call can raise OutOfMemoryError, so "everything

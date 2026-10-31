@@ -211,6 +211,8 @@ static_ownership_suggestions
 bang_report
 specialization_report
 throw_report
+alias_guard_report
+resource_leak_report
 StrictFinding
 StrictMode.Exemption
 format_findings

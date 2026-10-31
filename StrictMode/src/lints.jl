@@ -169,3 +169,117 @@ function specialization_report(
     end
     return out
 end
+
+# ── the aliasing guard ───────────────────────────────────────────────────────────────────────────
+
+# Julia's own overlap predicates. `Base.mightalias` is the oracle both `@assert_noalias` and
+# `Base.unalias` use, and `dataids` is what `mightalias` is built from. Naming any of them is
+# unambiguous evidence that the author considered overlap.
+const _ALIAS_ORACLES = Set{Symbol}((:mightalias, :unalias, :dataids))
+
+# `===` is the narrower guard LinearAlgebra's `mul!` writes by hand, and it counts ONLY between two
+# of the method's own arguments. Unqualified it also matches the `=== nothing` that every `for`
+# loop's iteration protocol emits — measured: counting it marked every looping method as guarded,
+# including one that reads `a[i + 1]` while writing `out[i]` with no check at all.
+function _is_arg_identity(nm::Symbol, args)
+    (nm === :(===) || nm === :(!==)) || return false
+    length(args) == 2 || return false
+    return all(a -> a isa Core.Argument || a isa Core.SlotNumber, args)
+end
+
+# Could a value of this type be an array, so that two parameters of it could name the same memory?
+# Asked of the TYPE, so the answer is "cannot be ruled out" rather than "is" — `Any` counts, and a
+# type the scan cannot narrow is not a type it has cleared.
+_could_be_array(@nospecialize(T)) = T isa Type && typeintersect(T, AbstractArray) !== Union{}
+
+# How many of this method's parameters could alias one another. One array argument has nothing to
+# overlap with, so the guard question only arises from two.
+function _aliasable_arity(m::Method)
+    sig = Base.unwrap_unionall(m.sig)
+    (sig isa DataType && length(sig.parameters) >= 2) || return 0
+    return count(_could_be_array(Base.unwrap_unionall(P)) for P in sig.parameters[2:end])
+end
+
+# Does this method's own body ask whether two of its arguments overlap? Read from UNOPTIMIZED IR,
+# because the guard is a call the author wrote and optimization folds `mightalias` into comparisons
+# that no longer carry its name. `nothing` when the IR could not be read — which a caller must not
+# read as "no guard".
+function _has_alias_guard(m::Method)
+    cis = try
+        Base.code_typed_by_type(m.sig; optimize = false)
+    catch
+        return nothing
+    end
+    isempty(cis) && return nothing
+    for pair in cis
+        ci = pair isa Pair ? pair.first : pair
+        ci isa Core.CodeInfo || continue
+        for st in ci.code
+            callee, args = _call_callee_and_args(ci, st)
+            isnothing(callee) && continue
+            nm = try
+                nameof(callee)
+            catch
+                continue
+            end
+            nm isa Symbol || continue
+            (nm in _ALIAS_ORACLES || _is_arg_identity(nm, args)) && return true
+        end
+    end
+    return false
+end
+
+"""
+    alias_guard_report(mod::Module; only = nothing, exempt = ()) -> Vector{StrictFinding}
+
+Mutating methods in `mod` that take two or more possibly-overlapping array arguments and never ask
+whether they overlap. Every finding is `:info`.
+
+Rust rejects `C = A * C` at compile time, because the call borrows `C` twice. Julia compiles it, and
+whether anything notices is up to the callee: `LinearAlgebra.mul!` throws on `C === A`, but only on
+its BLAS and small-matrix paths — the generic fallback has no check, so the same call on
+`Matrix{Int}` returns a silently wrong answer, and a `view(C, :, :)` slips past an identity test on
+every path. A user kernel usually has no check at all.
+
+What this asks is narrow and value-free: does the method's own body *mention* overlap, through
+`Base.mightalias`, `Base.unalias`, `dataids`, or an `===` between arguments. That is a question
+about text, not about values, so it can be swept — where [`@assert_noalias`](@ref) cannot, since
+overlap is a property of the arguments and a sweep has none.
+
+**It is `:info`, and the absent direction is a lead rather than a fact.** A guard living in a callee
+the scan did not follow reads as no guard, exactly as in [`bang_report`](@ref): "found a guard" is
+observed, "found none" is not. So this nominates methods to read, and the per-call-site
+`@assert_noalias` — or a `Base.unalias` in the body — is what actually establishes the property.
+
+```julia
+alias_guard_report(MyPkg)                      # every unguarded mutating kernel
+alias_guard_report(MyPkg; only = r"^gemm")     # one family
+```
+
+Judged on the method's declared signature, so a method with no compiled specialization is still
+covered — unlike the sweeps that read what has run.
+"""
+function alias_guard_report(mod::Module; only = nothing, exempt = ())
+    out = StrictFinding[]
+    methods_, _ = module_methods(mod; only, exempt)
+    for m in methods_
+        endswith(String(m.name), "!") || continue
+        n = _aliasable_arity(m)
+        n >= 2 || continue
+        _has_alias_guard(m) === false || continue    # `true` guards, `nothing` could not be read
+        push!(
+            out,
+            StrictFinding(
+                nameof(mod), string(m.name), string(m.sig), :alias_guard, :info,
+                string(m.file), Int(m.line),
+                "mutates, takes $n arguments that could overlap, and never asks whether they do",
+                "guard the overlap where the method is written — `Base.unalias` to copy, or an " *
+                    "explicit `Base.mightalias` test and a `throw` — or assert it per call site " *
+                    "with `@assert_noalias`. A guard inside a callee this scan did not follow " *
+                    "reads as none, so check by hand before adding one",
+                :report
+            )
+        )
+    end
+    return out
+end
