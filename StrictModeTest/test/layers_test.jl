@@ -108,3 +108,72 @@ end
     @test_throws "declared twice" test_layers(Solo => (), Solo => ())
     @test_throws "`Layer => (deps…)`" StrictModeTest._layer_graph((Solo,))
 end
+
+@testitem "rule 2 judges sibling submodules of ONE package" begin
+    using StrictMode, StrictModeTest
+
+    # Submodules of a single package are the main use of a layer graph: two packages already have
+    # Pkg-level separation, while siblings have nothing else holding the boundary. ExplicitImports
+    # defaults `allow_internal_accesses` to `true`, which drops every access between modules sharing
+    # a `Base.moduleroot` — so with the default this rule fired only between separate PACKAGES, and
+    # every positive control used a package pair, which is how the gap survived.
+    #
+    # A real package on disk, because the rule parses source: `pathof(Base.moduleroot(layer))` is
+    # the file it reads, and a module defined inside a test item has none.
+    dir = mktempdir()
+    pkg = joinpath(dir, "LayerSiblings")
+    mkpath(joinpath(pkg, "src"))
+    write(
+        joinpath(pkg, "Project.toml"),
+        # A fixed UUID, written out rather than generated: this fixture is never resolved from a
+        # registry, so the value only has to be unique, and a literal keeps `UUIDs` out of the test
+        # environment's dependencies.
+        """
+        name = "LayerSiblings"
+        uuid = "6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60"
+        version = "0.1.0"
+        """
+    )
+    write(
+        joinpath(pkg, "src", "LayerSiblings.jl"),
+        """
+        module LayerSiblings
+        module Store
+            public numel
+            const index = [1, 2, 3]
+            numel(x) = length(x)
+        end
+        module Reader
+            using ..Store
+            peek() = length(Store.index)
+        end
+        end
+        """
+    )
+    push!(LOAD_PATH, dir)
+    try
+        LS = @eval (using LayerSiblings; LayerSiblings)
+        store, reader = LS.Store, LS.Reader
+
+        # The read crosses two declared layers, so it is reported whatever the direction says.
+        failed = filter(
+            StrictMode._failed,
+            StrictModeTest._layer_findings([LS => (store, reader), store => (), reader => ()])
+        )
+        # Asserted before `only`, so a rule that stops firing reads as "Reader was not reported"
+        # rather than as an empty-collection error.
+        reader_rows = filter(f -> f.mod === :Reader, failed)
+        @test length(reader_rows) == 1
+        bad = only(reader_rows)
+        @test bad.func == "index"
+        @test bad.code === :SM0205
+        @test occursin("Reader", bad.reason) && occursin("Store.index", bad.reason)
+
+        # …and the graph stays the opt-in. With `Store` outside it there is no second layer to
+        # read from, and with both submodules inside ONE layer the read is internal to that layer.
+        @test iszero(nfailures(StrictModeTest._layer_findings([reader => ()])))
+        @test iszero(nfailures(StrictModeTest._layer_findings([LS => ()])))
+    finally
+        filter!(!=(dir), LOAD_PATH)
+    end
+end

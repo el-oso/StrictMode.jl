@@ -245,8 +245,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         no layer may read a non-public name of another. Only modules IN THE GRAPH are
                         judged — StrictMode's own 66 improper accesses are deliberate Base/Core reads,
                         and judging those would bury the layer findings. The access half calls
-                        ExplicitImports; do not re-implement it. Paths come from
-                        pathof(moduleroot(layer)), since a submodule has no pathof of its own
+                        ExplicitImports; do not re-implement it, and pass
+                        allow_internal_accesses = false — ExplicitImports defaults it to TRUE, which
+                        drops every access between modules sharing a Base.moduleroot, so with the
+                        default rule 2 fires only between separate PACKAGES and sibling submodules go
+                        unjudged (the main use of a layer graph: two packages already have Pkg-level
+                        separation). Safe because the graph is still the filter — a row is kept only
+                        when the accessed module is a declared layer AND a different one. Paths come
+                        from pathof(moduleroot(layer)), since a submodule has no pathof of its own
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
                         which is why it lives here)
   test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is

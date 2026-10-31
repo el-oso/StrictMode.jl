@@ -85,8 +85,17 @@ function _access_findings!(out, graph, layer::Module)
     # filter below selects on.
     path = pathof(Base.moduleroot(layer))
     isnothing(path) && return out         # not inside a package: nothing on disk to parse
+    # `allow_internal_accesses = false` is load-bearing. ExplicitImports defaults it to `true`,
+    # which drops every access between modules sharing a `Base.moduleroot` — so with the default,
+    # this rule only ever fires between separate PACKAGES, and sibling submodules of one package
+    # were never judged. That is the main use of a layer graph: two packages already have Pkg-level
+    # separation, while submodules have nothing else holding the boundary.
+    #
+    # Turning the suppression off is safe here because the graph is still the filter: the loop below
+    # keeps a row only when the accessed module is itself a declared layer and a DIFFERENT one, so
+    # reads within a layer, and reads of anything outside the graph, are dropped as before.
     rows = try
-        ExplicitImports.improper_qualified_accesses(layer, path)
+        ExplicitImports.improper_qualified_accesses(layer, path; allow_internal_accesses = false)
     catch err
         throw(AnalysisError(string(nameof(layer)), "(module)", err))
     end
