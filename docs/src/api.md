@@ -84,7 +84,7 @@ kernels **deterministically** instead of flakily, via a guard-page (electric-fen
 `Array` arguments are copied into `mmap`-backed buffers flush against a trailing `PROT_NONE` guard
 region, so an access one element past the intended bounds faults on every run rather than only when
 the next page happens to be unmapped. The probe always runs in a subprocess, so a fatal
-out-of-bounds *read* (an otherwise-uncatchable `SIGSEGV`) is detected via the child's exit signal
+out-of-bounds *read* (otherwise uncatchable) is detected from how the child died
 instead of crashing your session; a *write* is localized by a poisoned canary read back before the
 child touches the guard pages. Needs no extra dependency (`Serialization`, used for subprocess
 argument marshaling, is a core dep), and is scoped to `Array` arguments —

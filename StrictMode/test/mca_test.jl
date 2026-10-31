@@ -148,16 +148,7 @@ end
     end
 end
 
-@testitem "live: mca_report on a real vectorized kernel (only runs when LLVM_full_jll is loaded)" begin
-    using StrictMode
-    if StrictMode.mca_available()
-        include(joinpath(@__DIR__, "mca_live.jl"))
-        mca_live_checks()
-    else
-        # `LLVM_full_jll` is ~680MiB and is not a dependency of any environment in this repo, so
-        # this is the normal outcome here. The assertions are not lost to it: CI builds a throwaway
-        # environment that installs the weak dependency and runs `mca_live_runner.jl`, which calls
-        # the same `mca_live_checks` this branch would have.
-        @test_skip false
-    end
-end
+# The live `llvm-mca` assertions are NOT a test item here. `LLVM_full_jll` is a dependency of no
+# environment in this repo, so an item holding them could only ever skip in this suite — and a skip
+# counts as green. They live in `mca_live.jl` and run from `mca_live_runner.jl`, in the one
+# environment that installs the weak dependency, which CI builds for exactly that purpose.

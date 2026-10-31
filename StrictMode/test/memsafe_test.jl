@@ -31,8 +31,10 @@ end
 
     r = memsafe_report(memsafe_oob_read_kernel!, zeros(8), rand(8))
     @test !isnothing(r.violation)
-    # SIGSEGV on Linux, SIGBUS on macOS — same fault class, platform-dependent signal.
-    @test occursin("SIGSEGV", r.violation) || occursin("SIGBUS", r.violation)
+    # One fault class, three deliveries: a signal on POSIX (SIGSEGV on Linux, SIGBUS on macOS), an
+    # access-violation exit status on Windows, or a catchable memory-access exception on any of them
+    # when Julia's own handler reaches it first. The report must name how it arrived, whichever.
+    @test occursin(r"SIGSEGV|SIGBUS|access violation|memory-access exception", r.violation)
     @test occursin("memsafe_oob_read_kernel!", r.violation)   # the child's own report names the faulting op's frame
 
     @test_throws StrictViolation (@assert_memsafe memsafe_oob_read_kernel!(zeros(8), rand(8)))

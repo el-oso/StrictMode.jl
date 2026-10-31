@@ -1037,7 +1037,7 @@ How it works:
   page, so a one-element overrun faults on **every** run — not only when the allocator happens
   to leave the next page unmapped.
 - The probe runs in a subprocess, the only way to catch an out-of-bounds **read**: that is a
-  fatal `SIGSEGV` and cannot be caught in-process.
+  fatal fault and cannot be caught in-process.
 - A **poisoned canary** classifies writes. The bytes past the data carry a per-buffer,
   position-dependent pattern, read back before the child touches the guard page, so a store past
   the end is reported at its exact offset. This is needed because a write fault destroys its own
