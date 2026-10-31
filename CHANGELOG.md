@@ -92,6 +92,24 @@ A missing key records the run and returns, so adding this to a suite cannot fail
 added. `tolerance` allows a stated amount of growth, `update = true` accepts growth that is
 intended, and a method the baseline does not name has nothing to regress against.
 
+### `memsafe_report` works on Windows
+
+The guard-page harness needed three things from the operating system: a page-aligned anonymous
+allocation, a way to make its trailing pages inaccessible, and a way to release it. It asked for
+them with `mmap`/`mprotect`/`munmap`, so Windows was refused outright and twelve test items skipped
+there — a capability gap that read as green.
+
+Windows spells the same three `VirtualAlloc`/`VirtualProtect`/`VirtualFree`, and they now sit behind
+a `@static if` beside the POSIX calls. The `_PROT_*` flags stay the internal vocabulary on both,
+because `guard_prot` is read as a bitmask as well as passed through — whether the canary can be read
+back afterwards is `guard_prot & _PROT_READ`, a question Windows' page constants cannot answer, so
+they appear only at the call boundary.
+
+A guard-page fault now reaches the parent three ways, all counted as the same event: a fatal signal
+(SIGSEGV on Linux, SIGBUS on macOS), an exit status of `0xc0000005` on Windows, or a catchable
+`ReadOnlyMemoryError` on any of them when Julia's own fault handler gets there first. The status is
+compared modulo `UInt32`, since the same value arrives signed on some paths and unsigned on others.
+
 ### The `llvm-mca` path is tested
 
 `mca_report` shells out to `llvm-mca`, which ships inside `LLVM_full_jll` — a ~680MiB weak

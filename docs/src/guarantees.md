@@ -1049,7 +1049,7 @@ There is no in-process mode: an in-process probe can only use the canary, and a 
 end disturbs no canary, so its clean verdict would be indistinguishable from no overrun at all —
 in exactly the case this harness exists for.
 
-See [`memsafe_report`](@ref)'s docstring for the full scope (Linux/macOS only, `Array`
+See [`memsafe_report`](@ref)'s docstring for the full scope (`Array`
 arguments only, end-of-buffer overruns only — no interior or underrun detection). Arguments the
 harness cannot guard — a `view`, an `Adjoint`, a struct carrying arrays in its fields — are
 listed in the report's `unguarded` field, so a clean verdict over a partially covered call does

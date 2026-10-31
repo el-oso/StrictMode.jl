@@ -116,11 +116,19 @@ StrictMode/src/
                         that reachability-limit union-splits aren't covered — status/reason on the
                         structured StrictFinding are untouched, macro-path-only visibility)
   memsafe.jl          — @assert_memsafe, memsafe_report/MemsafeReport, _guarded_array/GuardedBuffer
-                        (mmap/mprotect guard-page harness for deterministic OOB read/write detection;
-                        the probe always runs in a subprocess via Serialization + Base.run — an
-                        in-process probe cannot observe a read overrun. _guarded_args shares one
-                        buffer between aliased argument positions; _unguarded_args names what the
-                        harness could not cover)
+                        (guard-page harness for deterministic OOB read/write detection; the probe
+                        always runs in a subprocess via Serialization + Base.run — an in-process
+                        probe cannot observe a read overrun. _guarded_args shares one buffer between
+                        aliased argument positions; _unguarded_args names what the harness could not
+                        cover). The page primitives are per-platform behind `@static if`:
+                        mmap/mprotect/munmap on POSIX, VirtualAlloc/VirtualProtect/VirtualFree on
+                        Windows. The _PROT_* flags stay the internal vocabulary on BOTH, because
+                        guard_prot is read as a bitmask (guard_prot & _PROT_READ decides whether the
+                        canary can be read back) and Windows page constants are an enumeration that
+                        cannot answer that — they appear only at the ccall boundary. The fault
+                        reaches the parent three ways and all count: a signal (POSIX), exit status
+                        0xc0000005 (Windows, compared modulo UInt32 since the sign varies), or a
+                        catchable ReadOnlyMemoryError when Julia's handler gets there first
   steady.jl           — steady_state_report/SteadyStateReport (dev-time measurement of allocation
                         that STOPS once warmed, for a pool climbing to a high-water mark. Takes
                         VALUES and runs the call, so it sits outside the value-free findings/audit

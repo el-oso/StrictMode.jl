@@ -32,34 +32,102 @@ using Serialization: serialize, deserialize
 
 # --- guard-page buffer construction -------------------------------------------------------------
 
-function _pagesize()
-    return Int(ccall(:getpagesize, Cint, ()))
-end
-
+# The harness needs three things from the operating system: a page-aligned anonymous allocation, a
+# way to make its trailing pages inaccessible, and a way to hand it all back. POSIX spells those
+# mmap/mprotect/munmap; Windows spells them VirtualAlloc/VirtualProtect/VirtualFree.
+#
+# The `_PROT_*` flags stay the internal vocabulary on both, because `guard_prot` is read as a
+# BITMASK as well as passed through — `guard_prot & _PROT_READ` is what decides whether the canary
+# can be read back afterwards. Windows page constants are an enumeration and cannot answer that, so
+# they appear only at the call boundary.
 const _PROT_READ = Cint(0x01)
 const _PROT_WRITE = Cint(0x02)
 const _PROT_NONE = Cint(0x00)
-const _MAP_PRIVATE = Cint(0x02)
-# MAP_ANONYMOUS: 0x20 on Linux, 0x1000 on Darwin — the only mmap flag that differs between the two
-# platforms this harness targets.
-const _MAP_ANON = Cint(Sys.isapple() ? 0x1000 : 0x20)
 
-function _mmap_anon(nbytes::Int)
-    ptr = ccall(
-        :mmap, Ptr{Cvoid}, (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int),
-        C_NULL, nbytes, _PROT_READ | _PROT_WRITE, _MAP_PRIVATE | _MAP_ANON, -1, 0
+@static if Sys.iswindows()
+    const _MEM_COMMIT = UInt32(0x1000)
+    const _MEM_RESERVE = UInt32(0x2000)
+    const _MEM_RELEASE = UInt32(0x8000)
+    const _PAGE_NOACCESS = UInt32(0x01)
+    const _PAGE_READONLY = UInt32(0x02)
+    const _PAGE_READWRITE = UInt32(0x04)
+
+    _win_page_prot(prot::Cint) =
+        iszero(prot) ? _PAGE_NOACCESS :
+        iszero(prot & _PROT_WRITE) ? _PAGE_READONLY : _PAGE_READWRITE
+
+    # `SYSTEM_INFO`'s second `DWORD` is `dwPageSize`; the first is a union of `dwOemId` with the
+    # processor-architecture words. Reading it as `UInt32`s indexes that field directly, and the
+    # layout past it does not matter.
+    function _pagesize()
+        si = zeros(UInt32, 16)
+        ccall((:GetSystemInfo, "kernel32"), Cvoid, (Ptr{UInt32},), si)
+        return Int(si[2])
+    end
+
+    # A `VirtualAlloc` with no address requested is aligned to the allocation granularity, which is
+    # a multiple of the page size — so the guard region computed from `base` is page-aligned, which
+    # `VirtualProtect` requires.
+    function _mmap_anon(nbytes::Int)
+        ptr = ccall(
+            (:VirtualAlloc, "kernel32"), Ptr{Cvoid},
+            (Ptr{Cvoid}, Csize_t, UInt32, UInt32),
+            C_NULL, nbytes, _MEM_COMMIT | _MEM_RESERVE, _PAGE_READWRITE
+        )
+        ptr == C_NULL && error(
+            "StrictMode @assert_memsafe: VirtualAlloc($nbytes bytes) failed " *
+                "(GetLastError $(Base.Libc.GetLastError()))"
+        )
+        return ptr
+    end
+
+    function _mprotect!(ptr::Ptr{Cvoid}, nbytes::Int, prot::Cint)
+        old = Ref{UInt32}(0)
+        ok = ccall(
+            (:VirtualProtect, "kernel32"), Cint,
+            (Ptr{Cvoid}, Csize_t, UInt32, Ptr{UInt32}),
+            ptr, nbytes, _win_page_prot(prot), old
+        )
+        iszero(ok) && error(
+            "StrictMode @assert_memsafe: VirtualProtect failed " *
+                "(GetLastError $(Base.Libc.GetLastError()))"
+        )
+        return nothing
+    end
+
+    # `MEM_RELEASE` frees the whole reservation and requires a size of zero and the exact pointer
+    # `VirtualAlloc` returned, so the byte count this takes for symmetry is unused.
+    _munmap!(ptr::Ptr{Cvoid}, ::Int) = (
+        ccall(
+            (:VirtualFree, "kernel32"), Cint, (Ptr{Cvoid}, Csize_t, UInt32),
+            ptr, 0, _MEM_RELEASE
+        ); nothing
     )
-    ptr == Ptr{Cvoid}(-1) && error("StrictMode @assert_memsafe: mmap($nbytes bytes) failed (errno $(Base.Libc.errno()))")
-    return ptr
-end
+else
+    const _MAP_PRIVATE = Cint(0x02)
+    # MAP_ANONYMOUS: 0x20 on Linux, 0x1000 on Darwin — the only mmap flag that differs between the
+    # two POSIX platforms this harness targets.
+    const _MAP_ANON = Cint(Sys.isapple() ? 0x1000 : 0x20)
 
-function _mprotect!(ptr::Ptr{Cvoid}, nbytes::Int, prot::Cint)
-    r = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint), ptr, nbytes, prot)
-    r == 0 || error("StrictMode @assert_memsafe: mprotect failed (errno $(Base.Libc.errno()))")
-    return nothing
-end
+    _pagesize() = Int(ccall(:getpagesize, Cint, ()))
 
-_munmap!(ptr::Ptr{Cvoid}, nbytes::Int) = (ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), ptr, nbytes); nothing)
+    function _mmap_anon(nbytes::Int)
+        ptr = ccall(
+            :mmap, Ptr{Cvoid}, (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int),
+            C_NULL, nbytes, _PROT_READ | _PROT_WRITE, _MAP_PRIVATE | _MAP_ANON, -1, 0
+        )
+        ptr == Ptr{Cvoid}(-1) && error("StrictMode @assert_memsafe: mmap($nbytes bytes) failed (errno $(Base.Libc.errno()))")
+        return ptr
+    end
+
+    function _mprotect!(ptr::Ptr{Cvoid}, nbytes::Int, prot::Cint)
+        r = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint), ptr, nbytes, prot)
+        iszero(r) || error("StrictMode @assert_memsafe: mprotect failed (errno $(Base.Libc.errno()))")
+        return nothing
+    end
+
+    _munmap!(ptr::Ptr{Cvoid}, nbytes::Int) = (ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), ptr, nbytes); nothing)
+end
 
 # Size of the trailing guard/canary region. More than one page so that a kernel overrunning by more
 # than a page's worth is still trapped (or canaried) at a known offset rather than landing in
@@ -298,7 +366,11 @@ end
 # both). A guard-page boundary fault raises SIGSEGV on Linux but SIGBUS on macOS for the same
 # out-of-bounds access — both indicate the same fault class this harness is designed to catch.
 # Julia renders a memory fault it caught itself as one of these; a raw signal death has no such text.
-const _MEMFAULT_RE = r"ReadOnlyMemoryError|SegmentationFault"
+const _MEMFAULT_RE = r"ReadOnlyMemoryError|SegmentationFault|EXCEPTION_ACCESS_VIOLATION"
+
+# Windows delivers no signal. A guard-page hit terminates the process with this exit STATUS, which
+# the kernel assigns to every access violation, so on Windows the status is what the parent reads.
+const _WIN_ACCESS_VIOLATION = 0xc0000005
 
 function _signal_name(sig::Integer)
     sig == 11 && return "SIGSEGV"
@@ -391,10 +463,17 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
         # the same event, and the harness must count both: treating the exception form as an
         # unrelated script error reports a real detection as a broken probe. The write kernel takes
         # the exception path on some Linux and macOS hosts and the signal path on others.
-        by_signal = proc.termsignal != 0
-        by_exception = !by_signal && proc.exitcode != 0 && occursin(_MEMFAULT_RE, err_s)
-        if by_signal || by_exception
+        #
+        # Windows is a third delivery: no signal at all, and the access violation shows up as the
+        # process's exit STATUS. The status is compared modulo `UInt32` because the same value
+        # reaches here signed on some paths and unsigned on others, and both spell the same code.
+        by_signal = !iszero(proc.termsignal)
+        by_status = !by_signal && (proc.exitcode % UInt32) == _WIN_ACCESS_VIOLATION
+        by_exception = !by_signal && !by_status && !iszero(proc.exitcode) &&
+            occursin(_MEMFAULT_RE, err_s)
+        if by_signal || by_status || by_exception
             how = by_signal ? "killed by $(_signal_name(proc.termsignal))" :
+                by_status ? "terminated by an access violation (status 0xc0000005)" :
                 "stopped by a memory-access exception"
             if canary !== nothing
                 # A store past the end. Report the canary's own localization: on Julia 1.12+ the
@@ -489,10 +568,12 @@ touches the guard pages, since a write fault's own backtrace is destroyed.
 `Adjoint`, any other non-`Array` `AbstractArray`, or a struct carrying arrays in its fields — are
 listed in `unguarded`; the call still runs, but those buffers are not covered. Only catches
 overruns past the *end* of an allocation (no leading guard, no interior-overread detection).
-Positions holding the same array share one guarded buffer, so aliasing is preserved. Linux/macOS
-only (needs `mmap`/`mprotect` + POSIX signal delivery). The fatal signal for a guard-page fault is
-platform-dependent — SIGSEGV on Linux, SIGBUS on macOS — both are reported identically as a memsafe
-violation.
+Positions holding the same array share one guarded buffer, so aliasing is preserved.
+
+How the guard-page fault reaches this process differs by platform, and all three are reported
+identically as a memsafe violation: a fatal SIGSEGV on Linux, SIGBUS on macOS, an exit status of
+`0xc0000005` on Windows, or — on any of them — a catchable `ReadOnlyMemoryError` when Julia's own
+fault handler gets there first.
 
 The subprocess loads `f` from its defining source file, so under a Revise-style edit loop it checks
 what is on disk, not what this session compiled. If the file changed since `f` was defined here, the
@@ -510,9 +591,13 @@ function memsafe_report(
         isolate = nothing
     )
     isnothing(isolate) || throw(ArgumentError(_ISOLATE_REMOVED))
-    Sys.islinux() || Sys.isapple() || error(
-        "StrictMode @assert_memsafe: only Linux/macOS are supported (needs mmap/mprotect + POSIX " *
-            "signal delivery); got Sys.KERNEL = $(Sys.KERNEL)."
+    # The harness needs page protection and a way to see the resulting fault from the parent. The
+    # three platforms below supply both; anything else fails here rather than reporting a clean
+    # probe it never ran.
+    Sys.islinux() || Sys.isapple() || Sys.iswindows() || error(
+        "StrictMode @assert_memsafe: only Linux, macOS and Windows are supported (it needs page " *
+            "protection plus a visible fault — mmap/mprotect, or VirtualAlloc/VirtualProtect); " *
+            "got Sys.KERNEL = $(Sys.KERNEL)."
     )
     target = _func_name(f) * _sig_string(map(typeof, args))
     violation = _memsafe_probe_subprocess(f, args; using_module, align)

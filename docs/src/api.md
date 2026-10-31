@@ -87,7 +87,7 @@ the next page happens to be unmapped. The probe always runs in a subprocess, so 
 out-of-bounds *read* (an otherwise-uncatchable `SIGSEGV`) is detected via the child's exit signal
 instead of crashing your session; a *write* is localized by a poisoned canary read back before the
 child touches the guard pages. Needs no extra dependency (`Serialization`, used for subprocess
-argument marshaling, is a core dep), but is Linux/macOS-only and scoped to `Array` arguments —
+argument marshaling, is a core dep), and is scoped to `Array` arguments —
 arguments it cannot guard are listed in the report's `unguarded` field, and `@assert_memsafe`
 rejects the ones the caller can materialize. See the docstring for the full scope/limits.
 
