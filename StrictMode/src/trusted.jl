@@ -84,8 +84,28 @@ const _DEREF_FUNCS = (Core.getfield, Base.getproperty, unsafe_trust)
 
 # Callee names of the payload reads in `f`'s OWN body — empty when there are none, and `nothing`
 # when the typed IR could not be obtained, which a caller must not read as "no sites".
+# `Untrusted` carries one field, so a read of it is `unsafe_trust`, the field's name, or the index
+# 1. When the object's type is erased this is the only evidence left, and it is what keeps the
+# erased case from firing on every `getfield` on an `Any`: a read of some OTHER field cannot be a
+# read of this one. Measured over StrictMode itself, which holds no `Untrusted` at all — 130 erased
+# derefs, of which 2 touch this field.
+const _UNTRUSTED_FIELD = first(fieldnames(Untrusted))
+
+function _reads_untrusted_field(@nospecialize(callee), args)
+    callee === unsafe_trust && return true
+    length(args) >= 2 || return false
+    fld = args[2]
+    fld isa QuoteNode && (fld = fld.value)
+    return fld === _UNTRUSTED_FIELD || fld === 1
+end
+
+# The payload reads in `f`'s OWN body, split by whether inference pinned the object's type down:
+# `certain` are reads of a value typed `<:Untrusted`, `erased` are reads of a value whose type
+# merely FAILS TO RULE OUT `Untrusted` — an `Any` carries no `Untrusted` for dispatch to match on,
+# and a type the scan cannot narrow is not a type it has cleared. `nothing` when the typed IR could
+# not be obtained, which a caller must not read as "none".
 function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
-    f in _TRUST_BOUNDARIES && return Symbol[]
+    f in _TRUST_BOUNDARIES && return (Symbol[], Symbol[])
     cts = try
         Base.code_typed(f, types; optimize = false)
     catch
@@ -93,31 +113,53 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     end
     isempty(cts) && return nothing
     ci = first(cts)[1]
-    sites = Symbol[]
+    certain = Symbol[]
+    erased = Symbol[]
     for st in ci.code
         callee, args = _call_callee_and_args(ci, st)
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
         T = _unopt_arg_type(ci, args[1])
-        T isa Type && T <: Untrusted && push!(sites, nameof(callee))
+        T isa Type || continue
+        if T <: Untrusted
+            push!(certain, nameof(callee))
+        elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args)
+            push!(erased, nameof(callee))
+        end
     end
-    return sites
+    return (certain, erased)
 end
 
-_trusted_reason(sites::Vector{Symbol}) =
-    "reads an `Untrusted` payload outside a trust boundary " *
-    "($(join(sort(unique(sites)), ", "))) — $(length(sites)) site(s)"
+function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
+    parts = String[]
+    isempty(certain) || push!(
+        parts,
+        "reads an `Untrusted` payload outside a trust boundary " *
+            "($(join(sort(unique(certain)), ", "))) — $(length(certain)) site(s)"
+    )
+    isempty(erased) || push!(
+        parts,
+        "may read an `Untrusted` payload — inference lost the object's type at " *
+            "$(length(erased)) site(s) ($(join(sort(unique(erased)), ", "))), so the read cannot " *
+            "be ruled out. An `Any`-typed value carries no `Untrusted` for dispatch to refuse, " *
+            "which is the one hole in this guarantee: annotate the value, or move the read into a " *
+            "boundary registered with `trust_boundary!`"
+    )
+    return join(parts, "; ")
+end
 
 function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
     sites = _untrusted_deref_sites(f, types)
     isnothing(sites) &&
         return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature")
+    certain, erased = sites
     m = try
         which(f, types)
     catch
         nothing
     end
     return _mkfinding(
-        md, fn, sg, :trusted, !isempty(sites), _trusted_reason(sites),
+        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased),
+        _trusted_reason(certain, erased),
         isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line)
     )
 end
@@ -126,11 +168,21 @@ function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple))
     sites = _untrusted_deref_sites(f, types)
     if isnothing(sites)
         _fail(:trusted, target, "no typed IR for this signature, so the guarantee is unchecked")
-    elseif !isempty(sites)
+        return nothing
+    end
+    certain, erased = sites
+    if !isempty(certain)
         _fail(
-            :trusted, target, _trusted_reason(sites) * ": move the read into a validating " *
-                "function that returns a plain value, and register it with `trust_boundary!`."
+            :trusted, target, _trusted_reason(certain, erased) * ": move the read into a " *
+                "validating function that returns a plain value, and register it with " *
+                "`trust_boundary!`."
         )
+    elseif !isempty(erased)
+        # An erased object type is inference failing to answer, not the scan observing a read, so
+        # this reports where a certain site throws — the same split `_guarantee_gates` draws between
+        # a check that OBSERVES and one that cannot. A `getfield` on an `Any` is ordinary code, and
+        # aborting a build over one would make the guarantee unusable.
+        _fail(:trusted, target, _trusted_reason(certain, erased) * "."; gates = false)
     end
     return nothing
 end

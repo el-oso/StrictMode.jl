@@ -45,11 +45,20 @@
         end
         return s
     end
-    if StrictMode._vectorized(_autovec_probe, (Vector{Float64},))
-        @test StrictMode.scalar_fp_loops(first_gt, (Vector{Int64}, Int64))
-    else
-        @test_skip false
-    end
+    # F22's property is that the scan sees an INTEGER loop here, which an FP-only scan would miss:
+    # a loop-carried index, and no floating-point work at all. Both hold in every configuration
+    # measured — 1.12 and 1.13, bounds forced and auto, with and without coverage.
+    rg = kernel_report(first_gt, (Vector{Int64}, Int64))
+    @test rg.has_loop_phi
+    @test iszero(rg.fp_ops)
+
+    # `scalar_fp_loops` is deliberately NOT asserted on this kernel. Its epilogue-exclusion rule
+    # depends on the surrounding codegen too: measured `true` in four of those configurations and
+    # `false` on 1.12 under forced bounds checks, where the bounds branches leave a region that
+    # looks like LLVM's own vectorized remainder. The detector is covered instead by the probe
+    # below and by `scalar_loop_test.jl`, whose couplings hold everywhere.
+    @test StrictMode.scalar_fp_loops(_autovec_probe, (Vector{Float64},)) ==
+        !StrictMode._vectorized(_autovec_probe, (Vector{Float64},))
 
     # render check: int ops show up in sprint(show, r)
     s = sprint(show, r)

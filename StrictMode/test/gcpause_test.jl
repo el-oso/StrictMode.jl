@@ -60,14 +60,19 @@ end
     # The control the verdict depends on: a second thread that is busy but allocation-free gives
     # the collector nothing to do, so an allocation-free call must still report no pause. Without
     # this, "no pause" could just mean the measurement is insensitive to other threads.
+    clean_kernel() = (
+        acc = 0.0; for i in 1:2000
+            acc += sqrt(i)
+        end; acc
+    )
     if Threads.nthreads() < 2
-        @test_skip false
+        # A single-threaded session has no second thread to spawn the busy loop onto — the loop
+        # never yields, so it would run forever rather than concurrently. The weaker half still
+        # holds and is asserted: an allocation-free call reports no pause. What only a
+        # multi-threaded run can show is that the verdict is SENSITIVE to another thread, which is
+        # why CI sets JULIA_NUM_THREADS.
+        @test StrictMode.gc_free(gc_pause_report(clean_kernel; samples = 200))
     else
-        clean_kernel() = (
-            acc = 0.0; for i in 1:2000
-                acc += sqrt(i)
-            end; acc
-        )
         stop = Threads.Atomic{Bool}(false)
         busy = Threads.@spawn begin
             acc = 0.0

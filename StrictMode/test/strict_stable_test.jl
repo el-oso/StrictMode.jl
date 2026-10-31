@@ -46,15 +46,13 @@ end
     plain_ir = StrictMode._llvm_ir(plain_dot, tt)
     @test !occursin("jl_throw", ir)
     @test !occursin("StrictViolation", ir)
-    # Equal instruction counts only mean anything without coverage instrumentation, which emits a
-    # counter per FUNCTION — and this macro defines two, the wrapper and its hidden inner, so the
-    # wrapper carries one extra line under `Pkg.test(; coverage = true)`. The elision itself is
-    # unaffected, which is what the two assertions above pin.
-    if iszero(Base.JLOptions().code_coverage)
-        @test count(==('\n'), ir) == count(==('\n'), plain_ir)
-    else
-        @test_skip count(==('\n'), ir) == count(==('\n'), plain_ir)
-    end
+    # Coverage instrumentation emits a counter per FUNCTION, and this macro defines two — the
+    # wrapper and its hidden inner — so under `Pkg.test(; coverage = true)` the wrapper carries
+    # exactly one line more than the plain function. Measured: 17 vs 17 with no coverage, 19 vs 18
+    # with it. The expected difference is stated rather than the assertion dropped, so a line left
+    # behind beyond that one still fails.
+    extra = iszero(Base.JLOptions().code_coverage) ? 0 : 1
+    @test count(==('\n'), ir) == count(==('\n'), plain_ir) + extra
 end
 
 @testitem "@strict_stable rejects what it cannot check, rather than passing silently" begin

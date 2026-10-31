@@ -26,8 +26,13 @@
     core_peek(u::Untrusted{Vector{UInt8}}) = length(Core.getfield(u, :x))
     dot_peek(u::Untrusted{Vector{UInt8}}) = u.x
 
-    # Payload typed `Any`: the documented blind spot.
+    # Payload typed `Any`: dispatch has nothing to refuse, so the scan can only say it cannot rule
+    # the read out.
     erased(v::Vector{Any}) = getfield(v[1], :x)
+
+    # The same erased object, reading a field `Untrusted` does not have. This cannot be the payload,
+    # which is what keeps the erased rule off every `getfield` on an `Any`.
+    reads_other_field(v::Vector{Any}) = getfield(v[1], :n)
 end
 
 @testitem "Untrusted is free, and dispatch alone refuses the payload" setup = [TrustedFixtures] begin
@@ -82,21 +87,18 @@ end
     fi = only(findings(TrustedFixtures.peek_length, (Int,); guarantees = (:trusted,)))
     @test StrictMode._failed(fi)
 
-    # Blind spot, and it stays one: an `Any`-typed payload carries no `Untrusted` for inference to
-    # match on, so the scan has nothing to key off.
-    #
-    # The obvious widening — flag every deref whose object type cannot be PROVED not to be an
-    # `Untrusted`, i.e. `typeintersect(T, Untrusted) !== Union{}` — is sound and useless. Measured
-    # over StrictMode itself, which contains no `Untrusted` at all: 51 of 340 methods and 130 sites,
-    # led by `_stmt_arg_type` (12) and `_unopt_arg_type` (10), all of them ordinary `getfield` calls
-    # on `Any`. A finding on 15% of a package's methods buries the real ones, the same reason
-    # `test_layers` declines to judge StrictMode's own Base reads.
-    #
-    # Nor can it be closed at the type level: Julia has no private field, so `getfield` reaches an
-    # `Untrusted` payload by name or by index whatever the struct does. `Untrusted` is a dispatch
-    # barrier, and erasing the type erases the barrier. `@test_broken` rather than a deletion — if a
-    # future Julia makes this knowable, this reports an unexpected pass and the gap closes.
-    @test_broken StrictMode._failed(
-        only(findings(TrustedFixtures.erased, (Vector{Any},); guarantees = (:trusted,)))
-    )
+    # An `Any`-typed payload carries no `Untrusted` for dispatch to refuse, so inference cannot
+    # confirm the read — and a type the scan could not narrow is not a type it has cleared. The
+    # verdict is therefore "cannot be ruled out", which is a failure and not a pass.
+    fe = only(findings(TrustedFixtures.erased, (Vector{Any},); guarantees = (:trusted,)))
+    @test StrictMode._failed(fe)
+    @test occursin("inference lost the object's type", fe.reason)
+
+    # What keeps that from firing on every `getfield` on an `Any`: the field read must be one
+    # `Untrusted` actually has. Measured over StrictMode itself, which holds no `Untrusted` at all —
+    # 130 derefs on an erased object, of which 2 touch this field. Without the narrowing the rule is
+    # sound and useless: 51 of 340 methods, which buries the real findings.
+    @test StrictMode._UNTRUSTED_FIELD === first(fieldnames(StrictMode.Untrusted))
+    fo = only(findings(TrustedFixtures.reads_other_field, (Vector{Any},); guarantees = (:trusted,)))
+    @test !StrictMode._failed(fo)
 end

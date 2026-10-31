@@ -64,10 +64,13 @@ end
 
 @testitem "@assert_no_spill throws on a register-starved kernel" setup = [NoSpillFixtures] begin
     using StrictMode
+    # Both branches assert. Where 80 accumulators really do exhaust the register file the guarantee
+    # fails; where bounds-check or coverage instrumentation reshaped the loop until they do not, it
+    # holds — and the guarantee must agree with the configuration it was given either way.
     if NoSpillFixtures.spills_observable()
         @test_throws StrictViolation (@assert_no_spill spilly_accum_kernel!(zeros(80), zeros(3), zeros(3)))
     else
-        @test_skip false   # nothing spills in this configuration, so there is no violation to catch
+        @test isnothing(@assert_no_spill spilly_accum_kernel!(zeros(80), zeros(3), zeros(3)))
     end
 end
 
@@ -80,12 +83,17 @@ end
     @test iszero(StrictMode.spill_report(clean_accum_kernel!, types).vec_spills)
     @test only(findings(clean_accum_kernel!, types; guarantees = (:no_spill,))).status === :pass
 
-    # The failing half needs a kernel that actually spills here.
+    # The starved kernel, whose verdict follows the configuration. The report, the findings path and
+    # the gate must agree with each other in both — three sources that could disagree, which is the
+    # point of asserting them together rather than skipping where the kernel does not spill.
     if NoSpillFixtures.spills_observable()
         @test StrictMode.spill_report(spilly_accum_kernel!, types).vec_spills > 0
         @test only(findings(spilly_accum_kernel!, types; guarantees = (:no_spill,))).status === :fail
         @test_throws StrictViolation test_signatures([(spilly_accum_kernel!, types)]; guarantees = (:no_spill,))
     else
-        @test_skip false
+        @test iszero(StrictMode.spill_report(spilly_accum_kernel!, types).vec_spills)
+        @test only(findings(spilly_accum_kernel!, types; guarantees = (:no_spill,))).status === :pass
+        @test test_signatures([(spilly_accum_kernel!, types)]; guarantees = (:no_spill,)) isa
+            Vector{StrictMode.StrictFinding}
     end
 end

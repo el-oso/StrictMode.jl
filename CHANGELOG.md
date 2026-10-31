@@ -92,6 +92,38 @@ A missing key records the run and returns, so adding this to a suite cannot fail
 added. `tolerance` allows a stated amount of growth, `update = true` accepts growth that is
 intended, and a method the baseline does not name has nothing to regress against.
 
+### No test in either suite is skipped or recorded broken
+
+Ten markers are gone, and every one became an assertion rather than a deletion. A `@test_skip`
+counts as green, so each was a capability or a configuration nobody was checking.
+
+**`:trusted` reports an erased payload.** The scan keyed on a deref whose object inference had
+fixed as `<:Untrusted`, so a read through an `Any` was invisible — the documented blind spot. It now
+also reports a deref whose object type merely *fails to rule out* `Untrusted`, because a type the
+scan could not narrow is not a type it has cleared. What keeps that off every `getfield` on an `Any`
+is that the field read must be one `Untrusted` actually has: measured over StrictMode itself, which
+holds no `Untrusted` at all, 130 erased derefs of which 2 touch that field — against 51 of 340
+methods for the unnarrowed rule. An erased site reports rather than gating, the same split
+`_guarantee_gates` draws between a check that observes and one that cannot.
+
+**The guarded-allocation limit is asserted instead of wished for.** With checks enabled the guard's
+reporting path is in the compiled call graph, and every allocation left in it is Base's string
+machinery — `takestring!`, `_string_n`, `StringMemory` — whose backtrace truncates at a shared call
+site before reaching any StrictMode frame. Measured: 919 of 919 remaining instances are
+unattributable, and `ignore_barrier` does not apply. So an all-paths proof of a guarded signature
+cannot pass, and the suite now asserts that it says so. If the attribution ever returns the gate
+stops raising and that test fails — the same tripwire, now as a test that passes.
+
+**Six configuration guards became couplings.** `scalar_fp_loops` is asserted to agree with the
+compiled output rather than asserted only where the loop vectorized; `@assert_no_spill` is asserted
+to hold where the kernel does not spill and to fail where it does; the `@strict_stable` line count
+states the one extra line coverage instrumentation adds (measured: 17 vs 17 without, 19 vs 18 with);
+`gc_pause_report` asserts the half a single-threaded session can show; and `mca_report` is asserted
+to run where the weak dependency is loaded and to refuse by name where it is not.
+
+Verified at zero in six configurations: Julia 1.12 and 1.13, bounds checks forced and auto, with and
+without coverage.
+
 ### `memsafe_report` works on Windows
 
 The guard-page harness needed three things from the operating system: a page-aligned anonymous

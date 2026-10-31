@@ -138,13 +138,17 @@ end
     @test !isempty(StrictMode._mca_bound_problems(ok_report, nothing, 5.0)) # below min_ipc
 end
 
-@testitem "mca_report/@assert_mca errors clearly without LLVM_full_jll loaded" begin
+@testitem "mca_report either runs or says the weak dependency is missing" begin
     using StrictMode
+    f(x::Int) = x + 1
+    # Both branches assert, because the two outcomes are the whole contract: without the extension
+    # `mca_report` must refuse with a message naming it, and with the extension it must run. Which
+    # branch applies is a property of the environment, so neither configuration goes unchecked.
     if StrictMode.mca_available()
-        @test_skip false   # LLVM_full_jll happens to be loaded in this session; covered by the live test below instead
+        @test mca_report(f, (Int,)) isa McaReport
     else
-        f(x::Int) = x + 1
         @test_throws ErrorException mca_report(f, (Int,))
+        @test_throws "LLVM_full_jll" mca_report(f, (Int,))
     end
 end
 

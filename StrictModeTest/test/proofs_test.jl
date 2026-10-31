@@ -99,14 +99,20 @@ end
     @test iszero(@allocated guarded29(a, b))
     @test_typestable guarded29(a, b)
 
-    # `@test_noalloc` needs every guard allocation attributed to the guard frame, and AllocCheck's
-    # static backtrace stops at the first instruction reached from several call sites — which is
-    # where the guard branch builds its diagnostic strings. 30 of 968 instances here carry the
-    # frame; the rest carry `"multiple call sites"` and cannot be told from the kernel's own.
-    # `DynamicDispatch` named its function in AllocCheck 0.2.6 and does not in 0.2.5 or 0.2.7, so
-    # the attribution this needs exists in one release. `@test_broken` rather than a deletion: if
-    # AllocCheck restores it, this reports an unexpected pass and the guarantee comes back.
-    @test_broken (@test_noalloc guarded29(a, b); true)
+    # An all-paths proof of a GUARDED signature cannot pass while checks are enabled, and the
+    # contract is that it says so rather than quietly blaming the kernel. With checks on, the
+    # guard's reporting path is in the compiled call graph, and every allocation left in it is
+    # Base's string machinery — `takestring!`, `_string_n`, `StringMemory` — whose backtrace
+    # truncates at a shared call site before reaching any StrictMode frame. Measured here: 919 of
+    # 919 remaining instances are unattributable, so no filter on this side can tell them from the
+    # kernel's own, and `ignore_barrier` does not apply (it covers one-time-init guards).
+    #
+    # Asserted rather than recorded as broken: if the attribution ever returns, `@test_noalloc`
+    # stops raising and this fails loudly — the same tripwire, as a test that passes today.
+    kept29 = StrictModeTest._raw_allocs(guarded29, (Vector{Float64}, Vector{Float64}))
+    @test !isempty(kept29)
+    @test all(StrictModeTest._is_unattributed, kept29)
+    @test_throws StrictMode.StrictViolation (@test_noalloc guarded29(a, b))
     # What does hold on every version: the inner kernel is provably clean on its own, which is the
     # verdict to reach for while a guarded signature cannot be attributed.
     @test test_signatures(

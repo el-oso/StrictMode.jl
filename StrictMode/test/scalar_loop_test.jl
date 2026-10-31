@@ -115,14 +115,11 @@ end
 
     # False positive (issue #22): LLVM's own `@simd` scalar epilogue must not be flagged.
     #
-    # Guarded on whether the kernel ACTUALLY vectorized, not on a flag believed to imply it. With no
-    # vector loop left there is no LLVM epilogue to mistake for a hand-written tail, so the check is
-    # right about the code it was given and the assertion means nothing. Several settings suppress
-    # vectorization — forced bounds checks and coverage instrumentation among them — so asking the
-    # compiled output directly is the only guard that stays correct as those defaults move.
-    if StrictMode._vectorized(vector_kernel!, (Vector{Float64}, Float64))
-        @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) == false
-    else
-        @test_skip false
-    end
+    # Coupled to the compiled output rather than guarded on it. Forced bounds checks and coverage
+    # instrumentation each suppress vectorization — and where they do, this loop really IS a scalar
+    # one, so the detector must say so. Asserting that the two agree holds in every configuration
+    # and checks more than asserting `false` where the loop happens to vectorize; skipping the other
+    # configuration would leave it unchecked, and a skip counts as green.
+    @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) ==
+        !StrictMode._vectorized(vector_kernel!, (Vector{Float64}, Float64))
 end
