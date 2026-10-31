@@ -218,7 +218,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         gated — measured on StrictMode itself, the other kinds are ~98% of the
                         output and not actionable. :calls is NOT in _GUARANTEES (no sweep-side
                         scan), so only/exempt BY NAME is the escape hatch for a guard inference
-                        cannot follow
+                        cannot follow. test_specializations gates the GROWTH of a compiled-
+                        specialization count, never the count: there is no absolute threshold, which
+                        is why specialization_report is :info. The Serialization baseline is keyed on
+                        (VERSION, workload) — the version because codegen decides the count, the
+                        workload because _specializations reports what compiled in THIS session, so
+                        the same call placed later in a suite measures something else. A missing key
+                        records and passes, so adding it to a suite never fails on day one; a method
+                        the baseline does not name has nothing to regress against
   src/layers.jl       — test_layers over a DECLARED layer graph: a method may only extend a function
                         owned by a layer its own layer declared (Julia has no orphan rule, and the
                         intended direction of dependency is a declaration, not a language fact), and

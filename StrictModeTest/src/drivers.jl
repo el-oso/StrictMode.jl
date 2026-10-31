@@ -475,3 +475,129 @@ function test_no_unsafe(mod::Module; only = nothing, exempt = (), allow = ())
     msg = sprint(io -> StrictMode.format_findings(io, fs; format = :text))
     throw(StrictMode.StrictViolation(:test_no_unsafe, string(nameof(mod)), msg))
 end
+
+# --- the specialization baseline ------------------------------------------------------------
+
+# A compiled-specialization count has no absolute threshold: twenty specializations of a numeric
+# kernel is Julia producing fast code, and `StrictMode.specialization_report` is `:info` for exactly
+# that reason. What CAN be gated is the change, so this one needs something to compare against.
+#
+# The baseline is keyed on `(Julia version, workload)`. The version, because inference and codegen
+# decide how many specializations exist and that moves between releases. The workload, because
+# `_specializations` reports what has compiled in THIS session: the same call placed after a full
+# suite sees more than one placed at the top of it, so two placements are two baselines and must
+# never be compared with each other.
+const _SpecBaseline = Dict{Tuple{String, String}, Dict{String, Int}}
+
+function _read_spec_baseline(path::AbstractString)
+    isfile(path) || return _SpecBaseline()
+    store = try
+        deserialize(path)
+    catch err
+        throw(
+            ArgumentError(
+                "could not read the specialization baseline at `$path`: " *
+                    "$(sprint(showerror, err)). It is written by `Serialization`; delete it and " *
+                    "let the next run record a new one."
+            )
+        )
+    end
+    store isa _SpecBaseline ||
+        throw(ArgumentError("`$path` holds a $(typeof(store)), not a specialization baseline."))
+    return store
+end
+
+function _write_spec_baseline(path::AbstractString, store::_SpecBaseline)
+    dir = dirname(path)
+    isempty(dir) || isdir(dir) || mkpath(dir)
+    serialize(path, store)
+    return nothing
+end
+
+"""
+    test_specializations(mod::Module; baseline, workload, tolerance = 0, update = false,
+                         only = nothing, exempt = ()) -> Dict{String, Int}
+
+Compare every method of `mod` against a recorded compiled-specialization count, and throw a
+`StrictMode.StrictViolation` naming each one that carries more than it did. Returns the counts this
+run measured, keyed by signature.
+
+A count on its own says nothing: a kernel specialized on twenty element types is Julia working as
+intended, which is why [`StrictMode.specialization_report`](@ref) is `:info` and has no absolute
+limit to offer. What this gates is the **change** — a method that compiled twelve specializations
+last release and forty now is a compile-time regression someone can act on.
+
+**The baseline records itself on first run and nothing can fail.** With no entry for this
+`(Julia version, workload)` pair the counts are written and the call returns, so adding this to a
+suite is never a failure on the first run. A later run on the same version and workload is compared.
+
+```julia
+test_specializations(MyPkg; baseline = "spec.bin", workload = "full-suite")
+test_specializations(MyPkg; baseline = "spec.bin", workload = "full-suite", tolerance = 4)
+test_specializations(MyPkg; baseline = "spec.bin", workload = "full-suite", update = true)
+```
+
+`workload` names what ran before this call, and it is part of the baseline key. Counts come from
+what has compiled **in this session**, so the same call placed at the end of a suite sees more than
+one placed at the start: those are two different measurements and must not be compared. Name them
+apart, and keep each call at the same point in the run.
+
+`tolerance` allows that much growth before failing. `update = true` records this run instead of
+comparing, for growth that is intended. A method the baseline does not name is recorded by the next
+`update`, never failed — a new method has nothing to regress against.
+
+The baseline is a machine artifact written with `Serialization`, so it is readable only by a Julia
+that can deserialize it. Keep one per host that gates, the way a benchmark baseline is kept.
+"""
+function test_specializations(
+        mod::Module; baseline::AbstractString, workload::AbstractString,
+        tolerance::Int = 0, update::Bool = false, only = nothing, exempt = ()
+    )
+    tolerance >= 0 || throw(
+        ArgumentError("test_specializations: tolerance must not be negative, got $tolerance")
+    )
+    isempty(workload) && throw(
+        ArgumentError(
+            "test_specializations: `workload` must name what ran before this call. It is part of " *
+                "the baseline key, because a count depends on what has compiled in this session."
+        )
+    )
+    methods_, _ = StrictMode.module_methods(mod; only, exempt)
+    counts = Dict{String, Int}(
+        string(m.sig) => length(StrictMode._specializations(m)) for m in methods_
+    )
+    key = (string(VERSION), workload)
+    store = _read_spec_baseline(baseline)
+    before = get(store, key, nothing)
+    if update || isnothing(before)
+        store[key] = counts
+        _write_spec_baseline(baseline, store)
+        isnothing(before) && @info "StrictModeTest.test_specializations: `$baseline` has no " *
+            "baseline for Julia $(VERSION) / workload `$workload`, so this run was recorded as " *
+            "one. A later run on the same version and workload is compared against it."
+        return counts
+    end
+    over = String[]
+    for (sig, n) in counts
+        was = get(before, sig, nothing)
+        # A method the baseline does not name has nothing to regress against.
+        isnothing(was) && continue
+        n > was + tolerance || continue
+        push!(over, "`$sig` carries $n compiled specializations against $was in the baseline")
+    end
+    isempty(over) && return counts
+    throw(
+        StrictMode.StrictViolation(
+            :test_specializations, string(nameof(mod)),
+            join(sort!(over), ";\n  ") * ".\n  A specialization count is compile-time pressure, " *
+                "not a defect — many of them is how Julia produces fast code. What this gates is " *
+                "the growth, so read it as \"this method got more expensive to compile\" and " *
+                "decide whether that is intended.\n  Counts come from what compiled in THIS " *
+                "session, measured for Julia $(VERSION) / workload `$workload`. A call that " *
+                "reaches this point after different work has run is measuring a different " *
+                "workload and needs its own name.\n  Record the new numbers with `update = true` " *
+                "if the growth is wanted; split the part that must specialize from the part that " *
+                "does not if it is not."
+        )
+    )
+end

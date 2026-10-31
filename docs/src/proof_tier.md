@@ -39,6 +39,7 @@ The macro you write picks the engine. There is no mode to switch.
 | — | `test_layers(L => (deps…), …)` — a declared layer graph holds, both ways |
 | — | `test_latency(pkg)` — load time and first-call time, measured in a fresh process |
 | — | `test_no_unsafe(mod)` — no `ccall`, `pointer` or `unsafe_*`, with a named allow list |
+| `specialization_report(mod)` | `test_specializations(mod; baseline, workload)` — the count's GROWTH against a baseline |
 
 ```@meta
 CurrentModule = StrictModeTest
@@ -73,6 +74,7 @@ test_calls
 test_layers
 test_latency
 test_no_unsafe
+test_specializations
 ```
 
 ### Proofs as data
