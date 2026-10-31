@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0
+
+### Fixed: `test_layers`' private-access rule skipped submodules of one package
+
+Rule 2 — no layer may read a non-public name of another — delegates to ExplicitImports, which
+defaults `allow_internal_accesses` to `true`. That setting drops every access between modules
+sharing a `Base.moduleroot`, and the keyword was never passed, so the rule only ever fired between
+separate **packages**. Sibling submodules went unjudged, which is the main use of a layer graph:
+two packages already have Pkg-level separation, while submodules have nothing else holding the
+boundary. The gate reported a pass, indistinguishable from finding no violations.
+
+Reproduced on a two-submodule package: a reader of a sibling's non-public name is reported with
+`allow_internal_accesses = false` and dropped with `true`. Turning the suppression off is safe
+because the graph remains the filter — a row survives only when the accessed module is itself a
+declared layer and a different one, so reads inside a layer, and reads of anything outside the
+graph, are dropped as before.
+
+Reported by a downstream user gating a package split into submodules. It survived because every
+positive control for this rule used a package pair — `StrictMode` and `StrictModeTest` — so the one
+configuration where the rule worked was the only one tested. A same-package submodule pair is now
+covered, and that test fails without the fix.
+
 ## 0.5.3
 
 ### Three advisory sweeps: `bang_report`, `specialization_report`, `throw_report`
