@@ -264,3 +264,120 @@ end
     # not a finding.
     @test !StrictMode._failed(one_finding(unprovable, (Float64,)))
 end
+
+@testitem "the concurrency guarantee is swept, and its status follows certainty" begin
+    using StrictMode
+
+    @test :concurrency_safe in StrictMode._GUARANTEES
+    @test StrictMode._code(:concurrency_safe) === :SM0014
+    @test StrictMode._suggestion(:concurrency_safe) != ""
+
+    # Absent from `:all`, which runs at a consumer's own precompile: a sweep reads argument 1, and
+    # a `!` method writes argument 1 by convention, so this must not be able to stop a module load.
+    @test !(:concurrency_safe in StrictMode.policy_sets()[:all])
+
+    module Plans
+    mutable struct Plan
+        x::Int
+    end
+    writes(p::Plan) = (p.x = 1; nothing)        # a write the scan READS
+    reads(p::Plan) = p.x + 1
+    # The callback is `Any`-typed, so the call through it cannot be resolved at ANY call site.
+    # A function passed as an argument would not do: the macro reads the argument's concrete type,
+    # so `opaque(p, identity)` resolves to `identity` and leaves nothing uncertain.
+    mutable struct Hooked
+        x::Int
+        cb::Any
+    end
+    opaque(h::Hooked) = (h.cb(h); nothing)
+    end
+
+    Plans.writes(Plans.Plan(0)); Plans.reads(Plans.Plan(0))
+    Plans.opaque(Plans.Hooked(0, _ -> nothing))
+
+    one_of(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:concurrency_safe,)))
+
+    # A write it read is a failure; a record it could not resolve is informational, not a failure.
+    wf = one_of(Plans.writes, (Plans.Plan,))
+    @test StrictMode._failed(wf)
+    @test occursin("is written", wf.reason)
+
+    of = one_of(Plans.opaque, (Plans.Hooked,))
+    @test !StrictMode._failed(of)
+    @test of.status === :info
+    @test occursin("cannot prove", of.reason)
+
+    @test !StrictMode._failed(one_of(Plans.reads, (Plans.Plan,)))
+
+    # The macro decides per finding rather than per guarantee, so the uncertain shape warns and the
+    # certain one still throws even though `_guarantee_gates(:concurrency_safe)` is false.
+    @test !StrictMode._guarantee_gates(:concurrency_safe)
+    @test_throws StrictMode.StrictViolation (@assert_concurrency_safe Plans.writes(Plans.Plan(0)))
+    @test_logs (:warn,) match_mode = :any (
+        @assert_concurrency_safe Plans.opaque(Plans.Hooked(0, _ -> nothing))
+    )
+end
+
+@testitem "a write past max_depth warns, because the scan never read it" begin
+    using StrictMode
+
+    # The pin for the boundary the certainty rule moves: the scan follows a tainted value through
+    # non-inlined frames up to `max_depth` and then stops. The write below is REAL, so this is not
+    # a false positive being softened — it is the scan declining to claim what it did not see.
+    module DeepW
+    mutable struct P
+        buf::Vector{Float64}
+    end
+    @noinline l5(b) = (b[1] = 1.0; nothing)
+    @noinline l4(b) = l5(b)
+    @noinline l3(b) = l4(b)
+    @noinline l2(b) = l3(b)
+    @noinline l1(b) = l2(b)
+    deep!(p::P) = (l1(p.buf); nothing)
+    near!(p::P) = (p.buf[1] = 1.0; nothing)
+    end
+
+    p = DeepW.P(zeros(2))
+    DeepW.deep!(p); DeepW.near!(p)
+
+    far = StrictMode.concurrency_findings(DeepW.deep!, (DeepW.P,))
+    @test !isempty(far)
+    @test !any(v -> v.certain, far)                  # recorded, but not as something it read
+    @test occursin("max_depth", far[1].message)
+
+    near = StrictMode.concurrency_findings(DeepW.near!, (DeepW.P,))
+    @test any(v -> v.certain, near)
+
+    # So the near write raises and the far one warns. Raising `max_depth` reaches it.
+    @test_throws StrictMode.StrictViolation (@assert_concurrency_safe DeepW.near!(p))
+    @test_logs (:warn,) match_mode = :any (@assert_concurrency_safe DeepW.deep!(p))
+    @test any(
+        v -> v.certain, StrictMode.concurrency_findings(DeepW.deep!, (DeepW.P,); max_depth = 8)
+    )
+end
+
+@testitem "a findings vector renders the same however it is shown" begin
+    using StrictMode
+
+    module Shown
+    kern(x::Float64) = x * 2.0
+    end
+    Shown.kern(1.0)
+
+    fs = StrictMode.findings(Shown.kern, (Float64,); guarantees = (:typestable, :noalloc))
+    two_arg = sprint(show, fs)
+    mime = sprint(show, MIME"text/plain"(), fs)
+    @test two_arg == mime                                  # no one-line array fallback
+    @test occursin("-element Vector{StrictFinding}", two_arg)
+
+    # An informational report expands rather than collapsing to a count: the reporting lints return
+    # `:info` only, so a tally would render their whole result as a number.
+    info = StrictMode.specialization_report(StrictMode; max_specializations = 1)
+    @test !isempty(info)
+    @test all(f -> f.status === :info, info)
+    rendered = sprint(show, info)
+    @test count(==('\n'), rendered) > 1
+    @test occursin("informational", rendered)
+
+    @test sprint(show, StrictMode.StrictFinding[]) == "0 StrictMode findings"
+end

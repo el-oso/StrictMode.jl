@@ -144,7 +144,10 @@ function specialization_report(
         throw(ArgumentError("specialization_report: max_specializations must be at least 1"))
     max_type_depth >= 1 ||
         throw(ArgumentError("specialization_report: max_type_depth must be at least 1"))
-    out = StrictFinding[]
+    # Ranked by the count, highest first: a sweep over a large package returns tens of findings,
+    # and the one a reader wants is the biggest. Order IS the summary view — every renderer walks
+    # the vector in order, and `findings_diff` is keyed, so it is unaffected.
+    ranked = Pair{Int, StrictFinding}[]
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
         n = length(_specializations(m))
@@ -154,8 +157,8 @@ function specialization_report(
         d > max_type_depth && push!(over, "type-parameter depth $d (limit $max_type_depth)")
         isempty(over) && continue
         push!(
-            out,
-            StrictFinding(
+            ranked,
+            n => StrictFinding(
                 nameof(mod), string(m.name), string(m.sig), :specialization, :info,
                 string(m.file), Int(m.line), join(over, ", "),
                 "each specialization is a separate inference and codegen of the same source. If " *
@@ -167,7 +170,8 @@ function specialization_report(
             )
         )
     end
-    return out
+    sort!(ranked; by = first, rev = true)
+    return StrictFinding[f for (_, f) in ranked]
 end
 
 # ── the aliasing guard ───────────────────────────────────────────────────────────────────────────

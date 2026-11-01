@@ -41,6 +41,26 @@ The macro you write picks the engine. There is no mode to switch.
 | — | `test_no_unsafe(mod)` — no `ccall`, `pointer` or `unsafe_*`, with a named allow list |
 | `specialization_report(mod)` | `test_specializations(mod; baseline, workload)` — the count's GROWTH against a baseline |
 
+### Failing on a specialization budget
+
+[`test_specializations`](@ref) gates the **growth** of a compiled-specialization count against a
+stored baseline, because there is no threshold that is right for every package — which is also why
+[`specialization_report`](@ref) is `:info` and cannot fail anything on its own.
+
+When a project has decided on a number, the report gates it with no extra machinery, because the
+report already takes the limit:
+
+```julia
+@test isempty(specialization_report(MyPkg; max_specializations = 256, max_type_depth = typemax(Int)))
+```
+
+That fails the suite on any method over the budget, and the findings name which ones — sorted by
+count, highest first. The report judges two limits, so pin the one you do not mean to gate:
+`max_type_depth` defaults to 4 and would otherwise fail the same assertion for a reason that has
+nothing to do with the specialization count. Use the growth gate to catch a regression against whatever is true today, and
+the line above to hold a number the project has agreed to. They answer different questions and
+compose.
+
 ```@meta
 CurrentModule = StrictModeTest
 ```

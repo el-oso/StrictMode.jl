@@ -298,7 +298,7 @@ end
     # declaration registry alone, which for an undeclared package is nothing at all, so a baseline
     # recorded without it would gate on an empty set and never fire.
     module Adopting
-        good(x::Float64) = x * 2.0
+    good(x::Float64) = x * 2.0
     end
     Adopting.good(1.0)
 
@@ -327,4 +327,57 @@ end
     finally
         rm(bl; force = true)
     end
+end
+
+@testitem "migration_report reports a deleted name in a documentation code block" begin
+    using StrictMode
+
+    root = mktempdir()
+    mkpath(joinpath(root, "src"))
+    mkpath(joinpath(root, "docs", "build"))
+    write(joinpath(root, "src", "Old.jl"), "@assert_trim_safe f(1.0)\n")
+    # Prose on line 2, a fenced example on line 5. Only the example tells a reader to write
+    # something that no longer exists; the prose is how a package records the removal.
+    write(
+        joinpath(root, "README.md"),
+        "# Pkg\nWe removed `@assert_trim_safe` in 0.4.\n\n```julia\n@assert_trim_safe f(1.0)\n```\n"
+    )
+    # Generated output is not a source of truth and must not be walked.
+    write(joinpath(root, "docs", "build", "stale.md"), "```julia\n@assert_trim_safe f(1.0)\n```\n")
+
+    io = IOBuffer()
+    n = migration_report(root; io)
+    out = String(take!(io))
+
+    @test occursin("README.md:5", out)          # the fenced example
+    @test !occursin("README.md:2", out)         # not the prose
+    @test !occursin("stale.md", out)            # not generated output
+    @test occursin("src/Old.jl:1", out)         # the .jl scan still works
+
+    # Which fences hold CODE. `@example`/`@repl`/`@setup` are run by Documenter and are copied by
+    # readers, so a removed name in one is a defect; `@docs`/`@meta` list names to resolve against
+    # the page's `CurrentModule`, where the bare name is correct and the qualified one would not be.
+    fences = mktempdir()
+    write(
+        joinpath(fences, "f.md"),
+        "```@example\n@assert_trim_safe f(1.0)\n```\n" *          # line 2
+            "```@docs\ndivergence_report\n```\n" *                # line 5
+            "```@setup s\n@assert_trim_safe f(1.0)\n```\n" *      # line 8
+            "```\ncheck_all()\n```\n"                             # line 11, untagged
+    )
+    fio = IOBuffer()
+    migration_report(fences; io = fio)
+    fout = String(take!(fio))
+    @test occursin("f.md:2", fout)              # @example is code
+    @test !occursin("f.md:5", fout)             # @docs is a reference list
+    @test occursin("f.md:8", fout)              # @setup is code
+    @test occursin("f.md:11", fout)             # an untagged fence is code
+    # A skipped block must still CLOSE: otherwise everything after it reads as fenced.
+    @test StrictMode._fence_tag("```@example") == "@example"
+    @test StrictMode._fence_tag("```julia") == "julia"
+    @test StrictMode._fence_tag("```") == ""
+
+    # Documentation changes no behavior, so it is reported without being counted: the return value
+    # is the number of sites whose behavior changed.
+    @test n == 1
 end

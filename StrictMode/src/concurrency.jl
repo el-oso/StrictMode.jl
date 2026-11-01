@@ -3,13 +3,20 @@
 # All value-free (`Base.code_typed` IR scans), like `trimsafe.jl`/`scheduling.jl`/`inlining.jl`: no
 # AllocCheck/JET backend needed.
 
+public _UnanalyzableSignature
+
 """
     _UnanalyzableSignature <: Exception
 
-Raised when a scan cannot obtain typed IR for a signature at all. These two guarantees GATE (see
-`_guarantee_gates` in report.jl), so an empty violation list must not be reachable from a scan that
-never ran: "could not check" and "is fine" would then render identically, on the guarantees a user
-trusts most. Returning `_ConcViol[]` here is the vacuous-green shape this package exists to remove.
+Raised when a scan cannot obtain typed IR for a signature at all. `concurrency_findings`,
+`threadid_state_findings` and `pool_balance_report` all raise it rather than returning an empty
+result: "could not check" and "is fine" would otherwise render identically, on guarantees that GATE
+(see `_guarantee_gates` in report.jl). Returning `_ConcViol[]` here is the vacuous-green shape this
+package exists to remove.
+
+The findings pipeline catches it and records `:fail` with the error text, so a sweep is not stopped
+by one unreadable signature. A caller using these functions directly handles it itself, which is why
+the name is `public`.
 """
 struct _UnanalyzableSignature <: Exception
     guarantee::Symbol
@@ -135,8 +142,37 @@ const _PROJECT_OPS = Dict(
 const _STORE_OPS = Dict(
     :setfield! => 1, :setproperty! => 1, :memoryrefset! => 1, :memoryset! => 1,
     :unsafe_store! => 1, :pointerset => 1, :setindex! => 1, :arrayset => 2,
+    # The atomic and once-only writes are builtins like the plain stores above, and they write the
+    # same first argument. They must be named here because a resolved builtin callee is otherwise
+    # read as non-mutating.
+    :swapfield! => 1, :modifyfield! => 1, :replacefield! => 1, :setfieldonce! => 1,
+    :memoryrefswap! => 1, :memoryrefmodify! => 1, :memoryrefreplace! => 1,
+    :memoryrefsetonce! => 1,
 )
 const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))   # value-carrying: taint result if any operand tainted
+
+# Is this dynamic callee a builtin or intrinsic that cannot mutate? A builtin cannot dispatch, so
+# it is not the unresolved call the conservative record is for — but `_STORE_OPS` and
+# `_BASE_MUTATORS` name the ones that DO write, and those must keep their records.
+function _is_readonly_builtin(@nospecialize(callee), nm)
+    callee isa GlobalRef || return false
+    isconst(callee.mod, callee.name) || return false
+    v = try
+        getglobal(callee.mod, callee.name)
+    catch
+        return false
+    end
+    (v isa Core.Builtin || v isa Core.IntrinsicFunction) || return false
+    # Judged on the RESOLVED name, not the spelling at the call site: `import Core: setfield! as
+    # st!` reaches the same builtin under a name no table lists, and clearing it would be a silent
+    # pass on a write.
+    true_name = try
+        nameof(v)
+    catch
+        return false
+    end
+    return !(haskey(_STORE_OPS, true_name) || true_name in _BASE_MUTATORS)
+end
 const _BASE_MUTATORS = Set{Symbol}(
     (
         :push!, :pushfirst!, :append!, :prepend!, :resize!, :sizehint!, :empty!, :deleteat!, :insert!,
@@ -145,10 +181,14 @@ const _BASE_MUTATORS = Set{Symbol}(
     )
 )
 
+# `certain` separates a write this scan READ from one it could not rule out. StrictMode throws only
+# where it is 100% sure and warns otherwise, so the two cannot share a verdict. The default is
+# `false`: an unclassified record warns, which is the safe direction.
 struct _ConcViol
     message::String
     file::String
     line::Int
+    certain::Bool
 end
 
 # ── the scan ──────────────────────────────────────────────────────────────────────────────────
@@ -159,12 +199,15 @@ struct _Frame
     line::Int
 end
 
-function _record!(out::Vector{_ConcViol}, seen::Set{String}, chain::Vector{String}, msg::String, fr::_Frame)
+function _record!(
+        out::Vector{_ConcViol}, seen::Set{String}, chain::Vector{String}, msg::String, fr::_Frame;
+        certain::Bool = false
+    )
     full = isempty(chain) ? msg : msg * " (reached via " * join(chain, " → ") * ")"
     key = full * "@" * fr.file * ":" * string(fr.line)
     key in seen && return nothing
     push!(seen, key)
-    push!(out, _ConcViol(full, fr.file, fr.line))
+    push!(out, _ConcViol(full, fr.file, fr.line, certain))
     return nothing
 end
 
@@ -234,7 +277,7 @@ function _taint_scan_ci(
             if nm !== nothing && haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
-                    _record!(out, seen, chain, _store_msg(nm, isinvoke, dataargs, targs), fr)
+                    _record!(out, seen, chain, _store_msg(nm, isinvoke, dataargs, targs), fr; certain = true)
                 end
                 continue
             end
@@ -267,16 +310,29 @@ function _taint_scan_ci(
                     rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen)
                     settaint(rt && _may_ref(types[i]))
                 elseif nm !== nothing && nm in _BASE_MUTATORS
-                    _record!(out, seen, chain, "hands a plan-reachable value to `$nm`, a mutating operation", fr)
+                    _record!(
+                        out, seen, chain,
+                        "hands a plan-reachable value to `$nm`, a mutating operation", fr;
+                        certain = true
+                    )
                 end
                 # other Base/Core invokes (reads, `throw_boundserror`, …) are treated as non-mutating
                 continue
             else
                 # dynamic `:call`
                 if nm !== nothing && nm in _BASE_MUTATORS
-                    _record!(out, seen, chain, "hands a plan-reachable value to `$nm`, a mutating operation", fr)
-                elseif callee isa GlobalRef && _is_base_core(callee.mod)
-                    # a Base/Core intrinsic/read (getfield-family handled above) — non-mutating
+                    _record!(
+                        out, seen, chain,
+                        "hands a plan-reachable value to `$nm`, a mutating operation", fr;
+                        certain = true
+                    )
+                elseif _is_readonly_builtin(callee, nm)
+                    # A builtin or intrinsic, which cannot dispatch and cannot mutate unless it is
+                    # one of the named writes. Classified by what the callee RESOLVES to, never by
+                    # the module its binding came through: optimized IR spells a builtin through
+                    # whichever module resolved the binding, so `===` imported into a package reads
+                    # as `GlobalRef(ThatPackage, :(===))` and a module test calls it dynamic
+                    # dispatch. The getfield family is handled above.
                 else
                     tgt = nm === nothing ? "an unresolved callee" : "`$nm`"
                     _record!(
@@ -452,14 +508,17 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
         v.file != "" && print(io, "\n        at ", v.file, ":", v.line)
         i < length(vs) && println(io)
     end
-    _fail(:concurrency_safe, target, String(take!(io)))
+    # Throws only where the scan READ a write; a record it could not rule out warns instead, which
+    # is the same rule `@assert_typestable` and `@assert_trusted` apply to their own uncertain
+    # signals. A single certain record is enough to fail: the others do not weaken it.
+    _fail(:concurrency_safe, target, String(take!(io)); gates = any(v -> v.certain, vs))
     return nothing
 end
 
 """
     @assert_concurrency_safe f(plan, args...)
 
-Fail unless `f` treats its **plan** argument (the first, by default) as read-only for the whole
+Raise, or warn where the scan cannot be sure, unless `f` treats its **plan** argument (the first, by default) as read-only for the whole
 call — writing no field of the plan and mutating no state reachable *only* through it. When it
 holds, one plan may be shared across concurrent tasks (each with its own outputs/scratch) with no
 data race. The intended use is an FFT-style apply:
@@ -477,6 +536,15 @@ non-inlined child method is scanned recursively (bounded by `max_depth`), so a p
 accidentally calls a child's embedded-scratch *convenience path* — mutating
 `plan.children[i].scratch.data` one frame down — is still caught; a plan-reachable value handed to
 a known Base mutator or to dynamic dispatch is flagged conservatively.
+
+**Failing and warning are different outcomes here, and which one you get follows how sure the scan
+is.** A write it READ — a store whose container is plan-reachable, or a hand-off to a known Base
+mutator — raises `StrictViolation`. A record it could only *not rule out* warns instead: a callee
+behind dynamic dispatch, a task body whose closure type did not resolve, or a chain that reached
+`max_depth` and stopped. So a real write far enough down the call chain warns rather than fails,
+because the scan never saw it — raise `max_depth` to reach it, or assert on the inner method
+directly. This is the package-wide rule: StrictMode raises only where it is sure, and
+`StrictModeTest` raises either way.
 
 This is a **complementary static proof**, not a total one: it does no alias analysis (if the
 scratch you pass secretly aliases plan-owned storage it will not notice), models Base mutation
@@ -600,7 +668,8 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                     _record!(
                         out, seen, String[],
                         "writes mutable state indexed by `Threads.threadid()` (`$nm`) — unsafe under task " *
-                            "migration; index by a captured task-local id or a per-task buffer instead", fr
+                            "migration; index by a captured task-local id or a per-task buffer instead", fr;
+                        certain = true
                     )
                 end
                 continue
@@ -729,5 +798,41 @@ function _threadid_state_finding(
             "no threadid-indexed mutable state (value-free IR scan)",
         fail ? vs[1].file : "", fail ? vs[1].line : 0,
         fail ? "index by a captured task-local id, or give each task its own buffer" : ""; tier
+    )
+end
+
+# `:concurrency_safe`'s verdict for one signature, shared by BOTH tiers through
+# `_compiled_output_finding`. No backend has anything to add: AllocCheck, JET and TrimCheck say
+# nothing about whether an argument is written.
+#
+# The status follows the records' certainty, which is the same rule `_assert_concurrency_safe`
+# applies: a write this scan READ is `:fail`, and a record it only failed to rule out is `:info`.
+# A sweep cannot be told which argument holds the plan, so it reads argument 1 — which is why
+# `:concurrency_safe` is absent from the `:all` policy set and cannot stop a module loading.
+function _concurrency_safe_finding(
+        @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
+    )
+    vs = try
+        concurrency_findings(f, types)
+    catch
+        nothing
+    end
+    isnothing(vs) && return _unevaluated(
+        md, fn, sg, :concurrency_safe, "the concurrency scan could not read this signature"; tier
+    )
+    isempty(vs) && return _mkfinding(
+        md, fn, sg, :concurrency_safe, false, "argument 1 is not written (value-free IR scan)",
+        "", 0; tier
+    )
+    certain = any(v -> v.certain, vs)
+    return StrictFinding(
+        md, fn, sg, :concurrency_safe, certain ? :fail : :info,
+        vs[1].file, vs[1].line,
+        (
+            certain ? "argument 1 is written during the call ($(length(vs)) site(s)): " :
+                "cannot prove argument 1 is read-only ($(length(vs)) site(s)): "
+        ) *
+            join((v.message for v in vs), "; "),
+        _suggestion(:concurrency_safe), tier, _code(:concurrency_safe)
     )
 end

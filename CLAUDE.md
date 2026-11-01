@@ -417,6 +417,16 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   cross-package insert there is discarded on the consumer's next cached load, and the consumer's test
   process then sees an empty registry however much its `src/` declares — which makes a default-deny
   coverage gate call the whole package undeclared. `test/consumer` pins this.
+- **Certainty decides throw-vs-warn, and it can be per FINDING, not only per guarantee.** StrictMode
+  throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
+  by definition, because AllocCheck/JET/TrimCheck are full machinery rather than a scan. `_fail`
+  takes a `gates` keyword for exactly this, so one guarantee can do both: `_ConcViol` carries
+  `certain`, set at the three record sites where the scan READ a write (a store, or a named
+  `_BASE_MUTATORS` callee) and left `false` at the six "flagged conservatively" sites, and
+  `_assert_concurrency_safe` raises only when `any(v -> v.certain, vs)`. `typestability.jl` and
+  `trusted.jl` do the same for their own uncertain signals. The DEFAULT on a new record is
+  `certain = false`, so an unclassified one warns.
+
 - **`_guarantee_gates` (report.jl) decides throw-vs-warn, per guarantee.** A check that OBSERVES
   compiled output gates (`:typestable`'s return-type layer, `:memsafe`, `:vectorized`, `:no_spill`,
   `:inlined`, `:owned`, `:trusted`). A check that INFERS something it cannot see reports:

@@ -253,7 +253,15 @@ end
     @test StrictMode.module_policy(Main) == sets[:default]
     @test issubset(sets[:default], sets[:hot])          # :hot adds to it rather than replacing
     @test :vectorized in sets[:hot]
-    @test Set(sets[:all]) == Set(StrictMode.guarantee_names())
+    # `:all` is every guarantee that is safe to ENFORCE on a whole module, which is not every
+    # guarantee the engine can compute: this policy runs at the consumer's own precompile. The one
+    # exclusion is named here rather than derived, so widening or narrowing it is a deliberate edit
+    # in two places.
+    @test issubset(Set(sets[:all]), Set(StrictMode.guarantee_names()))
+    @test setdiff(Set(StrictMode.guarantee_names()), Set(sets[:all])) == Set((:concurrency_safe,))
+    # A sweep reads argument 1, and a `!` method writes argument 1 by convention, so enforcing it
+    # module-wide would fail correct code. It stays available to `audit` and to an explicit request.
+    @test :concurrency_safe in StrictMode.guarantee_names()
 
     # A name expands wherever a guarantee may be written, so it composes with individual ones.
     @test StrictMode._check_guarantees(:default) == sets[:default]
@@ -269,19 +277,19 @@ end
     # nothing was claimed — and the coverage gate asks whether a declaration EXISTS, not whether it
     # names any particular guarantee. This is the route for a pool that allocates by design.
     module Owned
-        mutable struct WS
-            buf::Vector{Float64}
+    mutable struct WS
+        buf::Vector{Float64}
+    end
+    const POOL = WS(Float64[])
+    grow!(p::WS, n::Int) = (length(p.buf) < n && (p.buf = Vector{Float64}(undef, n)); p.buf)
+    function driver!(C::Matrix{Float64}, n::Int)
+        s = grow!(POOL, n)
+        for i in 1:n
+            s[i] = i
         end
-        const POOL = WS(Float64[])
-        grow!(p::WS, n::Int) = (length(p.buf) < n && (p.buf = Vector{Float64}(undef, n)); p.buf)
-        function driver!(C::Matrix{Float64}, n::Int)
-            s = grow!(POOL, n)
-            for i in 1:n
-                s[i] = i
-            end
-            C[1, 1] = s[n]
-            return C
-        end
+        C[1, 1] = s[n]
+        return C
+    end
     end
 
     StrictMode.register_strict!(

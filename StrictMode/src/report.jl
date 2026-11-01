@@ -42,8 +42,11 @@ end
 #   abort a build.
 #
 # The proofs gate unconditionally — that is what `StrictModeTest` is.
+# The DEFAULT for a guarantee whose caller does not decide per finding. `:concurrency_safe` is here
+# because most of its records are ones the scan could not rule out; `_assert_concurrency_safe`
+# overrides this with `gates = any(v -> v.certain, vs)`, so a write it actually READ still throws.
 _guarantee_gates(kind::Symbol) =
-    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape))
+    !(kind in (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape, :concurrency_safe))
 
 # The macro names for a guarantee, which are NOT derivable from its symbol: only four guarantees have
 # a proving counterpart at all, and `:no_scalar_loops` has none. Interpolating `@$kind` instead sends

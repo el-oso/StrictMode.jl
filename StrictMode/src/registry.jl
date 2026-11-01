@@ -473,7 +473,13 @@ const _LOCAL_POLICY = :__strict_policy__
 const _POLICY_SETS = Dict{Symbol, Tuple{Vararg{Symbol}}}(
     :default => (:typestable, :noalloc, :noboxing),
     :hot => (:typestable, :noalloc, :noboxing, :vectorized, :no_scalar_loops, :no_spill),
-    :all => _GUARANTEES,
+    # NOT every computable guarantee: `:concurrency_safe` asks whether ONE argument is read-only,
+    # and a sweep has nowhere to say which, so it reads argument 1. A `!` method writes argument 1
+    # by Julia's convention, which this policy would then fail at the consumer's own precompile.
+    # It stays available to `audit` and to an explicit `guarantees = (:concurrency_safe,)`, where the
+    # caller chose it and no module load depends on the answer. `audit` takes guarantee SYMBOLS, not
+    # policy names, so this exclusion does not hide it there.
+    :all => Tuple(g for g in _GUARANTEES if g !== :concurrency_safe),
 )
 
 const _DEFAULT_POLICY = _POLICY_SETS[:default]

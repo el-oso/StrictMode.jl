@@ -2,6 +2,19 @@
 # spelling, so a consumer's call sites compile and run unchanged and merely stop deciding the build.
 # A rename would have been caught by the compiler; this is the tool that stands in for that.
 
+# Documenter blocks whose contents are NAMES to look up rather than code to run: a bare name in one
+# is a reference, resolved against the page's `CurrentModule`, so the module-qualified spelling
+# would be wrong there. Every other fence — `julia`, `@example`, `@repl`, `@setup`, or no tag at
+# all — holds code a reader copies, and a removed name inside one is exactly what this looks for.
+const _REFERENCE_FENCES = ("@docs", "@meta", "@index", "@contents", "@autodocs")
+
+# The info string of an opening fence: " ```@example  " -> "@example", " ``` " -> "".
+function _fence_tag(line::AbstractString)
+    rest = lstrip(lstrip(line), '`')
+    stop = findfirst(c -> c == ' ' || c == '\t', rest)
+    return isnothing(stop) ? String(rest) : String(rest[1:(stop - 1)])
+end
+
 # Guarantee macros whose StrictMode form REPORTS, paired with the StrictModeTest form that proves.
 # Keyed by the macro's spelling: the composites are named for the bundle rather than for a
 # guarantee, so the spelling is not derivable from the guarantee symbol.
@@ -86,8 +99,59 @@ function migration_report(
         return out
     end
 
+    # Documentation carries a deleted name too, and that is where a stale one usually survives: the
+    # code stopped loading and got fixed, the README did not. Matched only INSIDE fenced code
+    # blocks, because a name in prose is normally a package's own changelog recording the removal —
+    # this package's docs mention the removed names many times for exactly that reason. Scanned from
+    # the repository root, since a README or a contributor guide sits in neither `dirs` nor
+    # `srcdirs`.
+    _scan_md(pairs) = begin
+        out = Tuple{String, Int, String, Union{Nothing, String}}[]
+        # Excluded by PATH rather than by mutating `walkdir`'s directory vector: that vector is the
+        # iterator's own state, and filtering it stops the walk instead of pruning it.
+        skip = ("/.git/", "/node_modules/", "/build/", "/deps/")
+        # `onerror` must not be the default `throw`: one unreadable directory anywhere under the
+        # package root would otherwise abort the whole report, including its counted `.jl` result.
+        for (dir, _, files) in walkdir(root; onerror = _ -> nothing)
+            any(s -> occursin(s, dir * "/"), skip) && continue
+            for file in files
+                endswith(file, ".md") || continue
+                path = joinpath(dir, file)
+                # Two states, not one: whether a fence is open at all, and whether its contents are
+                # example code. A Documenter directive block (` ```@docs `, ` ```@meta `, …) is not
+                # example code — a bare name inside `@docs` resolves against the page's
+                # `CurrentModule`, so the qualified spelling would be wrong there — but its closing
+                # fence still has to close it, or every line after it reads as fenced.
+                infence = false
+                iscode = false
+                for (n, line) in enumerate(eachline(path))
+                    if startswith(lstrip(line), "```")
+                        if infence
+                            infence = false
+                            iscode = false
+                        else
+                            infence = true
+                            iscode = !(_fence_tag(line) in _REFERENCE_FENCES)
+                        end
+                        continue
+                    end
+                    iscode || continue
+                    for (from, to) in pairs
+                        # A qualified name is the REPLACEMENT, not the removed one: several entries
+                        # map a bare name to its module-qualified spelling, so a plain word-boundary
+                        # match reports each of those against its own fix.
+                        occursin(Regex("(?<![\\w.])\\Q$from\\E\\b"), line) || continue
+                        push!(out, (relpath(path, root), n, from, to))
+                    end
+                end
+            end
+        end
+        return out
+    end
+
     # Deleted names are fatal wherever they appear, so every directory is scanned for them.
     broken = vcat((_scan(joinpath(root, d), _REMOVED_API) for d in (srcdirs..., dirs...))...)
+    stale_docs = _scan_md(_REMOVED_API)
     # Reporting macros are only a problem where the PROOF was available — a `src/` annotation
     # correctly reports, since StrictModeTest is not loadable at that package's own precompile.
     disarmed = vcat((_scan(joinpath(root, d), _MIGRATION_MAP) for d in dirs)...)
@@ -116,5 +180,14 @@ function migration_report(
             "\n  there is correct, since StrictModeTest is not loadable at that package's own precompile."
         )
     end
+    if !isempty(stale_docs)
+        println(io, "\nStrictMode 0.4: $(length(stale_docs)) deleted name(s) in documentation code blocks.")
+        println(io, "  These do not break anything; they tell a reader to write something that no longer exists.\n")
+        for (path, n, from, to) in stale_docs
+            println(io, "  ", path, ":", n, "  ", from, "  →  ", to)
+        end
+    end
+    # The documentation count is deliberately NOT added: the return value is the number of sites
+    # that change behavior, and a stale example changes none.
     return length(broken) + length(disarmed)
 end

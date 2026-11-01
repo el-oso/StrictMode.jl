@@ -31,7 +31,7 @@ _mkfinding(
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
     :no_scalar_loops, :no_spill, :trim_compatible, :trusted, :noescape,
-    :no_threadid_state,
+    :no_threadid_state, :concurrency_safe,
 )
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
@@ -61,6 +61,9 @@ function _compiled_output_finding(
     elseif g === :noescape
         # The compiler's own escape analysis answers this, so no backend has anything to add.
         return _noescape_finding(f, types, md, fn, sg; tier)
+    elseif g === :concurrency_safe
+        # Also no proving counterpart — no backend answers whether an argument is written.
+        return _concurrency_safe_finding(f, types, md, fn, sg; tier)
     elseif g === :no_threadid_state
         # Also no proving counterpart — AllocCheck, JET and TrimCheck say nothing about a
         # threadid-indexed store — so both tiers answer from here and cannot drift apart.

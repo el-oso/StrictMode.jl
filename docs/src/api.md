@@ -230,6 +230,7 @@ StrictMode.guarantee_names
 StrictMode.clear_declarations!
 StrictMode.declarations
 StrictMode.exemptions
+StrictMode._UnanalyzableSignature
 ```
 
 

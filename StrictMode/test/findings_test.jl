@@ -58,7 +58,10 @@ end
     # not-provably-confined even when the view is never used, because the wrapper is scalar-replaced
     # out of existence while the handle it came from stays marked unconfined. Gating on that would
     # fail correct code wherever a borrow is wrapped before use, which is the ordinary shape.
-    reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape)
+    # `:concurrency_safe` reports by default: most of its records are ones the scan could not rule
+    # out, and a sweep cannot be told which argument holds the plan. `_assert_concurrency_safe`
+    # overrides this per finding, so a write the scan READ still throws from the macro.
+    reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape, :concurrency_safe)
     # `:no_threadid_state` gates: a reported site is a store this scan READ in typed IR, not an
     # inference it could not check. Its limit is the other direction — a threadid store inside a
     # callee it cannot follow reads as absent, which costs recall and never a false failure.
@@ -75,10 +78,10 @@ end
 
     # The value-based guarantees are not in `_GUARANTEES` (they never reach the findings pipeline),
     # but they still route through `_fail`, and they gate.
-    for g in (:memsafe, :concurrency_safe)
-        @test StrictMode._guarantee_gates(g)
-        @test !(g in StrictMode._GUARANTEES)
-    end
+    # `:memsafe` takes VALUES and runs the call, so it never reaches the findings pipeline, and it
+    # gates: a guard page either faulted or it did not.
+    @test StrictMode._guarantee_gates(:memsafe)
+    @test !(:memsafe in StrictMode._GUARANTEES)
 end
 
 @testitem "the warn path names macros that exist" begin

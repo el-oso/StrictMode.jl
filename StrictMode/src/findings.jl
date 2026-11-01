@@ -89,6 +89,7 @@ function _suggestion(guarantee::Symbol)
     guarantee === :vectorized && return "did not vectorize: try @inbounds @simd / @simd ivdep, or assert on the leaf kernel (SIMD may be in a non-inlined callee). Use kernel_report for arithmetic-intensity diagnostics."
     guarantee === :no_scalar_loops && return "scalar hot loop (FP or integer) in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels."
     guarantee === :no_spill && return "vector register spill: reduce the live accumulator/tile count (register-block a smaller tile), or split the kernel into multiple passes. See register_report for zmm-saturation diagnostics."
+    guarantee === :concurrency_safe && return "the argument a concurrent caller would share is written, or cannot be shown not to be: treat the plan as read-only inside the call, or give each task its own copy. A record this scan could not resolve is reported as informational rather than failing, since it is a limit of the scan and not a proven write."
     guarantee === :no_threadid_state && return "mutable state indexed by `Threads.threadid()`: a task can migrate between threads mid-run, so the index it started on is not the one it finishes on. Index by an id captured once per task, or give each task its own buffer and merge at the end."
     guarantee === :trim_compatible && return "trim-incompatible call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/invokelatest/which/methods). StrictModeTest's @test_trim_compatible runs the same verifier; with `set_juliac_patches!(true)` it checks the patched Base juliac compiles, and without it some code juliac builds clean is rejected here."
     return ""
@@ -154,6 +155,11 @@ function Base.show(io::IO, f::StrictFinding)
     return nothing
 end
 
+# A findings vector renders the same however it is shown. Without this, the two-argument `show` is
+# Julia's generic array display — one line, however many findings there are — which is what an agent
+# or a log sees when a driver's return value is rendered, while a REPL gets the readable form below.
+Base.show(io::IO, fs::AbstractVector{StrictFinding}) = show(io, MIME"text/plain"(), fs)
+
 # Multi-line display for a list of findings. This is the whole rendering a caller sees when a
 # driver's return value is displayed — a REPL, a log, or an agent reading a tool result — so it
 # leads with the counts and the failures, and collapses the passes to a tally. A 400-finding sweep
@@ -169,14 +175,21 @@ function Base.show(io::IO, ::MIME"text/plain", fs::AbstractVector{StrictFinding}
     print(io, length(fs), "-element Vector{StrictFinding}: ", length(failed), " failing")
     isempty(info) || print(io, ", ", length(info), " informational")
     iszero(npass) || print(io, ", ", npass, " passing")
-    for f in Iterators.take(failed, 20)
-        print(io, "\n ", f)
-        f.file == "" || print(io, "\n     at ", f.file, ":", f.line)
-        f.policy == "" || print(io, "\n     required by ", f.policy)
-        f.suggestion == "" || print(io, "\n     → ", f.suggestion)
+    # Failures first, then the informational findings. Both are expanded: the reporting lints
+    # (`specialization_report`, `bang_report`, `conversion_report`, …) return `:info` only, so
+    # collapsing those to a count renders their whole result as a number and nothing else. Passes
+    # stay a tally — a pass has no content to read.
+    for (group, label) in ((failed, "failing"), (info, "informational"))
+        for f in Iterators.take(group, 20)
+            print(io, "\n ", f)
+            f.file == "" || print(io, "\n     at ", f.file, ":", f.line)
+            f.policy == "" || print(io, "\n     required by ", f.policy)
+            f.suggestion == "" || print(io, "\n     → ", f.suggestion)
+        end
+        length(group) > 20 && print(io, "\n … and ", length(group) - 20, " more ", label)
     end
-    length(failed) > 20 && print(io, "\n … and ", length(failed) - 20, " more failing")
-    isempty(failed) || print(io, "\n(format_findings(fs; format = :json) for the whole list)")
+    (isempty(failed) && isempty(info)) ||
+        print(io, "\n(format_findings(fs; format = :json) for the whole list)")
     return nothing
 end
 

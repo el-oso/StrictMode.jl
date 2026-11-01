@@ -1244,16 +1244,29 @@ The checks fall into three groups, and the group decides how much a verdict is w
 **Gating — these throw.** Each one reads compiled output, or the type the compiler assigned, so the
 verdict is an observation: [`@assert_typestable`](@ref), [`@assert_owned`](@ref),
 [`@assert_inlined`](@ref), [`@assert_vectorized`](@ref), [`@assert_no_spill`](@ref),
-[`@assert_trusted`](@ref), [`@assert_no_threadid_state`](@ref). So do the three that take values and
-run the call: [`@assert_memsafe`](@ref), [`@assert_noalias`](@ref),
-[`@assert_concurrency_safe`](@ref).
+[`@assert_trusted`](@ref), [`@assert_no_threadid_state`](@ref). So do the two that take values and
+run the call: [`@assert_memsafe`](@ref) and [`@assert_noalias`](@ref).
 
 **Reporting — these warn.** Each one infers something it cannot see, so a failure is a lead:
 `:noalloc` and `:noboxing` (typed IR cannot see what LLVM later removes), `:no_scalar_loops` (SLP
 output forges the signal the check looks for), `:trim_compatible` (the static scan does not model
 juliac's reachability limit, and juliac compiles a patched `Base`), and `:noescape` (a handle wrapped
-in a `view` reads as unconfined even when the view is never used). `StrictModeTest` gates these
-unconditionally, which is what that package is for.
+in a `view` reads as unconfined even when the view is never used), and `:concurrency_safe` (a callee
+it could not follow might treat the shared argument as read-only, or might not). `StrictModeTest`
+gates the first four unconditionally, which is what that package is for. `:concurrency_safe` is the
+exception: no backend answers whether an argument is written, so both tiers run the same scan and
+the proof tier inherits its uncertainty rather than removing it.
+
+**The dividing line is certainty, and it can be drawn per finding.** StrictMode throws only where it
+is sure and warns where its verdict is a guess; `StrictModeTest` throws by definition, because
+AllocCheck, JET and TrimCheck are full analyses rather than a scan. One check can do both, when its
+own findings differ in kind. [`@assert_concurrency_safe`](@ref) is the clearest case: a write it
+*read* in the typed IR throws, while a callee it could not follow warns — so the guarantee appears
+in the reporting list above, and [`@assert_concurrency_safe`](@ref) still raises at a call site on a
+write it can actually see. A chain that reached `max_depth` and stopped warns, because the scan never
+got to the store; raise `max_depth` or assert on the inner method. The module-sweep paths warn
+either way, since nothing there should be able to stop a module loading.
+[`@assert_typestable`](@ref) and [`@assert_trusted`](@ref) split their own signals the same way.
 
 **Informational — these never fail.** The module sweeps: [`dispatch_report`](@ref),
 [`unsafe_report`](@ref), [`throw_report`](@ref), [`bang_report`](@ref),
@@ -1262,9 +1275,18 @@ unconditionally, which is what that package is for.
 [`static_ownership_suggestions`](@ref), and the measured ones —
 [`steady_state_report`](@ref), [`gc_pause_report`](@ref), [`latency_report`](@ref),
 [`kernel_report`](@ref), [`register_report`](@ref), [`spill_report`](@ref), [`mca_report`](@ref),
-[`memsafe_report`](@ref). Twelve of the seventeen `@assert_` guarantees are also swept by
-[`audit`](@ref) with nothing written at the call site; the five that are not need actual argument
+[`memsafe_report`](@ref). Thirteen of the seventeen `@assert_` guarantees are also swept by
+[`audit`](@ref) with nothing written at the call site; the four that are not need actual argument
 values, or an optional dependency, or a set of effects only the caller can name.
+
+**[`audit`](@ref) is the second step, not the first.** It never throws and returns no exit status, so
+it is not a gate — it is what you run *after* a warning or a failing test, to see the whole picture
+around the one site that complained. The gate is the `@assert_` at the call site, or a
+`StrictModeTest` driver in your suite; `audit` is how you work out what to change. That is also why
+a guarantee can be swept without being safe to enforce everywhere: `:concurrency_safe` is swept, so
+`audit` reports it, but it is deliberately absent from the `:all` policy set — a sweep has nowhere to
+say which argument holds the shared object, so it reads argument 1, and a `!` method writes argument
+1 by convention. Enforcing that at a consumer's own precompile would fail correct code.
 
 One property is explicitly out of scope: **bit-reproducibility**.
 
