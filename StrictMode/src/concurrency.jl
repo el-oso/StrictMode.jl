@@ -687,3 +687,47 @@ function pool_balance_report(@nospecialize(f), @nospecialize(types::Tuple))
     end
     return (; takes, puts, balanced = takes == puts)
 end
+
+# `:no_threadid_state`'s verdict for one signature, shared by BOTH tiers through
+# `_compiled_output_finding`. There is no proving counterpart: AllocCheck, JET and TrimCheck say
+# nothing about a threadid-indexed store, so a second copy in `StrictModeTest` could only drift.
+#
+# `notaskstate` PROVES the absence and costs only inference, so the taint scan runs only where the
+# compiler could not clear the signature. `false` means unproven rather than present — a non-`const`
+# global read and a dynamic call both report it — which is why it falls through to the scan instead
+# of failing there.
+function _threadid_state_finding(
+        @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
+    )
+    eff = try
+        effects(f, types)
+    catch
+        nothing
+    end
+    if !isnothing(eff) && effect_holds(eff, :notaskstate)
+        return _mkfinding(
+            md, fn, sg, :no_threadid_state, false,
+            "no task-local state (compiler effects: `notaskstate`)", "", 0; tier
+        )
+    end
+    vs = try
+        threadid_state_findings(f, types)
+    catch
+        nothing
+    end
+    isnothing(vs) && return _unevaluated(
+        md, fn, sg, :no_threadid_state,
+        "the compiler could not prove `notaskstate` and the threadid scan could not read this " *
+            "signature"; tier
+    )
+    fail = !isempty(vs)
+    return _mkfinding(
+        md, fn, sg, :no_threadid_state, fail,
+        fail ?
+            "threadid-indexed mutable state ($(length(vs)) site(s)): " *
+            join((v.message for v in vs), "; ") :
+            "no threadid-indexed mutable state (value-free IR scan)",
+        fail ? vs[1].file : "", fail ? vs[1].line : 0,
+        fail ? "index by a captured task-local id, or give each task its own buffer" : ""; tier
+    )
+end

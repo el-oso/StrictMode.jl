@@ -57,7 +57,14 @@ function _compiled_output_finding(
     elseif g === :trusted
         # No proving counterpart: the scan reads a call on a type inference has already fixed, so
         # there is nothing a backend could add. Both tiers therefore answer from here.
-        return _trusted_finding(f, types, md, fn, sg)
+        return _trusted_finding(f, types, md, fn, sg; tier)
+    elseif g === :noescape
+        # The compiler's own escape analysis answers this, so no backend has anything to add.
+        return _noescape_finding(f, types, md, fn, sg; tier)
+    elseif g === :no_threadid_state
+        # Also no proving counterpart — AllocCheck, JET and TrimCheck say nothing about a
+        # threadid-indexed store — so both tiers answer from here and cannot drift apart.
+        return _threadid_state_finding(f, types, md, fn, sg; tier)
     end
     return nothing
 end
@@ -166,74 +173,6 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :noboxing
             fail = sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))
-        elseif g === :noescape
-            r = _escaping_scoped(Tuple{typeof(f), types...})
-            reason = !isempty(r.escaped) ?
-                "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
-                " — it is returned, stored, or captured, or handed to a function this analysis " *
-                "cannot see through" :
-                !isempty(r.undetermined) ?
-                "cannot decide whether a scoped value escapes: " * join(r.undetermined, ", ") *
-                " arrives from a call that did not inline, and the escape state of a call result " *
-                "is assumed rather than computed" :
-                "no scoped value escapes the frame"
-            push!(
-                out, _mkfinding(
-                    md, fn, sg, g,
-                    !(isempty(r.escaped) && isempty(r.undetermined)), reason, "", 0,
-                    !isempty(r.escaped) ?
-                        "return a copy, keep the handle inside the scope that owns it, or inline the callee that receives it" :
-                        isempty(r.undetermined) ? "" :
-                        "mark the function that produces the handle `@inline`, or assert this where the handle is created"
-                )
-            )
-        elseif g === :no_threadid_state
-            # `notaskstate` PROVES the absence and costs only inference, so the taint scan runs
-            # only where the compiler could not clear the signature. `false` means unproven rather
-            # than present, which is why it falls through to the scan instead of failing.
-            eff = try
-                effects(f, types)
-            catch
-                nothing
-            end
-            if !isnothing(eff) && effect_holds(eff, :notaskstate)
-                push!(
-                    out, _mkfinding(
-                        md, fn, sg, g, false,
-                        "no task-local state (compiler effects: `notaskstate`)", "", 0
-                    )
-                )
-            else
-                vs = try
-                    threadid_state_findings(f, types)
-                catch err
-                    nothing
-                end
-                if isnothing(vs)
-                    push!(
-                        out, _unevaluated(
-                            md, fn, sg, g,
-                            "the compiler could not prove `notaskstate` and the threadid scan " *
-                                "could not read this signature"
-                        )
-                    )
-                else
-                    fail = !isempty(vs)
-                    push!(
-                        out, _mkfinding(
-                            md, fn, sg, g, fail,
-                            fail ?
-                                "threadid-indexed mutable state ($(length(vs)) site(s)): " *
-                                join((v.message for v in vs), "; ") :
-                                "no threadid-indexed mutable state (value-free IR scan)",
-                            fail ? vs[1].file : "", fail ? vs[1].line : 0,
-                            fail ?
-                                "index by a captured task-local id, or give each task its own buffer" :
-                                ""
-                        )
-                    )
-                end
-            end
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try

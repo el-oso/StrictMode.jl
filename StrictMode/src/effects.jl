@@ -999,3 +999,30 @@ function _escaping_scoped(@nospecialize(sig))
     end
     return (; escaped = bad, undetermined = undet)
 end
+
+# `:noescape`'s verdict for one signature, shared by BOTH tiers through
+# `_compiled_output_finding`. The answer comes from the compiler's own escape analysis, so no
+# backend has anything to add and a second copy in `StrictModeTest` could only drift.
+function _noescape_finding(
+        @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
+    )
+    r = _escaping_scoped(Tuple{typeof(f), types...})
+    reason = !isempty(r.escaped) ?
+        "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
+        " — it is returned, stored, or captured, or handed to a function this analysis " *
+        "cannot see through" :
+        !isempty(r.undetermined) ?
+        "cannot decide whether a scoped value escapes: " * join(r.undetermined, ", ") *
+        " arrives from a call that did not inline, and the escape state of a call result " *
+        "is assumed rather than computed" :
+        "no scoped value escapes the frame"
+    return _mkfinding(
+        md, fn, sg, :noescape,
+        !(isempty(r.escaped) && isempty(r.undetermined)), reason, "", 0,
+        !isempty(r.escaped) ?
+            "return a copy, keep the handle inside the scope that owns it, or inline the callee that receives it" :
+            isempty(r.undetermined) ? "" :
+            "mark the function that produces the handle `@inline`, or assert this where the handle is created";
+        tier
+    )
+end

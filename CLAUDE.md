@@ -113,9 +113,16 @@ StrictMode/src/
                         session, or a Serialization baseline FILE another session can read
   check.jl            — findings/_findings_fast/_compiled_output_finding — the interference-proof
                         core every guarantee funnels through: no macro parsing, no execution.
-                        _compiled_output_finding covers the guarantees read from compiled output
-                        (owned/inlined/vectorized/no_scalar_loops/no_spill/trimsafe), so
-                        StrictModeTest delegates to it rather than keeping a second copy
+                        _compiled_output_finding is the SINGLE seam both tiers answer from, for
+                        every guarantee no backend can improve on: owned/inlined/vectorized/
+                        no_scalar_loops/no_spill/trimsafe (read from compiled output) plus
+                        trusted/noescape/no_threadid_state (read from IR or the compiler own
+                        escape and effects analyses). StrictModeTest delegates here rather than
+                        keeping a second copy, and _findings_fast calls it FIRST, so adding a
+                        guarantee here serves both tiers at once. A guarantee in _GUARANTEES that
+                        this does not cover and proofs.jl does not branch on throws
+                        `unknown guarantee` from a message that lists it as expected — a
+                        StrictModeTest testitem enumerates _GUARANTEES to pin that shut
   findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, `code`, and
                         `policy`: the macro line that required the guarantee),
                         format_findings,

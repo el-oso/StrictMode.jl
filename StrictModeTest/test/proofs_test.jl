@@ -131,3 +131,54 @@ end
     # An unguarded allocating call is unaffected either way.
     @test_throws StrictViolation (@test_noalloc dirty29(4))
 end
+
+@testitem "every guarantee in _GUARANTEES is answerable by the proof tier" begin
+    using StrictMode, StrictModeTest
+
+    # The two tiers ship in lockstep, and `proof_findings` dispatches on the guarantee by name:
+    # anything `_GUARANTEES` gains and this chain does not reach falls through to an
+    # `unknown guarantee` ArgumentError whose own message lists the guarantee as expected. That
+    # makes the reporting tier stricter than the gating one, which is the failure this pins.
+    kern(x::Float64) = x * 2.0 + 1.0
+    kern(1.0)
+
+    for g in StrictMode._GUARANTEES
+        fs = try
+            StrictModeTest.proof_findings(kern, (Float64,); guarantees = (g,))
+        catch err
+            err isa ArgumentError &&
+                error("proof_findings cannot answer :$g, which is in _GUARANTEES: " *
+                      sprint(showerror, err))
+            rethrow()
+        end
+        @test length(fs) == 1
+        @test fs[1].guarantee === g
+        @test fs[1].tier === :proof
+    end
+end
+
+@testitem "the threadid guarantee answers identically in both tiers" begin
+    using StrictMode, StrictModeTest
+
+    # One implementation serves both tiers through `_compiled_output_finding`, because no backend
+    # has anything to say about a `Threads.threadid()`-indexed store. A second copy could only drift.
+    tls = [0.0]
+    dirty() = (tls[Threads.threadid()] += 1.0)
+    clean(x::Float64) = x + 1.0
+    dirty(); clean(1.0)
+
+    for (f, tt, want_fail) in ((dirty, (), true), (clean, (Float64,), false))
+        rep = only(StrictMode.findings(f, tt; guarantees = (:no_threadid_state,)))
+        prf = only(StrictModeTest.proof_findings(f, tt; guarantees = (:no_threadid_state,)))
+        @test StrictMode._failed(rep) == want_fail
+        @test StrictMode._failed(prf) == want_fail
+        @test rep.reason == prf.reason
+        @test rep.tier === :report
+        @test prf.tier === :proof
+    end
+
+    # And the gating driver raises on it rather than refusing the guarantee's name.
+    @test_throws StrictMode.StrictViolation StrictModeTest.test_signatures(
+        [(dirty, ())]; guarantees = (:no_threadid_state,)
+    )
+end

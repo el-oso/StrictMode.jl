@@ -147,10 +147,10 @@ function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
     return join(parts, "; ")
 end
 
-function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
+function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report)
     sites = _untrusted_deref_sites(f, types)
     isnothing(sites) &&
-        return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature")
+        return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature"; tier)
     certain, erased = sites
     m = try
         which(f, types)
@@ -160,7 +160,8 @@ function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn,
     return _mkfinding(
         md, fn, sg, :trusted, !isempty(certain) || !isempty(erased),
         _trusted_reason(certain, erased),
-        isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line)
+        isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line);
+        tier
     )
 end
 

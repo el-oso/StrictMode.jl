@@ -515,6 +515,52 @@ why four of them do **not** answer the questions they appear to.
   detail. Possible pairing with `:trim_compatible`, since juliac rejects unresolved calls; not
   pursued.
 
+## Open — from the PureAtomistic/PureMLIP adoption of 0.5.6
+
+Reported after adopting 0.5.6 against a MACE model. Two of the four findings were bugs and are
+fixed in 0.5.7 (both tiers now answer `:no_threadid_state`, `:noescape` and `:trusted` from one
+implementation). These two remain.
+
+- [ ] **`conversion_report` attributes a Base callee's conversions to the caller.** Measured:
+  `f(x::T, n::Int) = x^n + one(T)` at `(Float32, Int)` reports TWO findings —
+  `Float32 → Float64 (widened)` and `Int64 → Int32 (narrowed)` — and **neither is the caller's**.
+  Base's generic `^(::Float32, ::Integer)` widens internally, inlines, and its 16 conversion
+  instructions land in the caller's optimized IR with operand types the caller's own arguments
+  name, which is exactly the filter `_conversions` uses. A literal exponent (`x^3`) is clean,
+  because `literal_pow` becomes repeated multiplication, so this only bites the generic path.
+  Consumers currently have to allowlist the calling function by name, which also hides any real
+  leak in it.
+
+  *Two fixes measured and DEAD, do not retry:*
+  (a) **`code_typed` debug info.** `ci.debuginfo.edges` is **0 entries** for an optimized
+      `CodeInfo`, and `Base.IRShow.append_scopes!` reports every one of Base's 16 conversions as
+      coming from the caller's own file. The provenance is already collapsed.
+  (b) **Innermost inlining frame.** `Base.code_ircode` DOES keep the edges (`edges = 2`, stacks
+      like `provenance.jl+pow.jl+intfuncs.jl+number.jl+boot.jl`), so the data exists — but it does
+      not separate the cases: the genuine leak in `0.529 * x` also has `float.jl` innermost,
+      because its `fpext` materializes inside `Base.:*` after inlining. Innermost-frame-is-Base is
+      true for every conversion, real or not.
+
+  *The direction that remains:* trigger on **a wider-typed literal constant in the method's own
+  statements**, not on the conversion instruction alone. That is what the docstring already names
+  as the fix ("suffix the float literals"), and `0.529` is a `Float64` constant in the caller's IR
+  while `x^n` introduces none. It changes what the check keys on, so it is not a patch-level tweak.
+
+- [ ] **`alias_guard_report`'s signal-to-noise is too low to gate on.** It flagged 28 mutating
+  kernels in one package — effectively every `!` method with two or more array arguments, since
+  none names `mightalias`/`unalias`/`dataids`/`===`. Most take a caller-owned workspace plus
+  read-only inputs of different shapes and element types, so they cannot alias at all. It is
+  `:info` with no gating counterpart, so nothing is broken; it is just not usable as a gate.
+  *Refinements suggested from the field, in increasing cost:*
+  (a) skip argument pairs whose element types or dimensions differ — cheap, and `Base.mightalias`
+      already answers `false` for those, so the scan is stricter than the run-time check it stands
+      in for;
+  (b) skip arguments that are fields of a `register_scoped!` type, since a workspace handed in by
+      the caller is owned rather than aliased;
+  (c) accept a per-method declaration ("these arguments never alias") that the gating tier then
+      proves, which is the same shape as `@strict_function`'s `signatures =`.
+  (a) looks worth doing on its own and needs no new surface.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding
