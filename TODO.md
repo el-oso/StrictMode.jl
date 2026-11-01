@@ -628,6 +628,14 @@ only when a package image grew 383 MiB) is exactly what the growth gate catches.
   | `PL[Threads.threadid()].value = 1` (array of mutable structs) | **0** |
   | `@atomic AC[Threads.threadid()].value += 1` | **0** |
 
+  *CLOSED in 0.5.7.* The mark now carries through a `_PROJECT_OPS` read whose result can hold a
+  reference, so a store into an object loaded out of a threadid slot is found; a scalar copied out
+  is not. Measured: 8 hazard shapes report with `certain = true`, 7 read-only shapes stay clean,
+  and 0 positives over the 39 Base/stdlib MethodInstances whose IR mentions `threadid`. One
+  correct-code shape reports and is documented rather than special-cased: a lock striped by thread.
+  Two limits remain and are pinned — a threadid stashed into another array, and a write inside a
+  callee the optimizer left out of line.
+
   Note the third row: it is NOT about atomics. A per-thread array of mutable cells — an ordinary
   way to write exactly the hazard this check exists for — passes silently, and
   `_guarantee_gates(:no_threadid_state)` is `true`, so it passes a GATE. The code review

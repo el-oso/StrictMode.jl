@@ -469,3 +469,107 @@ end
         @assert_concurrency_safe Headline.far!(p)
     )
 end
+
+@testitem "a store through a value loaded from a threadid slot is threadid state" begin
+    using StrictMode
+
+    # The scan taints `threadid()` and the reference built from it. Without carrying that mark
+    # through a PROJECTION, a store into the object loaded back out of the slot has a container in
+    # no set at all — and this guarantee gates, so it was a silent pass on an array of per-thread
+    # mutable cells, which is an ordinary way to write exactly this hazard.
+    module Slots
+    mutable struct Cell
+        value::Int
+    end
+    mutable struct ACell
+        @atomic value::Int
+    end
+    struct Wrap
+        v::Vector{Int}
+    end
+    const FLAT = zeros(Int, 8)
+    const PL = [Cell(0) for _ in 1:8]
+    const AC = [ACell(0) for _ in 1:8]
+    const NB = [[0] for _ in 1:8]
+    const WR = [Wrap([0]) for _ in 1:8]
+    const REFS = [Ref(0) for _ in 1:8]
+    const ANYS = Any[Cell(0) for _ in 1:8]
+    const OUT = zeros(Int, 8)
+    const CELLS = Vector{Cell}(undef, 8)
+    const STRS = ["a" for _ in 1:8]
+    const LKS = [ReentrantLock() for _ in 1:8]
+    tf() = Threads.threadid()
+
+    direct() = (FLAT[tf()] = 1; nothing)
+    field() = (PL[tf()].value = 1; nothing)
+    atomic_field() = (@atomic AC[tf()].value += 1; nothing)
+    nested() = (NB[tf()][1] = 2; nothing)
+    through_immutable() = (WR[tf()].v[1] = 2; nothing)
+    via_local() = (c = PL[tf()]; c.value = 1; nothing)
+    ref_slot() = (REFS[tf()][] = 1; nothing)
+    dynamic() = (setproperty!(ANYS[tf()], :value, 1); nothing)
+
+    read_field() = PL[tf()].value
+    copy_scalar() = (OUT[1] = PL[tf()].value; nothing)
+    store_elsewhere() = (CELLS[1] = PL[tf()]; nothing)
+    copy_int() = (x = FLAT[tf()]; OUT[1] = x; nothing)
+    read_len() = length(STRS[tf()])
+    read_atomic() = (@atomic AC[tf()].value)
+    read_ref() = REFS[tf()][]
+
+    striped_lock() = (lk = LKS[tf()]; lock(lk); OUT[1] = 1; unlock(lk); nothing)
+    @noinline bump!(c::Cell) = (c.value = 1; nothing)
+    through_callee() = (bump!(PL[tf()]); nothing)
+    end
+
+    for f in (
+            Slots.direct, Slots.field, Slots.atomic_field, Slots.nested,
+            Slots.through_immutable, Slots.via_local, Slots.ref_slot, Slots.dynamic,
+            Slots.read_field, Slots.copy_scalar, Slots.store_elsewhere, Slots.copy_int,
+            Slots.read_len, Slots.read_atomic, Slots.read_ref, Slots.striped_lock,
+            Slots.through_callee,
+        )
+        f()
+    end
+    scan(f) = StrictMode.threadid_state_findings(f, ())
+
+    # Every one of these writes state the running task may not own after a migration.
+    for (name, f) in (
+            ("direct", Slots.direct), ("field", Slots.field),
+            ("atomic_field", Slots.atomic_field), ("nested", Slots.nested),
+            ("through_immutable", Slots.through_immutable), ("via_local", Slots.via_local),
+            ("ref_slot", Slots.ref_slot), ("dynamic", Slots.dynamic),
+        )
+        vs = scan(f)
+        @test !isempty(vs)
+        @test all(v -> v.certain, vs)          # the store and its container were both READ
+    end
+
+    # Reading from a per-thread slot is not the hazard, and neither is copying a value out of one.
+    # `store_elsewhere` is the shape that decides where the mark goes: the loaded cell is in the
+    # store's VALUE position, and only the container position is consulted.
+    for (name, f) in (
+            ("read_field", Slots.read_field), ("copy_scalar", Slots.copy_scalar),
+            ("store_elsewhere", Slots.store_elsewhere), ("copy_int", Slots.copy_int),
+            ("read_len", Slots.read_len), ("read_atomic", Slots.read_atomic),
+            ("read_ref", Slots.read_ref),
+        )
+        @test isempty(scan(f))
+    end
+
+    # Two documented outcomes, pinned so a change in either is visible.
+    #
+    # A lock striped by thread is reported. It is not a data race — a `ReentrantLock` is owned by
+    # the task, not the thread — but the inlined fast path writes a field of a lock selected by
+    # `threadid()`, which is what this guarantee says. Striping locks that way is pointless under
+    # migration anyway, so the report is a lead rather than noise.
+    @test !isempty(scan(Slots.striped_lock))
+
+    # A write inside a callee the scan does not enter stays missed: this scan reads one method's IR
+    # and does not follow `:invoke`. There is no other signature that catches it either — the
+    # threadid taint is in the caller and the store is in the callee, and the callee alone has no
+    # `threadid()` in it to taint anything. Unlike `:concurrency_safe`, which recurses to
+    # `max_depth`, this scan has no knob that reaches it.
+    @test isempty(scan(Slots.through_callee))
+    @test isempty(StrictMode.threadid_state_findings(Slots.bump!, (Slots.Cell,)))
+end

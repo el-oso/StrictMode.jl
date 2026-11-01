@@ -614,8 +614,18 @@ end
 # Best-effort, value-free. Scans OPTIMIZED IR (pure SSA — no slots to lose taint through). A
 # `threadid()` call lowers to a `jl_threadid` foreigncall, which we seed; taint flows through the
 # lowered index arithmetic into a `memoryrefnew` index and out to the store. Detects the common
-# `buf[threadid()] = …` shape (including via a local); it does NOT track a threadid stashed into
-# another array and reused later (documented limit).
+# `buf[threadid()] = …` shape (including via a local), and a store into an object loaded back OUT
+# of such a slot — `buf[threadid()].field = …`, `buf[threadid()][i] = …`, `rand(rngs[threadid()])`
+# — because the mark carries through a `_PROJECT_OPS` read whose result can hold a reference. A
+# scalar copied out of a slot does not carry it: an `Int` can never be a store's container.
+#
+# Three documented limits. It does NOT track a threadid stashed into another array and reused
+# later. It does not follow `:invoke`, so a write inside a callee the optimizer left out of line is
+# missed, and no other signature catches that one either — the taint is in the caller and the store
+# is in the callee. And a lock STRIPED by thread (`lock(locks[threadid()])`) is reported: the
+# inlined fast path writes a field of a lock chosen by `threadid()`, which is literally what this
+# flags. It is not a data race, since a `ReentrantLock` is owned by the task rather than the
+# thread, but striping locks that way buys nothing under migration, so the report is a lead.
 # scalar ops that carry a threadid-derived index forward (lowered forms)
 const _TID_CARRY = Set{Symbol}(
     (
@@ -655,6 +665,7 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     )
     ci = cts[1].first
     code = ci.code
+    sts = ci.ssavaluetypes
     m = try
         which(f, types)
     catch nothing end
@@ -693,8 +704,25 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
             if nm in _TID_CARRY
                 any(a -> _op_tainted(a, tid, ()), dataargs) && mark(tid, true)
                 continue
-            elseif nm === :memoryrefnew || nm === :memoryref || nm === :arrayref
-                any(a -> _op_tainted(a, tid, ()), dataargs) && mark(tidref, true)
+            end
+            # A handle built from a threadid-derived INDEX. This is the seed; it no longer ends the
+            # statement, because `memoryrefnew` is also a projection and a handle built from another
+            # threadid-reachable handle has to carry the mark on.
+            if (nm === :memoryrefnew || nm === :memoryref || nm === :arrayref) &&
+                    any(a -> _op_tainted(a, tid, ()), dataargs)
+                mark(tidref, true)
+            end
+            if haskey(_PROJECT_OPS, nm)
+                # A value projected OUT of a threadid-reachable handle is itself threadid-reachable.
+                # `buf[threadid()].field = …` stores into the object loaded from the slot, and
+                # without this its container sits in no set at all — a silent pass, on a guarantee
+                # that gates. Only a result that can carry a reference propagates: an `Int` read out
+                # of a slot is a copy and can never be a store's container.
+                pos = _PROJECT_OPS[nm]
+                if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tidref, ())
+                    T = (sts isa Vector && 1 <= i <= length(sts)) ? sts[i] : nothing
+                    _may_ref(T) && mark(tidref, true)
+                end
                 continue
             elseif haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
@@ -735,9 +763,20 @@ end
 Fail if `f` writes **mutable state indexed by `Threads.threadid()`** (best-effort, value-free IR
 scan). Because a Julia task can migrate between OS threads mid-execution, `buffer[threadid()] = …`
 is a data-race hazard — two tasks can hit the same slot. Prefer a per-task buffer or a captured
-task-local id. Detects the direct `store buf[threadid()]` shape; it does not track a threadid
-stashed into another array and reused later. Not part of [`@strict`](@ref). Disabled builds expand
-to the bare call.
+task-local id.
+
+Detects a store to `buf[threadid()]`, and a store into an object loaded out of such a slot —
+`buf[threadid()].field = …`, `buf[threadid()][i] = …`, `rand(rngs[threadid()])`. A scalar read out
+of a slot and stored elsewhere is a copy, not the hazard, and stays clean.
+
+It does not track a threadid stashed into another array and reused later, and it does not follow
+calls: a write inside a callee the optimizer left out of line is missed, and no other signature
+catches it either, since the threadid is in the caller and the store is in the callee. A lock
+striped by thread (`lock(locks[threadid()])`) IS reported — the inlined fast path writes a field of
+a lock chosen by `threadid()`. That is not a data race, because a `ReentrantLock` belongs to the
+task rather than the thread, but striping locks by thread buys nothing once tasks migrate.
+
+Not part of [`@strict`](@ref). Disabled builds expand to the bare call.
 """
 macro assert_no_threadid_state(args...)
     pos, opts = _macro_call(args, (:types,))
