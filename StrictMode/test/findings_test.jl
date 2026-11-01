@@ -59,7 +59,10 @@ end
     # out of existence while the handle it came from stays marked unconfined. Gating on that would
     # fail correct code wherever a borrow is wrapped before use, which is the ordinary shape.
     reports = (:noalloc, :noboxing, :no_scalar_loops, :trim_compatible, :noescape)
-    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted)
+    # `:no_threadid_state` gates: a reported site is a store this scan READ in typed IR, not an
+    # inference it could not check. Its limit is the other direction — a threadid store inside a
+    # callee it cannot follow reads as absent, which costs recall and never a false failure.
+    gates = (:typestable, :owned, :inlined, :vectorized, :no_spill, :trusted, :no_threadid_state)
     for g in reports
         @test !StrictMode._guarantee_gates(g)
     end
@@ -72,8 +75,9 @@ end
 
     # The value-based guarantees are not in `_GUARANTEES` (they never reach the findings pipeline),
     # but they still route through `_fail`, and they gate.
-    for g in (:memsafe, :concurrency_safe, :no_threadid_state)
+    for g in (:memsafe, :concurrency_safe)
         @test StrictMode._guarantee_gates(g)
+        @test !(g in StrictMode._GUARANTEES)
     end
 end
 

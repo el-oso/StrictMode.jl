@@ -89,6 +89,7 @@ function _suggestion(guarantee::Symbol)
     guarantee === :vectorized && return "did not vectorize: try @inbounds @simd / @simd ivdep, or assert on the leaf kernel (SIMD may be in a non-inlined callee). Use kernel_report for arithmetic-intensity diagnostics."
     guarantee === :no_scalar_loops && return "scalar hot loop (FP or integer) in a numeric path: wrap it in @inbounds @simd / SIMD.jl, or reuse an existing vectorized kernel of the same shape — unaudited glue loops leak time between audited kernels."
     guarantee === :no_spill && return "vector register spill: reduce the live accumulator/tile count (register-block a smaller tile), or split the kernel into multiple passes. See register_report for zmm-saturation diagnostics."
+    guarantee === :no_threadid_state && return "mutable state indexed by `Threads.threadid()`: a task can migrate between threads mid-run, so the index it started on is not the one it finishes on. Index by an id captured once per task, or give each task its own buffer and merge at the end."
     guarantee === :trim_compatible && return "trim-incompatible call: make every call statically resolvable — concrete arg/return types, no Any/abstract containers, no runtime reflection (return_types/invokelatest/which/methods). StrictModeTest's @test_trim_compatible runs the same verifier; with `set_juliac_patches!(true)` it checks the patched Base juliac compiles, and without it some code juliac builds clean is rejected here."
     return ""
 end

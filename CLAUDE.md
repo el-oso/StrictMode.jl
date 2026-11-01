@@ -41,7 +41,14 @@ StrictMode/src/
                         :invoke boundary) + user-registered, both feed the `barrier` alloc signal),
                         _unopt_arg_type/_unopt_callee/_call_callee_and_args (UNOPTIMIZED typed-IR
                         statement reading, for the two scans that must look before the optimizer
-                        erases their pattern — static_ownership.jl and trusted.jl)
+                        erases their pattern — static_ownership.jl and trusted.jl). effects/
+                        effect_holds wrap Base.infer_effects, and effect_holds covers all NINE
+                        Effects fields, so a field Julia adds cannot stay unaskable through
+                        @assert_effects (a test compares the predicate set against fieldnames).
+                        Every one is a PROOF: false means the compiler could not establish the
+                        property, NOT that it fails — :noub is false for a non-const global read
+                        and for a dynamic call, neither of which is undefined behavior (measured),
+                        so a caller may act on true and must treat false as unknown
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES
@@ -60,6 +67,11 @@ StrictMode/src/
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
+                        :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
+                        annotation; check.jl clears a signature outright when the compiler proves
+                        :notaskstate and runs the taint scan only otherwise. It GATES, because a
+                        reported site is a store read from typed IR, not an unprovable inference —
+                        its limit is recall, a threadid store in an unfollowable callee.
                         The taint scan crosses TWO boundaries the statement loop would otherwise
                         drop: Expr(:new) passes taint to the struct built from a tainted value (an
                         INLINABLE wrapper is caught anyway, since inlining routes the store back

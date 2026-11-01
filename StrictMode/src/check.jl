@@ -31,6 +31,7 @@ _mkfinding(
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
     :no_scalar_loops, :no_spill, :trim_compatible, :trusted, :noescape,
+    :no_threadid_state,
 )
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
@@ -186,6 +187,53 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
                         "mark the function that produces the handle `@inline`, or assert this where the handle is created"
                 )
             )
+        elseif g === :no_threadid_state
+            # `notaskstate` PROVES the absence and costs only inference, so the taint scan runs
+            # only where the compiler could not clear the signature. `false` means unproven rather
+            # than present, which is why it falls through to the scan instead of failing.
+            eff = try
+                effects(f, types)
+            catch
+                nothing
+            end
+            if !isnothing(eff) && effect_holds(eff, :notaskstate)
+                push!(
+                    out, _mkfinding(
+                        md, fn, sg, g, false,
+                        "no task-local state (compiler effects: `notaskstate`)", "", 0
+                    )
+                )
+            else
+                vs = try
+                    threadid_state_findings(f, types)
+                catch err
+                    nothing
+                end
+                if isnothing(vs)
+                    push!(
+                        out, _unevaluated(
+                            md, fn, sg, g,
+                            "the compiler could not prove `notaskstate` and the threadid scan " *
+                                "could not read this signature"
+                        )
+                    )
+                else
+                    fail = !isempty(vs)
+                    push!(
+                        out, _mkfinding(
+                            md, fn, sg, g, fail,
+                            fail ?
+                                "threadid-indexed mutable state ($(length(vs)) site(s)): " *
+                                join((v.message for v in vs), "; ") :
+                                "no threadid-indexed mutable state (value-free IR scan)",
+                            fail ? vs[1].file : "", fail ? vs[1].line : 0,
+                            fail ?
+                                "index by a captured task-local id, or give each task its own buffer" :
+                                ""
+                        )
+                    )
+                end
+            end
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try

@@ -241,3 +241,26 @@ end
     @test isempty(StrictMode.concurrency_findings(reader, (Vector{Float64},)))
     @test isempty(StrictMode.concurrency_findings(private!, (Vector{Float64},)))
 end
+
+@testitem "the threadid guarantee is swept, with notaskstate as the fast clear" begin
+    using StrictMode
+
+    @test :no_threadid_state in StrictMode._GUARANTEES
+    @test StrictMode._code(:no_threadid_state) === :SM0013
+
+    tls = [0.0]
+    dirty() = (tls[Threads.threadid()] += 1.0)
+    cleankern(x) = x + 1.0
+    gref = Ref(1.0)
+    unprovable(x) = x + gref[]        # no task state, and the compiler cannot say so
+
+    @test StrictMode.effect_holds(StrictMode.effects(cleankern, (Float64,)), :notaskstate)
+    @test !StrictMode.effect_holds(StrictMode.effects(unprovable, (Float64,)), :notaskstate)
+
+    one_finding(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:no_threadid_state,)))
+    @test StrictMode._failed(one_finding(dirty, ()))
+    @test !StrictMode._failed(one_finding(cleankern, (Float64,)))
+    # An unproven signature falls through to the taint scan and passes there; a missing proof is
+    # not a finding.
+    @test !StrictMode._failed(one_finding(unprovable, (Float64,)))
+end

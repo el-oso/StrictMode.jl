@@ -550,3 +550,29 @@ end
         @test !(Nothing in seen)
     end
 end
+
+@testitem "effect_holds covers every field of the compiler's Effects struct" begin
+    using StrictMode
+
+    mul(a, b) = a * b + 1.0
+    eff = StrictMode.effects(mul, (Float64, Float64))
+    syms = (
+        :nothrow, :effect_free, :terminates, :consistent, :nonoverlayed,
+        :notaskstate, :noub, :inaccessiblememonly, :nortcall
+    )
+    for s in syms
+        @test StrictMode.effect_holds(eff, s) isa Bool
+    end
+    @test_throws ArgumentError StrictMode.effect_holds(eff, :bogus)
+
+    # The predicate set and the struct cannot drift apart: a field Julia adds or renames fails here
+    # rather than being silently unaskable through `@assert_effects`.
+    @test Set(fieldnames(Core.Compiler.Effects)) == Set(syms)
+
+    # Each one is a PROOF of its property, so `false` means unproven. A non-`const` global read is
+    # not undefined behavior and still reports `noub = false`, which is why a caller may act on
+    # `true` and must treat `false` as unknown.
+    gref = Ref(1.0)
+    readsg(x) = x + gref[]
+    @test StrictMode.effect_holds(StrictMode.effects(readsg, (Float64,)), :noub) == false
+end

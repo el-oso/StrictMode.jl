@@ -865,13 +865,27 @@ triage and by `@assert_effects`.
 effects(@nospecialize(f), @nospecialize(types::Tuple)) = Base.infer_effects(f, types)
 
 # Predicate by symbol, so callers can ask `effect_holds(eff, :nothrow)`.
+#
+# Every one of these is a PROOF of the property, so `false` means the compiler could not establish
+# it, NOT that the property fails. `:noub` is `false` for a non-`const` global read and for a
+# dynamic call, neither of which is undefined behavior (measured), so a caller may act on `true`
+# and must treat `false` as unknown.
 function effect_holds(eff, sym::Symbol)
     sym === :nothrow && return Core.Compiler.is_nothrow(eff)
     sym === :effect_free && return Core.Compiler.is_effect_free(eff)
     sym === :terminates && return Core.Compiler.is_terminates(eff)
     sym === :consistent && return Core.Compiler.is_consistent(eff)
     sym === :nonoverlayed && return Core.Compiler.is_nonoverlayed(eff)
-    throw(ArgumentError("unknown effect :$sym; expected :nothrow, :effect_free, :terminates, :consistent, or :nonoverlayed"))
+    sym === :notaskstate && return Core.Compiler.is_notaskstate(eff)
+    sym === :noub && return Core.Compiler.is_noub(eff)
+    sym === :inaccessiblememonly && return Core.Compiler.is_inaccessiblememonly(eff)
+    sym === :nortcall && return Core.Compiler.is_nortcall(eff)
+    throw(
+        ArgumentError(
+            "unknown effect :$sym; expected :nothrow, :effect_free, :terminates, :consistent, " *
+                ":nonoverlayed, :notaskstate, :noub, :inaccessiblememonly, or :nortcall"
+        )
+    )
 end
 
 # --- scoped values: a value that must not leave the frame that obtained it ----------------------
