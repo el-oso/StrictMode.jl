@@ -1281,28 +1281,65 @@ cookbook for a practical port workflow.
 
 ## Compared with Rust
 
-Rust is the usual reference point for "the compiler enforced it", so it is worth being precise about
-which of its guarantees StrictMode reaches and which it does not.
+Rust is the usual reference point for "the compiler enforced it", so it is worth saying precisely
+what the comparison is about — and memory safety is not it.
 
-### Where Rust is stronger
+### Safety is not the axis
 
-Rust proves each of these in the type system, for all code, before the program compiles. StrictMode
-checks them at development or CI time, for the signatures you name or sweep.
+In Julia, memory safety holds for all code, always. Use-after-free, double-free and dangling
+references cannot happen, because nothing frees anything while a reference exists. The borrow checker
+does not buy safety *over* a garbage collector; it buys the same safety *without a runtime*, and adds
+deterministic release.
 
-| property | Rust | StrictMode |
+The ways out of Julia's safety are a short list rather than a mode: `@inbounds`, `ccall`, `pointer`,
+`pointer_from_objref`, and the `unsafe_` functions. [`unsafe_report`](@ref) fences exactly that list,
+and `allow` excuses **one construct at a time** — `allow = (:unsafe_load,)` keeps a reviewed pointer
+read while every other escape still fails. Rust's `#![forbid(unsafe_code)]` is the same idea at crate
+granularity: all of it or none of it.
+
+### The cost of all-or-nothing
+
+Inside `unsafe`, Rust's aliasing and lifetime guarantees become the programmer's responsibility for
+that whole region, and there is no way to give up one property and keep the rest. This matters most
+in exactly the code StrictMode is for: high-performance numeric kernels reach for unchecked indexing
+and SIMD intrinsics, so the proof is switched off where the performance work happens.
+
+StrictMode inverts that. Safety is never what is at stake, so a guarantee is something you opt into,
+per signature, for the property you actually need:
+
+| you want | you ask for | and safety |
 |---|---|---|
-| aliasing | the borrow checker: `&mut` is exclusive, for every caller | [`@assert_noalias`](@ref) compares the arguments of the call that runs, so it narrows the property one site at a time. [`alias_guard_report`](@ref) asks only whether a body names overlap at all, and is `:info` |
-| lifetimes | a borrow cannot outlive its owner | [`@assert_noescape`](@ref) uses the compiler's escape analysis and gates, but cannot see through a callee it did not analyze. [`resource_leak_report`](@ref) covers a handle that arrives as an argument, and is `:info` |
-| release | `Drop` runs when the owner leaves scope | not attempted. [`resource_leak_report`](@ref) finds references that outlive their owner and deliberately does not try to prove release on every path: that needs post-dominance over the exception control flow, and a `close` in a helper defeats it |
-| unsafe code | `#![forbid(unsafe_code)]` rejects the crate | [`unsafe_report`](@ref) and `StrictModeTest.test_no_unsafe` are a test-time gate with a per-construct `allow` list |
-| data races | `Send` and `Sync` are checked by the compiler | [`@assert_concurrency_safe`](@ref) and [`@assert_no_threadid_state`](@ref) are IR scans, and field-insensitive: a task writing a disjoint slice of a shared output still reports |
-| bounds | checked at run time, and skipping the check requires `unsafe` | `@inbounds` is ordinary Julia and leaves no mark where it is written. [`unsafe_report`](@ref) reports it as `:inbounds`, read from `ci.ssaflags` |
+| no GC pause in a hot loop | [`@assert_noalloc`](@ref), [`gc_pause_report`](@ref) | unchanged |
+| the vector code you think you wrote | [`@assert_vectorized`](@ref), [`@assert_no_spill`](@ref) | unchanged |
+| one concrete type per specialization | [`@assert_typestable`](@ref) | unchanged |
+| a kernel that stays in its own precision | [`conversion_report`](@ref) | unchanged |
+| a static binary | [`@assert_trim_compatible`](@ref) | unchanged |
 
-The shape of the gap is the same in every row: Rust's answers are sound and cover all code, while
-StrictMode's cover the signatures it was pointed at, and five of them report rather than gate because
-they infer something typed IR cannot show. Julia has no construct that would let a package close
-that gap — `@assert_noalias` is a run-time assertion precisely because nothing in the language can
-decide overlap for every future caller.
+Nothing in that column is a trade against correctness, and nothing is all-or-nothing: a module can
+require allocation-freedom of three kernels and say nothing about the rest. The guarantee is scoped
+to where it earns its place, which is why there are seventeen of them rather than one mode.
+
+A garbage collector only pauses code that allocates. Remove the allocation from the hot path — the
+property [`@assert_noalloc`](@ref) checks and `StrictModeTest.@test_noalloc` proves — and the pause
+goes with it. That is the same end state Rust reaches by construction, reached instead by a check
+you can point at one function.
+
+### What Rust's model still wins
+
+Two things, and neither is about memory safety:
+
+- **Data races, at compile time.** `Send` and `Sync` are checked for all code. Julia has no
+  equivalent, and [`@assert_concurrency_safe`](@ref) and [`@assert_no_threadid_state`](@ref) are IR
+  scans: they find what they can read and are field-insensitive, so a task writing a disjoint slice
+  of a shared output still reports. This is a real gap, not a difference of style.
+- **Release of resources that are not memory.** `Drop` runs at scope exit, for every path.
+  Julia's collector decides when, and for a GPU buffer or a file handle that is not a performance
+  question — the CPU collector cannot see GPU memory pressure at all.
+  [`resource_leak_report`](@ref) finds a handle that outlives its owner and deliberately does not try
+  to prove release on every path, because that needs post-dominance over the exception control flow
+  and a `close` in a helper defeats it.
+
+Rust also needs no runtime, which matters where there cannot be one.
 
 ### Where there is no Rust counterpart
 
@@ -1324,12 +1361,13 @@ nothing to compare against:
 
 ### The difference that matters
 
-Rust decides before the code exists, and the answer holds for every caller forever. StrictMode asks,
-of generic source that already compiled, whether *this* specialization became the code you intended —
-and answers for the specializations it can see. Neither replaces the other: the first is a proof
-about a program, the second a measurement of one.
+Rust decides before the code exists, and the answer holds for every caller forever — one mode,
+entered or left wholesale. StrictMode starts from code that is already safe and already compiles, and
+asks whether *this* specialization became the code you intended, for the properties you named. The
+first is a proof about a program; the second a measurement of one. The second is the one you can
+apply to three functions on a Tuesday.
 
-That is also why the split between the two packages exists. `StrictMode` reports and depends on no
-analysis backend; `StrictModeTest` proves and depends on three. A heuristic that aborts a consumer's
-precompile is worse than no check, and a proof that costs a 680 MiB dependency does not belong in
-every user's package graph.
+That is also why the two packages are separate. `StrictMode` reports and depends on no analysis
+backend; `StrictModeTest` proves and depends on three. A heuristic that aborts a consumer's precompile
+is worse than no check, and a proof costing a 680 MiB dependency does not belong in every user's
+package graph.
