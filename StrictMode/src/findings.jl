@@ -147,7 +147,9 @@ function Base.show(io::IO, f::StrictFinding)
     print(io, "[", mark, " ", f.guarantee)
     # The code only earns its space where there is something to look up.
     f.status === :pass || print(io, " ", f.code)
-    print(io, "] ", f.func, f.signature)
+    # A separator: the signature renders as `Tuple{…}`, so without one the name runs straight into
+    # it and `foo` plus `Tuple{…}` reads as a single identifier `fooTuple{…}`.
+    print(io, "] ", f.func, " ", f.signature)
     f.status !== :pass && f.reason != "" && print(io, " — ", f.reason)
     return nothing
 end

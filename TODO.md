@@ -561,6 +561,59 @@ implementation). These two remain.
       proves, which is the same shape as `@strict_function`'s `signatures =`.
   (a) looks worth doing on its own and needs no new surface.
 
+## Open — from the PureBLAS adoption report (against 0.5.4)
+
+Reported against 0.5.4. The headline ask — a gating form for specialization count — **already
+exists** and the reporter had it: `StrictModeTest.test_specializations(mod; baseline, workload)`
+landed in 0.5.3 and is documented in `docs/src/proof_tier.md`, both as a table row and a docstring.
+It was missed because the gating surface was enumerated as `@test_*` MACROS and this one is a
+function. Worth noting as a discoverability result rather than a capability gap: the one real
+measured cost in that report (a `@generated` ladder going from ~576 to 1536 specializations, caught
+only when a package image grew 383 MiB) is exactly what the growth gate catches.
+
+- [ ] **A gating form for an ABSOLUTE specialization budget.** `test_specializations` gates GROWTH
+  against a stored baseline, deliberately — there is no universal threshold, which is why
+  `specialization_report` is `:info`. But `specialization_report(mod; max_specializations = N)`
+  already takes a project-chosen limit and emits findings against it, and nothing can fail on them:
+  `nfailures` is `count(_failed, fs)` and `_failed` is `status === :fail`, so an `:info` finding
+  never fails a suite (confirmed). So the missing piece is narrow: a driver that takes the same
+  explicit budget and raises. The argument for it over the growth gate is that a budget is a number
+  the project has written down and agreed to, where a baseline is whatever happened to be true when
+  it was recorded. The argument against is one more entry on a gating surface that is already large
+  — see the surface-area note under the 0.5.6 gaps.
+
+- [ ] **A sorted summary view for a large report.** `specialization_report` on a big package returns
+  tens of findings, and an agent reading a tool result gets the two-argument
+  `show(io, ::Vector{StrictFinding})`, which is one line — measured 3935 characters and **zero**
+  newlines for 25 findings. The `MIME"text/plain"` method and `format_findings` are both multi-line
+  (76 newlines for the same vector), so the data and a readable rendering already exist; what is
+  missing is a view sorted by the number that matters, descending, with the limit beside it. Purely
+  presentation. The separator bug behind the complaint (`fooTuple{…}`, name running into signature)
+  is fixed.
+
+- [ ] **`migration_report` scans only `.jl`, and a stale name often lives in a `.md`.**
+  The rename IS covered: `_REMOVED_API` in migration.jl carries
+  `"@assert_trim_safe" => "@assert_trim_compatible"`, and a fixture puts it at
+  `src/Old.jl:2` with the replacement named. What it does not do is read documentation — a
+  `CLAUDE.md` or README still saying `@assert_trim_safe` is invisible to it, which is where the
+  reported instance actually was. Scanning `.md` for the `_REMOVED_API` keys alone (not the
+  gating-macro pairs, which are legitimately discussed in prose) would close that, and the table
+  needs no new entries.
+
+- [ ] **An assertion guarded on the predicate it asserts.** Reported from a sibling session:
+  `if _SME_F32; @test f32_detected_wherever_f64_is; end`. A mistyped sysctl key makes `_SME_F32`
+  false, the block is skipped, and the suite passes vacuously on exactly the bug the test exists to
+  catch — found by breaking the gate deliberately, where the evidence was the assertion COUNT
+  (10 of 13 ran, not a failure). This is the vacuous-green shape `proofs.jl` already names, in a
+  mechanical and detectable variant: an `@test`/`@assert_*` whose only enclosing condition is the
+  predicate it is asserting about.
+  *Scope question, undecided:* every check here reads typed IR or compiled output of a COMPILED
+  METHOD. This pattern lives in the source text of a test file, which is a different analysis and a
+  different tool class — closer to what `TypedSyntaxNode` or a JuliaSyntax pass would do. A cheaper
+  partial answer, in the existing idiom, is to report the assertion COUNT the way the reporter used
+  it: a suite whose executed-assertion count drops is the signal, and that needs no source analysis
+  at all. Decide which before building either.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding
