@@ -1239,22 +1239,97 @@ the argument tuple is heap-allocated by the call itself, before any check sees i
 
 ## Promise scope
 
-StrictMode's guarantees cover **allocation-freedom**, **type-stability**, **vectorization**
-(where asserted with [`@assert_vectorized`](@ref) or [`@kernel`](@ref)), **register pressure**
-(via [`@assert_no_spill`](@ref)), **static-binary (`juliac --trim`) compatibility** (via
-[`@assert_trim_compatible`](@ref)), **owned scratch** (via [`@assert_owned`](@ref)), **validated
-foreign data** (via [`@assert_trusted`](@ref)), **argument separation at a call site** (via
-[`@assert_noalias`](@ref)), and, deterministically rather than flakily, **out-of-bounds array
-access** in unsafe kernels (via [`@assert_memsafe`](@ref)). One property is explicitly out of
-scope: **bit-reproducibility**.
+The checks fall into three groups, and the group decides how much a verdict is worth.
 
-SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction —
-how four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler
-and may differ from a reference implementation, even when both produce IEEE-correct results. A
-~1-ULP difference between your kernel and a Rust or C reference is expected behavior and *not* a
-StrictMode failure.
+**Gating — these throw.** Each one reads compiled output, or the type the compiler assigned, so the
+verdict is an observation: [`@assert_typestable`](@ref), [`@assert_owned`](@ref),
+[`@assert_inlined`](@ref), [`@assert_vectorized`](@ref), [`@assert_no_spill`](@ref),
+[`@assert_trusted`](@ref), [`@assert_no_threadid_state`](@ref). So do the three that take values and
+run the call: [`@assert_memsafe`](@ref), [`@assert_noalias`](@ref),
+[`@assert_concurrency_safe`](@ref).
+
+**Reporting — these warn.** Each one infers something it cannot see, so a failure is a lead:
+`:noalloc` and `:noboxing` (typed IR cannot see what LLVM later removes), `:no_scalar_loops` (SLP
+output forges the signal the check looks for), `:trim_compatible` (the static scan does not model
+juliac's reachability limit, and juliac compiles a patched `Base`), and `:noescape` (a handle wrapped
+in a `view` reads as unconfined even when the view is never used). `StrictModeTest` gates these
+unconditionally, which is what that package is for.
+
+**Informational — these never fail.** The module sweeps: [`dispatch_report`](@ref),
+[`unsafe_report`](@ref), [`throw_report`](@ref), [`bang_report`](@ref),
+[`alias_guard_report`](@ref), [`resource_leak_report`](@ref), [`conversion_report`](@ref),
+[`specialization_report`](@ref), [`pool_balance_report`](@ref), [`inline_suggestions`](@ref),
+[`static_ownership_suggestions`](@ref), and the measured ones —
+[`steady_state_report`](@ref), [`gc_pause_report`](@ref), [`latency_report`](@ref),
+[`kernel_report`](@ref), [`register_report`](@ref), [`spill_report`](@ref), [`mca_report`](@ref),
+[`memsafe_report`](@ref). Twelve of the seventeen `@assert_` guarantees are also swept by
+[`audit`](@ref) with nothing written at the call site; the five that are not need actual argument
+values, or an optional dependency, or a set of effects only the caller can name.
+
+One property is explicitly out of scope: **bit-reproducibility**.
+
+SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction — how
+four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler and may
+differ from a reference implementation, even when both produce IEEE-correct results. A ~1-ULP
+difference between your kernel and a Rust or C reference is expected behavior and *not* a StrictMode
+failure.
 
 When testing numerical correctness against a reference, use tolerance-aware comparisons for SIMD
 reductions. Exact matching remains valid for deterministic operations (non-reduction arithmetic,
-memory copies, index computations). See also [the golden-harness methodology](cookbook.md) in
-the cookbook for a practical port workflow.
+memory copies, index computations). See also [the golden-harness methodology](cookbook.md) in the
+cookbook for a practical port workflow.
+
+## Compared with Rust
+
+Rust is the usual reference point for "the compiler enforced it", so it is worth being precise about
+which of its guarantees StrictMode reaches and which it does not.
+
+### Where Rust is stronger
+
+Rust proves each of these in the type system, for all code, before the program compiles. StrictMode
+checks them at development or CI time, for the signatures you name or sweep.
+
+| property | Rust | StrictMode |
+|---|---|---|
+| aliasing | the borrow checker: `&mut` is exclusive, for every caller | [`@assert_noalias`](@ref) compares the arguments of the call that runs, so it narrows the property one site at a time. [`alias_guard_report`](@ref) asks only whether a body names overlap at all, and is `:info` |
+| lifetimes | a borrow cannot outlive its owner | [`@assert_noescape`](@ref) uses the compiler's escape analysis and gates, but cannot see through a callee it did not analyze. [`resource_leak_report`](@ref) covers a handle that arrives as an argument, and is `:info` |
+| release | `Drop` runs when the owner leaves scope | not attempted. [`resource_leak_report`](@ref) finds references that outlive their owner and deliberately does not try to prove release on every path: that needs post-dominance over the exception control flow, and a `close` in a helper defeats it |
+| unsafe code | `#![forbid(unsafe_code)]` rejects the crate | [`unsafe_report`](@ref) and `StrictModeTest.test_no_unsafe` are a test-time gate with a per-construct `allow` list |
+| data races | `Send` and `Sync` are checked by the compiler | [`@assert_concurrency_safe`](@ref) and [`@assert_no_threadid_state`](@ref) are IR scans, and field-insensitive: a task writing a disjoint slice of a shared output still reports |
+| bounds | checked at run time, and skipping the check requires `unsafe` | `@inbounds` is ordinary Julia and leaves no mark where it is written. [`unsafe_report`](@ref) reports it as `:inbounds`, read from `ci.ssaflags` |
+
+The shape of the gap is the same in every row: Rust's answers are sound and cover all code, while
+StrictMode's cover the signatures it was pointed at, and five of them report rather than gate because
+they infer something typed IR cannot show. Julia has no construct that would let a package close
+that gap — `@assert_noalias` is a run-time assertion precisely because nothing in the language can
+decide overlap for every future caller.
+
+### Where there is no Rust counterpart
+
+Beyond correctness, `rustc` makes no promise about the machine code it emits, so these axes have
+nothing to compare against:
+
+- **type stability** — not a Rust concept, because monomorphization is mandatory there. In Julia it
+  is a property each specialization either has or does not.
+- **allocation-freedom** — `#![no_std]` removes the allocating API surface; it does not prove that a
+  given function allocates nothing. That proof is what AllocCheck gives `StrictModeTest`.
+- **vectorization, scalar loops, register spills** — LLVM decides, and neither language promises an
+  outcome.
+- **static-binary compatibility** — whether `juliac --trim=safe` can resolve every call.
+- **GC pause** — Rust has no collector, so an allocating neighbor cannot stop an unrelated kernel.
+- **load time and first-call latency** — properties of a cold process, which no typed IR predicts.
+- **compiled-specialization count** — a consequence of Julia compiling per concrete type.
+- **numeric conversion width** — a bare literal in Julia carries a default type, so one unsuffixed
+  constant can widen a whole kernel.
+
+### The difference that matters
+
+Rust decides before the code exists, and the answer holds for every caller forever. StrictMode asks,
+of generic source that already compiled, whether *this* specialization became the code you intended —
+and answers for the specializations it can see. Neither replaces the other: the first is a proof
+about a program, the second a measurement of one.
+
+That is also why the split between the two packages exists. `StrictMode` reports and depends on no
+analysis backend; `StrictModeTest` proves and depends on three. A heuristic that aborts a consumer's
+precompile is worse than no check, and a proof that costs a 680 MiB dependency does not belong in
+every user's package graph.
