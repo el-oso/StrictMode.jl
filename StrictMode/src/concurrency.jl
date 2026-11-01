@@ -351,7 +351,11 @@ function _taint_scan_ci(
                     (_op_tainted(a, tset, targs) || !isnothing(_direct_fields(a, cset, cflds, cargs))) &&
                         push!(fields, k)
                 end
-                if !isempty(fields)
+                # Report a change only when one happened. Setting the flag unconditionally keeps the
+                # fixed point from ever converging early, so every frame runs the full statement
+                # budget: measured as a 7 s sweep turning into a 900 s timeout on a package whose
+                # entry point is large.
+                if !isempty(fields) && get(cflds, i, nothing) != fields
                     push!(cset, i)
                     cflds[i] = fields
                     changed = true
