@@ -1284,9 +1284,19 @@ it is not a gate — it is what you run *after* a warning or a failing test, to 
 around the one site that complained. The gate is the `@assert_` at the call site, or a
 `StrictModeTest` driver in your suite; `audit` is how you work out what to change. That is also why
 a guarantee can be swept without being safe to enforce everywhere: `:concurrency_safe` is swept, so
-`audit` reports it, but it is deliberately absent from the `:all` policy set — a sweep has nowhere to
-say which argument holds the shared object, so it reads argument 1, and a `!` method writes argument
-1 by convention. Enforcing that at a consumer's own precompile would fail correct code.
+`audit` reports it, but it is deliberately absent from the `:all` policy set.
+
+Two consequences of a sweep having nowhere to say *which* argument holds the shared object, both
+measured in the field rather than reasoned about:
+
+- **A `!` method gets `:info`, not `:fail`.** The name declares that argument 1 is written, so
+  finding that write is reading the convention back rather than finding a defect. The suggestion
+  names the fix — `@assert_concurrency_safe self=N f(…)` at a call site, where you can say which
+  argument is actually shared. On one package this was 92 of 134 sweep failures; on another, 755 of
+  762.
+- **An `isbits` first argument reports nothing at all.** A copy cannot be written through, so the
+  guarantee holds trivially — and seeding it as shared taints every index derived from it, which
+  made a store into a buffer the method allocated *itself* read as a write to the shared object.
 
 One property is explicitly out of scope: **bit-reproducibility**.
 

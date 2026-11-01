@@ -81,6 +81,36 @@ end
 
 # ── taint primitives ──────────────────────────────────────────────────────────────────────────
 
+# The direct-field positions of a CONTAINER operand, or `nothing` if it is not one. A container is
+# an object built around a plan value: reading the positions that received one gives the plan back,
+# reading any other gives whatever the method put there itself.
+function _direct_fields(@nospecialize(op), cset::BitSet, cflds::Dict{Int, Set{Int}}, cargs)
+    if op isa Core.SSAValue
+        return (op.id in cset) ? get(cflds, op.id, nothing) : nothing
+    elseif op isa Core.Argument
+        return get(cargs, op.n, nothing)
+    end
+    return nothing
+end
+
+# Which field a projection reads, as a 1-based position, or `nothing` when it is not a constant
+# field read (a runtime index, a `getindex` on a container with no fields). `getfield(x, :name)`
+# needs the source type to turn the name into a position.
+function _proj_field_index(dataargs, pos::Int, @nospecialize(srcT))
+    length(dataargs) >= pos + 1 || return nothing
+    f = dataargs[pos + 1]
+    f isa QuoteNode && (f = f.value)
+    f isa Int && return f
+    f isa Symbol || return nothing
+    T = _widen_taint(srcT)
+    T isa DataType || return nothing
+    return try
+        Int(Base.fieldindex(T, f))
+    catch
+        nothing
+    end
+end
+
 @inline _op_tainted(@nospecialize(op), tset::BitSet, targs) =
     op isa Core.SSAValue ? (op.id in tset) :
     op isa Core.Argument ? (op.n in targs) : false
@@ -205,6 +235,40 @@ struct _ConcViol
     file::String
     line::Int
     certain::Bool
+    # An ATOMIC write is race-free and the author plainly intended concurrent access, so it is not a
+    # build failure — but it is still shared mutable state, and atomicity does not make sharing
+    # safe: two tasks bumping an `@atomic` cursor on one plan corrupt each other's work even though
+    # no single write tears. So it is reported and does not raise, which is a different fact from
+    # `certain = false` ("the scan could not see"), and the two must not share a flag.
+    deliberate::Bool
+end
+
+# The memory orders a store carries when it is atomic. `:not_atomic` is what an ordinary array store
+# carries, so the presence of an order argument is not enough on its own.
+const _ATOMIC_ORDERS = Set{Symbol}(
+    (:unordered, :monotonic, :acquire, :release, :acquire_release, :sequentially_consistent)
+)
+
+# The store builtins that exist only in atomic form.
+const _ATOMIC_STORES = Set{Symbol}(
+    (
+        :modifyfield!, :swapfield!, :replacefield!, :setfieldonce!,
+        :memoryrefmodify!, :memoryrefswap!, :memoryrefreplace!, :memoryrefsetonce!,
+    )
+)
+
+# Is this store atomic? Three shapes: the `:invoke_modify` head that `@atomic x.f += v` lowers to,
+# a builtin that is atomic by name, and a plain `setfield!`/`memoryrefset!` carrying a real memory
+# order — `@atomic x.f = v` becomes `setfield!(x, :f, v, :sequentially_consistent)`, where the plain
+# form has no fourth argument at all.
+function _is_atomic_store(st, nm, dataargs)
+    Meta.isexpr(st, :invoke_modify) && return true
+    nm isa Symbol && nm in _ATOMIC_STORES && return true
+    for a in dataargs
+        v = a isa QuoteNode ? a.value : a
+        v isa Symbol && v in _ATOMIC_ORDERS && return true
+    end
+    return false
 end
 
 # ── the scan ──────────────────────────────────────────────────────────────────────────────────
@@ -217,13 +281,13 @@ end
 
 function _record!(
         out::Vector{_ConcViol}, seen::Set{String}, chain::Vector{String}, msg::String, fr::_Frame;
-        certain::Bool = false
+        certain::Bool = false, deliberate::Bool = false,
     )
     full = isempty(chain) ? msg : msg * " (reached via " * join(chain, " → ") * ")"
     key = full * "@" * fr.file * ":" * string(fr.line)
     key in seen && return nothing
     push!(seen, key)
-    push!(out, _ConcViol(full, fr.file, fr.line, certain))
+    push!(out, _ConcViol(full, fr.file, fr.line, certain, deliberate))
     return nothing
 end
 
@@ -231,12 +295,21 @@ end
 # the method may RETURN a plan-reachable reference (so the caller can keep tainting).
 function _taint_scan_ci(
         ci, targs::Set{Int}, chain::Vector{String}, fr::_Frame, depth::Int, max_depth::Int,
-        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String},
+        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String};
+        cargs::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(),
     )
     code = ci.code
     types = ci.ssavaluetypes
     n = length(code)
     tset = BitSet()
+    # Two levels, because "is the plan" and "holds a reference to the plan" are different facts and
+    # one set cannot hold both. A factorization `F = Factor(sym, …)` points at the plan; the plan
+    # does not point at `F`, so writing `F.ok` writes `F`. With one level, `F` either WAS the plan —
+    # and every field it initializes reported — or was invisible, losing a store through `F` into the
+    # plan's own arrays. `cset` holds such containers, and `cflds` records WHICH field positions of
+    # each received a plan value, so reading that field back is direct and reading any other is not.
+    cset = BitSet()
+    cflds = Dict{Int, Set{Int}}()
     returns_tainted = false
     changed = true
     passes = 0
@@ -263,7 +336,26 @@ function _taint_scan_ci(
                 # stops at every wrapper: `Threads.@spawn` captures its closed-over variables as
                 # fields of a closure struct, so a task writing a captured buffer reads as no write
                 # at all. `args[1]` is the type; the rest are the field values.
-                any(a -> _op_tainted(a, tset, targs), @view st.args[2:end]) && settaint(true)
+                # Only a PROJECTION of the plan carries the taint into the new object, never the
+                # plan argument itself. A struct built AROUND the plan is a different object: a
+                # factorization `F = Factor(sym, …)` points at `sym`, `sym` does not point at `F`,
+                # and writing `F.ok` writes `F`. Tainting from the argument made every method that
+                # allocates a fresh wrapper around its plan report its own initialization as a
+                # write to the plan. A value read OUT of the plan — `W(plan.buf)` — is the plan's
+                # own memory, so a store through that wrapper still counts.
+                # A struct built from a plan value is a CONTAINER, not the plan. Record which field
+                # positions received one, so a later read of that field is direct and a read of a
+                # freshly-built sibling field is not.
+                fields = Set{Int}()
+                for (k, a) in enumerate(@view st.args[2:end])
+                    (_op_tainted(a, tset, targs) || !isnothing(_direct_fields(a, cset, cflds, cargs))) &&
+                        push!(fields, k)
+                end
+                if !isempty(fields)
+                    push!(cset, i)
+                    cflds[i] = fields
+                    changed = true
+                end
                 continue
             elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task
                 # `Threads.@spawn` and `Threads.@threads` lower to a closure built by `:new` and
@@ -274,7 +366,12 @@ function _taint_scan_ci(
                 # argument-type `svec`, the required-argument count and the convention. The first
                 # of them is the task's function.
                 for a in @view st.args[6:end]
-                    _op_tainted(a, tset, targs) || continue
+                    # A task closure is a CONTAINER of its captures, so follow it at either level:
+                    # the body is where the write is, and the closure itself is never written.
+                    (
+                        _op_tainted(a, tset, targs) ||
+                            !isnothing(_direct_fields(a, cset, cflds, cargs))
+                    ) || continue
                     _recurse_task_body(
                         _operand_type(a, types), chain, depth, max_depth, memo, out, seen, fr
                     )
@@ -299,18 +396,50 @@ function _taint_scan_ci(
             if nm !== nothing && haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
-                    _record!(out, seen, chain, _store_msg(nm, isinvoke, dataargs, targs), fr; certain = true)
+                    atomic = _is_atomic_store(st, nm, dataargs)
+                    _record!(
+                        out, seen, chain,
+                        _store_msg(nm, isinvoke, dataargs, targs) *
+                            (
+                            atomic ?
+                                " — the write is ATOMIC, so it cannot tear, but the plan is still " *
+                                "shared mutable state and atomicity does not make sharing safe" : ""
+                        ), fr; certain = true, deliberate = atomic
+                    )
                 end
                 continue
             end
 
             # projection: derive a (maybe-shared) reference
-            if nm !== nothing && haskey(_PROJECT_OPS, nm)
+            if !isnothing(nm) && haskey(_PROJECT_OPS, nm)
                 pos = _PROJECT_OPS[nm]
-                if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
+                if 1 <= pos <= length(dataargs)
+                    src = dataargs[pos]
                     # a memoryref is a *writable handle* into its buffer — always a live reference
                     isref = (nm === :memoryrefnew || nm === :memoryref) ? true : _may_ref(types[i])
-                    settaint(isref)
+                    if _op_tainted(src, tset, targs)
+                        settaint(isref)
+                    else
+                        # Reading a field back OUT of a container: direct only for the positions
+                        # that received a plan value. `F.sym` is the plan; `F.stats`, built fresh
+                        # beside it, is not, and a store into that is this method's own business.
+                        flds = _direct_fields(src, cset, cflds, cargs)
+                        if !isnothing(flds)
+                            # The source's type has to come from the right table: an argument's is
+                            # in `slottypes`, and without it the field name cannot be turned into a
+                            # position, which would send every read of a container back to the
+                            # conservative answer.
+                            srcT = if src isa Core.Argument
+                                slots = ci.slottypes
+                                (slots isa Vector && 1 <= src.n <= length(slots)) ?
+                                    slots[src.n] : nothing
+                            else
+                                _operand_type(src, types)
+                            end
+                            idx = _proj_field_index(dataargs, pos, srcT)
+                            (isnothing(idx) || idx in flds) && settaint(isref)
+                        end
+                    end
                 end
                 continue
             end
@@ -323,13 +452,21 @@ function _taint_scan_ci(
 
             # a plain call that receives a tainted (plan-reachable) reference: follow it
             tainted_pos = Int[k for k in eachindex(dataargs) if _op_tainted(dataargs[k], tset, targs)]
-            isempty(tainted_pos) && continue
+            # Container arguments travel too, with their field map: the writes that matter often
+            # happen in a callee that received the fresh wrapper, so losing the distinction at the
+            # call boundary loses it entirely.
+            cpos = Dict{Int, Set{Int}}()
+            for k in eachindex(dataargs)
+                flds = _direct_fields(dataargs[k], cset, cflds, cargs)
+                isnothing(flds) || (cpos[k] = flds)
+            end
+            (isempty(tainted_pos) && isempty(cpos)) && continue
 
             if isinvoke
                 mi = _invoke_mi(st.args[1])
                 m = mi === nothing ? nothing : mi.def
                 if m isa Method && !_is_base_core(m.module)
-                    rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen)
+                    rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen; cpos)
                     settaint(rt && _may_ref(types[i]))
                 elseif nm !== nothing && nm in _BASE_MUTATORS
                     _record!(
@@ -356,7 +493,19 @@ function _taint_scan_ci(
                     # as `GlobalRef(ThatPackage, :(===))` and a module test calls it dynamic
                     # dispatch. The getfield family is handled above.
                 else
-                    tgt = nm === nothing ? "an unresolved callee" : "`$nm`"
+                    # `kwcall(kwargs, f, args…)` is Julia's keyword lowering, not a function
+                    # anybody wrote, so naming it tells a reader nothing. The callee they wrote is
+                    # the second argument; name that when it resolves.
+                    tgt = if nm === :kwcall && length(dataargs) >= 2
+                        inner = _callee_name(dataargs[2])
+                        isnothing(inner) ?
+                            "a keyword call whose callee is not resolvable" :
+                            "`$inner` (through a keyword call)"
+                    elseif isnothing(nm)
+                        "an unresolved callee"
+                    else
+                        "`$nm`"
+                    end
                     _record!(
                         out, seen, chain,
                         "hands a plan-reachable value to $tgt via dynamic dispatch — StrictMode cannot " *
@@ -454,9 +603,14 @@ end
 
 function _recurse(
         mi::Core.MethodInstance, m::Method, tainted_pos::Vector{Int}, chain::Vector{String},
-        depth::Int, max_depth::Int, memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String},
+        depth::Int, max_depth::Int, memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String};
+        cpos::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(),
     )
-    key = (mi, sort(tainted_pos))
+    # Canonical, and comparable: sorting the pairs directly falls through to comparing the `Set`
+    # values whenever two keys tie, and `isless` has no method for `Set`. Measured on a real
+    # package: every `cholesky!` signature came back unanalyzable with a `MethodError` from the
+    # memo key rather than from anything about the method.
+    key = (mi, sort(tainted_pos), [k => sort!(collect(v)) for (k, v) in sort!(collect(cpos); by = first)])
     haskey(memo, key) && return memo[key]
     label = string(m.name)
     if depth >= max_depth
@@ -473,8 +627,12 @@ function _recurse(
     ci === nothing && return false
     # user param k (1-based) ↔ Core.Argument(k+1)
     callee_targs = Set{Int}(p + 1 for p in tainted_pos)
+    callee_cargs = Dict{Int, Set{Int}}(p + 1 => v for (p, v) in cpos)
     fr = _Frame(label, string(m.file), Int(m.line))
-    rt = _taint_scan_ci(ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen)
+    rt = _taint_scan_ci(
+        ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen;
+        cargs = callee_cargs
+    )
     memo[key] = rt
     return rt
 end
@@ -511,8 +669,15 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
         _func_name(f) * _sig_string(types),
         m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0
     )
-    targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
+    # Seed the plan slot only if it can hold a reference. An `isbits` plan argument is a COPY, so
+    # nothing is reachable "only through it" and no store the caller's value could observe exists —
+    # the guarantee holds trivially. Seeding it anyway taints every INDEX derived from it, and a
+    # `memoryrefnew` on a buffer the method allocated itself then reads as plan-reachable: measured
+    # on a method whose first argument is an `Int` and whose only stores go into its own fresh
+    # arrays, which reported a write to the plan.
     out = _ConcViol[]
+    (1 <= self_arg <= length(types) && _may_ref(types[self_arg])) || return out
+    targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
     _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Bool}(), out, Set{String}())
     return out
 end
@@ -523,7 +688,8 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     io = IOBuffer()
     # The headline has to match what the scan actually established, or the warn path states as fact
     # the very thing the certainty split says it could not see.
-    sure = any(v -> v.certain, vs)
+    # Raise only on a write that is both READ by the scan and not a deliberate atomic one.
+    sure = any(v -> v.certain && !v.deliberate, vs)
     println(
         io,
         sure ?
@@ -859,10 +1025,11 @@ function _threadid_state_finding(
     catch
         nothing
     end
+    tloc = _method_loc(f, types)
     isnothing(vs) && return _unevaluated(
         md, fn, sg, :no_threadid_state,
         "the compiler could not prove `notaskstate` and the threadid scan could not read this " *
-            "signature"; tier
+            "signature"; tier, file = tloc[1], line = tloc[2]
     )
     fail = !isempty(vs)
     return _mkfinding(
@@ -892,14 +1059,33 @@ function _concurrency_safe_finding(
     catch
         nothing
     end
+    loc = _method_loc(f, types)
     isnothing(vs) && return _unevaluated(
-        md, fn, sg, :concurrency_safe, "the concurrency scan could not read this signature"; tier
+        md, fn, sg, :concurrency_safe, "the concurrency scan could not read this signature";
+        tier, file = loc[1], line = loc[2]
     )
     isempty(vs) && return _mkfinding(
         md, fn, sg, :concurrency_safe, false, "argument 1 is not written (value-free IR scan)",
         "", 0; tier
     )
-    certain = any(v -> v.certain, vs)
+    # A `!` name DECLARES that argument 1 is written — `mul!(C, A, B)`, `copyto!(dest, src)` — so
+    # finding that write is not finding a defect, it is reading the convention back. The sweep
+    # cannot be told which argument holds the shared object, so for these it cannot ask the question
+    # the guarantee is about, and it says so as `:info` rather than failing. It must not report
+    # `:pass`: "could not check here" and "is read-only" are different answers. Measured in the
+    # field before this: 92 of 134 sweep failures on one package were `!` methods writing their own
+    # first argument, which buried the 42 that were not.
+    if endswith(fn, "!")
+        return StrictFinding(
+            md, fn, sg, :concurrency_safe, :info, vs[1].file, vs[1].line,
+            "a `!` name declares that argument 1 is written, so the sweep cannot tell a shared " *
+                "plan from the intended output ($(length(vs)) site(s))",
+            "assert this at a call site with `@assert_concurrency_safe self=N f(…)`, naming the " *
+                "argument that is actually shared across tasks",
+            tier, _code(:concurrency_safe)
+        )
+    end
+    certain = any(v -> v.certain && !v.deliberate, vs)
     return StrictFinding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
         vs[1].file, vs[1].line,

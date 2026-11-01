@@ -61,3 +61,32 @@
     @test !(:alias_guard in StrictMode._GUARANTEES)
     @test !(:noalias in StrictMode._GUARANTEES)
 end
+
+@testitem "an `Any` argument is not evidence of an array" begin
+    using StrictMode
+
+    # `typeintersect(Any, AbstractArray)` is non-empty, so an unannotated argument counted as a
+    # possible array and any `!` method with two of them was reported. That is most generic Julia
+    # code: it was 5 of 6 findings on StrictMode itself, all on `f`/`types`/`ci` parameters. An
+    # `Any` declaration says nothing about aliasing. An abstract ARRAY type still counts.
+    @test !StrictMode._could_be_array(Any)
+    @test StrictMode._could_be_array(AbstractArray)
+    @test StrictMode._could_be_array(AbstractVector{Float64})
+    @test StrictMode._could_be_array(Vector{Float64})
+    @test StrictMode._could_be_array(Union{Nothing, Vector{Int}})
+    @test !StrictMode._could_be_array(Int)
+
+    module AnyArgs
+    # Two unannotated arguments, neither an array. Reported before, silent now.
+    register!(f, types) = (push!([], (f, types)); nothing)
+    # Two real arrays and no guard: still reported.
+    both!(a::Vector{Float64}, b::Vector{Float64}) = (a[1] = b[1]; nothing)
+    # An abstract array type is still an array.
+    absarr!(a::AbstractVector{Float64}, b::AbstractVector{Float64}) = (a[1] = b[1]; nothing)
+    end
+
+    named = Set(f.func for f in alias_guard_report(AnyArgs))
+    @test !("register!" in named)
+    @test "both!" in named
+    @test "absarr!" in named
+end
