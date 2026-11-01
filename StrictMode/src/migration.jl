@@ -8,6 +8,25 @@
 # all — holds code a reader copies, and a removed name inside one is exactly what this looks for.
 const _REFERENCE_FENCES = ("@docs", "@meta", "@index", "@contents", "@autodocs")
 
+# One regex builder for both scanners, because every boundary here has an exception.
+#
+# A TRAILING `\b` is wrong for a name ending in `!`: the boundary sits between `!` and whatever
+# follows, and `!` is already a non-word character, so `\b` holds only when the next character IS a
+# word character — which it never is at `set_ignore_barrier!(…)`. Such an entry matches nothing at
+# all.
+#
+# A LEADING `\b` is wrong before `@`, for the mirror-image reason, and a `(?<!\.)` lookbehind is
+# wrong except where it is needed: a handful of entries map a bare name to its module-qualified
+# spelling (`divergence_report` → `StrictModeTest.divergence_report`), and only those would
+# otherwise report every use of their own replacement. Applying the lookbehind to all of them hides
+# a genuinely stale `StrictMode.backend_available()`.
+function _removed_name_regex(from::AbstractString, to::Union{Nothing, AbstractString})
+    self_qualified = !isnothing(to) && endswith(to, from) && to != from
+    lead = self_qualified ? "(?<![\\w.])" : (startswith(from, '@') ? "" : "\\b")
+    trail = endswith(from, '!') ? "" : "\\b"
+    return Regex(lead * "\\Q" * from * "\\E" * trail)
+end
+
 # The info string of an opening fence: " ```@example  " -> "@example", " ``` " -> "".
 function _fence_tag(line::AbstractString)
     rest = lstrip(lstrip(line), '`')
@@ -86,8 +105,7 @@ function migration_report(
                     # The LEADING boundary is only added for bare identifiers: `\b` before `@`
                     # never matches, since both sides of that position are non-word characters,
                     # which would silently find zero macros.
-                    lead = startswith(from, '@') ? "" : "\\b"
-                    occursin(Regex(lead * "\\Q$from\\E\\b"), line) || continue
+                    occursin(_removed_name_regex(from, to), line) || continue
                     # Every distinct name on the line, not just the first: a single guard line can
                     # reference two deleted names (`analysis_mode() === :fast ||
                     # backend_available()` is the shape three consumers actually use), and
@@ -109,11 +127,15 @@ function migration_report(
         out = Tuple{String, Int, String, Union{Nothing, String}}[]
         # Excluded by PATH rather than by mutating `walkdir`'s directory vector: that vector is the
         # iterator's own state, and filtering it stops the walk instead of pruning it.
+        # Matched against the path RELATIVE to the package root. Against the absolute path, a
+        # checkout that merely sits under a directory called `deps` or `build` — a depot, a vendored
+        # tree — has every one of its own markdown files skipped.
         skip = ("/.git/", "/node_modules/", "/build/", "/deps/")
         # `onerror` must not be the default `throw`: one unreadable directory anywhere under the
         # package root would otherwise abort the whole report, including its counted `.jl` result.
         for (dir, _, files) in walkdir(root; onerror = _ -> nothing)
-            any(s -> occursin(s, dir * "/"), skip) && continue
+            rel = relpath(dir, root)
+            any(s -> occursin(s, "/" * rel * "/"), skip) && continue
             for file in files
                 endswith(file, ".md") || continue
                 path = joinpath(dir, file)
@@ -137,10 +159,7 @@ function migration_report(
                     end
                     iscode || continue
                     for (from, to) in pairs
-                        # A qualified name is the REPLACEMENT, not the removed one: several entries
-                        # map a bare name to its module-qualified spelling, so a plain word-boundary
-                        # match reports each of those against its own fix.
-                        occursin(Regex("(?<![\\w.])\\Q$from\\E\\b"), line) || continue
+                        occursin(_removed_name_regex(from, to), line) || continue
                         push!(out, (relpath(path, root), n, from, to))
                     end
                 end

@@ -381,3 +381,91 @@ end
 
     @test sprint(show, StrictMode.StrictFinding[]) == "0 StrictMode findings"
 end
+
+@testitem "an atomic read-modify-write is a write, in both concurrency scans" begin
+    using StrictMode
+
+    # `@atomic x.f += v` lowers to `Expr(:invoke_modify, …)`, a third call head beside `:call` and
+    # `:invoke`. A scan matching only the first two reads it as no call at all and reports a clean
+    # pass on a plan an apply atomically increments — a false pass, which is what these scans exist
+    # to prevent.
+    module Atomics
+    mutable struct Plan
+        @atomic counter::Int
+        buf::Vector{Int}
+    end
+    rmw(p::Plan) = (@atomic p.counter += 1; nothing)
+    swap(p::Plan) = (@atomicswap p.counter = 2; nothing)
+    store(p::Plan) = (@atomic p.counter = 1; nothing)
+    readonly(p::Plan) = p.counter + 1
+    end
+
+    p = Atomics.Plan(0, [0])
+    Atomics.rmw(p); Atomics.swap(p); Atomics.store(p); Atomics.readonly(p)
+
+    for (name, f) in (("rmw", Atomics.rmw), ("swap", Atomics.swap), ("store", Atomics.store))
+        vs = StrictMode.concurrency_findings(f, (Atomics.Plan,))
+        @test !isempty(vs)
+        @test any(v -> v.certain, vs)        # an atomic write is one the scan READ
+    end
+    @test isempty(StrictMode.concurrency_findings(Atomics.readonly, (Atomics.Plan,)))
+
+    # The threadid scan shares the same filter, and that guarantee GATES.
+    # Atomic indexing is defined on `GenericMemory`, not on `Array`, so the per-thread buffer is a
+    # `Memory` here.
+    module TidAtomics
+    const FLAT = AtomicMemory{Int}(undef, Threads.maxthreadid())
+    rmw() = (@atomic FLAT[Threads.threadid()] += 1; nothing)
+    end
+    for i in 1:Threads.maxthreadid()
+        @atomic TidAtomics.FLAT[i] = 0
+    end
+    TidAtomics.rmw()
+    @test !isempty(StrictMode.threadid_state_findings(TidAtomics.rmw, ()))
+
+    # An atomic write that neither store table names must not be cleared as read-only either.
+    for n in (:setglobal!, :swapglobal!, :atomic_pointerset, :atomic_pointermodify)
+        m = isdefined(Core, n) ? Core : Core.Intrinsics
+        @test !StrictMode._is_readonly_builtin(GlobalRef(m, n))
+    end
+    # …while a builtin that cannot mutate still is, whichever module resolved its binding.
+    @test StrictMode._is_readonly_builtin(GlobalRef(StrictMode, :(===)))
+end
+
+@testitem "the warn path does not assert a mutation the scan never saw" begin
+    using StrictMode
+
+    module Headline
+    mutable struct P
+        buf::Vector{Float64}
+    end
+    @noinline d5(b) = (b[1] = 1.0; nothing)
+    @noinline d4(b) = d5(b)
+    @noinline d3(b) = d4(b)
+    @noinline d2(b) = d3(b)
+    @noinline d1(b) = d2(b)
+    far!(p::P) = (d1(p.buf); nothing)
+    near!(p::P) = (p.buf[1] = 1.0; nothing)
+    end
+
+    p = Headline.P(zeros(2))
+    Headline.far!(p); Headline.near!(p)
+
+    # The certain case states the mutation; the uncertain case must not.
+    err = try
+        @assert_concurrency_safe Headline.near!(p)
+        nothing
+    catch e
+        e
+    end
+    @test err isa StrictMode.StrictViolation
+    @test occursin("is mutated", sprint(showerror, err))
+
+    # The uncertain case warns, and the warning says what the scan actually established.
+    @test_logs (:warn, r"cannot establish that the plan argument is read-only") match_mode = :any (
+        @assert_concurrency_safe Headline.far!(p)
+    )
+    @test_logs (:warn, r"unproven, not disproven") match_mode = :any (
+        @assert_concurrency_safe Headline.far!(p)
+    )
+end

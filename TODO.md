@@ -614,6 +614,53 @@ only when a package image grew 383 MiB) is exactly what the growth gate catches.
   it: a suite whose executed-assertion count drops is the signal, and that needs no source analysis
   at all. Decide which before building either.
 
+## Open — from the 0.5.7 code review
+
+- [ ] **A store through an object LOADED from a threadid-indexed slot is invisible, and this
+  guarantee GATES.** The threadid scan taints the `threadid()` result and the `memoryref` built
+  from it, so `FLAT[Threads.threadid()] = 1` is found. It does not taint a value loaded back OUT
+  of that slot, so a store into that value is not. Measured on 1.13.3:
+
+  | body | findings |
+  |---|---|
+  | `FLAT[Threads.threadid()] = 1` (flat array) | 1, certain |
+  | `@atomic FLAT[Threads.threadid()] += 1` (`AtomicMemory`) | 1, certain |
+  | `PL[Threads.threadid()].value = 1` (array of mutable structs) | **0** |
+  | `@atomic AC[Threads.threadid()].value += 1` | **0** |
+
+  Note the third row: it is NOT about atomics. A per-thread array of mutable cells — an ordinary
+  way to write exactly the hazard this check exists for — passes silently, and
+  `_guarantee_gates(:no_threadid_state)` is `true`, so it passes a GATE. The code review
+  attributed this to the `:invoke_modify` statement head; that was one of two causes and fixing it
+  did not fix these rows.
+
+  *The shape of the fix:* a third taint set beside `tid` and `tidref` for values loaded out of a
+  threadid-derived reference (`memoryrefget`/`getfield` on a `tidref`), so a store whose CONTAINER
+  is in that set records. It is a taint-propagation change to a gating scan, so it wants its own
+  review and its own false-positive measurement over a real package before landing — a value loaded
+  from a per-thread slot and then written is the hazard, but a value loaded and only READ must stay
+  clean.
+
+- [ ] **`findings(f, types; guarantees = (:no_threadid_state,))` returns `:pass` for a signature
+  with NO method.** `effects()` on the MethodError path satisfies `notaskstate`, so the fast clear
+  fires and the scan never runs. "Could not check" renders as a pass, on a gating guarantee, which
+  is the invariant CLAUDE.md states must never break (`_unevaluated` exists for exactly this).
+  Surfaced by the first adversarial pass, pre-existing. The fix is to confirm a method exists
+  before trusting the effects clear.
+
+- [ ] **`audit` does not expand policy-set names.** `audit(Mod; guarantees = :all)` throws
+  `MethodError: iterate(::Symbol)` from `_split_exempt`, and `guarantees = (:all,)` produces one
+  `:fail "unknown guarantee :all"` per item. Only `register_strict!`, `@strict_policy` and
+  `@strict_function` route through `_check_guarantees`. Pre-existing; the asymmetry is surprising
+  given both take a `guarantees` keyword.
+
+- [ ] **Nested and alternate markdown fences in `migration_report`.** The fence tracker counts any
+  line starting with three backticks, so a three-backtick block inside a four-backtick block closes
+  the outer one early, and `~~~` fences are not recognized at all. Both are false negatives only,
+  and the scan is informational and uncounted, so this is cosmetic until someone reports a miss.
+  Recording the backtick-count fix: remember the opening run length and close only on a run at
+  least that long.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding

@@ -154,7 +154,20 @@ const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))   # value-carrying: taint resu
 # Is this dynamic callee a builtin or intrinsic that cannot mutate? A builtin cannot dispatch, so
 # it is not the unresolved call the conservative record is for — but `_STORE_OPS` and
 # `_BASE_MUTATORS` name the ones that DO write, and those must keep their records.
-function _is_readonly_builtin(@nospecialize(callee), nm)
+# Resolved names that must never be cleared, and are not in `_STORE_OPS` or `_BASE_MUTATORS`.
+# `_STORE_OPS` means "the container is at position N", and these do not fit that: a global write's
+# container is a Module, which is never tainted, and an atomic pointer write is a store through a
+# raw pointer rather than through a tracked container. They belong here instead, because
+# `_is_readonly_builtin` clears by exclusion — anything a table does not name is treated as unable
+# to mutate, so an unnamed write is a silent pass.
+const _NEVER_READONLY = Set{Symbol}(
+    (
+        :setglobal!, :swapglobal!, :modifyglobal!, :replaceglobal!, :setglobalonce!,
+        :atomic_pointerset, :atomic_pointerswap, :atomic_pointermodify, :atomic_pointerreplace,
+    )
+)
+
+function _is_readonly_builtin(@nospecialize(callee))
     callee isa GlobalRef || return false
     isconst(callee.mod, callee.name) || return false
     v = try
@@ -171,7 +184,10 @@ function _is_readonly_builtin(@nospecialize(callee), nm)
     catch
         return false
     end
-    return !(haskey(_STORE_OPS, true_name) || true_name in _BASE_MUTATORS)
+    return !(
+        haskey(_STORE_OPS, true_name) || true_name in _BASE_MUTATORS ||
+            true_name in _NEVER_READONLY
+    )
 end
 const _BASE_MUTATORS = Set{Symbol}(
     (
@@ -267,8 +283,14 @@ function _taint_scan_ci(
                 continue
             end
 
-            (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) || continue
-            isinvoke = st.head === :invoke
+            # `:invoke_modify` is the third call head, and it is the one the atomic
+            # read-modify-write forms use: `@atomic p.x += 1` lowers to
+            # `Expr(:invoke_modify, ci, modifyfield!, …)`. It carries an `:invoke`'s layout —
+            # callee second, data from the third — so it is read the same way. Omitting it reports
+            # a clean pass on a plan whose field an apply atomically increments.
+            (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)) ||
+                continue
+            isinvoke = st.head === :invoke || st.head === :invoke_modify
             callee = isinvoke ? st.args[2] : st.args[1]
             dataargs = isinvoke ? st.args[3:end] : st.args[2:end]
             nm = _callee_name(callee)
@@ -326,7 +348,7 @@ function _taint_scan_ci(
                         "hands a plan-reachable value to `$nm`, a mutating operation", fr;
                         certain = true
                     )
-                elseif _is_readonly_builtin(callee, nm)
+                elseif _is_readonly_builtin(callee)
                     # A builtin or intrinsic, which cannot dispatch and cannot mutate unless it is
                     # one of the named writes. Classified by what the callee RESOLVES to, never by
                     # the module its binding came through: optimized IR spells a builtin through
@@ -499,9 +521,16 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
     io = IOBuffer()
+    # The headline has to match what the scan actually established, or the warn path states as fact
+    # the very thing the certainty split says it could not see.
+    sure = any(v -> v.certain, vs)
     println(
-        io, "plan argument is mutated during apply — NOT safe to share across concurrent tasks ",
-        "($(length(vs)) site(s)):"
+        io,
+        sure ?
+            "plan argument is mutated during apply — NOT safe to share across concurrent tasks" :
+            "cannot establish that the plan argument is read-only — sharing it across concurrent " *
+            "tasks is unproven, not disproven",
+        " ($(length(vs)) site(s)):"
     )
     for (i, v) in enumerate(vs)
         print(io, "  [", i, "] ", v.message)
@@ -511,7 +540,7 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     # Throws only where the scan READ a write; a record it could not rule out warns instead, which
     # is the same rule `@assert_typestable` and `@assert_trusted` apply to their own uncertain
     # signals. A single certain record is enough to fail: the others do not weaken it.
-    _fail(:concurrency_safe, target, String(take!(io)); gates = any(v -> v.certain, vs))
+    _fail(:concurrency_safe, target, String(take!(io)); gates = sure)
     return nothing
 end
 
@@ -543,8 +572,11 @@ mutator — raises `StrictViolation`. A record it could only *not rule out* warn
 behind dynamic dispatch, a task body whose closure type did not resolve, or a chain that reached
 `max_depth` and stopped. So a real write far enough down the call chain warns rather than fails,
 because the scan never saw it — raise `max_depth` to reach it, or assert on the inner method
-directly. This is the package-wide rule: StrictMode raises only where it is sure, and
-`StrictModeTest` raises either way.
+directly.
+
+The proof tier does not remove that uncertainty: no backend decides whether an argument is
+written, so `StrictModeTest` runs this same scan and inherits the same split — an uncertain record
+is informational there too. That is unlike `@test_noalloc`, where AllocCheck replaces the guess.
 
 This is a **complementary static proof**, not a total one: it does no alias analysis (if the
 scratch you pass secretly aliases plan-owned storage it will not notice), models Base mutation
@@ -648,8 +680,12 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                 any(v -> _op_tainted(v, tid, ()), st.values) && mark(tid, true)
                 continue
             end
-            (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) || continue
-            isinvoke = st.head === :invoke
+            # `:invoke_modify` as above: `@atomic BUF[Threads.threadid()].value += 1` is the
+            # canonical shape of this hazard and the one most likely to be written atomically, and
+            # this guarantee GATES, so missing the head is a silent pass rather than a quiet report.
+            (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)) ||
+                continue
+            isinvoke = st.head === :invoke || st.head === :invoke_modify
             callee = isinvoke ? st.args[2] : st.args[1]
             dataargs = isinvoke ? st.args[3:end] : st.args[2:end]
             nm = _resolve_callee_name(callee, code)

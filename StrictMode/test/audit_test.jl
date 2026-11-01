@@ -372,6 +372,23 @@ end
     @test !occursin("f.md:5", fout)             # @docs is a reference list
     @test occursin("f.md:8", fout)              # @setup is code
     @test occursin("f.md:11", fout)             # an untagged fence is code
+
+    # A removed name ending in `!` must be matchable: a trailing `\b` after `!` only holds when the
+    # NEXT character is a word character, which it never is at a call site.
+    @test occursin(StrictMode._removed_name_regex("set_ignore_barrier!", "StrictModeTest.set_ignore_barrier!"), "set_ignore_barrier!(true)")
+    # The lookbehind belongs only to entries whose replacement is their own qualified spelling.
+    @test !occursin(StrictMode._removed_name_regex("divergence_report", "StrictModeTest.divergence_report"), "StrictModeTest.divergence_report(x)")
+    @test occursin(StrictMode._removed_name_regex("backend_available", "proofs_loaded()"), "StrictMode.backend_available()")
+
+    # The skip list is relative to the package root, so a checkout that merely SITS under a
+    # directory called `deps` or `build` still has its own markdown read.
+    nested = joinpath(mktempdir(), "deps", "MyPkg")
+    mkpath(joinpath(nested, "src"))
+    write(joinpath(nested, "src", "a.jl"), "x = 1\n")
+    write(joinpath(nested, "README.md"), "```julia\n@assert_trim_safe f(1.0)\n```\n")
+    nio = IOBuffer()
+    migration_report(nested; io = nio)
+    @test occursin("README.md", String(take!(nio)))
     # A skipped block must still CLOSE: otherwise everything after it reads as fenced.
     @test StrictMode._fence_tag("```@example") == "@example"
     @test StrictMode._fence_tag("```julia") == "julia"

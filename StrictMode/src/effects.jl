@@ -101,7 +101,10 @@ end
 
 function _call_callee_and_args(ci, st)
     Meta.isexpr(st, :call) && return _unopt_callee(ci, st.args[1]), st.args[2:end]
-    Meta.isexpr(st, :invoke) && return _unopt_callee(ci, st.args[2]), st.args[3:end]
+    # `:invoke_modify` carries an `:invoke`'s layout and is what the atomic read-modify-write forms
+    # lower to, so a scan that omits it reads `@atomic x.f += v` as no call at all.
+    (Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)) &&
+        return _unopt_callee(ci, st.args[2]), st.args[3:end]
     return nothing, ()
 end
 
