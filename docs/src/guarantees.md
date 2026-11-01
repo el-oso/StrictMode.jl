@@ -1324,22 +1324,82 @@ property [`@assert_noalloc`](@ref) checks and `StrictModeTest.@test_noalloc` pro
 goes with it. That is the same end state Rust reaches by construction, reached instead by a check
 you can point at one function.
 
-### What Rust's model still wins
+### Safety, flexibility, speed — all three
 
-Two things, and neither is about memory safety:
+The position this package takes is a greedy one: safety, flexibility *and* speed, rather than a
+choice among them. Each approach gives one of the three away, and it is worth being explicit about
+which:
 
-- **Data races, at compile time.** `Send` and `Sync` are checked for all code. Julia has no
-  equivalent, and [`@assert_concurrency_safe`](@ref) and [`@assert_no_threadid_state`](@ref) are IR
-  scans: they find what they can read and are field-insensitive, so a task writing a disjoint slice
-  of a shared output still reports. This is a real gap, not a difference of style.
-- **Release of resources that are not memory.** `Drop` runs at scope exit, for every path.
-  Julia's collector decides when, and for a GPU buffer or a file handle that is not a performance
-  question — the CPU collector cannot see GPU memory pressure at all.
-  [`resource_leak_report`](@ref) finds a handle that outlives its owner and deliberately does not try
-  to prove release on every path, because that needs post-dominance over the exception control flow
-  and a `close` in a helper defeats it.
+| | safety | flexibility | speed |
+|---|---|---|---|
+| Julia, plain | by construction, for all code | full — generic code stays generic, no ownership discipline | leaks where a collector pauses, a specialization goes unstable, or a literal widens a kernel |
+| Rust | in safe code | **constrained** — every program obeys the rules, needed or not | yes, until a kernel needs `unsafe`, and then the proof stops wholesale |
+| Julia with StrictMode | unchanged | unchanged | the properties that cost speed are **named, checked and gated** |
 
-Rust also needs no runtime, which matters where there cannot be one.
+The third row is the only one that gives nothing up, and it is honest about what it delivers:
+StrictMode does not make code fast. It makes the difference between the code you wrote and the code
+you got *visible*, per property, and fails a build when that difference appears. The speed is still
+yours to write; what you gain is that a regression cannot pass quietly.
+
+Flexibility is the axis most easily lost sight of. A Julia kernel written once, generic in `T`,
+compiles to the same machine code a hand-specialized version would — and
+[`@assert_typestable`](@ref) plus [`@assert_vectorized`](@ref) are how you confirm it did, for each
+concrete type, without writing the kernel twice. Nothing has to be given up to ask the question.
+
+### Everyone pays for safety
+
+The disagreement between the two languages is about the currency, not the goal.
+
+**Julia pays with a runtime.** Safety comes by construction: nothing frees anything while a
+reference to it exists, so no annotation, lifetime or ownership discipline is required of the
+programmer, and a generic function stays generic. The bill is a collector in the process, choosing
+its own moment to run.
+
+**Rust pays at compile time.** There is no runtime to carry, but every program obeys a fixed set of
+rules whether or not it needs them, and that costs flexibility. A cyclic or self-referential
+structure has to be expressed with indices, an arena, or `Rc<RefCell<…>>` — and `RefCell` moves the
+aliasing check to run time, where a violation is a panic rather than a compile error. Rust's own
+escape hatch for shared mutation is a dynamic check, which is worth remembering when the comparison
+is framed as static-versus-dynamic.
+
+**The hot kernel is where both bills come due.** Julia's collector can pause the loop. Rust's checker
+is in the way of the indexing and the intrinsics the loop wants, so the kernel reaches for `unsafe` —
+and the proof stops for that whole region, including the parts that were never the problem.
+
+StrictMode is the third option, and it is deliberately not a third set of rules. It starts from the
+safe baseline Julia already has and lets a program name the property it actually needs, one signature
+at a time:
+
+- the hot loop must not allocate, so the collector has nothing to do there and cannot pause it
+  ([`@assert_noalloc`](@ref), proved by `StrictModeTest.@test_noalloc`);
+- this kernel must vectorize and must not spill ([`@assert_vectorized`](@ref),
+  [`@assert_no_spill`](@ref));
+- this specialization must be concretely typed ([`@assert_typestable`](@ref));
+- this layer must not leave the language's safety at all
+  ([`unsafe_report`](@ref), `StrictModeTest.test_no_unsafe`).
+
+None of those is a trade against correctness, and none is a mode. A package can demand
+allocation-freedom of three kernels and say nothing about the rest of itself, which is the opposite
+of entering `unsafe` to get one unchecked index.
+
+**And the opt-in is free where it matters.** `_gate` is a compile-time branch on a const, so with
+[`disable_checks!`](@ref) every `@assert_` expands to the bare call: a shipped application carries no
+check, no branch and no dependency. The cost is paid while developing, not while running — which is
+the one sense in which this really is cheaper than paying at compile time, because the price is
+charged only where somebody asked a question.
+
+### What "safe" claims, precisely
+
+Rust's `safe` is a narrow and precise claim: no undefined behavior in safe code. It is not a claim
+that a program cannot deadlock (safe Rust can), cannot leak (`mem::forget` is safe, and `Rc` cycles
+leak), cannot race in the general sense (data races are prevented; other race conditions are not), or
+cannot panic. The soundness of a safe abstraction also often rests on `unsafe` internals that the
+compiler does not verify — it checks the caller, not the proof the author made.
+
+That is worth stating because the word carries more weight in argument than it does in the
+specification, and the same caution applies here: Julia's memory safety says nothing about deadlocks,
+leaks or logic races either. Neither language's baseline is the whole of correctness, which is why
+both end up with tools layered on top.
 
 ### Where there is no Rust counterpart
 
@@ -1359,15 +1419,24 @@ nothing to compare against:
 - **numeric conversion width** — a bare literal in Julia carries a default type, so one unsuffixed
   constant can widen a whole kernel.
 
-### The difference that matters
+### Identified gaps
 
-Rust decides before the code exists, and the answer holds for every caller forever — one mode,
-entered or left wholesale. StrictMode starts from code that is already safe and already compiles, and
-asks whether *this* specialization became the code you intended, for the properties you named. The
-first is a proof about a program; the second a measurement of one. The second is the one you can
-apply to three functions on a Tuesday.
+Two properties Rust's model covers that this one does not yet. They are listed as open work rather
+than as a defense of the design:
 
-That is also why the two packages are separate. `StrictMode` reports and depends on no analysis
+- **Data races, at compile time.** `Send` and `Sync` are checked for all code.
+  [`@assert_concurrency_safe`](@ref) and [`@assert_no_threadid_state`](@ref) are IR scans instead:
+  they find what they can read, and they are field-insensitive, so a task writing a disjoint slice of
+  a shared output still reports. Closing this means a property that holds for every caller, which
+  typed IR alone cannot give.
+- **Release of resources that are not memory.** `Drop` runs at scope exit, on every path. Julia's
+  collector decides when, and for a GPU buffer or a file handle that is not a performance question —
+  the CPU collector cannot see GPU memory pressure at all.
+  [`resource_leak_report`](@ref) finds a handle that outlives its owner and stops short of proving
+  release on every path, because that needs post-dominance over the exception control flow and a
+  `close` in a helper defeats it.
+
+This is also why the two packages are separate. `StrictMode` reports and depends on no analysis
 backend; `StrictModeTest` proves and depends on three. A heuristic that aborts a consumer's precompile
 is worse than no check, and a proof costing a 680 MiB dependency does not belong in every user's
 package graph.
