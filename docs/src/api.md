@@ -213,6 +213,7 @@ specialization_report
 throw_report
 alias_guard_report
 resource_leak_report
+conversion_report
 StrictFinding
 StrictMode.Exemption
 format_findings

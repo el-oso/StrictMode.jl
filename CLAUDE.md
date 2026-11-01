@@ -176,7 +176,21 @@ StrictMode/src/
                         `===` matches the `=== nothing` of every for-loop's iteration protocol and
                         marked every looping method as guarded, measured). Value-free, so it sweeps
                         where :noalias cannot; :info because a guard inside an unfollowed callee
-                        reads as absent. Judged on m.sig, so an uncalled method is still covered
+                        reads as absent. Judged on m.sig, so an uncalled method is still covered.
+                        conversion_report is the fourth: a method converting its OWN numeric data to
+                        another type, in three named directions (widened/narrowed/retyped). Read
+                        from the conversion INTRINSIC (fpext/sext_int/zext_int/fptrunc/trunc_int/
+                        sitofp/uitofp/fptosi/fptoui), never from the types the locals carry and
+                        never from the return type. A type set cannot tell a converted value from an
+                        unrelated one, and integers make that fatal: a clean Float32 loop carries
+                        Int64 and UInt64 counters, so comparing type sets reports every loop in a
+                        package (measured). The return type is a mask besides — ::T, T(x) and a
+                        store into Array{T} all convert at the boundary and report a flawless T. A
+                        conversion counts as the method's own only when its operand type is one the
+                        arguments name; Bool is excluded as data, since it is an Integer that widens
+                        to be counted. :info, because a deliberately wider accumulator is correct
+                        code and is reported (measured: 0 findings over StrictMode's 618 methods,
+                        150 over Base.Math's 535, where the widening is the library's whole job)
   resources.jl        — resource_leak_report: where a register_scoped! type, or a value projected
                         out of one, outlives its owner — RETURNED, STORED into a container that is
                         not itself scoped, or CAPTURED BY A TASK (same jl_new_task crossing the

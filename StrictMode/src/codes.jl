@@ -44,6 +44,7 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:throws, nothing) => :SM0307,
     (:alias_guard, nothing) => :SM0308,
     (:resource, nothing) => :SM0309,
+    (:conversion, nothing) => :SM0310,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -84,6 +85,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0307 => "the exceptions the method's own body raises, which its callees' are not",
     :SM0308 => "the method mutates and takes arguments that could overlap, and never asks whether they do",
     :SM0309 => "a registered resource, or a value borrowed from one, outlives the scope that owns it",
+    :SM0310 => "the method converts its own numeric data to another type",
 )
 
 # The code for a verdict, or `nothing` when the kind is not in the table. A guarantee with a known

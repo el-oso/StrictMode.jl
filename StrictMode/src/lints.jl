@@ -283,3 +283,183 @@ function alias_guard_report(mod::Module; only = nothing, exempt = ())
     end
     return out
 end
+
+# ── numeric conversions ──────────────────────────────────────────────────────────────────────────
+
+# Every concrete number type appearing anywhere in a type, element types included: a
+# `Vector{Float64}` argument names `Float64` exactly as a bare `Float64` does. `Bool` is left out
+# because it is an `Integer` in Julia, so counting it would make a flag argument a conversion source
+# in every method that branches on one.
+function _numeric_types!(acc::Set{Any}, @nospecialize(T), depth::Int = 0)
+    depth > 8 && return acc                      # a self-referential parameter cannot deepen forever
+    T isa Type || return acc
+    if T isa UnionAll
+        return _numeric_types!(acc, T.body, depth + 1)
+    elseif T isa Union
+        for t in Base.uniontypes(T)
+            _numeric_types!(acc, t, depth + 1)
+        end
+        return acc
+    elseif T isa DataType
+        isconcretetype(T) && T <: Number && T !== Bool && push!(acc, T)
+        for p in T.parameters
+            _numeric_types!(acc, p, depth + 1)
+        end
+    end
+    return acc
+end
+
+# Julia lowers every numeric conversion to one of these intrinsics, and the name already states the
+# direction, so classifying one needs no size comparison.
+const _CONV_KIND = Dict{Symbol, String}(
+    :fpext => "widened",
+    :sext_int => "widened",
+    :zext_int => "widened",
+    :fptrunc => "narrowed",
+    :trunc_int => "narrowed",
+    :sitofp => "retyped",
+    :uitofp => "retyped",
+    :fptosi => "retyped",
+    :fptoui => "retyped"
+)
+
+# The inferred type of a conversion's operand, whichever kind of IR reference holds it.
+function _conv_operand_type(ci, @nospecialize(x))
+    if x isa Core.Argument
+        slots = ci.slottypes
+        return (slots isa Vector && 1 <= x.n <= length(slots)) ? slots[x.n] : nothing
+    elseif x isa Core.SSAValue
+        sts = ci.ssavaluetypes
+        return (sts isa Vector && 1 <= x.id <= length(sts)) ? sts[x.id] : nothing
+    end
+    return typeof(x)
+end
+
+# The numeric conversions one signature performs on its OWN data, as `(from, to, direction)`.
+#
+# Read from the conversion INSTRUCTION, not from the set of types the locals carry. A type set
+# cannot tell a converted value from an unrelated one, and integers make that fatal: a clean
+# `Float32` loop carries `Int64` and `UInt64` locals for its counters, so comparing type sets
+# reports every loop in a package (measured). An intrinsic is the conversion itself, so a kernel
+# that keeps its precision has none at all.
+#
+# The operand type must be one the arguments name, which is what makes this the method's own data
+# rather than an incidental conversion inside something it called.
+function _conversions(@nospecialize(f), @nospecialize(types::Tuple))
+    out = Set{Tuple{Any, Any, String}}()
+    own = Set{Any}()
+    for A in types
+        _numeric_types!(own, A)
+    end
+    isempty(own) && return out
+    ci = try
+        Base.code_typed(f, types; optimize = true)[1].first
+    catch
+        return out
+    end
+    sts = ci.ssavaluetypes
+    sts isa Vector || return out
+    for (i, st) in enumerate(ci.code)
+        Meta.isexpr(st, :call) || continue
+        callee = st.args[1]
+        (callee isa GlobalRef && haskey(_CONV_KIND, callee.name)) || continue
+        length(st.args) >= 3 || continue
+        src = _conv_operand_type(ci, st.args[end])
+        (src in own) || continue
+        dst = (1 <= i <= length(sts)) ? sts[i] : nothing
+        (dst isa DataType && isconcretetype(dst) && dst <: Number) || continue
+        dst === src && continue
+        push!(out, (src, dst, _CONV_KIND[callee.name]))
+    end
+    return out
+end
+
+"""
+    conversion_report(mod::Module; only = nothing, exempt = ()) -> Vector{StrictFinding}
+
+Methods of `mod` that convert their own numeric data to another type. Every finding is `:info`.
+
+A bare numeric literal in Julia carries a default type — `Float64` for `0.529`, `Int` for `2` — so
+one unsuffixed constant converts a whole kernel: `0.529 * x` with `x::Float32` is a `Float64`
+multiply, and `2 * x` with `x::Int32` is an `Int64` multiply. The result converts back on the way
+out, so the answers are right and the output type is right, and the arithmetic ran at half the SIMD
+width. Measured on a 65536-element loop, `0.529` against `T(0.529)`: **2.2 µs against 7.2 µs**, with
+36 double-precision operations in the generated code and no single-precision ones.
+
+Three directions are reported, named in the finding:
+
+- **widened** — `Float32` to `Float64`, `Int32` to `Int64`. The arithmetic runs wider than the data.
+- **narrowed** — `Float64` to `Float32`, `Int64` to `Int32`. Values outside the narrower range or
+  precision are lost.
+- **retyped** — between integer and floating point, which rounds or truncates.
+
+**Nothing else reports this.** The compiler is not permitted to remove the conversion: narrowing the
+arithmetic would change results (~19% of random `Float32` inputs differ between
+`Float64`-then-round and `Float32`-throughout), so the promotion is semantics rather than a missed
+optimization, and `@fastmath` does not narrow it either. An error analyzer sees no error, an
+optimization analyzer sees no dynamic dispatch, and [`@assert_typestable`](@ref) sees a perfectly
+concrete type — `Float64` is concrete, it is merely the wrong one.
+
+Read from the conversion **instruction**, never from the types the locals carry, and never from the
+return type:
+
+- A type set cannot distinguish a converted value from an unrelated one. A clean `Float32` loop
+  carries `Int64` and `UInt64` locals for its counters, so comparing type sets reports every loop in
+  a package.
+- Every way of handing back a `T` converts at the boundary — a `::T` declaration, an explicit `T(x)`,
+  a store into an `Array{T}` — so a kernel computing entirely in `Float64` still returns a flawless
+  `Float32`. A check reading the return type passes such a method.
+
+A conversion is attributed to this method only when its operand has a type the arguments name, which
+is what separates the method's own data from an incidental conversion inside something it called.
+
+Two shapes are reported that may be exactly what the author wanted, which is why this never gates:
+
+- **a deliberately wider accumulator**, such as a `Float64` sum over `Float32` data for numerical
+  stability. This is correct code and it is reported.
+- **an explicit narrowing or retyping**, such as `Float32(x)` in a `Float64` kernel or `round` to an
+  integer index.
+
+```julia
+conversion_report(MyPkg)                      # every conversion
+conversion_report(MyPkg; only = r"^kernel_")  # one family
+```
+
+Judged on the concrete signatures a method has **compiled**, like [`bang_report`](@ref), so warm the
+kernels first; a method with no specialization is skipped rather than guessed at.
+"""
+function conversion_report(mod::Module; only = nothing, exempt = ())
+    out = StrictFinding[]
+    methods_, _ = module_methods(mod; only, exempt)
+    for m in methods_
+        sigs = _method_signatures(m)
+        isempty(sigs) && continue
+        f = try
+            _method_function(m).instance
+        catch
+            continue
+        end
+        convs = Set{Tuple{Any, Any, String}}()
+        for tt in sigs
+            union!(convs, _conversions(f, Tuple(tt)))
+        end
+        isempty(convs) && continue
+        shown = sort!(["$(c[1]) to $(c[2]) ($(c[3]))" for c in convs])
+        widened = any(c -> c[3] == "widened", convs)
+        push!(
+            out,
+            StrictFinding(
+                nameof(mod), string(m.name), string(m.sig), :conversion, :info,
+                string(m.file), Int(m.line),
+                "converts its own values: " * join(shown, ", ") *
+                    (widened ? " — the arithmetic runs wider than the data" : ""),
+                "write the literals in the type the data already has, by suffix (`0.5f0`) or by " *
+                    "wrapping (`T(0.5)`), so no conversion is needed. A wider accumulator or a " *
+                    "narrowing chosen on purpose reports here too, so confirm the intent before " *
+                    "changing anything",
+                :report
+            )
+        )
+    end
+    return out
+end

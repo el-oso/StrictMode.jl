@@ -62,6 +62,7 @@ export dispatch_report, DispatchReport, dispatch_suggestions
 export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export unsafe_report, throw_report
 export bang_report, specialization_report, alias_guard_report, resource_leak_report
+export conversion_report
 export @assert_noescape, register_scoped!
 export @assert_noalias
 export clear_cache!, cache_stats
