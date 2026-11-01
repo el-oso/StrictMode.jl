@@ -194,7 +194,15 @@ end
 # Could a value of this type be an array, so that two parameters of it could name the same memory?
 # Asked of the TYPE, so the answer is "cannot be ruled out" rather than "is" — `Any` counts, and a
 # type the scan cannot narrow is not a type it has cleared.
-_could_be_array(@nospecialize(T)) = T isa Type && typeintersect(T, AbstractArray) !== Union{}
+# `Any` is excluded deliberately. `typeintersect(Any, AbstractArray)` is non-empty, so an
+# unannotated argument counted as a possible array and any `!` method with two of them was
+# reported — which is most generic Julia code, and was 5 of 6 findings on StrictMode itself (`f`,
+# `types`, `ci` parameters, none of them arrays). An `Any` declaration carries no information about
+# aliasing, and this check is `:info` precisely because an empty report is a lead rather than a
+# proof, so trading unknowable-type recall for a usable signal is the right side of that bargain.
+# An abstract ARRAY type still counts: `AbstractVector{T}` says the argument is an array.
+_could_be_array(@nospecialize(T)) =
+    T isa Type && T !== Any && typeintersect(T, AbstractArray) !== Union{}
 
 # How many of this method's parameters could alias one another. One array argument has nothing to
 # overlap with, so the guard question only arises from two.
@@ -262,6 +270,11 @@ alias_guard_report(MyPkg; only = r"^gemm")     # one family
 
 Judged on the method's declared signature, so a method with no compiled specialization is still
 covered — unlike the sweeps that read what has run.
+
+An argument declared `Any` does **not** count as a possible array. The declaration says nothing
+about aliasing, and counting it reported every `!` method with two unannotated arguments, which is
+most generic Julia code. An abstract array type still counts: `AbstractVector{T}` does say the
+argument is an array.
 """
 function alias_guard_report(mod::Module; only = nothing, exempt = ())
     out = StrictFinding[]
@@ -425,14 +438,34 @@ Two shapes are reported that may be exactly what the author wanted, which is why
   integer index.
 
 ```julia
-conversion_report(MyPkg)                      # every conversion
-conversion_report(MyPkg; only = r"^kernel_")  # one family
+conversion_report(MyPkg)                                  # every conversion
+conversion_report(MyPkg; only = r"^kernel_")              # one family
+conversion_report(MyPkg; from = Float32, to = Float64)    # one class
+conversion_report(MyPkg; directions = "narrowed")         # one direction
 ```
+
+`directions`, `from` and `to` filter which conversions count, and on a package with C-ABI shims
+that is the difference between a usable report and an unusable one: passing a Fortran `CHARACTER`
+through `Ptr{UInt8}` widens `UInt8` to `UInt32` at every such call, which is benign, unfixable
+without breaking the ABI, and numerous enough to bury the `Float32`-to-`Float64` findings this
+exists for. `from`/`to` take a type or a tuple of types; `directions` takes one of `"widened"`,
+`"narrowed"`, `"retyped"`, or a tuple.
 
 Judged on the concrete signatures a method has **compiled**, like [`bang_report`](@ref), so warm the
 kernels first; a method with no specialization is skipped rather than guessed at.
 """
-function conversion_report(mod::Module; only = nothing, exempt = ())
+function conversion_report(
+        mod::Module; only = nothing, exempt = (),
+        directions = ("widened", "narrowed", "retyped"), from = nothing, to = nothing
+    )
+    dirs = directions isa AbstractString ? (directions,) : directions
+    froms = isnothing(from) ? nothing : (from isa Type ? (from,) : from)
+    tos = isnothing(to) ? nothing : (to isa Type ? (to,) : to)
+    keep(c) =
+        (c[3] in dirs) &&
+        (isnothing(froms) || any(T -> c[1] === T, froms)) &&
+        (isnothing(tos) || any(T -> c[2] === T, tos))
+
     out = StrictFinding[]
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
@@ -447,6 +480,7 @@ function conversion_report(mod::Module; only = nothing, exempt = ())
         for tt in sigs
             union!(convs, _conversions(f, Tuple(tt)))
         end
+        filter!(keep, convs)
         isempty(convs) && continue
         shown = sort!(["$(c[1]) to $(c[2]) ($(c[3]))" for c in convs])
         widened = any(c -> c[3] == "widened", convs)

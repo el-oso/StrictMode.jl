@@ -669,6 +669,41 @@ only when a package image grew 383 MiB) is exactly what the growth gate catches.
   Recording the backtick-count fix: remember the opening run length and close only on a run at
   least that long.
 
+## Open — conversion_report attribution: THREE measured dead ends
+
+A conversion performed inside a Base callee is attributed to the caller. Reported independently by
+two packages: `x^n` at `(Float32, Int)` yields two findings neither of which is the caller's, and a
+`_larfg!`-style kernel with textbook `zero(T)`/`one(T)` discipline is reported because `hypot`
+promotes internally. Both read identically to a real leak, and only one is actionable.
+
+*Measured and dead, do not retry:*
+1. **`code_typed` debug info.** `ci.debuginfo.edges` is 0 for an optimized `CodeInfo`, and
+   `append_scopes!` attributes every one of Base's conversions to the caller's own file.
+2. **Innermost inlining frame.** `code_ircode` DOES keep the edges, but the innermost frame is Base
+   for a genuine leak too: `0.529 * x` materializes its `fpext` inside `Base.:*`, so
+   innermost-is-Base is true for everything.
+3. **Inlining depth.** Backwards, measured: the genuine leak in `0.529 * x` sits at depth 6, Base's
+   `^` spans 6–10 and overlaps it, and Base's `hypot` is at depth 4 — SHALLOWER than the real one.
+4. **A wide literal as the consumer's sibling operand.** Separates 4 of 5 fixtures — it correctly
+   clears the `hypot` case — but fails on `x^n`, because Base's `pow` carries its own `Float64`
+   literal. Not sound alone.
+
+*What is left:* source analysis. `TypedSyntaxNode` maps inferred types onto source positions, which
+answers both this and the older "name the offending literal" item, and it needs no new dependency
+since `Cthulhu` is already a weak dep that vendors `TypedSyntax`. That is a new analysis mode rather
+than a tweak to the IR scan, which is why it is still open.
+
+*Mitigated meanwhile:* `directions`/`from`/`to` filters make the real class visible without solving
+attribution — the field report that prompted them had 818 benign `UInt8` findings hiding about 20
+real ones.
+
+- [ ] **Does `conversion_report` see a GPU kernel's own code?** Reported from the field: 0 findings
+  across 43 `gpu_*` KernelAbstractions kernels, 35 of which had a CPU-visible specialization after a
+  real decode. A clean result there may mean the kernels were never analyzed rather than that they
+  are clean. Device helpers DID appear in the output, so it is not a blanket miss. Needs a positive
+  control — put a known `Float64` literal in a kernel and confirm it is reported — before either
+  claiming coverage or documenting the gap.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding

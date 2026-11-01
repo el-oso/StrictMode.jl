@@ -573,3 +573,213 @@ end
     @test isempty(scan(Slots.through_callee))
     @test isempty(StrictMode.threadid_state_findings(Slots.bump!, (Slots.Cell,)))
 end
+
+@testitem "an isbits plan argument cannot be written, and a `!` name is not a violation" begin
+    using StrictMode
+
+    module Shapes
+    mutable struct Plan
+        x::Int
+    end
+    const OUT = zeros(Int, 4)
+
+    # Argument 1 is an `Int`. The only stores go into arrays this method allocates itself, reached
+    # through an inlined helper. An `Int` is a COPY, so nothing is reachable only through it and no
+    # store the caller's value could observe exists — seeding it as shared taints every index
+    # derived from it, which made a write to a fresh local buffer read as a write to the plan.
+    @inline function link!(parent, ancestor, i, k)
+        while i != 0
+            nxt = ancestor[i]
+            ancestor[i] = k
+            parent[i] = k
+            i = nxt
+        end
+        return nothing
+    end
+    function etree(n::Int, colptr::Vector{Int}, rowval::Vector{Int})
+        parent = zeros(Int, n)
+        ancestor = zeros(Int, n)
+        for k in 1:n, p in colptr[k]:(colptr[k + 1] - 1)
+            link!(parent, ancestor, rowval[p], k)
+        end
+        return parent
+    end
+
+    writes(p::Plan) = (p.x = 1; nothing)
+    reads(p::Plan) = p.x + 1
+    fill_out!(out::Vector{Int}, p::Plan) = (out[1] = p.x; nothing)
+    at_two(n::Int, p::Plan) = (p.x = n; nothing)
+    end
+
+    Shapes.etree(2, [1, 1, 1], Int[])
+    Shapes.writes(Shapes.Plan(0))
+    Shapes.reads(Shapes.Plan(0))
+    Shapes.fill_out!(Shapes.OUT, Shapes.Plan(1))
+    Shapes.at_two(1, Shapes.Plan(0))
+
+    # An isbits plan argument reports nothing at all: the guarantee holds trivially.
+    @test isempty(StrictMode.concurrency_findings(Shapes.etree, (Int, Vector{Int}, Vector{Int})))
+    @test isempty(StrictMode.concurrency_findings(Shapes.at_two, (Int, Shapes.Plan); self_arg = 1))
+    # Naming the argument that really is shared still works.
+    @test !isempty(StrictMode.concurrency_findings(Shapes.at_two, (Int, Shapes.Plan); self_arg = 2))
+    # And a reference-holding plan is unaffected.
+    @test !isempty(StrictMode.concurrency_findings(Shapes.writes, (Shapes.Plan,)))
+
+    one_of(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:concurrency_safe,)))
+
+    # The swept verdicts. A `!` name declares that argument 1 is written, so the sweep says it
+    # cannot ask the question rather than failing — and must not say `:pass` either.
+    bang = one_of(Shapes.fill_out!, (Vector{Int}, Shapes.Plan))
+    @test bang.status === :info
+    @test !StrictMode._failed(bang)
+    @test occursin("`!` name declares", bang.reason)
+    @test occursin("self=", bang.suggestion)
+
+    @test StrictMode._failed(one_of(Shapes.writes, (Shapes.Plan,)))
+    @test !StrictMode._failed(one_of(Shapes.reads, (Shapes.Plan,)))
+    @test !StrictMode._failed(one_of(Shapes.etree, (Int, Vector{Int}, Vector{Int})))
+
+    # Only the real violation counts as a failure.
+    @test StrictMode.nfailures(
+        [
+            one_of(Shapes.writes, (Shapes.Plan,)),
+            one_of(Shapes.fill_out!, (Vector{Int}, Shapes.Plan)),
+            one_of(Shapes.reads, (Shapes.Plan,)),
+            one_of(Shapes.etree, (Int, Vector{Int}, Vector{Int})),
+        ]
+    ) == 1
+end
+
+@testitem "a keyword call names the function written, and an unreadable signature has a location" begin
+    using StrictMode
+
+    module KwShapes
+    mutable struct Plan
+        x::Int
+    end
+    mutable struct Holder
+        f::Any
+    end
+    @noinline target(p::Plan; scale::Int = 1) = p.x * scale
+    const H = Holder(target)
+    # The callee is `Any`-typed, so the keyword call cannot resolve and is recorded conservatively.
+    dyn(p::Plan) = H.f(p; scale = 2)
+    end
+    KwShapes.dyn(KwShapes.Plan(3))
+
+    # `kwcall` is Julia's keyword lowering, not a function anyone wrote, so naming it told a reader
+    # nothing about what to look at.
+    vs = StrictMode.concurrency_findings(KwShapes.dyn, (KwShapes.Plan,))
+    @test !isempty(vs)
+    @test !any(v -> v.certain, vs)                  # conservative, so the sweep reports `:info`
+    @test !occursin("`kwcall`", vs[1].message)
+    @test occursin("keyword call", vs[1].message)
+    @test !StrictMode._failed(
+        only(StrictMode.findings(KwShapes.dyn, (KwShapes.Plan,); guarantees = (:concurrency_safe,)))
+    )
+
+    # A finding a reader cannot navigate to was reported at `:0`. Where the method resolves, the
+    # location is now the method's own.
+    file, line = StrictMode._method_loc(KwShapes.dyn, (KwShapes.Plan,))
+    @test !isempty(file)
+    @test line > 0
+    # With no method at all there is genuinely nothing to point at, and it still fails rather than
+    # passing: "could not check" is not "is fine".
+    nometh(x::Float64) = x
+    u = only(StrictMode.findings(nometh, (String,); guarantees = (:concurrency_safe,)))
+    @test StrictMode._failed(u)
+    @test u.code === :SM0203
+end
+
+@testitem "an object built around the plan is not the plan" begin
+    using StrictMode
+
+    # The scan has two taint levels because "is the plan" and "holds a reference to the plan" are
+    # different facts. A factorization points at its symbolic analysis; the analysis does not point
+    # back. With one level the fresh factor either WAS the plan — so every field it initialized
+    # reported, which failed four passing assertions in a consumer across three releases — or was
+    # invisible, which loses a store through the factor into the plan's own arrays.
+    #
+    # What makes it exact rather than a guess: `:new` records WHICH field positions received a plan
+    # value, so reading that field back is direct and reading a freshly-built sibling is not.
+    module Factor
+    struct Sym
+        n::Int
+        colptr::Vector{Int}
+    end
+    mutable struct Stats
+        nnz::Int
+    end
+    mutable struct Fac
+        sym::Sym
+        ok::Bool
+        stats::Stats
+        buf::Vector{Float64}
+    end
+    struct Wrap
+        buf::Vector{Int}
+    end
+
+    # Writes only state this method allocated itself. The factor holds the plan at field 1.
+    @noinline function fill!(f::Fac, x::Vector{Float64})
+        f.ok = true
+        f.stats.nnz = 1
+        f.buf[1] = x[1]
+        return nothing
+    end
+    function build(s::Sym, x::Vector{Float64})
+        f = Fac(s, false, Stats(0), zeros(Float64, 2))
+        fill!(f, x)
+        return f
+    end
+
+    # Reaches the PLAN's own array, through the fresh factor.
+    @noinline poke!(f::Fac) = (f.sym.colptr[1] = 9; nothing)
+    reach_plan(s::Sym) = (poke!(Fac(s, false, Stats(0), zeros(2))); nothing)
+
+    # A `@noinline` wrapper around a value read OUT of the plan: that is the plan's memory.
+    @noinline wstore!(w::Wrap) = (w.buf[1] = 9; nothing)
+    via_wrapper(s::Sym) = (wstore!(Wrap(s.colptr)); nothing)
+
+    # A task closure is a container of its captures, so it must be followed at that level.
+    function spawn_projection(s::Sym)
+        buf = s.colptr
+        wait(Threads.@spawn (buf[1] = 7; nothing))
+        return nothing
+    end
+    function spawn_plan(s::Sym)
+        wait(Threads.@spawn (s.colptr[1] = 7; nothing))
+        return nothing
+    end
+    end
+
+    s = Factor.Sym(2, [1, 2])
+    Factor.build(s, [1.0, 2.0])
+    Factor.reach_plan(Factor.Sym(2, [1, 2]))
+    Factor.via_wrapper(Factor.Sym(2, [1, 2]))
+    Factor.spawn_projection(Factor.Sym(2, [1, 2]))
+    Factor.spawn_plan(Factor.Sym(2, [1, 2]))
+
+    scan(f, tt) = StrictMode.concurrency_findings(f, tt)
+
+    # Initializing one's own fresh state is not writing the plan, even several frames down.
+    @test isempty(scan(Factor.build, (Factor.Sym, Vector{Float64})))
+
+    # Everything that really does reach the plan still reports. Each of these was lost by the first
+    # rule I tried, which simply stopped tainting through `:new`.
+    @test !isempty(scan(Factor.reach_plan, (Factor.Sym,)))
+    @test !isempty(scan(Factor.via_wrapper, (Factor.Sym,)))
+    @test !isempty(scan(Factor.spawn_projection, (Factor.Sym,)))
+    @test !isempty(scan(Factor.spawn_plan, (Factor.Sym,)))
+
+    # The field map is what separates them: position 1 holds the plan, 3 and 4 hold fresh objects.
+    @test StrictMode._proj_field_index([nothing, QuoteNode(:sym)], 1, Factor.Fac) == 1
+    @test StrictMode._proj_field_index([nothing, QuoteNode(:stats)], 1, Factor.Fac) == 3
+    @test isnothing(StrictMode._proj_field_index([nothing], 1, Factor.Fac))
+
+    # And the whole assertion a consumer runs: a factorization over an immutable plan passes.
+    @test (@assert_concurrency_safe Factor.build(s, [1.0, 2.0]); true)
+    @test_throws StrictMode.StrictViolation (
+        @assert_concurrency_safe Factor.reach_plan(Factor.Sym(2, [1, 2]))
+    )
+end

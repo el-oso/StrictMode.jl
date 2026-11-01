@@ -142,3 +142,52 @@ end
     AllClean.combine(1.0f0, 2.0f0); AllClean.countem(1)
     @test isempty(conversion_report(AllClean))
 end
+
+@testitem "conversion_report filters by direction and by the types converted" begin
+    using StrictMode
+
+    # Measured in the field: on one numeric package 818 of the widened findings were `UInt8` to
+    # `UInt32`/`UInt64` from C-ABI shims passing Fortran CHARACTER arguments through `Ptr{UInt8}` —
+    # structurally benign and unfixable without breaking the ABI — which buried the ~20
+    # `Float32`-to-`Float64` findings the check exists for. The data was always there; what was
+    # missing was a way to ask for one class.
+    module Noise
+    abi_u32(c::UInt8) = UInt32(c)                 # benign: a character through the ABI
+    abi_u64(c::UInt8) = UInt64(c)
+    index(i::Int32, n::Int) = Int(i) + n          # benign: index widening
+    leak(x::T) where {T} = 0.529 * x              # the class the check is for
+    leak2(x::T) where {T} = 14.3 * x + 1.0
+    narrow(x::T) where {T} = Float32(x) * 2.0f0
+    end
+
+    Noise.abi_u32(0x01); Noise.abi_u64(0x01); Noise.index(Int32(1), 1)
+    Noise.leak(1.0f0); Noise.leak2(1.0f0); Noise.narrow(1.0)
+
+    names_of(fs) = Set(f.func for f in fs)
+
+    all_f = conversion_report(Noise)
+    @test length(all_f) >= 5
+    @test "abi_u32" in names_of(all_f)
+
+    # The float class alone, which is what a numeric package wants to see.
+    floats = conversion_report(Noise; from = (Float16, Float32, Float64))
+    @test "leak" in names_of(floats)
+    @test "leak2" in names_of(floats)
+    @test !("abi_u32" in names_of(floats))
+    @test !("index" in names_of(floats))
+
+    # A single `from`/`to` pair, given as bare types rather than a tuple.
+    pair = conversion_report(Noise; from = Float32, to = Float64)
+    @test names_of(pair) == Set(["leak", "leak2"])
+
+    # Direction, given as one string or as a tuple.
+    @test "narrow" in names_of(conversion_report(Noise; directions = "narrowed"))
+    @test !("leak" in names_of(conversion_report(Noise; directions = ("narrowed",))))
+    @test isempty(conversion_report(Noise; directions = ()))
+
+    # Filtering drops a finding entirely rather than leaving it with an empty reason.
+    for f in pair
+        @test occursin("Float32 to Float64", f.reason)
+        @test !occursin("UInt8", f.reason)
+    end
+end

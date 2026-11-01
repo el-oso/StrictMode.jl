@@ -17,8 +17,21 @@ end
 # A guarantee the analysis could not evaluate. `:fail`, never `:pass`: "I could not check this" and
 # "this is fine" must not render the same, which is how a crashed AllocCheck/JET run reported
 # success for every method in a sweep.
-_unevaluated(md, fn, sg, g, why; tier::Symbol = :report) =
-    StrictFinding(md, fn, sg, g, :fail, "", 0, why, _suggestion(g), tier, :SM0203)
+# `file`/`line` are worth passing wherever the caller knows the method: a finding a reader cannot
+# navigate to is reported at `:0`, and for a sweep over a whole package that is the difference
+# between a list they can act on and a list they have to grep.
+_unevaluated(md, fn, sg, g, why; tier::Symbol = :report, file = "", line = 0) =
+    StrictFinding(md, fn, sg, g, :fail, file, line, why, _suggestion(g), tier, :SM0203)
+
+# The method's source location for a signature, or `("", 0)` when it cannot be resolved.
+function _method_loc(@nospecialize(f), @nospecialize(types::Tuple))
+    m = try
+        which(f, types)
+    catch
+        nothing
+    end
+    return m isa Method ? (string(m.file), Int(m.line)) : ("", 0)
+end
 
 _mkfinding(
     md, fn, sg, g, fail::Bool, reason, file, line, suggestion = "";

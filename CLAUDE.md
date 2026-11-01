@@ -69,11 +69,27 @@ StrictMode/src/
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves
+                        A sweep has nowhere to name WHICH argument is shared, so it reads argument
+                        1: a `!` method therefore gets :info (its name declares that write) and an
+                        isbits first argument reports nothing (a copy cannot be written through,
+                        and seeding it taints every index derived from it, which made a store into
+                        the method own fresh buffer read as a shared write). Both measured in the
+                        field: 92 of 134 and 755 of 762 sweep failures were `!` methods.
                         :notaskstate and runs the taint scan only otherwise. It GATES, because a
                         reported site is a store read from typed IR, not an unprovable inference —
                         its limit is recall, a threadid store in an unfollowable callee.
                         The taint scan crosses TWO boundaries the statement loop would otherwise
                         drop: Expr(:new) passes taint to the struct built from a tainted value (an
+                        TWO taint levels, because "is the plan" and "holds a reference to the plan"
+                        are different facts: a fresh `Factor(sym, …)` points AT the plan and the
+                        plan does not point back, so writing its own fields is not writing the
+                        plan. `:new` records WHICH field positions received a plan value, so
+                        reading that field back is direct and a freshly-built sibling is not — exact
+                        rather than a type guess. The container and its field map cross the :invoke
+                        boundary, since the writes usually happen in a callee, and a task closure is
+                        a container so jl_new_task follows it at that level. One level either made
+                        the fresh wrapper BE the plan (four passing assertions in a consumer broke
+                        for three releases) or lost a store through it into the plan arrays.
                         INLINABLE wrapper is caught anyway, since inlining routes the store back
                         through the argument — only a @noinline one needs this), and a
                         :foreigncall to jl_new_task follows the task's closure body via
@@ -195,7 +211,11 @@ StrictMode/src/
                         `===` matches the `=== nothing` of every for-loop's iteration protocol and
                         marked every looping method as guarded, measured). Value-free, so it sweeps
                         where :noalias cannot; :info because a guard inside an unfollowed callee
-                        reads as absent. Judged on m.sig, so an uncalled method is still covered.
+                        reads as absent. An `Any` argument does NOT count as a possible array:
+                        typeintersect(Any, AbstractArray) is non-empty, so an unannotated argument
+                        made every `!` method with two of them a finding — 5 of 6 on StrictMode
+                        itself. An abstract ARRAY type still counts. Judged on m.sig, so an
+                        uncalled method is still covered.
                         conversion_report is the fourth: a method converting its OWN numeric data to
                         another type, in three named directions (widened/narrowed/retyped). Read
                         from the conversion INTRINSIC (fpext/sext_int/zext_int/fptrunc/trunc_int/
