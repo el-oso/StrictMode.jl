@@ -427,6 +427,94 @@ per-signature analysis errors, so the `@strict module` load gate silently skippe
   this list, not against its own usefulness in isolation. `:trusted` deliberately adds no second
   macro: `trust_boundary!` is a function.
 
+## Open — the gaps the Rust comparison identified (0.5.6)
+
+`docs/src/guarantees.md`'s "Compared with Rust" section ends in an **Identified gaps** list. These
+are those gaps as work items. The framing they come from: safety, flexibility and speed together,
+with memory safety never at stake — so what is missing is never safety, it is a property that holds
+for *every* caller rather than the ones a sweep reached.
+
+- [ ] **A property that holds for every caller, not every compiled signature.** This is the shape
+  of both gaps below and is worth naming once. `Send`/`Sync` are decided for all code before it
+  runs; every StrictMode check answers for the signatures it was pointed at, or for the ones that
+  have compiled. Julia offers no construct that would close this in general — `@assert_noalias` is a
+  run-time assertion precisely because nothing in the language can decide overlap for a future
+  caller. So the realistic target is not "prove it for all callers" but "make the uncovered set
+  visible", which is what `test_coverage`'s default-deny does for declarations and nothing yet does
+  for a guarantee's *argument space*.
+
+- [ ] **Compile-time data-race freedom.** `@assert_concurrency_safe` and `@assert_no_threadid_state`
+  are IR scans and **field-insensitive**: a task writing a disjoint slice of a captured output
+  reports, because a partition is a property of values and the scan has none. Recorded in
+  `concurrency.jl` as deliberate. What would move this forward, in increasing cost: (a) sweep
+  `:concurrency_safe` as well (see below), (b) a declaration primitive for "this task owns this
+  slice", settled against real shapes rather than invented ones — PureAtomistic has three, and that
+  is the reason this is not designed yet, (c) a `Send`/`Sync`-shaped type-level marker, which is a
+  language-design question rather than a package one.
+
+- [ ] **Deterministic release of resources that are not memory.** `Drop` runs at scope exit on every
+  path; Julia's collector decides when, and for a GPU buffer the CPU collector cannot see the
+  pressure at all. `resource_leak_report` finds a handle that outlives its owner — returned, stored
+  outside a scoped owner, or captured by a task — and deliberately stops short of proving release,
+  because that needs post-dominance over the exception CFG and a `close` in a helper defeats it.
+  Not a reason to leave it alone forever: the narrower question *"is there a path from this
+  acquisition to no release"* is answerable for a body with no helper calls, and that subset covers
+  the common `open`/`close` pair. Worth scoping before building.
+
+- [ ] **Sweep `:concurrency_safe`.** It is a value-free scan that is NOT in `_GUARANTEES`, so it is
+  one of the five guarantees still needing a hand-written annotation. `:no_threadid_state` joined the
+  sweep in 0.5.6 and the pattern is established: clear the signature from compiler effects where
+  possible, fall through to the taint scan otherwise. The four that genuinely cannot be swept are
+  `:noalias` and `:memsafe` (they need argument values), `:mca` (a 680 MiB optional dependency) and
+  `:effects` (no default set — only the caller can name which effects it wants). So this is the last
+  one available, and it would take hand-annotation from 5 of 17 to 4 of 17.
+
+- [ ] **`conversion_report` should name the offending literal.** It reports that a method converts
+  `Float32` to `Float64` and cannot say *which* constant did it. `TypedSyntax` maps inferred types
+  onto source positions, which is exactly the missing piece, and it needs **no new dependency**:
+  `Cthulhu` is already a StrictMode weak dep and vendors it. Measured on the current check: 0
+  findings over StrictMode's 618 methods, 150 over `Base.Math`'s 535 (120 widened, 46 retyped, 7
+  narrowed) — the `Base.Math` findings are correct code, which is why naming the literal matters more
+  than tightening the rule.
+
+- [ ] **`conversion_report`'s deliberate-wider-accumulator false positive.** A `Float64` accumulator
+  over `Float32` data for numerical stability is correct code and is reported. Pinned by a test
+  (`wide_acc`) so a change in it is visible, and the reason the check is `:info` with no gating
+  counterpart. A fix would need to distinguish "wider because the author chose stability" from
+  "wider because a literal leaked", which is intent and not in the IR. Possible partial signal: an
+  accumulator initialized from a *literal* of the wider type, versus a value converted from the
+  data. Unverified.
+
+- [ ] **`_UnanalyzableSignature` is private, so a caller cannot name it in a `catch`.** `pool_balance_report`
+  raises it rather than counting nothing, which is right, but a consumer writing a sweep of their own
+  has no way to catch exactly that. Additive fix: export it, or give it a public supertype.
+
+### Dead ends from the 0.5.6 effects survey — measured, do not retry
+
+All nine `Core.Compiler.Effects` fields were checked against StrictMode's existing concerns.
+`effect_holds` now accepts all nine, so these are available to `@assert_effects`; what follows is
+why four of them do **not** answer the questions they appear to.
+
+- **`:noub` cannot flag `@inbounds`.** It is a PROOF of no undefined behavior, so `false` means
+  unproven, not present. Measured over 7 fixtures: it agrees on four (`withib`/`noib`,
+  `caller`/`safecaller` — including the case where the `@inbounds` sits in an `@inline` helper and the
+  caller's own `ssaflags` scan is blind) and gives **three false positives** (`readsglobal`, `dyn`,
+  `taskstate` — all `noub = false` with no `@inbounds` anywhere). A non-`const` global read and a
+  dynamic call are not undefined behavior. So `unsafe_report` keeps reading `ci.ssaflags`, which
+  answers *who wrote it*; `noub = true` remains usable as a clear, not as a finding.
+- **`:inaccessiblememonly` and `is_inaccessiblemem_or_argmemonly` cannot separate reading an argument
+  from writing it.** Measured: `readsarg` and `writesarg!` both report `true` for the latter, and
+  `pure` reports `false` for the former because it touches no memory at all. That read/write
+  distinction is the only thing `:noalias` and the plan-read-only half of `:concurrency_safe` care
+  about, so neither field helps them.
+- **`:consistent`, `is_foldable` and `is_removable_if_unused` are `true` only for a method that
+  touches no memory.** Measured `true` for `pure` alone; `readsarg` — a plain read of two array
+  elements — is already `false`. Useless on kernels, which is every case of interest.
+- **`:nortcall` is weaker than what already exists.** It discriminates dynamic dispatch
+  (`dyn` false, `stat` true) but whole-method only, where `dispatch_report` gives per-call-site
+  detail. Possible pairing with `:trim_compatible`, since juliac rejects unresolved calls; not
+  pursued.
+
 ## Done
 
 - [x] **§8–§11 adversarially reviewed.** Done: 129 agents across eight lenses, every finding

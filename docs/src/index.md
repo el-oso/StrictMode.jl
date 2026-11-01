@@ -36,6 +36,25 @@ Julia will let your code box a value, miss an inline, drift into a type instabil
 a hot loop — without saying a word. You find out with a profiler, later. StrictMode lets you ask for
 those properties out loud, and hear about it the moment one breaks.
 
+### Safety, flexibility, speed — all three
+
+The position is a greedy one. Each of the usual approaches gives one of the three away:
+
+| | safety | flexibility | speed |
+|---|---|---|---|
+| Julia, plain | by construction, for all code | full — generic code stays generic | leaks where a collector pauses, a specialization goes unstable, or a literal widens a kernel |
+| Rust | in safe code | constrained — every program obeys the rules, needed or not | yes, until a kernel needs `unsafe`, and then the proof stops wholesale |
+| Julia with StrictMode | unchanged | unchanged | the properties that cost speed are named, checked and gated |
+
+Memory safety is never what is at stake here: in Julia it holds for all code, always. What leaks is
+speed, in a handful of specific and nameable ways — so a guarantee is something you opt into, for one
+property, one signature at a time, and it compiles away entirely in a shipped build.
+
+To be plain about what that delivers: StrictMode does not make code fast. It makes the difference
+between the code you wrote and the code you got *visible*, per property, and fails a build when that
+difference appears. The [comparison with Rust](guarantees.md#Compared-with-Rust) works this through,
+including the two places Rust's model covers ground this one does not yet.
+
 ## Two packages
 
 Know this first — it decides which macro you write.
