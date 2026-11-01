@@ -352,7 +352,7 @@ end
     @test occursin("README.md:5", out)          # the fenced example
     @test !occursin("README.md:2", out)         # not the prose
     @test !occursin("stale.md", out)            # not generated output
-    @test occursin("src/Old.jl:1", out)         # the .jl scan still works
+    @test occursin(joinpath("src", "Old.jl") * ":1", out)   # the .jl scan still works
 
     # Which fences hold CODE. `@example`/`@repl`/`@setup` are run by Documenter and are copied by
     # readers, so a removed name in one is a defect; `@docs`/`@meta` list names to resolve against

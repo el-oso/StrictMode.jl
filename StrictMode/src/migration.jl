@@ -130,12 +130,14 @@ function migration_report(
         # Matched against the path RELATIVE to the package root. Against the absolute path, a
         # checkout that merely sits under a directory called `deps` or `build` — a depot, a vendored
         # tree — has every one of its own markdown files skipped.
-        skip = ("/.git/", "/node_modules/", "/build/", "/deps/")
+        # Compared component by component, because the separator is `\` on Windows: a name wrapped
+        # in `/` matches nothing there, so a generated `docs\build` tree gets reported.
+        skip = (".git", "node_modules", "build", "deps")
         # `onerror` must not be the default `throw`: one unreadable directory anywhere under the
         # package root would otherwise abort the whole report, including its counted `.jl` result.
         for (dir, _, files) in walkdir(root; onerror = _ -> nothing)
             rel = relpath(dir, root)
-            any(s -> occursin(s, "/" * rel * "/"), skip) && continue
+            any(in(skip), splitpath(rel)) && continue
             for file in files
                 endswith(file, ".md") || continue
                 path = joinpath(dir, file)
