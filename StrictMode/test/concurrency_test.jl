@@ -783,3 +783,58 @@ end
         @assert_concurrency_safe Factor.reach_plan(Factor.Sym(2, [1, 2]))
     )
 end
+
+@testitem "a keyword body's leading arguments belong to the lowering, not to the author" begin
+    using StrictMode
+
+    module KwSweep
+    struct Plan
+        buf::Vector{Float64}
+    end
+    # `out` is the author's first argument. The lowered body receives `scale` and the function
+    # object ahead of it, so position 1 there is a keyword value.
+    function fill_out!(out::Vector{Float64}, src::Vector{Float64}; scale::Float64 = 1.0)
+        for i in eachindex(out, src)
+            out[i] = src[i] * scale
+        end
+        return out
+    end
+    # No `!`, and it writes a buffer the caller's plan can observe.
+    function apply(p::Plan, x::Vector{Float64}; gain::Float64 = 1.0)
+        for i in eachindex(x)
+            p.buf[i] = x[i] * gain
+        end
+        return sum(p.buf)
+    end
+    end
+    KwSweep.fill_out!(zeros(3), ones(3))
+    KwSweep.apply(KwSweep.Plan(zeros(3)), ones(3))
+
+    ms, _ = StrictMode.module_methods(KwSweep)
+    lowered(nm) = only(
+        m for m in ms
+            if startswith(String(m.name), "#") && StrictMode._demangle(m.name) === nm
+    )
+    parts(m) = (m.sig.parameters[1].instance, Tuple(m.sig.parameters[2:end]))
+    sweep(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:concurrency_safe,)))
+
+    f, tt = parts(lowered(:fill_out!))
+    @test StrictMode._self_arg_position(f, tt) == 3
+    @test tt[3] === Vector{Float64}
+    # An ordinary method and a closure carry their own first argument at position 1: a closure's
+    # captures live in the function object rather than in an argument.
+    @test StrictMode._self_arg_position(KwSweep.fill_out!, (Vector{Float64}, Vector{Float64})) == 1
+    @test StrictMode._self_arg_position(x -> x, (Int,)) == 1
+
+    # Position 1 of the lowered body is `scale`, which is isbits and so reports nothing. Reading it
+    # renders as `:pass` for a method whose output buffer was never examined, and the author's `!`
+    # is unreadable through the mangling.
+    bang = sweep(f, tt)
+    @test bang.status === :info
+    @test occursin("argument 3", bang.reason)
+
+    # A write the caller's plan can observe is found in the lowered body as well as the wrapper.
+    fa, ta = parts(lowered(:apply))
+    @test StrictMode._self_arg_position(fa, ta) == 3
+    @test StrictMode._failed(sweep(fa, ta))
+end
