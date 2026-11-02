@@ -1047,19 +1047,49 @@ function _threadid_state_finding(
     )
 end
 
+# The position in `types` of a method's OWN first argument.
+#
+# Julia's keyword lowering splits one `f(x; k)` definition into a thin wrapper and a mangled body,
+# and the mangled body's leading arguments belong to the lowering: the keyword values, then the
+# function object, and only then the arguments the author wrote. Position 1 there is a keyword
+# value, so reading it answers a question about a keyword and leaves the argument the guarantee is
+# about unexamined — a verdict of `pass` on a method nothing looked at. The function object marks
+# the boundary: its type is the one argument whose singleton instance answers to the demangled name.
+function _self_arg_position(@nospecialize(f), @nospecialize(types::Tuple))
+    nm = try
+        nameof(f)
+    catch
+        return 1
+    end
+    base = _demangle(nm)
+    base === nm && return 1
+    for (i, p) in enumerate(types)
+        p isa DataType && isdefined(p, :instance) || continue
+        p.instance isa Function && nameof(p.instance) === base && return i + 1
+    end
+    # A closure or an `@strict_stable` inner body carries its captures in the function object
+    # itself, not in an argument, so position 1 is already the author's first argument.
+    return 1
+end
+
 # `:concurrency_safe`'s verdict for one signature, shared by BOTH tiers through
 # `_compiled_output_finding`. No backend has anything to add: AllocCheck, JET and TrimCheck say
 # nothing about whether an argument is written.
 #
 # The status follows the records' certainty, which is the same rule `_assert_concurrency_safe`
 # applies: a write this scan READ is `:fail`, and a record it only failed to rule out is `:info`.
-# A sweep cannot be told which argument holds the plan, so it reads argument 1 — which is why
-# `:concurrency_safe` is absent from the `:all` policy set and cannot stop a module loading.
+# A sweep cannot be told which argument holds the plan, so it reads the method's own first argument
+# — which is why `:concurrency_safe` is absent from the `:all` policy set and cannot stop a module
+# loading.
 function _concurrency_safe_finding(
         @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
     )
+    self = _self_arg_position(f, types)
+    # The convention is a property of the name the author wrote, and a mangled body carries the
+    # same name with the lowering's decoration around it.
+    bang = endswith(String(_demangle(Symbol(fn))), "!")
     vs = try
-        concurrency_findings(f, types)
+        concurrency_findings(f, types; self_arg = self)
     catch
         nothing
     end
@@ -1069,21 +1099,21 @@ function _concurrency_safe_finding(
         tier, file = loc[1], line = loc[2]
     )
     isempty(vs) && return _mkfinding(
-        md, fn, sg, :concurrency_safe, false, "argument 1 is not written (value-free IR scan)",
-        "", 0; tier
+        md, fn, sg, :concurrency_safe, false,
+        "argument $self is not written (value-free IR scan)", "", 0; tier
     )
-    # A `!` name DECLARES that argument 1 is written — `mul!(C, A, B)`, `copyto!(dest, src)` — so
-    # finding that write is not finding a defect, it is reading the convention back. The sweep
-    # cannot be told which argument holds the shared object, so for these it cannot ask the question
-    # the guarantee is about, and it says so as `:info` rather than failing. It must not report
-    # `:pass`: "could not check here" and "is read-only" are different answers. Measured in the
-    # field before this: 92 of 134 sweep failures on one package were `!` methods writing their own
-    # first argument, which buried the 42 that were not.
-    if endswith(fn, "!")
+    # A `!` name DECLARES that the first argument is written — `mul!(C, A, B)`, `copyto!(dest,
+    # src)` — so finding that write is not finding a defect, it is reading the convention back. The
+    # sweep cannot be told which argument holds the shared object, so for these it cannot ask the
+    # question the guarantee is about, and it says so as `:info` rather than failing. It must not
+    # report `:pass`: "could not check here" and "is read-only" are different answers. Measured in
+    # the field before this: 92 of 134 sweep failures on one package were `!` methods writing their
+    # own first argument, which buried the 42 that were not.
+    if bang
         return StrictFinding(
             md, fn, sg, :concurrency_safe, :info, vs[1].file, vs[1].line,
-            "a `!` name declares that argument 1 is written, so the sweep cannot tell a shared " *
-                "plan from the intended output ($(length(vs)) site(s))",
+            "a `!` name declares that argument $self is written, so the sweep cannot tell a " *
+                "shared plan from the intended output ($(length(vs)) site(s))",
             "assert this at a call site with `@assert_concurrency_safe self=N f(…)`, naming the " *
                 "argument that is actually shared across tasks",
             tier, _code(:concurrency_safe)
@@ -1094,8 +1124,8 @@ function _concurrency_safe_finding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
         vs[1].file, vs[1].line,
         (
-            certain ? "argument 1 is written during the call ($(length(vs)) site(s)): " :
-                "cannot prove argument 1 is read-only ($(length(vs)) site(s)): "
+            certain ? "argument $self is written during the call ($(length(vs)) site(s)): " :
+                "cannot prove argument $self is read-only ($(length(vs)) site(s)): "
         ) *
             join((v.message for v in vs), "; "),
         _suggestion(:concurrency_safe), tier, _code(:concurrency_safe)

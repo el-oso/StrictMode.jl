@@ -697,12 +697,44 @@ than a tweak to the IR scan, which is why it is still open.
 attribution — the field report that prompted them had 818 benign `UInt8` findings hiding about 20
 real ones.
 
-- [ ] **Does `conversion_report` see a GPU kernel's own code?** Reported from the field: 0 findings
-  across 43 `gpu_*` KernelAbstractions kernels, 35 of which had a CPU-visible specialization after a
-  real decode. A clean result there may mean the kernels were never analyzed rather than that they
-  are clean. Device helpers DID appear in the output, so it is not a blanket miss. Needs a positive
-  control — put a known `Float64` literal in a kernel and confirm it is reported — before either
-  claiming coverage or documenting the gap.
+The GPU half of this question is answered, and the answer is in the roadmap section below.
+
+## Roadmap — GPU kernels are not analyzed, and currently render as clean
+
+**No scan here reads device code.** A KernelAbstractions kernel compiles twice: a host stub for the
+CPU and the real body for the device. Every scan reads `Base.code_typed`, which reaches only the
+stub, so a kernel's arithmetic is never examined and the verdict renders as `:pass`.
+
+*The positive control that settles it* (run in the field against an AMD device, on a kernel with
+`* 0.5 * 2.0` inserted): `AMDGPU.@device_code_llvm` shows three `fpext float -> double` and an
+`fmul double … 5.0e-01` in device IR, while `conversion_report(M; from = Float32, to = Float64)`
+returns **0 findings**. Of the eight compiled specializations of the kernel, five are
+`Core.throw_methoderror(…); unreachable` and three are `return nothing`. So the earlier field
+result — 0 findings across 43 `gpu_*` kernels — measured the stub, not the kernels.
+
+This breaks the invariant the package rests on: a scan that could not look must not render as one
+that looked and approved.
+
+- [ ] **Report a body with no work as unevaluated, not as a pass.** Needs no GPU dependency at all:
+  a host stub carries no arithmetic to read, and `_unevaluated` (`:fail`, `SM0203`) is already the
+  verdict for a signature the scan could not read. The open question is separating a stub from a
+  function that is genuinely and correctly empty.
+- [ ] **Read device IR.** Requires GPUCompiler reflection behind a weak dependency, the way
+  `LLVM_full_jll` sits behind `mca_report`, plus a compiler job describing the target. The obstacle
+  is dispersion rather than difficulty: `Base.code_typed` is called at 22 sites across 12 files,
+  with no shared seam to teach about a second compiler.
+
+## Open — `alias_guard_report` reads a keyword function's wrapper, not its body
+
+A guard the author wrote is reported as missing. Julia's keyword lowering splits one definition into
+a thin wrapper and a mangled body; the guard can only live in the body, and the scan judges the
+wrapper. Measured: `guarded!(out, src; k)` opening with
+`Base.mightalias(out, src) && throw(ArgumentError(…))` is reported as unguarded, while the identical
+function without keywords is correctly silent.
+
+Demangling the name test is **not** the fix — it makes the body eligible as well as the wrapper, so
+one definition yields two findings. The fix is to judge the body and skip the wrapper, which changes
+which method the report names.
 
 ## Done
 

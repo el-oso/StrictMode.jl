@@ -52,7 +52,11 @@ function bang_report(mod::Module; only = nothing, exempt = (), max_depth::Int = 
     out = StrictFinding[]
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
-        bang = endswith(String(m.name), "!")
+        # The convention is a property of the name the author wrote. Julia's keyword lowering moves
+        # the body of `f(x; k)` into a method named `#f#NN`, which ends in a digit, so a raw test
+        # reports every keyword-taking `f!` as a mutating method that forgot its `!`.
+        name = _demangle(m.name)
+        bang = endswith(String(name), "!")
         sigs = _method_signatures(m)
         isempty(sigs) && continue
         f = try
@@ -65,7 +69,7 @@ function bang_report(mod::Module; only = nothing, exempt = (), max_depth::Int = 
         reason, suggestion = if mutates
             (
                 "writes an argument, and its name does not end in `!`",
-                "rename it `$(m.name)!`, or return a modified copy instead — a caller reading the " *
+                "rename it `$(name)!`, or return a modified copy instead — a caller reading the " *
                     "name has no warning that its data changes",
             )
         else

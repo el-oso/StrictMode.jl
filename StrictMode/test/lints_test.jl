@@ -66,3 +66,38 @@ end
     @test StrictMode._type_depth(Union{Int, Float64}) == 1
     @test StrictMode._type_depth(Vector{T} where {T}) >= 1             # a UnionAll reads its body
 end
+
+@testitem "the `!` convention is read through Julia's keyword mangling" begin
+    using StrictMode
+
+    module BangKw
+    # The author wrote the `!`. Julia's keyword lowering moves the body into a method named
+    # `#blend!#NN`, whose name ends in a digit.
+    function blend!(out::Vector{Float64}, src::Vector{Float64}; w::Float64 = 1.0)
+        for i in eachindex(out, src)
+            out[i] = src[i] * w
+        end
+        return out
+    end
+    # No `!`, takes keywords, and writes an argument: this one is a genuine finding, and the
+    # suggestion has to name something the author can rename.
+    function mix(out::Vector{Float64}, src::Vector{Float64}; w::Float64 = 1.0)
+        for i in eachindex(out, src)
+            out[i] = src[i] + w
+        end
+        return out
+    end
+    end
+    BangKw.blend!(zeros(3), ones(3))
+    BangKw.mix(zeros(3), ones(3))
+
+    fs = StrictMode.bang_report(BangKw)
+    # A raw name test reports every keyword-taking `f!` as a mutating method that forgot its `!`.
+    @test !any(f -> StrictMode._demangle(Symbol(f.func)) === :blend!, fs)
+    # The real finding survives on both of the methods a keyword definition creates, and the
+    # rename it suggests is one the author can actually write.
+    mixed = filter(f -> StrictMode._demangle(Symbol(f.func)) === :mix, fs)
+    @test length(mixed) == length(fs) == 2
+    @test all(f -> occursin("does not end in `!`", f.reason), mixed)
+    @test all(f -> occursin("`mix!`", f.suggestion), mixed)
+end
