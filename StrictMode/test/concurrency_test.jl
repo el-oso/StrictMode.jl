@@ -838,3 +838,49 @@ end
     @test StrictMode._self_arg_position(fa, ta) == 3
     @test StrictMode._failed(sweep(fa, ta))
 end
+
+@testitem "an undefined phi slot is skipped, not read" begin
+    using StrictMode, LinearAlgebra
+
+    # A `PhiNode` merging a variable that is not defined along every incoming edge leaves those
+    # slots undefined. Reading one raises `UndefRefError`, which the scan reports as a signature it
+    # could not read — and the raw `any` below is the shape that does it.
+    p = Core.PhiNode(Int32[1, 2], Vector{Any}(undef, 2))
+    @test !isassigned(p.values, 1)
+    @test_throws UndefRefError any(_ -> false, p.values)
+    @test StrictMode._any_phi_tainted(p, BitSet([1]), (1,)) === false
+
+    # A defined slot among undefined ones is still seen, so the guard costs no recall.
+    q = Core.PhiNode(Int32[1, 2], Vector{Any}(undef, 2))
+    q.values[2] = Core.SSAValue(7)
+    @test StrictMode._any_phi_tainted(q, BitSet([7]), ()) === true
+
+    module PhiShape
+    using LinearAlgebra
+    struct Buffers{T}
+        Z::Array{T, 3}
+        Y::Array{T, 3}
+    end
+    # Two array fields of argument 1 handed to `mul!` inside a loop: the phi this builds has an
+    # undefined slot.
+    function channel_products!(buf::Buffers, M::AbstractArray, nf, nc, n)
+        for c in axes(M, 3)
+            mul!(view(buf.Y, 1:nc, c, 1:n), transpose(view(M, :, :, c)), view(buf.Z, 1:nf, c, 1:n))
+        end
+        return buf
+    end
+    end
+
+    buf = PhiShape.Buffers(zeros(4, 2, 3), zeros(4, 2, 3))
+    M = zeros(4, 4, 2)
+    PhiShape.channel_products!(buf, M, 4, 4, 3)
+    tt = (typeof(buf), typeof(M), Int, Int, Int)
+
+    # The write through the struct's own field is found, rather than the signature being unreadable.
+    vs = StrictMode.concurrency_findings(PhiShape.channel_products!, tt)
+    @test !isempty(vs)
+    @test any(v -> occursin("reachable from the plan", v.message), vs)
+    f = only(StrictMode.findings(PhiShape.channel_products!, tt; guarantees = (:concurrency_safe,)))
+    @test f.code !== :SM0203          # not "could not read this signature"
+    @test f.status === :info           # a `!` name declares the write of argument 1
+end

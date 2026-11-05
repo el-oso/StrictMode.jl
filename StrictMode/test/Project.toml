@@ -1,5 +1,6 @@
 [deps]
 CpuId = "adafc99b-e345-5852-983c-f28acb93d879"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
@@ -14,7 +15,7 @@ StrictMode = {path = ".."}
 StrictModeTest = {path = "../../StrictModeTest"}
 
 [compat]
+LinearAlgebra = "1"
 SIMD = "3"
 TestItemRunner = "1"
 julia = "1.12"
-

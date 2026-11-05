@@ -115,6 +115,16 @@ end
     op isa Core.SSAValue ? (op.id in tset) :
     op isa Core.Argument ? (op.n in targs) : false
 
+# A `PhiNode`/`PhiCNode` slot is UNDEFINED where the variable it merges is not defined along that
+# incoming edge, so each one is asked with `isassigned` before it is read. Iterating the values
+# directly raises `UndefRefError` from `getindex`, which the scan reports as a signature it could
+# not read. Measured on a real package: a `!` method whose first argument is a struct, passing two
+# of its array fields to `mul!` inside a loop, builds exactly such a phi.
+_any_phi_tainted(st, set::BitSet, targs) = any(
+    j -> isassigned(st.values, j) && _op_tainted(st.values[j], set, targs),
+    eachindex(st.values)
+)
+
 _widen_taint(@nospecialize(T)) =
     T isa Core.Const ? Core.Typeof(T.val) :
     (T isa Core.PartialStruct ? T.typ : T)
@@ -323,7 +333,7 @@ function _taint_scan_ci(
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) && settaint(true)
                 continue
             elseif st isa Core.PhiNode || st isa Core.PhiCNode
-                any(v -> _op_tainted(v, tset, targs), st.values) && settaint(true)
+                _any_phi_tainted(st, tset, targs) && settaint(true)
                 continue
             elseif st isa Core.UpsilonNode
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) && settaint(true)
@@ -858,7 +868,7 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                 isdefined(st, :val) && _op_tainted(st.val, tid, ()) && mark(tid, true)
                 continue
             elseif st isa Core.PhiNode
-                any(v -> _op_tainted(v, tid, ()), st.values) && mark(tid, true)
+                _any_phi_tainted(st, tid, ()) && mark(tid, true)
                 continue
             end
             # `:invoke_modify` as above: `@atomic BUF[Threads.threadid()].value += 1` is the
