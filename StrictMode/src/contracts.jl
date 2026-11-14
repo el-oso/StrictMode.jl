@@ -71,9 +71,16 @@ end
 
 Verify that type `T` implements its [`@strict_contract`](@ref) interface (through
 `TypeContracts.@verify`), and that each representative call you list satisfies StrictMode's per-call
-guarantees ([`@strict`](@ref): type stability throws, owned scratch and allocation warn). The calls
-run against the
-instances and values you bind in the surrounding scope.
+guarantees ([`@strict`](@ref): type stability throws, owned scratch and allocation warn). Each call
+is checked at the signature its arguments give it, so the instances and values you bind in the
+surrounding scope are what decide which specialization is verified.
+
+The listed calls are **not performed**. Every check reads the argument types — an inferred return
+type and a scan of typed IR — so the values serve to name those types, and this block's results
+would be discarded anyway. Performing one call would compile its whole tree, which a block at a
+package's top level pays for at every consumer's precompile.
+
+Each argument expression is still evaluated once, so bind them to values that are cheap to produce.
 
 The interface check always runs. The per-call performance checks gate themselves on the
 `checks_enabled` preference, so a production build only pays for the interface verification.
@@ -100,7 +107,10 @@ macro verify_strict(T, block)
     out = Any[verify_call]
     for s in stmts
         s isa LineNumberNode && continue
-        push!(out, _strict_expr(s))   # already fully escaped + self-gated
+        # Already fully escaped and self-gated. The call itself is NOT performed: every check here
+        # reads the argument types, this block's values are discarded, and performing one call
+        # compiles its whole tree.
+        push!(out, _strict_expr(s; execute = false))
     end
     push!(out, :nothing)
     return Expr(:block, out...)
