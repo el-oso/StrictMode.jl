@@ -5,7 +5,39 @@
 # escape hatches). All of these use only Base + InteractiveUtils — no AllocCheck/JET backend.
 
 # Best-effort: did the method's LLVM IR contain SIMD vector ops? (`<N x double>` & friends.)
+# A method with a default argument compiles its shorter call form to a forwarder: a body that calls
+# the same function with the default filled in and returns the result. The checks below read the
+# body they are handed, so on that form they inspected no loop at all, and `@assert_no_spill` passed
+# for want of anything to spill. The signature the forwarder calls is the one to read. Every other
+# statement must make no call, so a body that does real work before forwarding is read as itself.
+function _forwarded_types(@nospecialize(f), @nospecialize(types::Tuple))
+    for _ in 1:8                       # a chain of trailing defaults forwards once per default
+        cts = try
+            Base.code_typed(f, types; optimize = true)
+        catch
+            return types
+        end
+        length(cts) == 1 || return types
+        code = first(cts[1]).code
+        ret = code[end]
+        (ret isa Core.ReturnNode && isdefined(ret, :val) && ret.val isa Core.SSAValue) || return types
+        st = code[ret.val.id]
+        Meta.isexpr(st, :invoke) || return types
+        mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+        mi isa Core.MethodInstance || return types
+        ps = mi.specTypes.parameters
+        (!isempty(ps) && ps[1] === Core.Typeof(f)) || return types
+        for (j, s) in enumerate(code)
+            j == ret.val.id && continue
+            (Meta.isexpr(s, :invoke) || Meta.isexpr(s, :foreigncall)) && return types
+        end
+        types = Tuple(ps[2:end])
+    end
+    return types
+end
+
 function _vectorized(@nospecialize(f), @nospecialize(types::Tuple))
+    types = _forwarded_types(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
@@ -170,6 +202,7 @@ Base.@kwdef struct KernelReport
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
+    types = _forwarded_types(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
@@ -180,6 +213,7 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
+    types = _forwarded_types(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_native(io, f, types; debuginfo = :none)

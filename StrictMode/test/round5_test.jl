@@ -236,3 +236,25 @@ end
     StrictMode.clear_cache!()
     @test !haskey(StrictMode._TOP_SIGNAL_MEMO, sig)
 end
+
+@testitem "compiled-output checks read past a default-argument forwarder" begin
+    using StrictMode
+    # Omitting a defaulted argument calls a forwarder that only calls the full method. Without
+    # following it the checks read no loop, and a spill check passes for want of anything to spill.
+    @noinline function fwd_kernel!(y::Vector{Float64}, x::Vector{Float64}, ::Val{B} = Val(false)) where {B}
+        @inbounds @simd for i in eachindex(y, x)
+            y[i] = y[i] * x[i] + x[i]
+        end
+        return y
+    end
+    V = Vector{Float64}
+    fwd_kernel!(rand(64), rand(64))
+    @test StrictMode._forwarded_types(fwd_kernel!, (V, V)) == (V, V, Val{false})
+    @test StrictMode._vectorized(fwd_kernel!, (V, V)) == StrictMode._vectorized(fwd_kernel!, (V, V, Val{false}))
+    @test StrictMode.spill_report(fwd_kernel!, (V, V)).vec_spills ==
+        StrictMode.spill_report(fwd_kernel!, (V, V, Val{false})).vec_spills
+
+    # A body that is not a forwarder is read as itself.
+    plain(x::Vector{Float64}) = sum(x)
+    @test StrictMode._forwarded_types(plain, (V,)) == (V,)
+end
