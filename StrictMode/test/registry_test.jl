@@ -302,7 +302,10 @@ end
     )
     Owned.driver!(zeros(2, 2), 8)         # compile, so the census has a signature to find
 
-    @test isempty(StrictMode.exemptions())
+    # No exemption names either method, so the coverage pass below is satisfied by the declarations
+    # alone. Scoped to these two names because the exemption store is session-global and other
+    # items on the same worker write to it.
+    @test !any(e -> e.func in (:driver!, :grow!), StrictMode.exemptions())
     cov = StrictMode.audit(Owned; require = :all, guarantees = (:typestable, :noboxing))
     @test !any(f -> StrictMode._failed(f) && occursin("declar", lowercase(f.reason)), cov)
 
