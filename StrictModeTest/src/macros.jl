@@ -390,3 +390,33 @@ macro test_allocated_zero(args...)
         $(p.litcall)
     end
 end
+
+function _check_reaches(target, @nospecialize(f), @nospecialize(types), @nospecialize(g))
+    r = StrictMode.reach_report(f, Tuple(types))
+    StrictMode.reaches(r, g) && return r
+    throw(StrictMode.StrictViolation(:test_reaches, target, StrictMode._reaches_reason(r, g)))
+end
+
+"""
+    @test_reaches f(args...) g
+
+Fail unless the function `g` is in the call graph of `f(args...)` after optimization.
+
+[`StrictMode.@assert_reaches`](@ref) reads the same graph and only warns when `g` is absent from a
+graph it could not read in full. This fails in that case too: a target that cannot be shown to be
+reached has not been shown to be reached. The message says how much of the graph was unread.
+
+The macro returns the call's value.
+
+```julia
+@test_reaches dgemm_64_(ta, tb, m, n, k, α, A, lda, B, ldb, β, C, ldc, 1, 1) MyBLAS._gemm_threaded!
+```
+"""
+macro test_reaches(call, g)
+    p = StrictMode._call_parts(call)
+    return quote
+        $(p.binds...)
+        $(_check_reaches)($(string(call)), $(p.checkfn), $(p.types), $(esc(g)))
+        $(p.litcall)
+    end
+end

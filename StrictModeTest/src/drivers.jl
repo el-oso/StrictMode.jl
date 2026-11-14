@@ -700,3 +700,144 @@ function Base.show(io::IO, r::AllocEntryReport)
     end
     return nothing
 end
+
+"""
+    StrictModeTest.test_threaded_speedup(pkg::Symbol, call; efficiency = nothing,
+                                         max_slowdown = 1.5, kwargs...) -> ThreadedSpeedupReport
+
+Fail when threading makes `call` slower than its bounds allow, measured in fresh processes by
+[`StrictMode.threaded_speedup_report`](@ref), which takes the remaining keywords (`setup`, `cpus`,
+`threads`, `workers`, `repeats`).
+
+Two bounds, both on the ratio of the threaded time to the one-thread time taken on the same
+machine minutes apart:
+
+- `max_slowdown` — the threaded run may take at most this many times the serial one. On by
+  default at `1.5`: a threaded kernel that loses to its own serial path by half is a defect on
+  any machine. Pass `nothing` to drop it.
+- `efficiency` — the threaded run must reach this fraction of perfect scaling over its workers,
+  `threaded <= serial / (efficiency * workers)`. Off by default, because how well a kernel scales
+  depends on the cores, the SMT layout and what else the host is doing; a number that holds on
+  one machine fails on another. Set it only in a suite that runs on a host you control.
+
+The efficiency bound needs the processes confined to `cpus` CPUs. Where `taskset` is not available
+it is not applied, a warning says so, and only `max_slowdown` gates.
+
+```julia
+test_threaded_speedup(:MyPkg, "MyPkg.lu!(copy(A))"; setup = "A = rand(1024, 1024)")
+test_threaded_speedup(:MyPkg, "MyPkg.lu!(copy(A))"; setup = "A = rand(1024, 1024)", efficiency = 0.4)
+```
+"""
+function test_threaded_speedup(
+        pkg::Symbol, call::AbstractString; efficiency = nothing, max_slowdown = 1.5, kwargs...
+    )
+    isnothing(efficiency) && isnothing(max_slowdown) && throw(
+        ArgumentError("test_threaded_speedup: no bound was given, so there is nothing to gate on")
+    )
+    r = StrictMode.threaded_speedup_report(pkg, call; kwargs...)
+    ratio = r.threaded_ms / r.serial_ms
+    shown = round(ratio; digits = 2)
+    over = String[]
+    isnothing(max_slowdown) || ratio <= max_slowdown || push!(
+        over, "the threaded run took $(shown)x the serial time against a limit of $(max_slowdown)x"
+    )
+    if !isnothing(efficiency)
+        if r.pinned
+            bound = 1 / (efficiency * r.workers)
+            ratio <= bound || push!(
+                over,
+                "the threaded run took $(shown)x the serial time, and an efficiency of " *
+                    "$efficiency over $(r.workers) worker(s) allows $(round(bound; digits = 2))x"
+            )
+        else
+            @warn "test_threaded_speedup: `taskset` is not available, so the processes were not " *
+                "confined and the efficiency bound of $efficiency was not applied. Only " *
+                "`max_slowdown` gated this run."
+        end
+    end
+    isempty(over) && return r
+    throw(
+        StrictMode.StrictViolation(
+            :test_threaded_speedup, String(call),
+            join(over, "; ") * ".\n  1 thread: $(round(r.serial_ms; digits = 3)) ms; " *
+                "$(r.nthreads) threads: $(round(r.threaded_ms; digits = 3)) ms, " *
+                (r.pinned ? "both confined to $(r.cpus) CPU(s)" : "not confined to a CPU set") *
+                ".\n  Measured in fresh processes on this machine. The ratio moves with the " *
+                "host's cores and load, so a bound belongs to the host that set it."
+        )
+    )
+end
+
+"""
+    StrictModeTest.test_threadcount_invariant(pkg::Symbol, call; witness, setup = "",
+                                              threads = 1:Sys.CPU_THREADS)
+
+Fail unless `call` returns the same bits at every thread count in `threads` **and** `witness`
+reports that the threaded path ran at each count above one. See
+[`StrictMode.threadcount_invariant_report`](@ref) for how the result is compared.
+
+`witness` is required. Identical results at every thread count are exactly what a call that
+never threads produces, and whether a package's threaded path ran can only be observed from
+inside the package — so this takes that observation as code, such as
+`"MyPkg.pool_jobs() > 0"`, and does not run without it.
+
+```julia
+test_threadcount_invariant(
+    :MyPkg, "MyPkg.mul(A, B)";
+    setup = "using Random; Random.seed!(1); A = rand(300, 300); B = rand(300, 300)",
+    witness = "MyPkg.pool_jobs() > 0", threads = 1:4,
+)
+```
+"""
+function test_threadcount_invariant(
+        pkg::Symbol, call::AbstractString; witness::Union{Nothing, AbstractString} = nothing,
+        kwargs...
+    )
+    isnothing(witness) && throw(
+        ArgumentError(
+            "test_threadcount_invariant: pass `witness`, code that returns `true` when the " *
+                "threaded path ran. Without it a call that never threads passes at every " *
+                "thread count."
+        )
+    )
+    r = StrictMode.threadcount_invariant_report(pkg, call; witness, kwargs...)
+    why = String[]
+    for i in eachindex(r.threads)
+        r.identical[i] || push!(
+            why, "at -t $(r.threads[i]) the result differs from the one at -t $(r.threads[1]), " *
+                "first at byte $(r.first_difference[i])"
+        )
+        r.nthreads[i] > 1 && !r.witnessed[i] &&
+            push!(why, "at -t $(r.threads[i]) the witness reported that the threaded path did not run")
+    end
+    any(>(1), r.nthreads) ||
+        push!(why, "no process had more than one thread, so the threaded path was never asked for")
+    isempty(why) && return r
+    throw(StrictMode.StrictViolation(:test_threadcount_invariant, String(call), join(why, "; ") * "."))
+end
+
+"""
+    StrictModeTest.test_route_parity(f => types, g => types; mod = nothing, stop = ()) -> RouteParity
+
+Fail unless the two calls are shown to take the same route: both call graphs were read in full,
+neither is empty, and they reach the same functions. See [`StrictMode.route_parity`](@ref) for how
+the graphs are read and what `mod` and `stop` do.
+
+A graph that could not be read in full fails as well as one that differs. Two entries are not
+shown to agree by a comparison that left part of either unread, and an entry whose graph came back
+empty would otherwise agree with anything.
+
+```julia
+T = (Matrix{Float64}, Matrix{Float64}, Matrix{Float64})
+test_route_parity(MyBLAS.gemm! => T, MyBLAS.gemm_cabi! => T; mod = MyBLAS)
+```
+"""
+function test_route_parity(a::Pair, b::Pair; kwargs...)
+    p = StrictMode.route_parity(a, b; kwargs...)
+    StrictMode.status(p) === :agree && return p
+    throw(
+        StrictMode.StrictViolation(
+            :test_route_parity, p.a.target * " against " * p.b.target, StrictMode._parity_reason(p)
+        )
+    )
+end

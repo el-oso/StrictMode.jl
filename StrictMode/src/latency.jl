@@ -50,6 +50,29 @@ end
 
 const _LATENCY_RE = r"^STRICTMODE_LATENCY (\S+) (\S+)$"
 
+# Run `script` in a fresh Julia that inherits this session's active project, so the child measures
+# the environment under test. `flags` are appended to the Julia command line (a later `-t` wins
+# over an inherited one) and `wrapper` is put in front of it, for a launcher such as `taskset`.
+# Returns `(stdout, stderr, exitcode)`.
+function _run_child(script::AbstractString; flags::Cmd = ``, wrapper::Cmd = ``)
+    cmd = `$wrapper $(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no $flags -e $script`
+    outbuf, errbuf = IOBuffer(), IOBuffer()
+    proc = run(pipeline(ignorestatus(cmd); stdout = outbuf, stderr = errbuf); wait = false)
+    wait(proc)
+    return String(take!(outbuf)), String(take!(errbuf)), proc.exitcode
+end
+
+# The `key value` pairs a child printed on lines matching `re`, whose two groups are the key and
+# the value. Everything else the child printed is ignored.
+function _child_values(out::AbstractString, re::Regex)
+    vals = Dict{String, String}()
+    for line in eachline(IOBuffer(out))
+        m = match(re, line)
+        isnothing(m) || (vals[m[1]] = m[2])
+    end
+    return vals
+end
+
 function _latency_child_script(pkg::Symbol, calls::Vector{String})
     lines = [
         "t = @elapsed (using $pkg)",
@@ -133,23 +156,16 @@ function latency_report(
         false
     end
     script = _latency_child_script(pkg, cs)
-    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`
-    outbuf, errbuf = IOBuffer(), IOBuffer()
-    proc = run(pipeline(cmd; stdout = outbuf, stderr = errbuf); wait = false)
-    wait(proc)
-    out = String(take!(outbuf))
-    err = String(take!(errbuf))
+    out, err, exitcode = _run_child(script)
     seconds = Dict{String, Float64}()
-    for line in eachline(IOBuffer(out))
-        m = match(_LATENCY_RE, line)
-        isnothing(m) && continue
-        v = tryparse(Float64, m[2])
-        isnothing(v) || (seconds[m[1]] = v)
+    for (k, s) in _child_values(out, _LATENCY_RE)
+        v = tryparse(Float64, s)
+        isnothing(v) || (seconds[k] = v)
     end
     haskey(seconds, "load") || throw(
         ErrorException(
             "latency_report: the child process did not report a load time for `$pkg`" *
-                (iszero(proc.exitcode) ? "" : " (it exited $(proc.exitcode))") *
+                (iszero(exitcode) ? "" : " (it exited $exitcode)") *
                 (isempty(err) ? "" : ".\n" * err)
         )
     )

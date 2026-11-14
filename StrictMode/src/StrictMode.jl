@@ -50,7 +50,10 @@ export steady_state_report, SteadyStateReport
 export allocated_bytes, AllocatedBytes
 export gc_pause_report, GcPauseReport
 export spin_wait_report, SpinWaitReport, SpinWaitFinding
+export @assert_reaches, reach_report, ReachReport, ReachedFunction, route_parity, RouteParity
 export latency_report, LatencyReport
+export threaded_speedup_report, ThreadedSpeedupReport
+export threadcount_invariant_report, ThreadcountInvariantReport
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt, @strict_policy
 export @strict_contract, @verify_strict, @explain
@@ -94,6 +97,7 @@ include("resources.jl")
 include("scheduling.jl")
 include("concurrency.jl")
 include("spinwait.jl")
+include("reach.jl")
 include("findings.jl")
 include("codes.jl")
 include("cache.jl")
@@ -103,6 +107,7 @@ include("mca.jl")
 include("steady.jl")
 include("gcpause.jl")
 include("latency.jl")
+include("threaded.jl")
 include("registry.jl")
 include("dispatch.jl")
 include("audit.jl")

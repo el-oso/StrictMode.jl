@@ -288,7 +288,40 @@ StrictMode/src/
                         The child reports by line and keys times by INDEX, never by the call's text,
                         which is the caller's and may hold a quote or a newline. Gating form:
                         StrictModeTest.test_latency, whose budgets are opt-in because a wall-clock
-                        threshold belongs to one host
+                        threshold belongs to one host. _run_child/_child_values are the shared
+                        child-process plumbing (script in, marker lines out); threaded.jl uses them
+  threaded.jl         — threaded_speedup_report/ThreadedSpeedupReport and
+                        threadcount_invariant_report/ThreadcountInvariantReport: what a call does at
+                        another THREAD COUNT. Julia fixes the count at process start, so each data
+                        point is a child with its own `-t`, and the call and its setup are strings
+                        of code. Speedup times `-t 1` against `-t auto`, both under
+                        `taskset -c 0:cpus-1` (unconfined, and reported so, where taskset is
+                        missing). Invariance has each child WRITE the result's bytes to a file and
+                        compares them here — bits, not printed values and not a tolerance — and
+                        takes a `witness` string, because whether a package's threaded path ran is
+                        only observable from inside the package and a call that never threads is
+                        identical at every count. Gating forms: StrictModeTest.test_threaded_speedup
+                        (max_slowdown = 1.5 on by default, a ratio taken on one host; the
+                        efficiency bound is opt-in) and test_threadcount_invariant (refuses to run
+                        without a witness)
+  reach.jl            — reach_report/ReachReport/ReachedFunction, route_parity/RouteParity,
+                        @assert_reaches: which functions a call reaches, from OPTIMIZED IR. The
+                        defect this finds is a default argument of an inlined call, so only
+                        constant propagation exposes it — unoptimized IR shows neither the pruned
+                        branch nor anything behind the first hop. Inlined callees leave no call
+                        statement and are read from the inlining EDGES of the body's debug info
+                        (code_typed_by_type(…; debuginfo = :source); the default strips them),
+                        which name a callee only while a statement of it survives. Identity is
+                        (module, demangled name), so a keyword method, its `#f#N` body and the
+                        positional method are one function. Reuses spinwait.jl's follow policy and
+                        task-closure reading. A run-time dispatch is followed when it matches at
+                        most _REACH_MAX_METHODS methods; a Base function on Base types is not
+                        counted as unread. `stop` cuts a hub (a pool dispatcher reaches every job).
+                        unread/dynamic are counted, RouteParity's status is :agree only for two
+                        complete non-empty graphs (:incomplete otherwise — an empty graph must not
+                        agree with anything), and @assert_reaches throws only when the graph was
+                        read in full, warning otherwise. :reaches takes a target, so it is NOT in
+                        _GUARANTEES. Gating forms: StrictModeTest.@test_reaches / test_route_parity
   test/mca_live.jl    — the live llvm-mca assertions, shared by mca_test.jl's live item and
                         test/mca_live_runner.jl so the two cannot drift. LLVM_full_jll is ~680MiB
                         and is a dep of NO environment here, so mca_available() is false everywhere
@@ -330,7 +363,8 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         _call_parts and hands the VALUES to StrictMode.allocated_bytes; any positive
                         figure FAILS, and the control window only decides whether the message calls
                         it unattributable, since "could not measure" and "is clean" must not render
-                        alike. The call runs warmups + windows + 1 times.
+                        alike. The call runs warmups + windows + 1 times. @test_reaches fails on an
+                        absent target whether or not the graph was read in full.
                         Deliberately NOT wrapped in _gate: a gate that compiles itself away under
                         a preference is a gate that can vanish silently
   src/drivers.jl      — test_signatures/test_compiled/test_registered/test_coverage (the last one
@@ -414,14 +448,19 @@ instrumentation reshape generated code, and the items asserting on its SHAPE
 compiled output directly and SKIP where the flags erased their subject — a skip that counts as
 green. Measured: a `@simd` loop does not vectorize under coverage on either version, nor under
 forced bounds checks on 1.12. So one pass neutralizes `@inbounds` and the other leaves codegen
-alone; only the `:trusted` `@test_broken` and the absent llvm-mca dep stay broken in the second.
+alone.
+
+The suite contains no `@test_broken` and no `@test_skip`, so every pass reports passes only: a
+broken or errored count in any of the four is a regression. A skipped shape item shows up as a
+lower TOTAL instead — the 1.12 bounds-checked pass runs a couple fewer assertions than the other
+three, which agree with each other.
 
 ```bash
-# safety: every @inbounds neutralized. 6 broken on 1.12, 2 on 1.13.
+# safety: every @inbounds neutralized.
 julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
 julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
 
-# codegen: the compiled-output items actually run. 2 broken on both versions.
+# codegen: the compiled-output items actually run.
 julia --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
 julia +1.12 --project=StrictMode -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=auto"])'
 ```

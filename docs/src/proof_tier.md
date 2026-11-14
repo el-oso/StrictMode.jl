@@ -39,6 +39,12 @@ The macro you write picks the engine. There is no mode to switch.
 | — | `test_layers(L => (deps…), …)` — a declared layer graph holds, both ways |
 | — | `test_latency(pkg)` — load time and first-call time, measured in a fresh process |
 | — | `test_no_unsafe(mod)` — no `ccall`, `pointer` or `unsafe_*`, with a named allow list |
+| `@assert_reaches f(x) g` | `@test_reaches f(x) g` — `g` is in the call graph after optimization; fails on a graph it could not read in full too |
+| `route_parity(f => T, g => T)` | `test_route_parity(f => T, g => T)` — two entries reach the same functions, both graphs read in full |
+| `allocated_bytes(f, args)` | `@test_allocated_zero f(x)` — the call allocates nothing, measured |
+| `threaded_speedup_report(pkg, call)` | `test_threaded_speedup(pkg, call)` — threading does not lose to the serial path, measured in fresh processes |
+| `threadcount_invariant_report(pkg, call)` | `test_threadcount_invariant(pkg, call; witness)` — the same bits at every thread count, with a witness that the threaded path ran |
+| — | `alloc_entry_report(f)` — every entry point of `f`, keyword methods included, with the allocation proof for each |
 | `specialization_report(mod)` | `test_specializations(mod; baseline, workload)` — the count's GROWTH against a baseline |
 
 ### Failing on a specialization budget
@@ -78,6 +84,8 @@ StrictModeTest.StrictModeTest
 @test_trim_compatible
 @test_steady_state
 @test_no_gc_pause
+@test_allocated_zero
+@test_reaches
 @test_strict
 @test_kernel
 ```
@@ -95,6 +103,12 @@ test_layers
 test_latency
 test_no_unsafe
 test_specializations
+test_route_parity
+test_threaded_speedup
+test_threadcount_invariant
+alloc_entry_report
+AllocEntryReport
+AllocEntry
 ```
 
 ### Proofs as data

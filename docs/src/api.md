@@ -103,6 +103,16 @@ gc_pause_report
 GcPauseReport
 latency_report
 LatencyReport
+allocated_bytes
+AllocatedBytes
+threaded_speedup_report
+ThreadedSpeedupReport
+StrictMode.speedup
+StrictMode.efficiency
+threadcount_invariant_report
+ThreadcountInvariantReport
+StrictMode.invariant
+StrictMode.witnessed
 ```
 
 ## Trusted data
@@ -152,12 +162,36 @@ dispatch_suggestions
 concurrent tasks. `@assert_no_threadid_state` fails on mutable state indexed by
 `Threads.threadid()`, the task-migration hazard: a task can move threads mid-run, stranding state
 keyed on the thread it started on. `pool_balance_report` is the companion diagnostic for
-thread-pool balance questions.
+thread-pool balance questions. `spin_wait_report` reads how the tasks a call spawns wait, and
+reports a migratable one that spins without ever blocking.
 
 ```@docs
 @assert_concurrency_safe
 @assert_no_threadid_state
 pool_balance_report
+spin_wait_report
+SpinWaitReport
+SpinWaitFinding
+```
+
+## Route parity
+
+Two entry points to one operation — a native method and its C-ABI wrapper, a keyword method and
+the positional one behind it — can each pass every per-call guarantee and still take different
+routes, when one of them calls a shared core with its defaults. `reach_report` lists the functions
+a call reaches after optimization, `@assert_reaches` checks one named target, and `route_parity`
+compares two entries and names what only one of them reaches.
+
+```@docs
+@assert_reaches
+reach_report
+ReachReport
+ReachedFunction
+StrictMode.reaches
+StrictMode.complete
+route_parity
+RouteParity
+StrictMode.status
 ```
 
 ## Testing
