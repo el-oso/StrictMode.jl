@@ -104,7 +104,7 @@ macro verify_strict(T, block)
     )
 
     stmts = Meta.isexpr(block, :block) ? block.args : Any[block]
-    out = Any[verify_call]
+    out = Any[]
     for s in stmts
         s isa LineNumberNode && continue
         # Already fully escaped and self-gated. The call itself is NOT performed: every check here
@@ -112,7 +112,10 @@ macro verify_strict(T, block)
         # compiles its whole tree.
         push!(out, _strict_expr(s; execute = false))
     end
-    push!(out, :nothing)
+    # The interface check runs AFTER the per-call checks. Those infer each listed call at its
+    # concrete types, and TypeContracts reads conformance for an unannotated member from that cached
+    # result instead of inferring the contract's abstract signature.
+    push!(out, verify_call, :nothing)
     return Expr(:block, out...)
 end
 
