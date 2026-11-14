@@ -576,3 +576,32 @@ end
     readsg(x) = x + gref[]
     @test StrictMode.effect_holds(StrictMode.effects(readsg, (Float64,)), :noub) == false
 end
+
+@testitem "GC.@preserve does not make a preserved immutable allocate" begin
+    using StrictMode
+    function sumview(A::Matrix{Float64}, n::Int)
+        v = view(A, 1:n, 1)
+        s = 0.0
+        GC.@preserve v begin
+            p = pointer(v)
+            for i in 1:n
+                s += unsafe_load(p, i)
+            end
+        end
+        return s
+    end
+    const SINKV = Any[]
+    function sumview_escapes(A::Matrix{Float64}, n::Int)
+        v = view(A, 1:n, 1)
+        GC.@preserve v begin
+            push!(SINKV, v)
+        end
+        return n
+    end
+    A = ones(8, 8)
+    sumview(A, 4); sumview_escapes(A, 4)
+    @test iszero(@allocated(sumview(A, 4)))
+    @test !StrictMode._alloc_signals(sumview, (Matrix{Float64}, Int)).alloc
+    # Preserving it does not excuse a real escape.
+    @test StrictMode._alloc_signals(sumview_escapes, (Matrix{Float64}, Int)).alloc
+end

@@ -681,6 +681,10 @@ function _immutable_escapes(ci, @nospecialize(sig), uses, dead, i::Int, seen::Bi
             else
                 return true
             end
+        elseif Meta.isexpr(st, :gc_preserve_begin)
+            # `GC.@preserve x` roots `x` for a block. It neither stores nor copies `x`, so an
+            # immutable it preserves stays where it is: a preserved `view` reads 0 bytes.
+            continue
         else
             return true
         end
