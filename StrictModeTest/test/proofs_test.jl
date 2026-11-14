@@ -182,3 +182,21 @@ end
         [(dirty, ())]; guarantees = (:no_threadid_state,)
     )
 end
+
+@testitem "an exempt callee does not excuse its caller from the allocation proof" begin
+    using StrictMode, StrictModeTest, Test
+    module ExemptProof
+    using StrictMode
+    const BUF = Ref(Float64[])
+    @noinline function xgrow_proof!(n::Int)
+        length(BUF[]) < n && (BUF[] = zeros(n))
+        return BUF[]
+    end
+    StrictMode._exempt!(:xgrow_proof!; guarantees = (:noalloc,), reason = "grows to a high-water mark")
+    only_grows(n::Int) = (b = xgrow_proof!(n); b[1])
+    end
+    ExemptProof.only_grows(4)
+    # The scan reports the caller as a note; the proof still sees the allocation.
+    @test only(StrictMode.findings(ExemptProof.only_grows, (Int,); guarantees = (:noalloc,))).status === :info
+    @test_throws StrictViolation @test_noalloc ExemptProof.only_grows(4)
+end

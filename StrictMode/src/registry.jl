@@ -244,6 +244,21 @@ function Base.show(io::IO, e::Exemption)
     return nothing
 end
 
+# The exemptions that cover `:noalloc`, for the allocation scan, which asks at every call it follows.
+# `exemptions()` walks each loaded package's store, so the result is kept until the world advances
+# (a package load or a method definition, which is how a package's stored exemptions appear) or
+# this session records one.
+const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Vector{Exemption}}}((typemax(UInt), -1, Exemption[]))
+function _noalloc_exemptions()
+    w = Base.get_world_counter()
+    n = length(STRICT_EXEMPT)
+    m = _NOALLOC_EXEMPT_MEMO[]
+    (m[1] == w && m[2] == n) && return m[3]
+    v = filter(e -> isnothing(e.guarantees) || :noalloc in e.guarantees, exemptions())
+    _NOALLOC_EXEMPT_MEMO[] = (w, n, v)
+    return v
+end
+
 # Opt-outs recorded in THIS session. Rust-like: in a strict module everything is hot by default and
 # you opt the rare cold helper out, rather than opting the hot code in.
 const STRICT_EXEMPT = Exemption[]
@@ -285,6 +300,8 @@ function _exempt!(
     e = Exemption(name, isnothing(types) ? nothing : Tuple(types), gs, String(reason), String(file), Int(line))
     store = isnothing(mod) ? STRICT_EXEMPT : _local_store!(mod, _LOCAL_EXEMPT, Exemption[])
     e in store || push!(store, e)
+    # The allocation scan reads `:noalloc` exemptions, so a verdict cached before this one is stale.
+    clear_cache!()
     return nothing
 end
 

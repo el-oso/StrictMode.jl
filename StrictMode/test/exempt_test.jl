@@ -264,3 +264,41 @@ end
         @test occursin("Doc of it.", doc)
     end
 end
+
+@testitem "a caller whose only allocation is an exempt callee is a note" begin
+    using StrictMode, Test
+    # Names unique to this item: an exemption is matched by function name in every loaded module.
+    module ExemptCallers
+    using StrictMode
+    const BUF = Ref(Float64[])
+    @noinline function xgrow_note!(n::Int)
+        length(BUF[]) < n && (BUF[] = zeros(n))
+        return BUF[]
+    end
+    const BOXES = Any[1]
+    @noinline xbox_note!(n::Int) = BOXES[1] + n
+    StrictMode._exempt!(:xgrow_note!; guarantees = (:noalloc,), reason = "grows to a high-water mark")
+    StrictMode._exempt!(:xbox_note!; guarantees = (:noalloc,), reason = "boxes")
+    only_grows(n::Int) = (b = xgrow_note!(n); b[1])
+    also_allocs(n::Int) = (b = xgrow_note!(n); sum(zeros(n)) + b[1])
+    calls_boxer(n::Int) = xbox_note!(n) + 1
+    end
+    E = ExemptCallers
+    E.only_grows(4); E.also_allocs(4); E.calls_boxer(1)
+    noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
+
+    r = noalloc(E.only_grows)
+    @test r.status === :info
+    @test occursin("xgrow_note!", r.reason)
+    @test !StrictMode._failed(r)
+
+    # Its own allocation is not excused by reaching an exempt one.
+    @test StrictMode._failed(noalloc(E.also_allocs))
+    # `:noalloc` excuses the callee's allocation, not its boxing.
+    @test StrictMode._failed(noalloc(E.calls_boxer))
+
+    logs = Test.collect_test_logs() do
+        @strict E.only_grows(4)
+    end[1]
+    @test !any(l -> l.level === Base.CoreLogging.Warn, logs)
+end

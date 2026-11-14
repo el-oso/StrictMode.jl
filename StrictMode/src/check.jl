@@ -185,7 +185,19 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             )
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
-            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))
+            if !fail && !isnothing(sig.exempt)
+                # Its only allocation is in a callee exempted from `:noalloc`: a note, so the
+                # excusal stays visible without being reported again at every caller.
+                push!(
+                    out, StrictFinding(
+                        md, fn, sg, g, :info, sig.file, sig.line,
+                        "reaches `$(sig.exempt)`, exempt from :noalloc; its allocation is excused there",
+                        "", :report, _code(g, nothing)
+                    )
+                )
+            else
+                push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))
+            end
         elseif g === :noboxing
             fail = sig.boxing || !isnothing(sig.abscontainer)
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))

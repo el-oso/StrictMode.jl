@@ -296,7 +296,7 @@ Location is the method's definition site.
 """
 const _AllocSignals = @NamedTuple{
     alloc::Bool, boxing::Bool, dictlookup::Bool, abscontainer::Any,
-    barrier::Bool, unionphi::Bool, file::String, line::Int,
+    barrier::Bool, unionphi::Bool, exempt::Union{Nothing, Symbol}, file::String, line::Int,
 }
 
 # The scan of `f`'s OWN body, memoized on the same terms as the callee recursion below: identity on
@@ -335,8 +335,8 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     end
     seen = Base.IdSet{Any}()
     push!(seen, sig)
-    alloc, boxing, dictlookup, abscontainer, barrier, unionphi =
-        isempty(cts) ? (false, false, false, nothing, false, false) :
+    alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt =
+        isempty(cts) ? (false, false, false, nothing, false, false, nothing) :
         _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
@@ -345,7 +345,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     end
     file = isnothing(m) ? "" : string(m.file)
     line = isnothing(m) ? 0 : Int(m.line)
-    return (; alloc, boxing, dictlookup, abscontainer, barrier, unionphi, file, line)
+    return (; alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, file, line)
 end
 
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
@@ -514,11 +514,11 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, false, nothing, false, false)
+    sig in seen && return (false, false, false, nothing, false, false, nothing)
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -527,7 +527,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -535,9 +535,9 @@ function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.Id
     cts = try
         Base.code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, false, nothing, false, false)
+        return (false, false, false, nothing, false, false, nothing)
     end
-    isempty(cts) && return (false, false, false, nothing, false, false)
+    isempty(cts) && return (false, false, false, nothing, false, false, nothing)
     return _scan_ci(first(cts)[1], sig, depth, seen)
 end
 
@@ -726,6 +726,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     abscontainer = nothing            # the abstract element type of the first abstract-eltype container seen
     barrier = false                   # a call reached a recognized one-time-init allocation barrier
     unionphi = false                  # a union-typed phi whose members do not all ride unboxed (F39)
+    exempt = nothing                  # the first `@strict_exempt :noalloc` callee whose allocation was excused
     # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
     # Computed on demand: the analysis costs about as much as the whole rest of the scan, and it can
     # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
@@ -814,8 +815,19 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # more so: it is a top-level-only signal, never propagated from a callee
                         # (widening it to callees and to dict value types over-flags `IdDict`, #17).
                         if depth > 0 && (!alloc || !boxing || !dictlookup)
-                            a2, b2, d2, _, br2, up2 = _signals_by_type(mi.specTypes, depth - 1, seen)
-                            a2 && (alloc = true)
+                            a2, b2, d2, _, br2, up2, ex2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            # A callee exempted from `:noalloc` has its allocation excused here
+                            # too — it is the same allocation, already excused where it is made —
+                            # and the excusal is recorded, so the caller is reported as reaching it
+                            # rather than as clean. Only allocation is excused: the callee's boxing
+                            # and dictionary lookups still count against the caller.
+                            exname = a2 ? _mi_exempt_name(mi) : nothing
+                            if isnothing(exname)
+                                a2 && (alloc = true)
+                            elseif isnothing(exempt)
+                                exempt = exname
+                            end
+                            (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
                             b2 && (boxing = true)
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
@@ -857,7 +869,22 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         end
     end
-    return (alloc, boxing, dictlookup, abscontainer, barrier, unionphi)
+    return (alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt)
+end
+
+# The name of the function `mi` calls, when an exemption in scope covers `:noalloc` for it at the
+# types it is called with; `nothing` otherwise.
+function _mi_exempt_name(mi::Core.MethodInstance)
+    mi.def isa Method || return nothing
+    es = _noalloc_exemptions()
+    isempty(es) && return nothing
+    name = _demangle(mi.def.name)
+    ps = mi.specTypes.parameters
+    types = length(ps) > 1 ? Tuple(ps[2:end]) : ()
+    for e in es
+        _covers(e, name, types, :noalloc) && return name
+    end
+    return nothing
 end
 
 # --- Base.infer_effects layer (cheap; basis for @assert_effects in Phase 3) -------------------
