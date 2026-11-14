@@ -222,7 +222,15 @@ const _GENERATION = Ref{UInt}(0)
 
 # Build the gated expression for a single `f(args...)` call, or the bare call when checks are
 # disabled. Factored out so `@verify_strict` can reuse it without fragile nested-macro composition.
-function _strict_expr(call; types = nothing)
+#
+# `execute = false` keeps the checks and drops the call. Both of them read only the argument TYPES —
+# `promote_op` infers a return type and `_strict_scan` reads typed IR — so the values are needed to
+# name those types and for nothing else. Running the call is what a site wrapping a real call wants
+# and is pure cost for a list of representative calls whose values are discarded: performing one
+# forces its whole tree to be compiled, and a `@verify_strict` block at a package's top level pays
+# that at every consumer's precompile (issue #40, measured at 672 s and 5.7 GB on a 119-call BLAS
+# consumer against the same build with the block skipped, of which the IR scans are 13 s).
+function _strict_expr(call; types = nothing, execute::Bool = true)
     target = string(call)
     p = _call_parts(call; types)
     site = QuoteNode(gensym(:strictsite))
@@ -241,9 +249,9 @@ function _strict_expr(call; types = nothing)
             $(_strict_scan)($target, $(p.checkfn), $(p.types))
             var"#flag"[] = var"#stamp"
         end
-        $(p.litcall)
+        $(execute ? p.litcall : nothing)
     end
-    return _gate(checked, esc(call))
+    return _gate(checked, execute ? esc(call) : nothing)
 end
 
 # The inspection half of `@strict`, off the hot path. `@noinline` keeps its frame out of the
