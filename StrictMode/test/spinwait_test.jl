@@ -1,0 +1,219 @@
+# How a spawned worker waits. The discriminator is whether the task can ever park, not whether it
+# spins: a pool that spins before it blocks is the correct shape.
+
+@testitem "spin_wait_report flags a migratable task that waits without parking" begin
+    using StrictMode
+
+    module SpinPool
+    mutable struct P
+        @atomic gen::Int
+        ev::Threads.Event
+        ch::Channel{Int}
+        io::IOBuffer
+    end
+
+    # Waits by `yield` alone: the loop holds a CPU for as long as it waits, and every `yield`
+    # returns the task to the shared queue where it can wake a spare Julia thread.
+    function start_broken(p::P)
+        Threads.@spawn begin
+            seen = 0
+            while (@atomic p.gen) == seen
+                yield()
+            end
+            nothing
+        end
+    end
+
+    # The same loop as a named function the closure calls, which is how a pool is usually written.
+    @noinline function worker_loop(p::P)
+        while iszero(@atomic p.gen)
+            yield()
+        end
+        return nothing
+    end
+    start_named(p::P) = Threads.@spawn worker_loop(p)
+
+    # Workers spawned by a helper, from a comprehension.
+    @noinline spawn_one(p::P) = Threads.@spawn worker_loop(p)
+    start_pool(p::P, n::Int) = [spawn_one(p) for _ in 1:n]
+
+    # Spin, then block. This is the shape the check must approve.
+    function start_fixed(p::P)
+        Threads.@spawn begin
+            seen = 0
+            while (@atomic p.gen) == seen
+                spun = false
+                for _ in 1:2048
+                    if (@atomic p.gen) != seen
+                        spun = true
+                        break
+                    end
+                    Base.Threads.atomic_fence()
+                end
+                spun && break
+                wait(p.ev)
+            end
+            nothing
+        end
+    end
+
+    # The blocking stage sits in a callee.
+    @noinline park(p::P) = wait(p.ev)
+    function start_parks_in_callee(p::P)
+        Threads.@spawn while iszero(@atomic p.gen)
+            yield()
+            park(p)
+        end
+    end
+
+    # A fence, a safepoint and a pause keep the CPU without even requeuing the task.
+    function start_fence_only(p::P)
+        Threads.@spawn while iszero(@atomic p.gen)
+            Base.Threads.atomic_fence()
+        end
+    end
+    function start_safepoint_only(p::P)
+        Threads.@spawn while iszero(@atomic p.gen)
+            GC.safepoint()
+        end
+    end
+    function start_pause_only(p::P)
+        Threads.@spawn while iszero(@atomic p.gen)
+            ccall(:jl_cpu_pause, Cvoid, ())
+        end
+    end
+
+    # Emptying a buffer and taking a spin lock do not park the task.
+    function start_drains_buffer(p::P)
+        Threads.@spawn while iszero(@atomic p.gen)
+            yield()
+            take!(p.io)
+        end
+    end
+    function start_spinlock(p::P, l::Threads.SpinLock)
+        Threads.@spawn while iszero(@atomic p.gen)
+            lock(l)
+            unlock(l)
+            yield()
+        end
+    end
+
+    # Blocking workers with no spin at all.
+    function start_channel(p::P)
+        Threads.@spawn for job in p.ch
+            @atomic p.gen += job
+        end
+    end
+    function start_channel_yielding(p::P)
+        Threads.@spawn for job in p.ch
+            yield()
+        end
+    end
+    function start_reader(p::P, io::IOStream)
+        Threads.@spawn while !eof(io)
+            readline(io)
+        end
+    end
+
+    # Bound to a thread: by an explicit write, and by never being released.
+    function start_pinned(p::P)
+        t = Threads.@spawn while iszero(@atomic p.gen)
+            yield()
+        end
+        t.sticky = true
+        return t
+    end
+    start_async(p::P) = @async while iszero(@atomic p.gen)
+        yield()
+    end
+    start_task(p::P) = schedule(
+        Task(
+            () -> while iszero(@atomic p.gen)
+                yield()
+            end
+        )
+    )
+
+    # A bound task that spawns the migratable worker.
+    start_supervised(p::P) = @async start_broken(p)
+
+    # A task whose function is not known at the spawn site.
+    start_unknown(f) = schedule(Task(f))
+
+    spawns_nothing(p::P) = (@atomic p.gen) + 1
+    end
+
+    T = (SpinPool.P,)
+    polls(r) = only(r.findings).polls
+    clean(r) = isempty(r.findings) && isempty(r.unread)
+
+    r = StrictMode.spin_wait_report(SpinPool.start_broken, T)
+    v = only(r.findings)
+    @test :yield in v.polls
+    @test v.atomic_poll
+    @test occursin("shared queue", v.reason)
+    @test occursin("busy_wait", sprint(show, r))
+
+    # The loop is read through the call, whether the closure reaches it directly or the spawn
+    # itself sits in a helper.
+    rn = StrictMode.spin_wait_report(SpinPool.start_named, T)
+    @test :yield in polls(rn)
+    rpool = StrictMode.spin_wait_report(SpinPool.start_pool, (SpinPool.P, Int))
+    @test isone(rpool.tasks)
+    @test :yield in polls(rpool)
+
+    # The correct shape passes, with its blocking stage in the loop or in a callee. A per-loop rule
+    # would report the inner spin loop, since the `wait` sits in the enclosing one.
+    rf = StrictMode.spin_wait_report(SpinPool.start_fixed, T)
+    @test clean(rf)
+    @test isone(rf.tasks)
+    @test occursin("no spin-wait loop", sprint(show, rf))
+    @test clean(StrictMode.spin_wait_report(SpinPool.start_parks_in_callee, T))
+
+    # Waiting operations that are not Julia calls.
+    @test polls(StrictMode.spin_wait_report(SpinPool.start_fence_only, T)) == [:atomic_fence]
+    @test polls(StrictMode.spin_wait_report(SpinPool.start_safepoint_only, T)) == [:safepoint]
+    @test polls(StrictMode.spin_wait_report(SpinPool.start_pause_only, T)) == [:cpu_pause]
+
+    # A blocking NAME on a non-blocking operation does not excuse the spin.
+    @test :yield in polls(StrictMode.spin_wait_report(SpinPool.start_drains_buffer, T))
+    @test :yield in polls(
+        StrictMode.spin_wait_report(SpinPool.start_spinlock, (SpinPool.P, Threads.SpinLock))
+    )
+
+    # A loop that only blocks is not a spin, and a channel loop that also yields still parks.
+    @test clean(StrictMode.spin_wait_report(SpinPool.start_channel, T))
+    @test clean(StrictMode.spin_wait_report(SpinPool.start_channel_yielding, T))
+    @test clean(StrictMode.spin_wait_report(SpinPool.start_reader, (SpinPool.P, IOStream)))
+
+    # A bound task is counted and not judged. `Threads.@spawn` writes `sticky = false`; `@async`
+    # and `Task` write nothing and leave the task bound.
+    for start in (SpinPool.start_pinned, SpinPool.start_async, SpinPool.start_task)
+        rb = StrictMode.spin_wait_report(start, T)
+        @test isempty(rb.findings)
+        @test isone(rb.tasks)
+        @test isone(rb.bound)
+        @test occursin("bound to a thread", sprint(show, rb))
+    end
+
+    # …but the tasks it spawns are read.
+    rs = StrictMode.spin_wait_report(SpinPool.start_supervised, T)
+    @test rs.tasks == 2
+    @test isone(rs.bound)
+    @test :yield in polls(rs)
+
+    # A task that could not be read is listed, and the report does not render as clean.
+    ru = StrictMode.spin_wait_report(SpinPool.start_unknown, (Function,))
+    @test isone(ru.tasks)
+    @test isone(length(ru.unread))
+    @test isempty(ru.findings)
+    @test occursin("not read", sprint(show, ru))
+    @test !occursin("no spin-wait loop", sprint(show, ru))
+
+    # Nothing spawned, nothing to say.
+    rz = StrictMode.spin_wait_report(SpinPool.spawns_nothing, T)
+    @test iszero(rz.tasks)
+    @test isempty(rz.findings)
+
+    @test_throws "no method matches" StrictMode.spin_wait_report(SpinPool.start_broken, (Int,))
+end

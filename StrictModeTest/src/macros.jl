@@ -316,3 +316,77 @@ macro test_no_gc_pause(args...)
         $(p.litcall)
     end
 end
+
+# A measured allocation gate, so it belongs beside `@test_steady_state` rather than at a `src` call
+# site. Any positive figure FAILS, whether or not the control window attributes it: "could not
+# measure" and "is clean" must not render the same. The control decides only what the message says,
+# and a control that recorded nothing shows the process was quiet during the control, not during
+# the measurement — so the message reports the control's figure and draws no conclusion from it.
+function _check_allocated_zero(
+        kind::Symbol, target, @nospecialize(f), args::Tuple, kw::NamedTuple,
+        warmups::Int, windows::Int
+    )
+    r = StrictMode.allocated_bytes(f, args, kw; warmups, windows)
+    iszero(r.bytes) && return r
+    why = if StrictMode.inconclusive(r)
+        "allocated $(r.bytes) byte(s), and an allocation-free control window of the same " *
+            "duration recorded $(r.noise) — something else in this process was allocating, so " *
+            "this figure cannot be attributed to the call. Measure it again with the process quiet"
+    else
+        "allocated $(r.bytes) byte(s) in the worst of $windows window(s) after $warmups warmup " *
+            "call(s); an allocation-free control window of the same duration recorded 0"
+    end
+    throw(StrictMode.StrictViolation(kind, target, why * "."))
+end
+
+"""
+    @test_allocated_zero f(args...; kw...)
+    @test_allocated_zero f(args...) warmups=2 windows=3
+
+Fail unless `f(args...; kw...)` is **measured** to allocate nothing.
+
+Unlike [`@test_noalloc`](@ref), which proves the property from compiled code, this runs the call
+and reads the allocation counter — so it covers what a proof cannot reach, and it answers for the
+arguments you actually passed.
+
+The callee and every argument are evaluated once and are concrete inside the measured window, so
+the figure does not depend on how the call site's bindings are declared. A non-const global — which
+every local inside a `@testitem` is — or a function passed as an argument makes a plain
+`@allocated` report bytes that the call itself does not allocate; neither adds anything here.
+
+The call runs `warmups + windows + 1` times: `warmups` discarded calls, `windows` measured ones of
+which the largest figure is kept, and a last one whose value the macro returns. A call that
+mutates its arguments therefore mutates them that many times, and one that allocates only on some
+calls — a buffer that grows now and then — fails.
+
+The allocation counter is process-wide, so a positive figure is followed by an allocation-free
+control window of the same duration. The call fails either way; the control decides whether the
+message reports the figure as unattributable.
+
+The arguments reach the measured call as run-time values, so a call the compiler would fold away
+when written with literal arguments is measured unfolded. Splatted arguments are not supported:
+use [`StrictMode.allocated_bytes`](@ref), which takes the argument tuple.
+
+```julia
+@test_allocated_zero gemm!(C, A, B; alpha = 2.0, beta = 1.0)
+@test_allocated_zero dot3(a, b) windows=5
+```
+"""
+macro test_allocated_zero(args...)
+    pos, opts = StrictMode._macro_call(args, (:warmups, :windows))
+    isempty(pos) && throw(ArgumentError("@test_allocated_zero needs a call expression"))
+    call = pos[1]
+    p = StrictMode._call_parts(call)
+    argtup = Expr(:tuple, p.args...)
+    # `Expr(:tuple)` is the empty TUPLE; an empty NamedTuple needs the parameters block.
+    kwnt = isempty(p.kwsyms) ? Expr(:tuple, Expr(:parameters)) :
+        Expr(:tuple, (Expr(:(=), n, s) for (n, s) in zip(p.kwnames, p.kwsyms))...)
+    return quote
+        $(p.binds...)
+        $(_check_allocated_zero)(
+            :test_allocated_zero, $(string(call)), $(p.fn), $argtup, $kwnt,
+            $(esc(get(opts, :warmups, 2))), $(esc(get(opts, :windows, 3)))
+        )
+        $(p.litcall)
+    end
+end

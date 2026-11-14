@@ -28,6 +28,15 @@ function _callinfo(call)
             end
         elseif Meta.isexpr(a, :kw)          # inline `k=v`
             _collect_kw!(kwexprs, a)
+        elseif Meta.isexpr(a, :...)
+            # Each argument is bound to its own name, and a splat has no single value to bind.
+            throw(
+                ArgumentError(
+                    "StrictMode guarantee macros can't handle the splatted argument `$a`. Bind " *
+                        "the arguments individually, or use the function API instead: " *
+                        "`StrictMode.findings(f, (T1, T2, …))`."
+                )
+            )
         else
             push!(argexprs, a)
         end
@@ -59,6 +68,8 @@ end
 #   checkfn — the function whose signature the backends inspect: `f`, or `Core.kwcall` when there
 #             are keyword args (so `check_allocs`/`return_types` see the real kwarg sites unchanged).
 #   types   — the inference-signature tuple expr matching `checkfn`.
+#   fn, args, kwnames, kwsyms — the gensyms the callee, the positional arguments and the keyword
+#             values are bound to, for a macro that hands the VALUES to a measurement.
 # `types = (...)` override pins the signature verbatim (fixes DataType-widening false positives).
 function _call_parts(call; types = nothing)
     fexpr, argexprs, kwexprs = _callinfo(call)
@@ -108,7 +119,10 @@ function _call_parts(call; types = nothing)
         checkfn = fnsym
         typesexpr = Expr(:tuple, (:(typeof($s)) for s in argsyms)...)
     end
-    return (; binds, litcall, thunk, checkfn, types = typesexpr)
+    return (;
+        binds, litcall, thunk, checkfn, types = typesexpr,
+        fn = fnsym, args = argsyms, kwnames, kwsyms,
+    )
 end
 
 # Varargs scan generalizing the `static=`/`self=` option loops: pulls any `Expr(:(=), key, val)`

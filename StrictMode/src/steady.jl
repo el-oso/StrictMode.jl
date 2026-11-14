@@ -173,3 +173,141 @@ function steady_state_report(
         _control_bytes(round(UInt64, 1.0e9 * (@elapsed f(args...))), repeats)
     return SteadyStateReport(target, bytes, noise, warmups, repeats, fresh_task, Threads.nthreads())
 end
+
+"""
+    StrictMode.AllocatedBytes
+
+What one call allocates, measured. `bytes` is the largest figure over `windows` measurements, so a
+call that allocates only on some of them is not read as clean; `noise` is what an allocation-free
+window of the same duration recorded, which is `0` whenever `bytes` is.
+
+See [`allocated_bytes`](@ref StrictMode.allocated_bytes).
+"""
+struct AllocatedBytes
+    target::String
+    bytes::Int
+    noise::Int
+    warmups::Int
+    windows::Int
+end
+
+# A type passed as a value sits in a tuple as `DataType`, which would make the measured call a
+# dynamic dispatch. Carrying it as a type parameter lets the window splice the type itself back in.
+struct _TypeArg{T} end
+_wrap_type(@nospecialize(a)) = a isa Type ? _TypeArg{a}() : a
+_window_slot(::Type{_TypeArg{T}}, ex) where {T} = T
+_window_slot(::Type, ex) = ex
+
+# The measured window. The counter is process-wide, so the window has to contain the call and
+# nothing else: a dynamic dispatch on the callee or on an argument allocates inside it and is
+# charged to the call.
+#
+# Three things keep it to the call alone, and each is required:
+# - The callee and the arguments arrive as `f::F` and as a tuple with a type parameter. A plain
+#   `f` or `args...` that is only passed on is not specialized for a function-valued argument, and
+#   `@allocated f(args...)` is such a pass-through — it lowers to `Base.allocated(f, args...)`.
+# - The call is generated with its positional and keyword arguments written out, so a keyword
+#   call dispatches the way one written by hand does.
+# - The result is kept alive until the counter has been read. A result nothing uses lets the
+#   compiler delete the allocation that produced it.
+@generated function _alloc_window(
+        f::F, args::A, ::Val{names}, kw::K
+    ) where {F, A <: Tuple, names, K <: Tuple}
+    pos = Any[_window_slot(A.parameters[i], :(args[$i])) for i in eachindex(A.parameters)]
+    kws = Any[
+        Expr(:kw, names[i], _window_slot(K.parameters[i], :(kw[$i])))
+            for i in eachindex(K.parameters)
+    ]
+    callee = _window_slot(F, :f)
+    call = isempty(kws) ? Expr(:call, callee, pos...) :
+        Expr(:call, callee, Expr(:parameters, kws...), pos...)
+    return quote
+        Base.@_noinline_meta
+        b0 = Base.gc_bytes()
+        r = $call
+        b1 = Base.gc_bytes()
+        Base.donotdelete(r)
+        return Int(b1 - b0)
+    end
+end
+
+_alloc_target(f, args::Tuple, kw::NamedTuple) =
+    string(f isa Function || f isa Type ? f : typeof(f)) * "(" *
+    join(map(a -> string(Core.Typeof(a)), args), ", ") *
+    (isempty(kw) ? "" : "; " * join(("$k::$(Core.Typeof(v))" for (k, v) in pairs(kw)), ", ")) * ")"
+
+"""
+    StrictMode.allocated_bytes(f, args = (), kw = (;); warmups = 2, windows = 3) -> AllocatedBytes
+
+Measure what `f(args...; kw...)` allocates. The callee and every argument are concrete inside the
+measured window, so the figure does not depend on how the caller's bindings are declared — a
+non-const global callee, or a function passed as an argument, adds nothing to it.
+
+`args` is a tuple of values and `kw` a `NamedTuple`. The call is run `warmups + windows` times: the
+first `warmups` are discarded and the largest figure of the rest is kept, so a call that allocates
+only now and then — a buffer that grows on some calls — is reported.
+
+The allocation counter is process-wide and cannot say whose allocation it counted. A positive
+figure is therefore followed by an allocation-free control window of the same duration, and
+[`inconclusive`](@ref StrictMode.inconclusive) reports whether that also recorded bytes. A control
+that recorded nothing shows the process was quiet then; it cannot show it was quiet during the
+measurement. A zero needs no control, because another task's allocation can only add.
+
+The arguments reach the call as run-time values. A call the compiler would fold away when written
+with literal arguments is measured as the call it is with those values supplied at run time.
+
+The gating form is `StrictModeTest.@test_allocated_zero`, which reads the call expression directly.
+
+```julia
+r = StrictMode.allocated_bytes(gemm!, (C, A, B), (alpha = 2.0, beta = 1.0))
+iszero(r.bytes)
+```
+"""
+function allocated_bytes(
+        @nospecialize(f), args::Tuple = (), kw::NamedTuple = (;);
+        warmups::Int = 2, windows::Int = 3
+    )
+    warmups >= 1 || throw(ArgumentError("allocated_bytes: warmups must be at least 1"))
+    windows >= 1 || throw(ArgumentError("allocated_bytes: windows must be at least 1"))
+    wf = _wrap_type(f)
+    wargs = map(_wrap_type, args)
+    names = Val(keys(kw))
+    wkw = map(_wrap_type, values(kw))
+    once() = _alloc_window(wf, wargs, names, wkw)::Int
+    # Warming through the window compiles the window too, so no measured call pays for it.
+    for _ in 1:warmups
+        once()
+    end
+    t0 = time_ns()
+    bytes = maximum(_ -> once(), 1:windows)
+    per_window = (time_ns() - t0) ÷ UInt64(windows)
+    noise = iszero(bytes) ? 0 : _control_bytes(per_window, windows)
+    return AllocatedBytes(_alloc_target(f, args, kw), bytes, noise, warmups, windows)
+end
+
+"""
+    StrictMode.inconclusive(r::AllocatedBytes) -> Bool
+
+Whether something else in the process was allocating while the call was measured, which leaves
+`bytes` unattributable.
+"""
+inconclusive(r::AllocatedBytes) = !iszero(r.bytes) && !iszero(r.noise)
+
+function Base.show(io::IO, r::AllocatedBytes)
+    printstyled(io, "AllocatedBytes"; bold = true)
+    print(io, ": ", r.target, "\n")
+    if iszero(r.bytes)
+        printstyled(io, "  zero"; color = :green)
+        print(io, ": allocates nothing over ", r.windows, " window(s)")
+    elseif inconclusive(r)
+        printstyled(io, "  INCONCLUSIVE"; color = :yellow, bold = true)
+        print(
+            io, ": ", r.bytes, " byte(s), but an allocation-free control window recorded ",
+            r.noise, " — something else in this process was allocating"
+        )
+    else
+        printstyled(io, "  ", r.bytes, " byte(s)"; color = :red)
+        print(io, " in the worst of ", r.windows, " window(s); a control window recorded 0")
+    end
+    return nothing
+end

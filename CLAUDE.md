@@ -189,7 +189,36 @@ StrictMode/src/
                         the process is. Measured: one neighbor task charges 2120 bytes to a clean
                         call, 3MB over a 2ms window. Do NOT try to separate noise by aggregating
                         repeats (min-of-K, or two batches agreeing): a periodic neighbor gives the
-                        SAME figure every batch, measured, so agreement proves nothing)
+                        SAME figure every batch, measured, so agreement proves nothing).
+                        allocated_bytes/AllocatedBytes lives here too and shares _control_bytes.
+                        _alloc_window is @generated and reads Base.gc_bytes() around a call
+                        written out argument by argument, with the callee as f::F and the
+                        arguments in a tuple with a type parameter. Do NOT replace it with
+                        `@allocated f(args...)`: that lowers to Base.allocated(f, args...), a
+                        pass-through Julia does not specialize for a function-valued argument, so
+                        sum(abs2, x) reads 16 B there against 0 B here. A type passed as a value
+                        rides in _TypeArg{T} for the same reason (a tuple holds it as DataType),
+                        and the result is kept alive past the second read, since an unused result
+                        lets the compiler delete the allocation. It keeps the MAXIMUM over its
+                        windows, like steady_state_report: a minimum reads amortized growth
+                        (push!, one call in three) as zero
+  spinwait.jl         — spin_wait_report/SpinWaitReport/SpinWaitFinding: how the MIGRATABLE tasks a
+                        call spawns wait. A finding needs both a waiting operation read in a loop
+                        (yield; the jl_gc_safepoint / jl_cpu_pause foreigncalls; atomic_fence, an
+                        intrinsic on 1.13 and an llvmcall of `fence` on 1.12) and NO blocking
+                        operation anywhere the task reaches — judged over the whole reach, not per
+                        loop, because the correct shape nests its spin inside the loop that
+                        blocks. A loop with neither is not reported: it may block in a foreign
+                        call. _sw_reach follows :invoke into callees outside Base (a worker loop is
+                        usually a named function) and into a Base callee only when it carries a
+                        user function (a comprehension's Generator); Base is otherwise judged by
+                        name and argument types and NOT entered, because yield itself parks through
+                        wait. `lock` is not a blocking operation (a SpinLock spins) and take! on an
+                        IO is not either. A task is created BOUND (Task(f), @async); only
+                        Threads.@spawn's `sticky = false` write, matched on the task's own SSA
+                        value, makes it migratable — bound tasks are counted, not judged, and the
+                        tasks they spawn are still read. Unread tasks and unfollowed calls are
+                        fields of the report and suppress the green line
   gcpause.jl          — gc_pause_report/GcPauseReport (whether a GC ran while the call did, plus the
                         per-call pause distribution). The axis the allocation guarantees cannot
                         cover: the collector stops the world, so an allocation-free kernel is paused
@@ -295,12 +324,25 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         _trim_child_modules resolves what the child must load — the METHOD's module
                         and each argument type's, not parentmodule(f)
   src/macros.jl       — @test_noalloc/@test_noboxing/@test_typestable/@test_trim_compatible,
-                        @test_steady_state/@test_no_gc_pause (the two MEASURED gates — they take values
-                        and run the call, and need no analysis backend at all).
+                        @test_steady_state/@test_no_gc_pause/@test_allocated_zero (the MEASURED
+                        gates — they take values and run the call, and need no analysis backend at
+                        all). @test_allocated_zero binds the callee and each argument through
+                        _call_parts and hands the VALUES to StrictMode.allocated_bytes; any positive
+                        figure FAILS, and the control window only decides whether the message calls
+                        it unattributable, since "could not measure" and "is clean" must not render
+                        alike. The call runs warmups + windows + 1 times.
                         Deliberately NOT wrapped in _gate: a gate that compiles itself away under
                         a preference is a gate that can vanish silently
   src/drivers.jl      — test_signatures/test_compiled/test_registered/test_coverage (the last one
-                        gates on UNdeclared methods, the hole the others cannot see); each collects
+                        gates on UNdeclared methods, the hole the others cannot see), plus
+                        alloc_entry_report/AllocEntryReport/AllocEntry: every ENTRY POINT of one
+                        function with the allocation proof's verdict for each. A proof of
+                        f(args...) covers the positional method; the Core.kwcall method a keyword
+                        caller reaches is separate compiled code whose NamedTuple parameter is
+                        declared abstract, so it is ALWAYS :unproven and is listed rather than
+                        omitted — omitting it is what makes a suite read as covered. The kwcall
+                        lookup uses Core.Typeof(f): typeof of a type is DataType, which matches
+                        every type's keyword constructor. Each driver collects
                         every failure and raises ONCE, so one unanalyzable method leaves the rest
                         evaluated. test_calls gates on whether a call RESOLVES at all: report_opt
                         answers a performance question and is silent on a MethodError sitting on a

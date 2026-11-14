@@ -42,11 +42,12 @@ using PrecompileTools: @setup_workload, @compile_workload
 using Serialization: serialize, deserialize   # issue #19: patched trim verification runs in a child
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible, @test_steady_state
-export @test_no_gc_pause
+export @test_no_gc_pause, @test_allocated_zero
 export @test_strict, @test_kernel
 export test_signatures, test_compiled, test_registered, test_coverage, test_exemptions
 export test_calls, test_layers, test_latency, test_no_unsafe, test_specializations
 export proof_audit
+export alloc_entry_report, AllocEntryReport, AllocEntry
 export proof_findings, AnalysisError
 export ignore_barrier, set_ignore_barrier!
 export juliac_patches, set_juliac_patches!

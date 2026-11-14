@@ -601,3 +601,102 @@ function test_specializations(
         )
     )
 end
+
+"""
+    StrictModeTest.AllocEntry
+
+One entry point of a function and what an allocation proof says about it. `kind` is `:positional`
+or `:keyword`. `status` is `:pass`, `:fail`, or `:unproven` when no proof ran: the signature names
+no concrete types to run one against, which is always so for a `:keyword` entry.
+"""
+struct AllocEntry
+    sig::Any
+    kind::Symbol
+    status::Symbol
+    reason::String
+end
+
+"""
+    StrictModeTest.AllocEntryReport
+
+Every entry point of one function, with the allocation proof's verdict for each.
+
+See [`alloc_entry_report`](@ref StrictModeTest.alloc_entry_report).
+"""
+struct AllocEntryReport
+    target::String
+    entries::Vector{AllocEntry}
+end
+
+# A keyword call dispatches through `Core.kwcall`, and that method is a separate entry point with
+# its own compiled code: proving `f(args...)` says nothing about it. `Core.Typeof` rather than
+# `typeof`: for a type, `typeof` is `DataType`, which matches the keyword constructor of every type
+# in the session.
+_kw_entries(@nospecialize(f)) =
+    collect(methods(Core.kwcall, Tuple{Any, Core.Typeof(f), Vararg{Any}}))
+
+function _positional_entry(@nospecialize(f), sig)
+    Base.isdispatchtuple(sig) || return AllocEntry(
+        sig, :positional, :unproven,
+        "the signature names no concrete argument types — list them with `types = (…)`"
+    )
+    fs = try
+        _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,))
+    catch e
+        return AllocEntry(
+            sig, :positional, :unproven, "the proof could not run: " * sprint(showerror, e)
+        )
+    end
+    failed = filter(StrictMode._failed, fs)
+    isempty(failed) && return AllocEntry(sig, :positional, :pass, "")
+    return AllocEntry(sig, :positional, :fail, join((f.reason for f in failed), "; "))
+end
+
+# A `Core.kwcall` method declares its keyword `NamedTuple` abstract, so its signature is never one
+# a proof can run against: the keyword types have to be named at a call.
+_keyword_entry(sig) = AllocEntry(
+    sig, :keyword, :unproven,
+    "the keyword NamedTuple is abstract — name the keyword types with " *
+        "`@test_noalloc f(…; k = v)`, or measure the call with `@test_allocated_zero`"
+)
+
+"""
+    StrictModeTest.alloc_entry_report(f) -> AllocEntryReport
+
+Every entry point of `f` — each of its own methods, and each `Core.kwcall` method that reaches it —
+with what the allocation proof says about each.
+
+A proof of `f(args...)` covers the positional method only. The keyword method is separate compiled
+code reached by `f(args...; k = v)`, and it is always listed as `:unproven`: its signature declares
+the keyword `NamedTuple` abstract, so a proof needs a call that names the keyword types. Listing it
+is what shows a suite that proved only the positional method that the keyword path is uncovered.
+
+```julia
+r = StrictModeTest.alloc_entry_report(gemm!)
+filter(e -> e.status === :unproven, r.entries)
+```
+"""
+function alloc_entry_report(@nospecialize(f))
+    entries = AllocEntry[]
+    for m in methods(f)
+        push!(entries, _positional_entry(f, m.sig))
+    end
+    for m in _kw_entries(f)
+        push!(entries, _keyword_entry(m.sig))
+    end
+    target = string(f isa Function || f isa Type ? f : typeof(f))
+    return AllocEntryReport(target, entries)
+end
+
+function Base.show(io::IO, r::AllocEntryReport)
+    printstyled(io, "AllocEntryReport"; bold = true)
+    print(io, ": ", r.target, " — ", length(r.entries), " entry point(s)\n")
+    for e in r.entries
+        color = e.status === :pass ? :green : (e.status === :fail ? :red : :yellow)
+        mark = e.status === :pass ? "✓" : (e.status === :fail ? "✗" : "?")
+        printstyled(io, "  ", mark, " ", rpad(string(e.status), 9); color)
+        print(io, e.kind === :keyword ? "keyword   " : "positional ", e.sig, "\n")
+        isempty(e.reason) || print(io, "      ", e.reason, "\n")
+    end
+    return nothing
+end

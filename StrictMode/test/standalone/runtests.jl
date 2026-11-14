@@ -97,3 +97,26 @@ using Test
         end
     end
 end
+
+# `@strict_contract` declares an abstract type, so these must sit at top level rather than inside a
+# testset's local scope.
+@strict_contract AbstractBoxMetric begin
+    boxscore(::Self, t::Tuple)::Real
+end
+function boxscore end
+struct BoxMetric end
+boxscore(::BoxMetric, t::Tuple) = (
+    s = 0.0; for i in 1:3
+        s += t[i]
+    end; s
+)
+
+@testset "@verify_strict checks each listed call with no proof tier installed" begin
+    # The per-call half needs no backend: it is the value-free scan, and it REPORTS, because its
+    # allocation verdict is a structural guess. `boxscore` is an implementation that scan rejects.
+    bm = BoxMetric()
+    hetero = (1, 2.0, 3.0f0)
+    @test_logs (:warn,) match_mode = :any @verify_strict BoxMetric begin
+        boxscore(bm, hetero)
+    end
+end

@@ -47,7 +47,9 @@ export @assert_no_spill, spill_report, SpillReport
 export @assert_memsafe, memsafe_report, MemsafeReport
 export @assert_mca, mca_report, McaReport, mca_available
 export steady_state_report, SteadyStateReport
+export allocated_bytes, AllocatedBytes
 export gc_pause_report, GcPauseReport
+export spin_wait_report, SpinWaitReport, SpinWaitFinding
 export latency_report, LatencyReport
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt, @strict_policy
@@ -91,6 +93,7 @@ include("throws.jl")
 include("resources.jl")
 include("scheduling.jl")
 include("concurrency.jl")
+include("spinwait.jl")
 include("findings.jl")
 include("codes.jl")
 include("cache.jl")
