@@ -249,12 +249,24 @@ function _strict_expr(call; types = nothing, execute::Bool = true)
     p = _call_parts(call; types)
     site = QuoteNode(gensym(:strictsite))
 
+    # (1) Type stability, from inference. Two spellings of one question, because a site wrapping a
+    # hot call and a block checked once need different things from the answer. `promote_op` is a
+    # compile-time constant, so a stable call folds the branch away and the guarded body carries
+    # nothing — that is why the hot path uses it. It also costs more than performing the call:
+    # measured cold, in a fresh process, on one signature of a generic complex kernel with five
+    # inlined layers, `promote_op` takes 104.7 ms against 41.7 ms to run the call and 41.3 ms for
+    # `return_types`. A block that lists a hundred calls pays that per call and has no branch to
+    # fold, so it asks the cheap way. The verdicts agree.
+    stability = execute ?
+        quote
+            local var"#T" = $(Base.promote_op)($(p.checkfn), $(p.types)...)
+            $(_is_typestable_return)(var"#T") || $(_stable_violation)($target, var"#T")
+        end :
+        :($(_check_stable_once)($target, $(p.checkfn), $(p.types)))
+
     checked = quote
         $(p.binds...)
-        # (1) Type stability, from inference. `promote_op` is a compile-time constant, so a stable
-        # call folds this away and keeps no branch at all.
-        local var"#T" = $(Base.promote_op)($(p.checkfn), $(p.types)...)
-        $(_is_typestable_return)(var"#T") || $(_stable_violation)($target, var"#T")
+        $stability
         # (2) The IR scans, once per (site, specialization). `Sig` is constant in the specialization
         # and `_site_flag` const-folds, so the warm path is a load and a compare.
         local var"#flag" = $(_site_flag)(Val($site), Tuple{typeof($(p.checkfn)), $(p.types)...})
@@ -266,6 +278,16 @@ function _strict_expr(call; types = nothing, execute::Bool = true)
         $(execute ? p.litcall : nothing)
     end
     return _gate(checked, execute ? esc(call) : nothing)
+end
+
+# The type-stability layer for a call that is checked rather than performed. Nothing here has to
+# const-fold, so it asks inference for the return type directly instead of through `promote_op`.
+# Several matching methods are promoted together, which is what `promote_op` reports for them.
+@noinline function _check_stable_once(target, @nospecialize(f), @nospecialize(types::Tuple))
+    rts = Base.return_types(f, types)
+    T = length(rts) == 1 ? only(rts) : reduce(Base.promote_type, rts; init = Union{})
+    _is_typestable_return(T) || _stable_violation(target, T)
+    return nothing
 end
 
 # The inspection half of `@strict`, off the hot path. `@noinline` keeps its frame out of the
