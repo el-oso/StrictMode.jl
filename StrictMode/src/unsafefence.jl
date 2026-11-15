@@ -3,9 +3,9 @@
 # this — `ccall` and `unsafe_load` are ordinary calls — so it is a scan, and the declaration is the
 # caller asking for it.
 #
-# Read from UNOPTIMIZED typed IR, like `trusted.jl` and `static_ownership.jl`: a small wrapper
-# around a pointer load inlines under optimization, and its `unsafe_load` then surfaces in an
-# innocent caller while disappearing from the method that wrote it.
+# Read from each method's own LOWERED code, before any inlining: a small wrapper around a pointer
+# load inlines under optimization, and its `unsafe_load` then surfaces in an innocent caller while
+# disappearing from the method that wrote it.
 
 # `pointer` does not begin with `unsafe_`, and taking one is the step that leaves the language's
 # guarantees even when nothing is dereferenced yet.
@@ -138,9 +138,9 @@ proved and tested.
 A `Base.@propagate_inbounds` method is clean on its own, and the finding lands on the caller that
 wrote `@inbounds`, which is the method that made the claim.
 
-Read from unoptimized IR on purpose. A small wrapper around a pointer load inlines under
-optimization, so its `unsafe_load` would surface in an innocent caller and vanish from the method
-that actually wrote it.
+Read from each method's own lowered code on purpose. A small wrapper around a pointer load inlines
+under optimization, so its `unsafe_load` would surface in an innocent caller and vanish from the
+method that actually wrote it. Lowered code needs no inference, so the scan is cheap on any module.
 """
 function unsafe_report(mod::Module; only = nothing, exempt = (), allow = ())
     allowed = Set{Symbol}(Symbol(a) for a in allow)
