@@ -124,7 +124,7 @@ _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) =
 
 function _raw_allocs(@nospecialize(f), @nospecialize(types))
     all = _raw_allocs_unfiltered(f, types)
-    kept = filter(!_is_guard_alloc, all)
+    kept = filter(a -> !_is_guard_alloc(a) && !_nonallocating_runtime_call(a), all)
     # AllocCheck's backtrace walk stops at the first instruction reached from several call sites,
     # recording a `"multiple call sites"` frame instead. An instance that ends there cannot be
     # attributed to the guard frame or to the kernel, and the guard branch builds diagnostic strings
@@ -140,6 +140,12 @@ function _raw_allocs(@nospecialize(f), @nospecialize(types))
     end
     return kept
 end
+
+# Runtime calls AllocCheck lists as allocating that do not allocate. `jl_hrtime` (behind `time_ns`)
+# reads the system clock and returns an integer: a call measured at 0 bytes.
+const _NONALLOCATING_RUNTIME = (:jl_hrtime,)
+_nonallocating_runtime_call(@nospecialize(a)) =
+    a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) in _NONALLOCATING_RUNTIME
 
 # Does this instance's attribution stop at AllocCheck's shared-call-site marker?
 _is_unattributed(@nospecialize(inst)) =

@@ -217,3 +217,12 @@ end
     )
     @test (StrictModeTest._test_guarantee(:noalloc, (:noalloc,), "t", OnceGrow.reads, (Int,)); true)
 end
+
+@testitem "the clock read behind time_ns is not an allocation" begin
+    using StrictMode, StrictModeTest
+    spin(n::Int) = (t0 = time_ns(); s = 0; for i in 1:n; s += i; end; time_ns() - t0 + s)
+    spin_alloc(n::Int) = (t0 = time_ns(); v = zeros(n); time_ns() - t0 + length(v))
+    spin(10); spin_alloc(10)
+    @test only(proof_findings(spin, (Int,); guarantees = (:noalloc,))).status === :pass
+    @test StrictMode._failed(only(proof_findings(spin_alloc, (Int,); guarantees = (:noalloc,))))
+end
