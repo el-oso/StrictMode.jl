@@ -961,3 +961,26 @@ end
     HeldAcross.merged(true); HeldAcross.merged(false)
     @test any(v -> v.certain, StrictMode.threadid_state_findings(HeldAcross.merged, (Bool,)))
 end
+
+@testitem "tasks spawned in a comprehension and writes to a global are read" begin
+    using StrictMode
+    module Spawned
+    struct Pool; slots::Vector{Vector{Float64}}; end
+    @noinline job!(plan::Vector{Float64}, buf::Vector{Float64}) = (buf[1] = plan[1]; nothing)
+    # Every task writes slot 1 of the shared pool: a race, spawned inside a comprehension.
+    racy(p::Pool, plan::Vector{Float64}) =
+        (foreach(wait, [Threads.@spawn job!(plan, p.slots[1]) for _ in eachindex(p.slots)]); nothing)
+    const SLOTS = [zeros(4) for _ in 1:8]
+    const TABLE = [1.0, 2.0, 3.0]
+    job_global(plan::Vector{Float64}, wi::Int) = (s = SLOTS[wi]; s[1] = plan[1]; nothing)
+    reads_global(plan::Vector{Float64}, wi::Int) = plan[1] + TABLE[wi]
+    end
+    p = Spawned.Pool([zeros(4) for _ in 1:2])
+    Spawned.racy(p, [1.0]); Spawned.job_global([1.0], 1); Spawned.reads_global([1.0], 1)
+    certain(f, T) = any(v -> v.certain, StrictMode.concurrency_findings(f, T))
+    @test certain(Spawned.racy, (Spawned.Pool, Vector{Float64}))
+    @test certain(Spawned.job_global, (Vector{Float64}, Int))
+    @test isempty(StrictMode.concurrency_findings(Spawned.reads_global, (Vector{Float64}, Int)))
+    # A job that receives its own buffer writes nothing shared.
+    @test isempty(StrictMode.concurrency_findings(Spawned.job!, (Vector{Float64}, Vector{Float64})))
+end

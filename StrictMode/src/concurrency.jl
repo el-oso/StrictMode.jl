@@ -321,6 +321,10 @@ function _taint_scan_ci(
     cset = BitSet()
     cflds = Dict{Int, Set{Int}}()
     returns_tainted = false
+    # Values reachable from a mutable constant global. Every caller shares it, so a store into one
+    # is shared state whatever argument the check was told is shared.
+    gset = BitSet()
+    gtainted(@nospecialize(a)) = (a isa Core.SSAValue && a.id in gset) || _is_mutable_global(a)
     changed = true
     passes = 0
     while changed && passes <= n + 2
@@ -330,6 +334,7 @@ function _taint_scan_ci(
             settaint(b) = (b && !(i in tset)) ? (push!(tset, i); changed = true; true) : false
 
             if st isa Core.PiNode
+                isdefined(st, :val) && gtainted(st.val) && !(i in gset) && (push!(gset, i); changed = true)
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) && settaint(true)
                 continue
             elseif st isa Core.PhiNode || st isa Core.PhiCNode
@@ -370,6 +375,11 @@ function _taint_scan_ci(
                     cflds[i] = fields
                     changed = true
                 end
+                # A closure built from a plan value is a function that will be called — by a Base
+                # higher-order function, a generator, a task spawned from it — and its body is where
+                # any write happens. Reading it here does not depend on following the call that
+                # eventually runs it through Base.
+                !isempty(fields) && _recurse_closure_body(types[i], chain, depth, max_depth, memo, out, seen, fr)
                 continue
             elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task
                 # `Threads.@spawn` and `Threads.@threads` lower to a closure built by `:new` and
@@ -409,6 +419,14 @@ function _taint_scan_ci(
             # store into a tainted container → violation
             if nm !== nothing && haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
+                if 1 <= pos <= length(dataargs) && gtainted(dataargs[pos])
+                    _record!(
+                        out, seen, chain,
+                        "writes process-global state (`$nm` into a mutable constant global) — every " *
+                            "concurrent call shares it; pass the buffer in, or own it per task", fr;
+                        certain = true
+                    )
+                end
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
                     atomic = _is_atomic_store(st, nm, dataargs)
                     _record!(
@@ -429,6 +447,9 @@ function _taint_scan_ci(
                 pos = _PROJECT_OPS[nm]
                 if 1 <= pos <= length(dataargs)
                     src = dataargs[pos]
+                    if gtainted(src) && _may_ref(types[i]) && !(i in gset)
+                        push!(gset, i); changed = true
+                    end
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
                     # and so is a raw pointer read out of one (`ptr_or_offset`), though it is bits
                     isref = (nm === :memoryrefnew || nm === :memoryref) ? true :
@@ -566,6 +587,68 @@ function _operand_type(@nospecialize(a), types)
     (1 <= a.id <= length(types)) || return nothing
     T = types[a.id]
     return (T isa DataType && isconcretetype(T)) ? T : nothing
+end
+
+# A constant global holding a mutable value, as optimized code spells it: the value itself, quoted
+# or bare, or a `GlobalRef` to a constant binding. A string or symbol is not shared state.
+function _is_mutable_global(@nospecialize(a))
+    (a isa Core.SSAValue || a isa Core.Argument || a isa Core.SlotNumber || a isa Expr) && return false
+    v = if a isa QuoteNode
+        a.value
+    elseif a isa GlobalRef
+        (isdefined(a.mod, a.name) && isconst(a.mod, a.name)) ? getglobal(a.mod, a.name) : return false
+    else
+        a
+    end
+    (v isa String || v isa Symbol || v isa Module || v isa Type || v isa Function) && return false
+    return ismutable(v)
+end
+
+# The call methods of a closure built from a plan value, each scanned with the closure itself tainted,
+# as a task's body is. A non-closure struct carries no body to read.
+function _recurse_closure_body(
+        @nospecialize(T), chain::Vector{String}, depth::Int, max_depth::Int,
+        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
+    )
+    T = Core.Compiler.widenconst(T)
+    (T isa DataType && T <: Function && startswith(String(nameof(T)), "#")) || return nothing
+    key = (T, :closure)
+    haskey(memo, key) && return nothing
+    memo[key] = false
+    if depth >= max_depth
+        _record!(
+            out, seen, chain,
+            "builds a closure holding a plan-reachable value at recursion depth $depth (≥ " *
+                "max_depth=$max_depth) — not followed; flagged conservatively", caller
+        )
+        return nothing
+    end
+    ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+    ms isa Vector || return nothing
+    for match in ms
+        m = match.method
+        # The closure's own call methods only: a generic method on `Function` matches too.
+        _is_base_core(m.module) && continue
+        # A compiled specialization for this closure type has concrete argument types, so a task
+        # it spawns has a concrete closure type; the declared signature is the fallback.
+        sigs = Any[mi.specTypes for mi in Base.specializations(m)
+            if mi isa Core.MethodInstance && mi.specTypes isa DataType && mi.specTypes.parameters[1] === T]
+        isempty(sigs) && push!(sigs, Tuple{T, Base.unwrap_unionall(m.sig).parameters[2:end]...})
+        for sig in sigs
+            cts = try
+                _code_typed_by_type(sig; optimize = true)
+            catch
+                continue
+            end
+            isempty(cts) && continue
+            fr = _Frame("closure", string(m.file), Int(m.line))
+            _taint_scan_ci(
+                cts[1].first, Set{Int}(1), vcat(chain, "closure"), fr, depth + 1, max_depth,
+                memo, out, seen
+            )
+        end
+    end
+    return nothing
 end
 
 # A task's body is a method of its own, reached through `jl_new_task` rather than through a call, so
