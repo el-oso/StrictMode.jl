@@ -565,12 +565,10 @@ end
     # migration anyway, so the report is a lead rather than noise.
     @test !isempty(scan(Slots.striped_lock))
 
-    # A write inside a callee the scan does not enter stays missed: this scan reads one method's IR
-    # and does not follow `:invoke`. There is no other signature that catches it either — the
-    # threadid taint is in the caller and the store is in the callee, and the callee alone has no
-    # `threadid()` in it to taint anything. Unlike `:concurrency_safe`, which recurses to
-    # `max_depth`, this scan has no knob that reaches it.
-    @test isempty(scan(Slots.through_callee))
+    # A write inside an out-of-line callee is reported at the caller, which is the only place it can
+    # be: the threadid taint is in the caller and the store is in the callee, and the callee alone has
+    # no `threadid()` in it to taint anything.
+    @test !isempty(scan(Slots.through_callee))
     @test isempty(StrictMode.threadid_state_findings(Slots.bump!, (Slots.Cell,)))
 end
 
@@ -902,4 +900,21 @@ end
     @test flagged(() -> @assert_concurrency_safe self = 2 via_ptr!(out, plan))
     @test flagged(() -> @assert_concurrency_safe self = 2 via_offset!(out, plan))
     @test !flagged(() -> @assert_concurrency_safe self = 2 own_ptr!(out, plan))
+end
+
+@testitem "a threadid-indexed buffer written through an out-of-line helper is reported" begin
+    using StrictMode
+    const OTX = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
+    @noinline grow_x!(v, n) = (length(v) < n && resize!(v, n); v)
+    @noinline read_x(v) = isempty(v) ? 0.0 : v[1]
+    @noinline copy_x(v) = (c = copy(v); isempty(c) ? push!(c, 0.0) : c)
+    through_helper(n) = (grow_x!(OTX(), n)[1] = 1.0; nothing)
+    reads_only(n) = read_x(OTX()) + n
+    writes_a_copy(n) = (copy_x(OTX())[1] = 1.0; nothing)
+    through_helper(4); reads_only(1); writes_a_copy(1)
+    nf(f) = length(StrictMode.threadid_state_findings(f, (Int,)))
+    # The threadid is in the caller and the write in the callee: neither alone shows it.
+    @test nf(through_helper) >= 1
+    @test nf(reads_only) == 0
+    @test nf(writes_a_copy) == 0
 end

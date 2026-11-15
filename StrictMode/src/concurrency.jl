@@ -871,6 +871,8 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     tidref = BitSet()       # ref handles indexed by a threadid-derived value
     out = _ConcViol[]
     seen = Set{String}()
+    writes_memo = Dict{Tuple{Core.MethodInstance, Int}, Bool}()   # the fixpoint revisits each call
+    returns_memo = Dict{Tuple{Core.MethodInstance, Int}, Bool}()
     changed = true
     while changed
         changed = false
@@ -931,10 +933,85 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                     )
                 end
                 continue
+            elseif isinvoke
+                # A threadid-reachable value handed to a callee the optimizer left out of line: the
+                # write, or the handle the caller then writes through, is in the callee. The
+                # threadid is in the caller and the store in the callee, so neither signature alone
+                # shows the hazard.
+                mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+                mi isa Core.MethodInstance || continue
+                for k in eachindex(dataargs)
+                    _op_tainted(dataargs[k], tidref, ()) || continue
+                    if get!(() -> _callee_writes_arg(mi, k), writes_memo, (mi, k))
+                        _record!(
+                            out, seen, String[],
+                            "writes mutable state indexed by `Threads.threadid()` through `$nm` " *
+                                "(argument $k) — unsafe under task migration; index by a captured " *
+                                "task-local id or a per-task buffer instead", fr;
+                            certain = true
+                        )
+                    end
+                    get!(() -> _returns_argument(mi, k), returns_memo, (mi, k)) && mark(tidref, true)
+                end
+                continue
             end
         end
     end
     return out
+end
+
+# Whether the callee `mi` writes its argument `k`, by the concurrency scan's own reading of a write
+# to a chosen argument — which follows its callees and raw pointers in turn. Only a write it READ
+# counts: this guarantee gates, and a conservative record for a callee it could not resolve would
+# make an unreadable helper fail the caller.
+function _callee_writes_arg(mi::Core.MethodInstance, k::Int)
+    ps = mi.specTypes.parameters
+    (!isempty(ps) && ps[1] isa DataType && isdefined(ps[1], :instance)) || return false
+    vs = try
+        concurrency_findings(ps[1].instance, Tuple(ps[2:end]); self_arg = k, max_depth = 3)
+    catch
+        return false
+    end
+    return any(v -> v.certain, vs)
+end
+
+# Whether the callee `mi` returns its argument `k`, or a reference projected out of it, so that the
+# caller's store into the returned value writes the argument.
+function _returns_argument(mi::Core.MethodInstance, k::Int)
+    cts = try
+        Base.code_typed_by_type(mi.specTypes; optimize = true)
+    catch
+        return false
+    end
+    length(cts) == 1 || return false
+    ci = first(cts[1])
+    code = ci.code
+    sts = ci.ssavaluetypes
+    arg = Core.Argument(k + 1)
+    t = BitSet()
+    is_t(a) = a == arg || (a isa Core.SSAValue && a.id in t)
+    changed = true
+    while changed
+        changed = false
+        for (i, st) in enumerate(code)
+            i in t && continue
+            hit = if st isa Core.PiNode
+                isdefined(st, :val) && is_t(st.val)
+            elseif st isa Core.PhiNode
+                any(j -> isassigned(st.values, j) && is_t(st.values[j]), eachindex(st.values))
+            elseif Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)
+                isinv = st.head === :invoke
+                nm = _resolve_callee_name(isinv ? st.args[2] : st.args[1], code)
+                da = isinv ? st.args[3:end] : st.args[2:end]
+                p = isnothing(nm) ? 0 : get(_PROJECT_OPS, nm, 0)
+                1 <= p <= length(da) && is_t(da[p]) && sts isa Vector && _may_ref(sts[i])
+            else
+                false
+            end
+            hit && (push!(t, i); changed = true)
+        end
+    end
+    return any(st -> st isa Core.ReturnNode && isdefined(st, :val) && is_t(st.val), code)
 end
 
 function _assert_no_threadid_state(target, @nospecialize(f), @nospecialize(types::Tuple))
@@ -963,9 +1040,10 @@ Detects a store to `buf[threadid()]`, and a store into an object loaded out of s
 `buf[threadid()].field = …`, `buf[threadid()][i] = …`, `rand(rngs[threadid()])`. A scalar read out
 of a slot and stored elsewhere is a copy, not the hazard, and stays clean.
 
-It does not track a threadid stashed into another array and reused later, and it does not follow
-calls: a write inside a callee the optimizer left out of line is missed, and no other signature
-catches it either, since the threadid is in the caller and the store is in the callee. A lock
+A slot's value handed to a callee the optimizer left out of line is followed: a callee that writes
+it is reported, and so is a store into a value the callee returns when that value is its argument.
+A callee that only reads it, or returns a fresh copy, stays clean. It does not track a threadid
+stashed into another array and reused later. A lock
 striped by thread (`lock(locks[threadid()])`) IS reported — the inlined fast path writes a field of
 a lock chosen by `threadid()`. That is not a data race, because a `ReentrantLock` belongs to the
 task rather than the thread, but striping locks by thread buys nothing once tasks migrate.
