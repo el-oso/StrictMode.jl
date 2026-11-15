@@ -156,3 +156,28 @@ end
 # environment in this repo, so an item holding them could only ever skip in this suite — and a skip
 # counts as green. They live in `mca_live.jl` and run from `mca_live_runner.jl`, in the one
 # environment that installs the weak dependency, which CI builds for exactly that purpose.
+
+@testitem "_innermost_loop_span picks an unrolled main loop over its smaller cleanup loop" begin
+    using StrictMode
+    # A 4-accumulator dot product: the main loop does four FMAs per iteration, the cleanup loop one.
+    # Both are innermost and both vectorized; the cleanup is the smaller span.
+    asm = """
+    .LBB0_3:                                # %main
+    \tvmovupd\t(%rax), %ymm4
+    \tvfmadd231pd\t(%rcx), %ymm4, %ymm0
+    \tvmovupd\t32(%rax), %ymm5
+    \tvfmadd231pd\t32(%rcx), %ymm5, %ymm1
+    \tvmovupd\t64(%rax), %ymm6
+    \tvfmadd231pd\t64(%rcx), %ymm6, %ymm2
+    \tvmovupd\t96(%rax), %ymm7
+    \tvfmadd231pd\t96(%rcx), %ymm7, %ymm3
+    \tjne\t.LBB0_3
+    .LBB0_5:                                # %cleanup
+    \tvmovupd\t(%rax), %ymm4
+    \tvfmadd231pd\t(%rcx), %ymm4, %ymm0
+    \tjne\t.LBB0_5
+    \tretq
+    """
+    span = StrictMode._innermost_loop_span(asm)
+    @test occursin("LBB0_3", split(asm, '\n')[span[1]])
+end

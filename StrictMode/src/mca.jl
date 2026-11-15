@@ -70,14 +70,16 @@ targeted by a backward jump), prefer spans that contain a vector register mentio
 kernel core, as opposed to an incidental scalar remainder/tail loop, which is typically smaller in
 line count but not what a codegen-quality report should focus on); among those, prefer spans using
 `%zmm` over `%ymm`-only (LLVM's unroll-epilogue vectorization emits a narrower-width "cleanup" loop
-alongside the main wide loop, and the main loop is the one worth reporting on); ties (including the
-nested-loop case, where an inner loop's span is a sub-range of any loop containing it) go to the
-smallest span. `nothing` if no loop was found at all (the caller then falls back to a whole-function
-run, flagged with a caveat).
+alongside the main wide loop, and the main loop is the one worth reporting on). Only innermost spans
+are candidates — a span containing another span is an outer loop. Among the candidates the one with
+the most vector-register lines wins, ties going to the smaller span: an unrolled main loop and its
+one-vector cleanup loop are both innermost and both vectorized, and the cleanup loop is the smaller,
+so size alone picks the loop that runs least. `nothing` if no loop was found at all (the caller then
+falls back to a whole-function run, flagged with a caveat).
 
 **Known limitation, inherent to a text-based heuristic with no real CFG**: two DISJOINT
-(non-nested) vectorized loops of comparable width in the same function are not distinguished by
-runtime weight — the smaller one wins regardless of which one actually dominates. This is why
+(non-nested) vectorized loops in the same function are told apart by how much vector work each
+contains, not by how often each runs. This is why
 [`mca_report`](@ref)'s result is informational-only and [`@assert_mca`](@ref) never hard-gates
 without an explicit bound; pass `region = :whole_function`, or point `f` at a smaller helper
 containing only the loop you actually want measured, if this matters for your case.
@@ -86,15 +88,19 @@ function _innermost_loop_span(sanitized_asm::AbstractString)
     lines = split(sanitized_asm, '\n')
     spans = _asm_loop_spans(lines)
     isempty(spans) && return nothing
+    contains_other((a, b)) = any(((c, d),) -> (c, d) != (a, b) && a <= c && d <= b, spans)
+    inner = filter(!contains_other, spans)
+    isempty(inner) && (inner = spans)
     has_match(re, a, b) = any(l -> occursin(re, l), view(lines, a:b))
-    vec_spans = filter(((a, b),) -> has_match(_ASM_VEC_REG_RE, a, b), spans)
+    vec_spans = filter(((a, b),) -> has_match(_ASM_VEC_REG_RE, a, b), inner)
     pool = if isempty(vec_spans)
-        spans
+        inner
     else
         zmm_spans = filter(((a, b),) -> has_match(_ASM_ZMM_RE, a, b), vec_spans)
         isempty(zmm_spans) ? vec_spans : zmm_spans
     end
-    return pool[argmin(b - a for (a, b) in pool)]
+    nvec((a, b)) = count(l -> occursin(_ASM_VEC_REG_RE, l), view(lines, a:b))
+    return argmax(s -> (nvec(s), -(s[2] - s[1])), pool)
 end
 
 """
