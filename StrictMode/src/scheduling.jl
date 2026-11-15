@@ -739,12 +739,60 @@ const _VEC_REG_RE = r"\b(?:xmm|ymm|zmm)\d+\b"
 """
     SpillReport
 
-The result of [`spill_report`](@ref): `target` (the checked signature, as a string) and
-`vec_spills` (the count of vector-register spill/reload lines found).
+The result of [`spill_report`](@ref): `target` (the checked signature, as a string) and three counts
+of vector-register spill/reload lines — `vec_spills` over the whole function, `loop_spills` inside
+any loop, and `innermost_spills` inside an innermost loop.
 """
 struct SpillReport
     target::String
-    vec_spills::Int   # lines carrying both a vector register and a Spill/Reload annotation
+    vec_spills::Int        # every line carrying both a vector register and a Spill/Reload annotation
+    loop_spills::Int       # those inside a loop: code that runs more than once per call
+    innermost_spills::Int  # those inside an innermost loop
+end
+
+# The loop each line of `asm` sits in, read from LLVM's block annotations: a block starts at a label
+# (`.LBB0_3:`) or a fall-through marker (`# %bb.4:`), and the comment lines that open it name its loop
+# — `=>This Loop Header: Depth=N` or `=>  This Inner Loop Header: Depth=N` for a header, and
+# `in Loop: Header=BB0_3 Depth=N` for a block inside one. "Inner" marks an innermost loop. Returns the
+# depth of each line (0 outside every loop) and whether it is in an innermost loop.
+function _asm_loop_depths(lines::AbstractVector{<:AbstractString})
+    label = r"^\s*\.L(BB\d+_\d+):"
+    fallthrough = r"^\s*# %bb\.\d+:"
+    innermost = Set{String}()
+    cur = ""
+    for l in lines
+        m = match(label, l)
+        isnothing(m) || (cur = m.captures[1])
+        occursin(fallthrough, l) && (cur = "")
+        occursin("This Inner Loop Header", l) && !isempty(cur) && push!(innermost, cur)
+    end
+    depth = zeros(Int, length(lines))
+    inner = falses(length(lines))
+    d = 0
+    hdr = ""
+    cur = ""
+    for (k, l) in enumerate(lines)
+        m = match(label, l)
+        if !isnothing(m)
+            cur = m.captures[1]
+            d = 0
+            hdr = ""
+        elseif occursin(fallthrough, l)
+            cur = ""
+            d = 0
+            hdr = ""
+        end
+        if (h = match(r"Loop Header: Depth=(\d+)", l); !isnothing(h))
+            d = parse(Int, h.captures[1])
+            hdr = cur
+        elseif (h = match(r"in Loop: Header=(BB\d+_\d+) Depth=(\d+)", l); !isnothing(h))
+            d = parse(Int, h.captures[2])
+            hdr = h.captures[1]
+        end
+        depth[k] = d
+        inner[k] = d > 0 && hdr in innermost
+    end
+    return depth, inner
 end
 
 """
@@ -758,16 +806,38 @@ reload instead of running from registers. Complements [`register_report`](@ref) 
 zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-allocation LLVM IR
 and can't see spills at all). Empty/unavailable `code_native` output reports zero spills, matching
 [`scalar_fp_loops`](@ref)'s "can't analyze ⇒ don't fail" convention.
+
+Each spill is placed by the loop its block is in, from LLVM's own loop annotations. `loop_spills`
+leaves out code that runs once per call — the prologue and the epilogue that stores a tile's
+results — where a spill costs one store and one load per call rather than per iteration.
+`innermost_spills` keeps only innermost loops; note that an innermost loop can be a remainder loop,
+so it is not the same as the hot loop.
 """
 function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
     target = _func_name(f) * _sig_string(types)
     s = _native_asm(f, types)
-    isempty(s) && return SpillReport(target, 0)
-    n = count(
-        l -> occursin(_SPILL_RELOAD_RE, l) && occursin(_VEC_REG_RE, l),
-        split(s, '\n')
-    )
-    return SpillReport(target, n)
+    isempty(s) && return SpillReport(target, 0, 0, 0)
+    lines = split(s, '\n')
+    depth, inner = _asm_loop_depths(lines)
+    total = 0
+    inloop = 0
+    ininner = 0
+    for (k, l) in enumerate(lines)
+        (occursin(_SPILL_RELOAD_RE, l) && occursin(_VEC_REG_RE, l)) || continue
+        total += 1
+        depth[k] > 0 && (inloop += 1)
+        inner[k] && (ininner += 1)
+    end
+    return SpillReport(target, total, inloop, ininner)
+end
+
+const _SPILL_SCOPES = (:loops, :innermost, :function)
+
+function _spill_count(r::SpillReport, scope::Symbol)
+    scope === :loops && return r.loop_spills
+    scope === :innermost && return r.innermost_spills
+    scope === :function && return r.vec_spills
+    throw(ArgumentError("spill scope must be one of $(_SPILL_SCOPES), got :$scope"))
 end
 
 function Base.show(io::IO, r::SpillReport)
@@ -777,18 +847,27 @@ function Base.show(io::IO, r::SpillReport)
         printstyled(io, "  clean"; color = :green)
         print(io, ": no vector-register spills.")
     else
-        printstyled(io, "  $(r.vec_spills) vector-register spill/reload line(s)"; color = :red)
-        print(io, " — reduce the live accumulator/tile count, or split into multiple passes. See `register_report` for zmm-saturation diagnostics.")
+        color = r.loop_spills > 0 ? :red : :yellow
+        printstyled(io, "  $(r.vec_spills) vector-register spill/reload line(s)"; color)
+        print(
+            io, " — $(r.loop_spills) inside a loop, $(r.innermost_spills) inside an innermost loop."
+        )
+        r.loop_spills > 0 && print(
+            io, " Reduce the live accumulator/tile count, or split into multiple passes. See " *
+                "`register_report` for zmm-saturation diagnostics."
+        )
     end
     return nothing
 end
 
-function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple))
+function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple), scope::Symbol = :loops)
     r = spill_report(f, types)
-    r.vec_spills == 0 && return nothing
+    n = _spill_count(r, scope)
+    iszero(n) && return nothing
+    where_ = scope === :function ? "" : scope === :loops ? " inside a loop" : " inside an innermost loop"
     _fail(
         :no_spill, target,
-        "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s)) — the " *
+        "vector register(s) spilled to the stack$where_ ($n spill/reload line(s)) — the " *
             "kernel needs more live vector registers than the target ISA provides. Reduce the " *
             "live accumulator/tile count, or split into multiple passes."
     )
@@ -810,15 +889,25 @@ Each argument is evaluated once; disabled builds expand to the bare call. Hard-g
 [`kernel_report`](@ref)/[`register_report`](@ref), which are advisory and never fail) since a
 spill is unambiguous evidence of register pressure, not a heuristic judgment call.
 
+`scope` chooses which spills count. The default, `:loops`, counts spills inside any loop and leaves
+out code that runs once per call, such as the epilogue that stores a tile's results: a spill there is
+one store and one load per call, not register pressure in the loop. `:innermost` counts innermost
+loops only, which can include a remainder loop; `:function` counts every spill.
+
 ```julia
-@assert_no_spill dtrsm_tile!(B, A)     # throws if the tile grew past the register budget
+@assert_no_spill dtrsm_tile!(B, A)                     # throws if the tile spills inside its loop
+@assert_no_spill dtrsm_tile!(B, A) scope = :function   # any spill at all
 ```
 """
 macro assert_no_spill(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call(args, (:types, :scope))
     isempty(pos) && throw(ArgumentError("@assert_no_spill needs a call expression"))
     call = pos[1]
-    checked = _guarantee_expr(call, _assert_no_spill; types = get(opts, :types, nothing))
+    scope = get(opts, :scope, QuoteNode(:loops))
+    scope isa QuoteNode && scope.value in _SPILL_SCOPES || throw(
+        ArgumentError("@assert_no_spill: scope must be one of $(_SPILL_SCOPES), got $scope")
+    )
+    checked = _guarantee_expr(call, _assert_no_spill, scope; types = get(opts, :types, nothing))
     return _gate(checked, esc(call))
 end
 

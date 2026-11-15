@@ -65,8 +65,9 @@ function _compiled_output_finding(
     elseif g === :no_scalar_loops
         return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
     elseif g === :no_spill
+        # Spills inside a loop, the same scope `@assert_no_spill` gates on by default.
         r = spill_report(f, types)
-        return _mkfinding(md, fn, sg, g, r.vec_spills > 0, "vector register(s) spilled to the stack ($(r.vec_spills) spill/reload line(s))", "", 0; tier)
+        return _mkfinding(md, fn, sg, g, r.loop_spills > 0, "vector register(s) spilled to the stack inside a loop ($(r.loop_spills) spill/reload line(s))", "", 0; tier)
     elseif g === :trusted
         # No proving counterpart: the scan reads a call on a type inference has already fixed, so
         # there is nothing a backend could add. Both tiers therefore answer from here.

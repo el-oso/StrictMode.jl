@@ -274,3 +274,36 @@ end
     @test StrictMode._forwarded_types(fwd_void!, (V, V)) == (V, V, Val{false})
     @test StrictMode._vectorized(fwd_void!, (V, V)) == StrictMode._vectorized(fwd_void!, (V, V, Val{false}))
 end
+
+@testitem "spills are placed by the loop LLVM's annotations put them in" begin
+    using StrictMode
+    # Canned x86 assembly in the shape LLVM prints: a prologue, an outer loop with an inner loop and
+    # a remainder loop, and an epilogue. One spill sits in each place.
+    asm = """
+    julia_k:
+    \tvmovups\t%ymm0, (%rsp)                # 32-byte Spill
+    .LBB0_3:                                # %L13
+                                            # =>This Loop Header: Depth=1
+                                            #     Child Loop BB0_6 Depth 2
+    \tvmovups\t%ymm1, 32(%rsp)              # 32-byte Spill
+    .LBB0_6:                                # %L28
+                                            #   Parent Loop BB0_3 Depth=1
+                                            # =>  This Inner Loop Header: Depth=2
+    \tvmovups\t64(%rsp), %ymm2              # 32-byte Reload
+    \tjne\t.LBB0_6
+    # %bb.7:                                #   in Loop: Header=BB0_3 Depth=1
+    \tjne\t.LBB0_3
+    .LBB0_12:                               # %L170
+    \tvmovsd\t(%rsp), %xmm3                 # 8-byte Reload
+    \tretq
+    """
+    lines = split(asm, '\n')
+    depth, inner = StrictMode._asm_loop_depths(lines)
+    at(pat) = findfirst(l -> occursin(pat, l), lines)
+    @test depth[at("%ymm0, (%rsp)")] == 0          # prologue
+    @test depth[at("%ymm1, 32(%rsp)")] == 1        # outer loop body
+    @test !inner[at("%ymm1, 32(%rsp)")]
+    @test depth[at("64(%rsp), %ymm2")] == 2        # innermost loop
+    @test inner[at("64(%rsp), %ymm2")]
+    @test depth[at("%xmm3")] == 0                  # epilogue
+end
