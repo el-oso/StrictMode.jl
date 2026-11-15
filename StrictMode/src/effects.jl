@@ -922,7 +922,12 @@ function _mi_exempt_name(mi::Core.MethodInstance)
     types = length(ps) > 1 ? Tuple(ps[2:end]) : ()
     root = Base.moduleroot(mi.def.module)
     for (mod, e) in es
-        (isnothing(mod) || mod === root) || continue
+        # The declaring module when recorded, else the package root of the store it came from.
+        if !isnothing(e.mod)
+            mi.def.module === e.mod || continue
+        else
+            (isnothing(mod) || mod === root) || continue
+        end
         _covers(e, name, types, :noalloc) && return name
     end
     return nothing

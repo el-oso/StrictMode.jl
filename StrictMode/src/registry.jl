@@ -233,6 +233,9 @@ struct Exemption
     reason::String
     file::String
     line::Int
+    # The module that declared it, whose own functions and methods it covers; `nothing` for one
+    # declared outside a module, which covers by name.
+    mod::Union{Nothing, Module}
 end
 
 function Base.show(io::IO, e::Exemption)
@@ -297,8 +300,8 @@ end
 # exemption must NOT answer yes here — it would silence guarantees it never claimed.
 function _is_exempt(@nospecialize(f))
     name = _demangle(_callable_name(f))
-    for e in exemptions()
-        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && return true
+    for (mod, e) in _scoped_exemptions()
+        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && _exempt_in(mod, e, f, nothing) && return true
     end
     return false
 end
@@ -306,10 +309,56 @@ end
 # The precise question a verdict asks: is THIS signature opted out of THIS guarantee?
 function _is_exempt(@nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
     name = _demangle(_callable_name(f))
-    for e in exemptions()
-        _covers(e, name, types, g) && return true
+    for (mod, e) in _scoped_exemptions()
+        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return true
     end
     return false
+end
+
+# Every exemption with the package root that declared it, or `nothing` for one this session declared.
+function _scoped_exemptions()
+    v = Tuple{Union{Nothing, Module}, Exemption}[]
+    for m in _store_modules()
+        s = _store_for(m, _LOCAL_EXEMPT)
+        s isa AbstractVector || continue
+        for e in s
+            push!(v, (m, e))
+        end
+    end
+    for e in STRICT_EXEMPT
+        push!(v, (nothing, e))
+    end
+    return v
+end
+
+# An exemption covers the declaring module's own code only: the function it owns, or its method of a
+# function it extends. Matched by name alone, one module's exemption of `build_q` silenced the checks
+# on every other module's `build_q`. One declared outside any module matches by name.
+function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f), @nospecialize(types))
+    mod = something(e.mod, store, Some(nothing))
+    isnothing(mod) && return true
+    root = mod
+    owner = try
+        parentmodule(f isa Type ? f : Core.Typeof(f))
+    catch
+        nothing
+    end
+    owner === root && return true
+    ms = if isnothing(types)
+        try
+            methods(f)
+        catch
+            Method[]
+        end
+    else
+        m = try
+            which(f, Tuple{types...})
+        catch
+            nothing
+        end
+        isnothing(m) ? Method[] : [m]
+    end
+    return any(m -> m.module === root, ms)
 end
 
 function _exempt!(
@@ -318,7 +367,7 @@ function _exempt!(
         file::AbstractString = "", line::Integer = 0
     )
     gs = isnothing(guarantees) ? nothing : _check_guarantees(guarantees)
-    e = Exemption(name, isnothing(types) ? nothing : Tuple(types), gs, String(reason), String(file), Int(line))
+    e = Exemption(name, isnothing(types) ? nothing : Tuple(types), gs, String(reason), String(file), Int(line), mod)
     store = isnothing(mod) ? STRICT_EXEMPT : _local_store!(mod, _LOCAL_EXEMPT, Exemption[])
     e in store || push!(store, e)
     # The allocation scan reads `:noalloc` exemptions, so a verdict cached before this one is stale.
@@ -419,8 +468,8 @@ end
 
 function _matching_exemption(@nospecialize(f), @nospecialize(types), g::Symbol)
     name = _demangle(_callable_name(f))
-    for e in exemptions()
-        _covers(e, name, types, g) && return e
+    for (mod, e) in _scoped_exemptions()
+        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return e
     end
     return nothing
 end

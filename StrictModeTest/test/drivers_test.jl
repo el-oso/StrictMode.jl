@@ -213,3 +213,21 @@ end
     @test_throws "never yields" StrictModeTest.test_waits_yield(ThreadsWait.spin, (Vector{Float64},))
     @test StrictModeTest.test_waits_yield(ThreadsWait.plain, (Vector{Float64},)) isa StrictMode.SpinWaitReport
 end
+
+@testitem "an exemption covers only the module that declared it" begin
+    using StrictMode, StrictModeTest
+    module LeakA
+    using StrictMode
+    @strict_exempt build_q(n::Int) = collect(1:n)
+    end
+    module LeakB
+    using StrictMode
+    build_q(n::Int) = collect(1:n)              # same name, not exempted here
+    end
+    LeakA.build_q(3); LeakB.build_q(3)
+    @test StrictMode._is_exempt(LeakA.build_q)
+    @test !StrictMode._is_exempt(LeakB.build_q)
+    @test StrictMode._is_exempt(LeakA.build_q, (Int,), :noalloc)
+    @test !StrictMode._is_exempt(LeakB.build_q, (Int,), :noalloc)
+    @test_throws StrictViolation test_compiled(LeakB; guarantees = (:noalloc,))
+end
