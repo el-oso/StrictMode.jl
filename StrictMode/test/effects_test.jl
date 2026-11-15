@@ -605,3 +605,25 @@ end
     # Preserving it does not excuse a real escape.
     @test StrictMode._alloc_signals(sumview_escapes, (Matrix{Float64}, Int)).alloc
 end
+
+@testitem "a returned immutable scoped handle escapes" begin
+    using StrictMode
+    # The compiler's escape analysis reads an immutable value as confined even when it is returned,
+    # yet the returned copy carries any pointer it holds out of the frame.
+    struct ImmHandle
+        p::Ptr{Float64}
+    end
+    leak(p::Ptr{Float64}) = ImmHandle(p)
+    branchy(p::Ptr{Float64}, b::Bool) = b ? ImmHandle(p) : ImmHandle(p + 8)
+    kept(p::Ptr{Float64}) = (h = ImmHandle(p); h.p === C_NULL)
+    saved = copy(StrictMode._SCOPED_TYPES)
+    try
+        StrictMode.register_scoped!(ImmHandle)
+        @test !isempty(StrictMode._escaping_scoped(Tuple{typeof(leak), Ptr{Float64}}).escaped)
+        @test !isempty(StrictMode._escaping_scoped(Tuple{typeof(branchy), Ptr{Float64}, Bool}).escaped)
+        @test isempty(StrictMode._escaping_scoped(Tuple{typeof(kept), Ptr{Float64}}).escaped)
+    finally
+        empty!(StrictMode._SCOPED_TYPES); append!(StrictMode._SCOPED_TYPES, saved)
+        StrictMode.clear_cache!()
+    end
+end

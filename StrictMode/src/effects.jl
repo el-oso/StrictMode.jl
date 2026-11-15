@@ -1038,6 +1038,22 @@ function _escaping_scoped(@nospecialize(sig))
             name in undet || push!(undet, name)
         end
     end
+    # The escape analysis tracks heap objects. An immutable value has no identity, so it reads as
+    # confined even when returned, and a returned copy of a handle carries whatever pointer it holds
+    # out of the frame. A return of a handle created here is therefore an escape whatever the
+    # analysis says.
+    for s in ir.stmts.stmt
+        (s isa Core.ReturnNode && isdefined(s, :val)) || continue
+        v = s.val
+        while v isa Core.SSAValue && ir.stmts.stmt[v.id] isa Core.SSAValue
+            v = ir.stmts.stmt[v.id]
+        end
+        v isa Core.SSAValue || continue
+        src = ir.stmts.stmt[v.id]
+        Meta.isexpr(src, :new) || continue
+        T = Core.Compiler.widenconst(ir.stmts.type[v.id])
+        _is_scoped_type(T) && !(string(T) in bad) && push!(bad, string(T))
+    end
     return (; escaped = bad, undetermined = undet)
 end
 
