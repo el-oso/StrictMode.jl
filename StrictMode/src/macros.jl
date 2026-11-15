@@ -108,16 +108,16 @@ function _call_parts(call; types = nothing)
     nt = Expr(:tuple, (Expr(:(=), n, s) for (n, s) in zip(kwnames, kwsyms))...)
     if !isnothing(types) && haskw
         checkfn = Core.kwcall
-        typesexpr = :((typeof($nt), typeof($fnsym), $(esc(types))...))
+        typesexpr = :((typeof($nt), Core.Typeof($fnsym), $(esc(types))...))
     elseif !isnothing(types)
         checkfn = fnsym
         typesexpr = esc(types)
     elseif haskw
         checkfn = Core.kwcall
-        typesexpr = Expr(:tuple, :(typeof($nt)), :(typeof($fnsym)), (:(typeof($s)) for s in argsyms)...)
+        typesexpr = Expr(:tuple, :(typeof($nt)), :(Core.Typeof($fnsym)), (:(Core.Typeof($s)) for s in argsyms)...)
     else
         checkfn = fnsym
-        typesexpr = Expr(:tuple, (:(typeof($s)) for s in argsyms)...)
+        typesexpr = Expr(:tuple, (:(Core.Typeof($s)) for s in argsyms)...)
     end
     return (;
         binds, litcall, thunk, checkfn, types = typesexpr,
@@ -173,7 +173,7 @@ end
 function _guarded_check(p, body)
     site = QuoteNode(gensym(:site))
     return quote
-        local var"#flag" = $(_site_flag)(Val($site), Tuple{typeof($(p.checkfn)), $(p.types)...})
+        local var"#flag" = $(_site_flag)(Val($site), Tuple{Core.Typeof($(p.checkfn)), $(p.types)...})
         local var"#stamp" = $(_guard_stamp)()
         if var"#flag"[] != var"#stamp"
             $body
@@ -269,7 +269,7 @@ function _strict_expr(call; types = nothing, execute::Bool = true)
         $stability
         # (2) The IR scans, once per (site, specialization). `Sig` is constant in the specialization
         # and `_site_flag` const-folds, so the warm path is a load and a compare.
-        local var"#flag" = $(_site_flag)(Val($site), Tuple{typeof($(p.checkfn)), $(p.types)...})
+        local var"#flag" = $(_site_flag)(Val($site), Tuple{Core.Typeof($(p.checkfn)), $(p.types)...})
         local var"#stamp" = $(_guard_stamp)()
         if var"#flag"[] != var"#stamp"
             $(_strict_scan)($target, $(p.checkfn), $(p.types))

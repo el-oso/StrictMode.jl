@@ -157,17 +157,17 @@ end
     @test any(f -> f.status === :fail, proof_findings(bad, (Int,); guarantees = (:noalloc,)))
 end
 
-@testitem "an UNNARROWED Any-returning lookup correctly fails all three" begin
+@testitem "an UNNARROWED Any-returning lookup is unstable without boxing anything" begin
     using StrictMode, StrictModeTest
-    # The counterpart: `docs/src/guarantees.md`'s own `unit` example returns `Any` unnarrowed, so it
-    # is genuinely unstable and every guarantee fails on the return type alone — even though it too
-    # is 0-alloc warm. Narrowing is what separates this from the item above; the doc used to claim
-    # all three passed on it.
+    # The counterpart: `docs/src/guarantees.md`'s own `unit` example returns `Any` unnarrowed, so its
+    # return type is unstable. Narrowing is what separates this from the item above. It boxes nothing:
+    # at `Type{Float64}`, the instance `unit(Float64)` runs, the lookup returns a value the table
+    # already holds boxed.
     const _U = IdDict{Type, Any}(Int => 1, Float64 => 1.0)
     unit(::Type{T}) where {T} = _U[T]
     unit(Float64)
     @test_throws StrictViolation @assert_typestable unit(Float64)
-    @test_throws StrictViolation @test_noboxing unit(Float64)
+    @test (@test_noboxing unit(Float64)) == 1.0
 end
 
 @testitem "the tier is the macro you wrote, not ambient state" begin

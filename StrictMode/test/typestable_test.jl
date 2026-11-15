@@ -81,13 +81,15 @@ end
     @test_throws StrictViolation @assert_typestable pickkw(heterogeneous; i = rand(1:3))
 end
 
-@testitem "@assert_typestable types= override pins the inference signature (issue #5)" begin
+@testitem "a type argument is checked at Type{T}, and types= still pins the signature (issue #5)" begin
     using StrictMode
     g(::Type{T}) where {T} = Vector{T}(undef, 1)
-    # typeof(Float64) === DataType widens the inferred return to non-concrete → false positive.
-    @test_throws StrictViolation @assert_typestable g(Float64)
-    # Pinning Type{Float64} restores concreteness.
+    # `g(Float64)` runs the `Type{Float64}` instance, which is the one checked. At `DataType`, which
+    # `typeof(Float64)` names, the return type is not concrete.
+    @test (@assert_typestable g(Float64)) isa Vector{Float64}
     @test (@assert_typestable g(Float64) types = (Type{Float64},)) isa Vector{Float64}
+    # `types =` still decides the checked signature, wider or not.
+    @test_throws StrictViolation @assert_typestable g(Float64) types = (DataType,)
 end
 
 @testitem "a JET failure names the check instead of surfacing raw (issue #25)" begin

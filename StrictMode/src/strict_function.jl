@@ -438,7 +438,7 @@ macro strict_stable(def)
     wrapper = deepcopy(def)
     wrapper.args[2] = Expr(
         :block,
-        :(local var"#T" = $(Base.promote_op)($inner, $((:(typeof($a)) for a in argnames)...))),
+        :(local var"#T" = $(Base.promote_op)($inner, $((:(Core.Typeof($a)) for a in argnames)...))),
         # The compile-time-constant test comes FIRST so a stable specialization folds the whole
         # branch away; anything runtime-valued here would keep it alive.
         :(
