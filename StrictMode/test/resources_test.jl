@@ -25,8 +25,15 @@
     Leaks.borrow_escapes(W(zeros(2))); Leaks.stash!(W(zeros(2)))
     Leaks.spawn_it(W(zeros(2))); Leaks.owned!(W(zeros(2)), W(zeros(2))); Leaks.total(W(zeros(2)))
 
-    # With nothing registered there is no resource to leak, so the sweep is silent by construction.
-    @test isempty(resource_leak_report(Leaks))
+    # With nothing registered there is no resource to leak: an empty result, and a warning that it
+    # proves nothing. The registered set is session-wide, so it is emptied for this one assertion.
+    saved = copy(StrictMode._SCOPED_TYPES)
+    empty!(StrictMode._SCOPED_TYPES)
+    try
+        @test isempty(@test_logs (:warn, r"0 checks") resource_leak_report(Leaks))
+    finally
+        append!(StrictMode._SCOPED_TYPES, saved)
+    end
 
     register_scoped!(W)
     fs = resource_leak_report(Leaks)

@@ -93,7 +93,12 @@ nothing has called.
 """
 function resource_leak_report(mod::Module; only = nothing, exempt = ())
     out = StrictFinding[]
-    isempty(_SCOPED_TYPES) && return out
+    # Nothing registered renders exactly like nothing leaking, so say so, as the registry does.
+    if isempty(_SCOPED_TYPES)
+        @warn "resource_leak_report($(nameof(mod))): no type is registered with " *
+            "`register_scoped!` (0 checks) — this result proves nothing."
+        return out
+    end
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
         sigs = _method_signatures(m)
