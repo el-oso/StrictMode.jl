@@ -258,3 +258,19 @@ end
     plain(x::Vector{Float64}) = sum(x)
     @test StrictMode._forwarded_types(plain, (V,)) == (V,)
 end
+
+@testitem "a forwarder to a kernel returning nothing is read past too" begin
+    using StrictMode
+    # When the callee returns `nothing`, inference returns that constant from the forwarder and
+    # leaves the call's own result unused, so the forwarder does not return the call.
+    @noinline function fwd_void!(y::Vector{Float64}, x::Vector{Float64}, ::Val{B} = Val(false)) where {B}
+        @inbounds @simd for i in eachindex(y, x)
+            y[i] = y[i] * x[i] + x[i]
+        end
+        return nothing
+    end
+    V = Vector{Float64}
+    fwd_void!(rand(64), rand(64))
+    @test StrictMode._forwarded_types(fwd_void!, (V, V)) == (V, V, Val{false})
+    @test StrictMode._vectorized(fwd_void!, (V, V)) == StrictMode._vectorized(fwd_void!, (V, V, Val{false}))
+end
