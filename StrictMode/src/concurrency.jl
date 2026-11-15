@@ -429,8 +429,10 @@ function _taint_scan_ci(
                 pos = _PROJECT_OPS[nm]
                 if 1 <= pos <= length(dataargs)
                     src = dataargs[pos]
-                    # a memoryref is a *writable handle* into its buffer — always a live reference
-                    isref = (nm === :memoryrefnew || nm === :memoryref) ? true : _may_ref(types[i])
+                    # a memoryref is a *writable handle* into its buffer — always a live reference —
+                    # and so is a raw pointer read out of one (`ptr_or_offset`), though it is bits
+                    isref = (nm === :memoryrefnew || nm === :memoryref) ? true :
+                        (_may_ref(types[i]) || Core.Compiler.widenconst(types[i]) <: Ptr)
                     if _op_tainted(src, tset, targs)
                         settaint(isref)
                     else
@@ -461,6 +463,18 @@ function _taint_scan_ci(
             # value-carrying op (tuple/ifelse): result may carry the reference forward
             if nm !== nothing && nm in _CARRY_OPS
                 any(a -> _op_tainted(a, tset, targs), dataargs) && settaint(true)
+                continue
+            end
+
+            # A raw pointer into the plan writes the plan: `pointer(x)` lowers to
+            # `bitcast(Ptr{T}, getfield(getfield(x, :ref), :ptr_or_offset))`, and an offset from it
+            # to `add_ptr`, ending in a `pointerset`. Only the pointer operand carries the taint — an
+            # offset read from the plan must not make a pointer into another array look like it.
+            if nm === :bitcast && length(dataargs) == 2
+                _op_tainted(dataargs[2], tset, targs) && settaint(true)
+                continue
+            elseif (nm === :add_ptr || nm === :sub_ptr) && !isempty(dataargs)
+                _op_tainted(dataargs[1], tset, targs) && settaint(true)
                 continue
             end
 

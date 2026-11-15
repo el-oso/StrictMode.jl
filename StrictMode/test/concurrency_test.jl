@@ -884,3 +884,22 @@ end
     @test f.code !== :SM0203          # not "could not read this signature"
     @test f.status === :info           # a `!` name declares the write of argument 1
 end
+
+@testitem "a store through a raw pointer into the shared argument is a write to it" begin
+    using StrictMode
+    flagged(f) = try
+        f()
+        false
+    catch e
+        e isa StrictViolation
+    end
+    via_ptr!(out, plan) = (GC.@preserve plan unsafe_store!(pointer(plan), 0.0); out[1] = 1.0; nothing)
+    via_offset!(out, plan) = (GC.@preserve plan unsafe_store!(pointer(plan) + 16, 0.0); out[1] = 1.0; nothing)
+    # Writes `out`; the offset is read from the plan, which must not make `out` look like the plan.
+    own_ptr!(out, plan) = (GC.@preserve out unsafe_store!(pointer(out) + 8 * length(plan), 0.0); nothing)
+    out = zeros(32)
+    plan = randn(4, 4)
+    @test flagged(() -> @assert_concurrency_safe self = 2 via_ptr!(out, plan))
+    @test flagged(() -> @assert_concurrency_safe self = 2 via_offset!(out, plan))
+    @test !flagged(() -> @assert_concurrency_safe self = 2 own_ptr!(out, plan))
+end
