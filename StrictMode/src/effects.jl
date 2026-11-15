@@ -1202,7 +1202,7 @@ const _CONFINE_DEPTH = 64
 const _CONFINE_BUDGET = 1000
 # C functions that read or write through a pointer and never keep it.
 const _CONFINE_C_NONRETAINING = (:memmove, :memcpy, :memset, :memcmp)
-const _GLOBAL_STORES = (:setglobal!, :swapglobal!, :setglobalonce!, :replaceglobal!)
+const _GLOBAL_STORES = (:setglobal!, :swapglobal!, :setglobalonce!, :replaceglobal!, :modifyglobal!)
 
 _carries(@nospecialize(T)) = _may_ref(T) || _holds_ptr(Core.Compiler.widenconst(T))
 
@@ -1216,6 +1216,41 @@ end
 # Records why the scan stopped: the first reason, and the statement it was read at.
 _esc!(st::Dict{Symbol, Any}, why::String, i::Int) = (haskey(st, :why) || (st[:why] = why); (true, false))
 
+# Builtins that only read or rearrange their arguments, so a tracked value given to one stays in the
+# frame. Any other builtin given one — `invokelatest`, a splatted call, an atomic global update — is
+# read as an escape, since it can call or keep anything.
+const _CONFINE_PURE_BUILTINS = (
+    :getfield, :tuple, :typeassert, :ifelse, :(===), :isa, :typeof, :isdefined, :nfields, :sizeof,
+    :memoryrefnew, :memoryref, :memoryrefget, :memoryref_isassigned, :memoryrefoffset, :svec, :fieldtype,
+    :apply_type, :compilerbarrier, :donotdelete, :getindex,
+)
+
+# The allocation a store's container was made from in this frame, walking back through the steps
+# that reach an array's memory; `nothing` when it was not made here.
+function _confine_fresh(code, @nospecialize(x))
+    for _ in 1:8
+        x isa Core.SSAValue || return nothing
+        s = code[x.id]
+        if s isa Core.PiNode
+            x = s.val
+            continue
+        end
+        Meta.isexpr(s, :new) && return x.id
+        Meta.isexpr(s, :foreigncall) && startswith(string(_fcall_name(s)), "jl_alloc") && return x.id
+        Meta.isexpr(s, :call) || return nothing
+        nm = _callee_name(s.args[1])
+        nm === :memorynew && return x.id
+        if nm === :memoryrefnew || nm === :memoryref
+            x = s.args[2]
+        elseif nm === :getfield && length(s.args) >= 3 && _field_sym(s.args[3]) in (:ref, :mem)
+            x = s.args[2]
+        else
+            return nothing
+        end
+    end
+    return nothing
+end
+
 # `(escapes, returns)` for `ir` with the values in `seed` (SSA ids) and `args` (argument numbers)
 # tracked. `returns` is whether a tracked value is returned, which a caller reads as its call result
 # being tracked and the top frame reads as an escape.
@@ -1224,6 +1259,9 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
     types = ir.stmts.type
     tset = copy(seed)
     tracked(@nospecialize(a)) = (a isa Core.SSAValue && a.id in tset) || (a isa Core.Argument && a.n in args)
+    # A frame that can catch receives what it throws back as `the_exception`, so a thrown value is
+    # only on the throw path when nothing here catches it.
+    catches = any(s -> s isa Core.EnterNode || Meta.isexpr(s, :enter), code)
     returns = false
     changed = true
     while changed
@@ -1256,28 +1294,37 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                 nm = _callee_name(fx)
                 if f isa Core.Builtin || f isa Core.IntrinsicFunction
                     if nm in _GLOBAL_STORES
-                        return _esc!(st, "stored into a global", i)
+                        return _esc!(st, "stored into a global (`$nm`)", i)
                     elseif !isnothing(nm) && haskey(_STORE_OPS, nm)
+                        # A tracked VALUE stored anywhere but into memory allocated in this frame
+                        # leaves with that memory's owner. Writing plain data through it does not.
                         pos = _STORE_OPS[nm]
-                        # Stored into an object it does not own: the container is not tracked.
-                        cont = 1 <= pos <= length(data) && tracked(data[pos])
-                        (!cont && any(k -> k != pos, hit)) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
+                        stored = any(k -> k != pos, hit)
+                        fresh = 1 <= pos <= length(data) && !isnothing(_confine_fresh(code, data[pos]))
+                        (stored && !fresh) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
                     elseif nm === :throw
-                        # the throw path does not count, as `ignore_throw` decides for allocation
-                    else
+                        catches && return _esc!(st, "thrown in a frame that catches it", i)
+                        # otherwise the throw path, which does not count, as `ignore_throw` decides
+                    elseif f isa Core.IntrinsicFunction
+                        nm === :llvmcall && return _esc!(st, "handed to `llvmcall`", i)
                         _carries(types[i]) && add(i)
+                    elseif nm in _CONFINE_PURE_BUILTINS
+                        _carries(types[i]) && add(i)
+                    else
+                        return _esc!(st, "handed to the builtin `$nm`", i)
                     end
                 elseif isinv
                     mi = s.args[1] isa Core.CodeInstance ? s.args[1].def : s.args[1]
                     (mi isa Core.MethodInstance && mi.def isa Method) || return _esc!(st, "an invoke with no method", i)
-                    startswith(String(mi.def.name), "throw") && continue
-                    # Building an exception is the throw path too.
-                    (p1 = mi.specTypes.parameters[1]; p1 isa DataType && p1 <: Type && p1.parameters[1] isa Type &&
-                        p1.parameters[1] <: Exception) && continue
+                    # A call that only throws is the throw path, unless this frame catches it.
+                    (types[i] === Union{} && !catches) && continue
                     depth >= _CONFINE_DEPTH && return _esc!(st, "deeper than the depth limit: `$(mi.def.name)`", i)
                     st[:budget] = st[:budget] - 1
                     st[:budget] < 0 && return _esc!(st, "past the body budget at `$(mi.def.name)`", i)
-                    key = (mi, Tuple(hit))
+                    # A position past the last named argument lands in the vararg tuple.
+                    m = mi.def
+                    pos = BitSet(m.isva ? min(k + 1, Int(m.nargs)) : k + 1 for k in hit)
+                    key = (mi, Tuple(pos))
                     r = get(st[:memo], key, nothing)
                     if r === :pending
                         # A recursive call to a callee still being read: assume for now that it does
@@ -1296,7 +1343,7 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                             Any[]
                         end
                         r = length(cirs) == 1 ?
-                            _confine(first(cirs[1]), BitSet(), BitSet(k + 1 for k in hit), depth + 1, st) : (true, false)
+                            _confine(first(cirs[1]), BitSet(), pos, depth + 1, st) : (true, false)
                         used = delete!(st[:assumed], key)
                         if isempty(used) || r[1]
                             st[:memo][key] = r          # an escape holds whatever was assumed
@@ -1308,11 +1355,11 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                     r[1] && (get!(st, :chain, String[]); pushfirst!(st[:chain], string(mi.def.name)); return (true, returns))
                     r[2] && _carries(types[i]) && add(i)
                 else
-                    return _esc!(st, "a dynamic call to `$nm`", i)                                 # a dynamic call
+                    return _esc!(st, "a dynamic call to `$nm`", i)
                 end
             elseif s isa Expr && !(s.head in (:gc_preserve_begin, :gc_preserve_end, :boundscheck, :leave, :pop_exception)) &&
                     any(tracked, s.args)
-                return _esc!(st, "a statement form this scan does not read: $(s.head)", i)                                     # a form this scan does not read
+                return _esc!(st, "a statement form this scan does not read: $(s.head)", i)
             end
         end
     end

@@ -117,12 +117,14 @@ end
     \tldp\td15, d14, [sp], #144            ; 16-byte Folded Reload
     """
     lines = split(asm, '\n')
-    re = StrictMode._vec_reg_re(:aarch64)
-    spill = [occursin(StrictMode._SPILL_RELOAD_RE, l) && occursin(re, l) for l in lines]
-    depth, inner = StrictMode._asm_loop_depths(lines)
-    @test count(spill) == 4                                   # the x-register spill is not a vector one
-    @test count(spill .& (depth .> 0)) == 2                   # two of them inside the loop
-    @test count(spill .& inner) == 2
+    # The two in the loop count. The `x` register is not a vector one, and `d14`/`d15` saved in the
+    # prologue and restored after the loop are callee-saved registers, which every function that
+    # keeps a float across a call saves.
+    @test StrictMode._spill_counts(lines, :aarch64) == (2, 2, 2)
+    # A callee-saved register spilled INSIDE a loop is a real spill.
+    inloop = replace(asm, "str\tq3" => "str\td9")
+    @test StrictMode._spill_counts(split(inloop, '\n'), :aarch64) == (2, 2, 2)
+    @test StrictMode._spill_counts(lines, :x86_64) == (0, 0, 0)
     # The x86 pattern reads none of it: the blind spot this closes.
     @test !any(l -> occursin(StrictMode._vec_reg_re(:x86_64), l), lines)
 end

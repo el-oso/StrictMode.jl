@@ -708,3 +708,36 @@ end
     @test escapes(Confine.both)
     @test escapes(Confine.gonly)
 end
+
+@testitem ":noescape sees a handle leave through varargs, builtins, shared fields and exceptions" begin
+    using StrictMode
+    module Leaves
+    mutable struct H; buf::Vector{Float64}; end
+    mutable struct Node; next::Any; end
+    mutable struct HN; n::Node; end
+    struct HErr <: Exception; h::H; end
+    const G = Ref{Any}(nothing)
+    const GV = Any[]
+    const GN = Node(nothing)
+    global gg::Any = nothing
+    mk() = H(zeros(4))
+    @noinline sinkg(h) = (G[] = h; nothing)
+    @noinline sinkva(xs...) = (G[] = xs[2]; nothing)
+    @noinline throwpush!(h) = (push!(GV, h); nothing)
+    @noinline HErr(h::H, tag::Int) = (G[] = h; HErr(h))
+    @noinline link!(h) = (h.n.next = h; nothing)
+    f_va() = (h = mk(); sinkva(1, h); 1)
+    f_thrname() = (h = mk(); throwpush!(h); 1)
+    f_exc() = (h = mk(); e = HErr(h, 1); 1)
+    f_latest() = (h = mk(); Base.invokelatest(sinkg, h); 1)
+    f_modglobal() = (h = mk(); Core.modifyglobal!(Leaves, :gg, (o, n) -> n, h); 1)
+    f_selfn() = (h = HN(GN); link!(h); 1)
+    f_catch() = (h = mk(); try; throw(HErr(h)); catch e; G[] = e; end; 1)
+    end
+    StrictMode.register_scoped!(Leaves.H); StrictMode.register_scoped!(Leaves.HN)
+    for f in (Leaves.f_va, Leaves.f_thrname, Leaves.f_exc, Leaves.f_latest, Leaves.f_modglobal,
+              Leaves.f_selfn, Leaves.f_catch)
+        f()
+        @test !isempty(StrictMode._escaping_scoped(Tuple{typeof(f)}).escaped)
+    end
+end

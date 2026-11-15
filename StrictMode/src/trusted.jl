@@ -234,110 +234,176 @@ end
 
 _foreign_positions(@nospecialize(f)) = @lock _FOREIGN_LOCK get(_FOREIGN_ENTRIES, f, ())
 
-# Calls that carry foreign data on without reading it: the result is foreign too.
-const _FOREIGN_CARRY = (
-    +, -, Core.bitcast, reinterpret, convert, Base.unsafe_convert, Base.cconvert, unsafe_wrap,
-    pointer, view, reshape, oftype, Core.typeassert, getfield, getproperty, Core.tuple, UInt, Int,
-    UInt64, Int64, identity,
-)
-# Calls that look at foreign data without reading the memory behind it.
-const _FOREIGN_INERT = (
-    ==, !=, ===, !==, <, <=, >, >=, isequal, length, size, axes, eachindex, firstindex, lastindex,
-    typeof, isa, isnothing, Base.isdone, string,
-)
+# Two kinds of foreign value. A POINTER is the foreign address, or something holding it: an integer
+# made from it, a `Ref`, a struct. Arithmetic, comparison and conversion only carry it on; reading
+# through it (`unsafe_load`, `unsafe_string`, …) is the read. MEMORY is an array wrapped around the
+# address (`unsafe_wrap`): anything but asking its size, or taking a view or a pointer of it, reads it.
+const _FK_PTR = Int8(1)
+const _FK_MEM = Int8(2)
 
-# The reads of foreign memory in one body: `(certain, uncertain, returns_foreign)`. `certain` names
-# each read and the chain of package calls that reached it; `uncertain` names a dynamic call or a
-# callee too deep to read that was handed a foreign value.
-function _foreign_reads(@nospecialize(sig), positions, chain::Vector{String}, depth::Int, memo::Dict{Any, Any})
-    key = (sig, positions)
-    haskey(memo, key) && return something(memo[key], (String[], String[], false))
-    memo[key] = nothing                                   # in progress: a recursive call reads nothing new
+# Base functions that read through a foreign pointer.
+const _FOREIGN_PTR_READS = (unsafe_load, unsafe_string, unsafe_pointer_to_objref, Base.unsafe_copyto!, unsafe_read)
+# Base functions that ask a foreign array about its shape without reading its elements.
+const _FOREIGN_MEM_META = (
+    length, size, axes, eachindex, firstindex, lastindex, isempty, ndims, eltype, sizeof, strides, stride,
+)
+# Base functions that give another handle on the same foreign memory without reading it.
+const _FOREIGN_MEM_VIEWS = (view, reshape, vec, pointer, Base.unsafe_convert, Base.cconvert)
+
+# The method a call resolves to, or `nothing` when it is not exactly one.
+function _foreign_method(@nospecialize(sig))
+    ms = try
+        Base._methods_by_ftype(sig, -1, Base.get_world_counter())
+    catch
+        nothing
+    end
+    (ms isa Vector && length(ms) == 1) || return nothing
+    return ms[1].method
+end
+
+# `(certain, uncertain, returned_kind)` for the body `sig` names, with `kinds` the foreign kind of
+# each argument position (0 is the callable itself). `certain` names each read and the chain of
+# package calls that reached it; `uncertain` names a call that could not be resolved to one method.
+function _foreign_reads(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, depth::Int, st::Dict{Symbol, Any})
+    memo = st[:memo]
+    key = (sig, kinds)
+    hit = get(memo, key, nothing)
+    if hit === :pending
+        # A recursive call to a body still being read: assume for now that it reads nothing and
+        # returns the most foreign of its inputs. Its own reading covers the same body, so a read
+        # there is still found; a result that rests on this is not saved until it is settled.
+        push!(st[:assumed], key)
+        return (String[], String[], maximum(last, kinds; init = Int8(0)))
+    end
+    isnothing(hit) || return hit
+    outer = st[:assumed]
+    st[:assumed] = Set{Any}()
+    memo[key] = :pending
+    r = _foreign_body(sig, kinds, chain, depth, st)
+    used = delete!(st[:assumed], key)
+    (isempty(used) || !isempty(r[1])) ? (memo[key] = r) : delete!(memo, key)
+    st[:assumed] = union(outer, used)
+    return r
+end
+
+function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, depth::Int, st::Dict{Symbol, Any})
     certain = String[]
     uncertain = String[]
+    here(what) = join([chain; what], " → ")
     cts = try
         _code_typed_by_type(sig; optimize = false)
     catch
         Any[]
     end
     if length(cts) != 1
-        push!(uncertain, join([chain; "no single typed body for $(sig)"], " → "))
-        r = (certain, uncertain, true)
-        memo[key] = r
-        return r
+        push!(uncertain, here("no single typed body for $(sig)"))
+        return (certain, uncertain, _FK_MEM)
     end
     ci = first(cts[1])
     code = ci.code
-    slots = BitSet(k + 1 for k in positions)              # slot 1 is the function itself
-    tset = BitSet()
-    tainted(@nospecialize(a)) = (a isa Core.SSAValue && a.id in tset) || (a isa Core.SlotNumber && a.id in slots) ||
-        (a isa Core.Argument && a.n in slots)
-    here(what) = join([chain; what], " → ")
-    returns = false
+    nslots = length(ci.slotnames)
+    m = _foreign_method(sig)
+    nargs = isnothing(m) ? nslots : Int(m.nargs)
+    isva = !isnothing(m) && m.isva
+    slotk = Dict{Int, Int8}()
+    for (k, kd) in kinds
+        s = k + 1
+        isva && s > nargs && (s = nargs)               # past the last named argument: the vararg tuple
+        1 <= s <= nslots && (slotk[s] = max(get(slotk, s, Int8(0)), kd))
+    end
+    ssak = Dict{Int, Int8}()
+    kind(@nospecialize(a)) = a isa Core.SSAValue ? get(ssak, a.id, Int8(0)) :
+        (a isa Core.SlotNumber || a isa Core.Argument) ? get(slotk, a isa Core.SlotNumber ? a.id : a.n, Int8(0)) : Int8(0)
+    returns = Int8(0)
     changed = true
     while changed
         changed = false
         for (i, st0) in enumerate(code)
-            st, lhs = Meta.isexpr(st0, :(=)) ? (st0.args[2], st0.args[1]) : (st0, nothing)
-            out = false
-            if st isa Core.ReturnNode
-                isdefined(st, :val) && tainted(st.val) && (returns = true)
+            s, lhs = Meta.isexpr(st0, :(=)) ? (st0.args[2], st0.args[1]) : (st0, nothing)
+            out = Int8(0)
+            if s isa Core.ReturnNode
+                isdefined(s, :val) && (returns = max(returns, kind(s.val)))
                 continue
-            elseif st isa Core.SSAValue || st isa Core.SlotNumber || st isa Core.Argument
-                out = tainted(st)
-            elseif st isa Core.PiNode
-                out = isdefined(st, :val) && tainted(st.val)
-            elseif st isa Core.PhiNode
-                out = any(k -> isassigned(st.values, k) && tainted(st.values[k]), eachindex(st.values))
-            elseif Meta.isexpr(st, :new)
-                out = any(tainted, @view st.args[2:end])
-            elseif Meta.isexpr(st, :foreigncall)
-                out = false                               # handed to C, which is where it came from
-            elseif Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)
-                callee, args = _call_callee_and_args(ci, st)
-                hit = Int[k for k in eachindex(args) if tainted(args[k])]
-                if !isempty(hit)
-                    if isnothing(callee)
-                        changed |= _note!(uncertain, here("a dynamic call handed foreign data"))
-                        out = true
-                    elseif callee in _TRUST_BOUNDARIES
-                        out = false
-                    elseif callee isa Type || any(c -> c === callee, _FOREIGN_CARRY)
-                        out = true
-                    elseif any(c -> c === callee, _FOREIGN_INERT)
-                        out = false
-                    elseif callee isa Function && !_sw_is_base(parentmodule(callee)) &&
-                            Base.moduleroot(parentmodule(callee)) !== StrictMode
-                        if depth >= _FOREIGN_DEPTH
-                            changed |= _note!(uncertain, here("`$(nameof(callee))` (deeper than $_FOREIGN_DEPTH calls, not read)"))
-                            out = true
-                        else
-                            csig = Tuple{Core.Typeof(callee), Any[_unopt_arg_type(ci, a) for a in args]...}
-                            c, u, r = _foreign_reads(csig, Tuple(hit), [chain; string(nameof(callee))], depth + 1, memo)
-                            for s in c; changed |= _note!(certain, s); end
-                            for s in u; changed |= _note!(uncertain, s); end
-                            out = r
-                        end
-                    else
-                        changed |= _note!(certain, here("`$(nameof(callee))` reads foreign memory"))
-                        out = false
-                    end
-                end
+            elseif s isa Core.SSAValue || s isa Core.SlotNumber || s isa Core.Argument
+                out = kind(s)
+            elseif s isa Core.PiNode
+                out = isdefined(s, :val) ? kind(s.val) : Int8(0)
+            elseif s isa Core.PhiNode
+                out = maximum(k -> isassigned(s.values, k) ? kind(s.values[k]) : Int8(0), eachindex(s.values); init = Int8(0))
+            elseif Meta.isexpr(s, :new) || Meta.isexpr(s, :splatnew)
+                out = maximum(kind, @view(s.args[2:end]); init = Int8(0))
+            elseif Meta.isexpr(s, :foreigncall)
+                # Handed back to C is not a read, except to Julia's own runtime, which reads it.
+                fn = string(_fcall_name(s))
+                any(a -> kind(a) > 0, s.args) && startswith(fn, "jl_") &&
+                    (changed |= _note!(certain, here("`$fn` (Julia runtime) reads foreign memory")))
+            elseif Meta.isexpr(s, :call) || Meta.isexpr(s, :invoke)
+                out, c, u = _foreign_call(ci, s, kind, here, chain, depth, st)
+                for x in c; changed |= _note!(certain, x); end
+                for x in u; changed |= _note!(uncertain, x); end
             end
-            if out
-                if !isnothing(lhs) && lhs isa Core.SlotNumber
-                    lhs.id in slots || (push!(slots, lhs.id); changed = true)
+            if out > 0
+                if lhs isa Core.SlotNumber
+                    get(slotk, lhs.id, Int8(0)) < out && (slotk[lhs.id] = out; changed = true)
                 end
-                i in tset || (push!(tset, i); changed = true)
+                get(ssak, i, Int8(0)) < out && (ssak[i] = out; changed = true)
             end
         end
     end
-    r = (certain, uncertain, returns)
-    memo[key] = r
-    return r
+    return (certain, uncertain, returns)
 end
 
-const _FOREIGN_DEPTH = 8
+# One call statement: `(result_kind, certain, uncertain)`.
+function _foreign_call(ci, s::Expr, kind, here, chain, depth::Int, st::Dict{Symbol, Any})
+    isinv = s.head === :invoke
+    fx = isinv ? s.args[2] : s.args[1]
+    args = Vector{Any}(isinv ? s.args[3:end] : s.args[2:end])
+    callee = _unopt_callee(ci, fx)
+    selfk = kind(fx)
+    if callee === Core.kwcall && length(args) >= 2       # keyword call: the callee is its second argument
+        fx = args[2]; callee = _unopt_callee(ci, fx); selfk = kind(fx); args = args[3:end]
+    end
+    ks = Int8[kind(a) for a in args]
+    (selfk == 0 && all(iszero, ks)) && return (Int8(0), String[], String[])
+    nm = string(_callable_name(isnothing(callee) ? _unopt_arg_type(ci, fx) : callee))
+    if callee isa Core.Builtin || callee isa Core.IntrinsicFunction
+        if callee === Core.Intrinsics.pointerref || callee === Core.memoryrefget || nameof(callee) === :arrayref
+            return (Int8(0), [here("`$nm` reads foreign memory")], String[])
+        elseif callee === Core._apply_iterate || callee === Core.invoke || callee === Core._call_latest
+            return (_FK_MEM, String[], [here("`$nm` calls a function this scan does not resolve")])
+        elseif callee === (===) || callee === Core.isa || callee === Core.isdefined
+            return (Int8(0), String[], String[])
+        end
+        return (max(selfk, maximum(ks)), String[], String[])
+    end
+    callee in _TRUST_BOUNDARIES && return (Int8(0), String[], String[])
+    argT = Any[_unopt_arg_type(ci, a) for a in args]
+    csig = Tuple{isnothing(callee) ? _unopt_arg_type(ci, fx) : Core.Typeof(callee), argT...}
+    m = _foreign_method(csig)
+    if isnothing(m)
+        return (_FK_MEM, String[], [here("$nm (no single method for its argument types) is handed foreign data")])
+    end
+    if !_sw_is_base(m.module)
+        depth >= _FOREIGN_DEPTH && return (_FK_MEM, String[], [here("`$nm` (deeper than $_FOREIGN_DEPTH calls, not read)")])
+        kinds = Tuple(sort!([(0 => selfk); [k => ks[k] for k in eachindex(ks)]]; by = first))
+        kinds = Tuple(p for p in kinds if last(p) > 0)
+        c, u, r = _foreign_reads(csig, kinds, [chain; nm], depth + 1, st)
+        return (r, c, u)
+    end
+    # A Base method, judged by what it does with each kind of foreign value.
+    anymem = selfk == _FK_MEM || any(==(_FK_MEM), ks)
+    any(f -> f === callee, _FOREIGN_PTR_READS) && return (Int8(0), [here("`$nm` reads foreign memory")], String[])
+    callee === unsafe_wrap && return (_FK_MEM, String[], String[])
+    if anymem
+        any(f -> f === callee, _FOREIGN_MEM_META) && return (Int8(0), String[], String[])
+        any(f -> f === callee, _FOREIGN_MEM_VIEWS) && return (_FK_MEM, String[], String[])
+        return (Int8(0), [here("`$nm` reads foreign memory")], String[])
+    end
+    # Only the address: arithmetic, comparison, conversion carry it on.
+    return (_FK_PTR, String[], String[])
+end
+
+const _FOREIGN_DEPTH = 32
 _note!(v::Vector{String}, s::String) = (s in v) ? false : (push!(v, s); true)
 
 # The foreign-pointer half of `:trusted` for one signature: `(certain, uncertain)`, both empty when
@@ -349,7 +415,10 @@ function _foreign_sites(@nospecialize(f), @nospecialize(types::Tuple), positions
             "`foreign` names argument $k, but the call has $(length(types)) argument(s)"
         ))
     end
-    c, u, _ = _foreign_reads(Tuple{Core.Typeof(f), types...}, Tuple(positions), String[string(_callable_name(f))], 0, Dict{Any, Any}())
+    # A declared position holding an array is foreign memory already; anything else is an address.
+    kinds = Tuple(sort!([k => (types[k] <: AbstractArray ? _FK_MEM : _FK_PTR) for k in positions]; by = first))
+    st = Dict{Symbol, Any}(:memo => Dict{Any, Any}(), :assumed => Set{Any}())
+    c, u, _ = _foreign_reads(Tuple{Core.Typeof(f), types...}, kinds, String[string(_callable_name(f))], 0, st)
     return (c, u)
 end
 

@@ -141,3 +141,58 @@ end
     @test StrictMode._failed(only(StrictMode.findings(Foreign.c_wrap, sig; guarantees = (:trusted,))))
     @test_throws ArgumentError StrictMode._foreign_sites(Foreign.c_bad, sig, (3,))
 end
+
+@testitem "foreign data is judged by the method that runs, and by whether it is an address or memory" begin
+    using StrictMode
+    module ForeignKinds
+    struct Hdr; p::Ptr{Int}; end
+    Base.length(h::Hdr) = unsafe_load(h.p)
+    Base.getproperty(h::Hdr, s::Symbol) = s === :n ? unsafe_load(getfield(h, :p)) : getfield(h, s)
+    struct Parsed; n::Int; Parsed(p::Ptr{Int}) = new(unsafe_load(p)); end
+    (h::Hdr)(i) = unsafe_load(getfield(h, :p), i)
+    apply(f) = f()
+    a(p, n) = n == 0 ? p : b(p, n)
+    b(p, n) = a(p, n - 1)
+    # Reads, each through something the name of the call does not show.
+    e_ctor(p::Ptr{Int}) = Parsed(p).n
+    e_len(p::Ptr{Int}) = length(Hdr(p))
+    e_prop(p::Ptr{Int}) = Hdr(p).n
+    e_clos(p::Ptr{Int}) = (g = () -> unsafe_load(p); g())
+    e_clos2(p::Ptr{Int}) = apply(() -> unsafe_load(p))
+    e_functor(p::Ptr{Int}) = (h = Hdr(p); h(1))
+    e_eq(p::Ptr{Int}, n) = unsafe_wrap(Array, p, n) == [1, 2, 3]
+    e_str(p::Ptr{Int}, n) = string(unsafe_wrap(Array, p, n))
+    e_copy(p::Ptr{Int}, n) = Vector{Int}(unsafe_wrap(Array, p, n))
+    e_tuple(p::Ptr{Int}, n) = Tuple(unsafe_wrap(Array, p, n))
+    e_ccall(p::Ptr{UInt8}, n) = ccall(:jl_pchar_to_string, Ref{String}, (Ptr{UInt8}, Int), p, n)
+    e_memo(p::Ptr{Int}) = (x = a(p, 1); y = b(p, 2); unsafe_load(y))
+    # Not reads: the address is checked, compared or carried, and a wrapped array is only measured.
+    e_view(p::Ptr{Int}, n) = length(view(unsafe_wrap(Array, p, n), 1:2))
+    e_align(p::Ptr{Int}) = UInt(p) % 8 == 0
+    e_kw(p::Ptr{Int}, n) = length(unsafe_wrap(Array, p, n; own = false))
+    e_null(p::Ptr{Int}) = p == C_NULL ? 0 : 1
+    e_isnull(p::Ptr{Int}) = iszero(UInt(p))
+    e_diff(p::Ptr{Int}, q::Ptr{Int}) = div(q - p, 8)
+    e_ref(p::Ptr{Int}) = (r = Ref(p); r[] == C_NULL)
+    e_isempty(p::Ptr{Int}, n) = isempty(unsafe_wrap(Array, p, n))
+    end
+    F = ForeignKinds
+    reads(f, ts, pos = (1,)) = !isempty(first(StrictMode._foreign_sites(f, ts, pos)))
+    P = (Ptr{Int},); PN = (Ptr{Int}, Int)
+    for f in (F.e_ctor, F.e_len, F.e_prop, F.e_clos, F.e_clos2, F.e_functor, F.e_memo)
+        @test reads(f, P)
+    end
+    for f in (F.e_eq, F.e_str, F.e_copy, F.e_tuple)
+        @test reads(f, PN)
+    end
+    @test reads(F.e_ccall, (Ptr{UInt8}, Int))
+    for f in (F.e_align, F.e_null, F.e_isnull, F.e_ref)
+        @test !reads(f, P)
+    end
+    for f in (F.e_view, F.e_kw, F.e_isempty)
+        @test !reads(f, PN)
+    end
+    @test !reads(F.e_diff, (Ptr{Int}, Ptr{Int}), (1, 2))
+    # The chain names the package method that read it.
+    @test occursin("getproperty", only(first(StrictMode._foreign_sites(F.e_prop, P, (1,)))))
+end

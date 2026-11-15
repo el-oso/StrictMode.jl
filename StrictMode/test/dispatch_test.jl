@@ -244,3 +244,19 @@ end
     @test !occursin("Task.storage", f.reason)          # the accessor's own field read is not the cause
     @test only(StrictMode.findings(ReturnUnion.stable, (Int,); guarantees = (:typestable,))).status === :pass
 end
+
+@testitem "a union narrowed out of an abstract value is blamed on the abstract value" begin
+    using StrictMode
+    module Narrowed
+    global G = 1
+    f(x::Int) = (g = G; g isa String ? g : [1])
+    mutable struct B; a::Any; end
+    fb(b::B) = (v = b.a; v isa Int ? v : "s")
+    fa(x::String, c::Bool) = c ? x : [1.0]
+    end
+    Narrowed.f(1); Narrowed.fb(Narrowed.B(1)); Narrowed.fa("a", true)
+    code(f, t) = only(StrictMode.findings(f, t; guarantees = (:typestable,))).code
+    @test code(Narrowed.f, (Int,)) === :SM0102            # the non-const global
+    @test code(Narrowed.fb, (Narrowed.B,)) === :SM0103     # the abstract field
+    @test code(Narrowed.fa, (String, Bool)) === :SM0108    # a returned argument has its declared type
+end

@@ -239,13 +239,21 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
-# The concrete types the body returns, following a returned phi to its incoming values. Empty when a
-# returned value is not concrete, since then the union is not the whole story.
+# The concrete types the body returns, following a returned phi to its incoming values. Empty when the
+# union is not the whole story: a returned value that is not concrete, or one narrowed (`isa`, a type
+# assertion) out of an abstractly typed value — then the abstract declaration is the cause.
 function _returned_types(ci::Core.CodeInfo)
     out = Any[]
     tys = ci.ssavaluetypes
     tys isa Vector || return out
+    narrowed = false
     function add!(@nospecialize(v), depth::Int)
+        if v isa Core.SSAValue && ci.code[v.id] isa Core.PiNode
+            src = ci.code[v.id].val
+            S = src isa Core.SSAValue ? Core.Compiler.widenconst(tys[src.id]) :
+                src isa Core.Argument && ci.slottypes isa Vector ? Core.Compiler.widenconst(ci.slottypes[src.n]) : Any
+            isconcretetype(S) || (narrowed = true)
+        end
         if v isa Core.SSAValue && ci.code[v.id] isa Core.PhiNode && depth < 4
             p = ci.code[v.id]
             for k in eachindex(p.values)
@@ -254,6 +262,7 @@ function _returned_types(ci::Core.CodeInfo)
             return
         end
         T = v isa Core.SSAValue ? Core.Compiler.widenconst(tys[v.id]) :
+            (v isa Core.Argument && ci.slottypes isa Vector) ? Core.Compiler.widenconst(ci.slottypes[v.n]) :
             (v isa Core.Argument || v isa Core.SlotNumber || v isa GlobalRef) ? Any :
             Core.Typeof(v isa QuoteNode ? v.value : v)
         T in out || push!(out, T)
@@ -261,7 +270,7 @@ function _returned_types(ci::Core.CodeInfo)
     for st in ci.code
         (st isa Core.ReturnNode && isdefined(st, :val)) && add!(st.val, 0)
     end
-    return out
+    return narrowed ? Any[] : out
 end
 
 # A `global x::Int` declares a concrete type, so reading it is stable even though the binding is not

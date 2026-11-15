@@ -870,18 +870,33 @@ function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
     target = _func_name(f) * _sig_string(types)
     s = _native_asm(f, types)
     isempty(s) && return SpillReport(target, 0, 0, 0)
-    lines = split(s, '\n')
+    total, inloop, ininner = _spill_counts(split(s, '\n'), Sys.ARCH)
+    return SpillReport(target, total, inloop, ininner)
+end
+
+# Vector spill and reload lines in `lines`: over the whole function, inside a loop, inside an innermost
+# loop. On AArch64 the calling convention makes `d8`–`d15` callee-saved, so a function that keeps a float
+# across a call saves them in its prologue and restores them in its epilogue — outside every loop, and
+# marked `Spill` by LLVM. x86-64 has no callee-saved vector register, so those lines are not counted.
+function _spill_counts(lines::AbstractVector{<:AbstractString}, arch::Symbol)
+    re = _vec_reg_re(arch)
     depth, inner = _asm_loop_depths(lines)
     total = 0
     inloop = 0
     ininner = 0
     for (k, l) in enumerate(lines)
-        (occursin(_SPILL_RELOAD_RE, l) && occursin(_VEC_REG_RE, l)) || continue
+        (occursin(_SPILL_RELOAD_RE, l) && occursin(re, l)) || continue
+        (arch === :aarch64 && depth[k] == 0 && _arm_callee_saved_only(l, re)) && continue
         total += 1
         depth[k] > 0 && (inloop += 1)
         inner[k] && (ininner += 1)
     end
-    return SpillReport(target, total, inloop, ininner)
+    return (total, inloop, ininner)
+end
+
+function _arm_callee_saved_only(l::AbstractString, re::Regex)
+    regs = [m.match for m in eachmatch(re, l)]
+    return !isempty(regs) && all(r -> (m = match(r"^d(\d+)$", r); !isnothing(m) && 8 <= parse(Int, m[1]) <= 15), regs)
 end
 
 const _SPILL_SCOPES = (:loops, :innermost, :function)

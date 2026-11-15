@@ -9,8 +9,8 @@
 
 What [`history_report`](@ref) measured. `status` is `:same` (the same bits after the movers),
 `:different` (different bits after the movers, with the same bits between two calls run back to
-back), `:first_call` (the first call differs from the second and third, which agree: the first call
-leaves state behind that changes the result), or `:nondeterministic` (every call differs, so a
+back), `:first_call` (the first call differs from the next three, which agree: consistent with state
+the first call leaves behind), or `:nondeterministic` (every call differs, so a
 difference after the movers cannot be put down to them). `difference` names where the first differing bit was found.
 """
 struct HistoryReport
@@ -36,8 +36,8 @@ function Base.show(io::IO, ::MIME"text/plain", r::HistoryReport)
         )
     elseif r.status === :first_call
         print(
-            io, "the FIRST call differs from the calls after it, at ", r.difference,
-            ": the first call leaves state behind that changes the result"
+            io, "the FIRST call differs from the three calls after it, which agree, at ", r.difference,
+            ": consistent with state left behind by the first call that changes the result"
         )
     else
         print(
@@ -97,9 +97,9 @@ It calls `f` twice back to back on fresh copies of the arguments, as a control, 
 in `movers` (calls that change state the package keeps between calls — a thread count, a tuning
 knob, a large call that grows a pool or moves a measured threshold), then `f` once more, and
 compares the result and the arguments afterwards, bit for bit. When the two control calls already
-differ, a third call tells why. If it repeats the second, the status is `:first_call`: the first
-call left state behind that changes the result, such as a workspace created on first use. If it
-differs again — a result built from `rand()`, an `objectid`, a timer, a reduction whose order
+differ, two more calls tell why. If both repeat the second, the status is `:first_call`: consistent
+with the first call leaving state behind that changes the result, such as a workspace created on
+first use (a result with few possible values can also repeat by chance). If either differs — a result built from `rand()`, an `objectid`, a timer, a reduction whose order
 varies — the status is `:nondeterministic`, and the movers cannot be judged.
 
 The arguments are copied with `deepcopy` before each call, so state a call keeps in its own
@@ -134,11 +134,11 @@ function history_report(@nospecialize(f), args...; movers = ())
     control = call()
     d = differ(first_run, control)
     if !isnothing(d)
-        # A third call tells the two apart: when it repeats the second, only the first call differed,
-        # so the first call left state behind that changes the result. When it differs again, the
-        # result is not a function of its inputs at all.
-        third = call()
-        repeat = isnothing(differ(control, third))
+        # Two more calls tell the two apart: when both repeat the second, only the first call differed,
+        # which is what state left behind by the first call looks like. When either differs, the result
+        # is not a function of its inputs. A result with few possible values (`rand(Bool)`) can still
+        # repeat by chance, which is why the report says "consistent with" rather than "is".
+        repeat = isnothing(differ(control, call())) && isnothing(differ(control, call()))
         return HistoryReport(target, repeat ? :first_call : :nondeterministic, length(movers), d)
     end
     for m in movers
