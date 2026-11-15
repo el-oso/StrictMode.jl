@@ -187,7 +187,7 @@ end
 # A call whose scan already finds allocation, boxing or an abstract-eltype container gets the
 # unfiltered proof, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
-    allocs = _raw_allocs(f, types)
+    allocs = _not_own_excused(f, _raw_allocs(f, types))
     _IGNORE_BARRIER[] || return (allocs, false)
     sig = StrictMode._alloc_signals(f, types)
     (sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)) || return (allocs, false)
@@ -200,6 +200,20 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
             "usual. Disable with set_ignore_barrier!(false)." maxlog = 1
     end
     return (kept, isempty(kept) && excused > 0)
+end
+
+# Running pending finalizers is not the call's own allocation. Base's `unlock` does it on every lock,
+# `Condition` and `Threads.Event`; finalizers are code registered elsewhere, and they run at other GC
+# points too. A Base slow path that allocates for its own sake (a contended lock) is still judged.
+# An `@strict_exempt` callee is NOT excused here: `@test_noalloc` proves no allocation on any path,
+# and a pool that grows on first use is gated by `@test_steady_state` instead.
+function _not_own_excused(@nospecialize(f), allocs)
+    fin(a) = a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
+    kept = filter(!fin, allocs)
+    nfin = length(allocs) - length(kept)
+    nfin > 0 && @info "StrictModeTest: `$(f)`: $nfin site(s) that run pending finalizers (from Base's " *
+        "`unlock`) excused: finalizers are code registered elsewhere, not this call's allocation." maxlog = 1
+    return kept
 end
 
 _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)

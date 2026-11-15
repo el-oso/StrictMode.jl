@@ -226,3 +226,14 @@ end
     @test only(proof_findings(spin, (Int,); guarantees = (:noalloc,))).status === :pass
     @test StrictMode._failed(only(proof_findings(spin_alloc, (Int,); guarantees = (:noalloc,))))
 end
+
+@testitem "the finalizer hook in Base's unlock is not the call's own allocation" begin
+    using StrictMode, StrictModeTest
+    # Base's `unlock` runs pending finalizers; that site is dropped, others are still judged.
+    lk(l::ReentrantLock) = (lock(l); unlock(l); nothing)
+    l = ReentrantLock(); lk(l)
+    fin(a) = a isa StrictModeTest.AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
+    raw = StrictModeTest._raw_allocs(lk, (ReentrantLock,))
+    @test any(fin, raw)
+    @test !any(fin, StrictModeTest._not_own_excused(lk, raw))
+end
