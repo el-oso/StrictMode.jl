@@ -104,3 +104,16 @@ end
     # Inlining consumes the flag, which is why the scan must stay on unoptimized IR.
     @test isempty(flags(Base.code_typed(F.elided, tt; optimize = true)[1][1]))
 end
+
+@testitem "unsafe_report charges a construct to the method that wrote it" begin
+    using StrictMode
+    # The generic method's declared signature also matches the specific one. Read through inference,
+    # that returned both bodies, and the generic method was charged with its sibling's `@inbounds`.
+    module Siblings
+    first_of(x::AbstractVector) = first(x)
+    first_of(x::Vector{Float64}) = @inbounds x[1]
+    end
+    fs = unsafe_report(Siblings)
+    @test length(fs) == 1
+    @test occursin("Vector{Float64}", only(fs).signature)
+end

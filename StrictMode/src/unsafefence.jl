@@ -26,43 +26,80 @@ _is_unsafe_name(nm::Symbol) = nm in _UNSAFE_NAMES || startswith(String(nm), "uns
 # `allow` names constructs by bare `Symbol`, but a reader looks for the macro they wrote.
 _render_construct(nm::Symbol) = nm === :inbounds ? "`@inbounds`" : "`" * String(nm) * "`"
 
+# The function a lowered call names, resolved without inference: a `GlobalRef`, a constant, or
+# `M.name` on a module, which lowers to `getproperty(M, :name)` in a statement of its own.
+function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
+    depth > 8 && return nothing
+    a isa GlobalRef && return isdefined(a.mod, a.name) ? getglobal(a.mod, a.name) : nothing
+    a isa QuoteNode && return a.value
+    if a isa Core.SSAValue
+        s = code[a.id]
+        if Meta.isexpr(s, :call) && length(s.args) == 3 &&
+                _lowered_callee(code, s.args[1], depth + 1) === getproperty
+            M = _lowered_callee(code, s.args[2], depth + 1)
+            nm = s.args[3] isa QuoteNode ? s.args[3].value : s.args[3]
+            return (M isa Module && nm isa Symbol && isdefined(M, nm)) ? getglobal(M, nm) : nothing
+        end
+        return _lowered_callee(code, s, depth + 1)
+    end
+    return a isa Expr ? nothing : a
+end
+
+function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
+    # One finding per method, so the span an `@inbounds` block covers does not matter: a bare
+    # `@inbounds a[i]` flags one statement and `@inbounds for …` flags most of the loop, and both
+    # mean the same thing about this method.
+    any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
+    for st in ci.code
+        st isa Expr || continue
+        if st.head === :foreigncall
+            push!(out, :ccall)
+            continue
+        end
+        (st.head === :call && !isempty(st.args)) || continue
+        callee = resolve(st.args[1])
+        isnothing(callee) && continue
+        nm = try
+            nameof(callee)
+        catch
+            continue
+        end
+        nm isa Symbol && _is_unsafe_name(nm) && push!(out, nm)
+    end
+    return out
+end
+
 # The unsafe constructs in one method's body, as a sorted, deduplicated list of names. `ccall`
 # stands for a `:foreigncall` statement, which is what a `ccall` becomes.
+#
+# Read from the method's LOWERED code, which is what it wrote: every construct here is visible
+# there, and reading it runs no inference. Inferring at the method's declared signature cost
+# seconds on a large generic kernel, and for an abstract signature it returned the code of every
+# method matching it, so a generic method was charged with the `@inbounds` and `unsafe_*` calls of
+# its more specific siblings. A `@generated` method has no lowered body of its own and is inferred,
+# keeping only its own result.
 function _unsafe_constructs(m::Method)
     out = Set{Symbol}()
-    tt = try
-        m.sig
-    catch
-        return Symbol[]
-    end
-    cis = try
-        Base.code_typed_by_type(tt; optimize = false)
-    catch
-        return Symbol[]
-    end
-    for pair in cis
-        ci = pair isa Pair ? pair.first : pair
-        ci isa Core.CodeInfo || continue
-        # One finding per method, so the span an `@inbounds` block covers does not matter: a bare
-        # `@inbounds a[i]` flags one statement and `@inbounds for …` flags most of the loop, and
-        # both mean the same thing about this method.
-        any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
-        for st in ci.code
-            st isa Expr || continue
-            if st.head === :foreigncall
-                push!(out, :ccall)
-                continue
-            end
-            st.head === :call && !isempty(st.args) || continue
-            callee = _unopt_callee(ci, st.args[1])
-            isnothing(callee) && continue
-            nm = try
-                nameof(callee)
-            catch
-                continue
-            end
-            nm isa Symbol && _is_unsafe_name(nm) && push!(out, nm)
+    if isdefined(m, :generator)
+        cis = try
+            Base.code_typed_by_type(m.sig; optimize = false)
+        catch
+            return Symbol[]
         end
+        for pair in cis
+            ci = pair isa Pair ? pair.first : pair
+            ci isa Core.CodeInfo || continue
+            mi = ci.parent
+            (mi isa Core.MethodInstance && mi.def !== m) && continue
+            _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a))
+        end
+    else
+        src = try
+            Base.uncompressed_ast(m)
+        catch
+            return Symbol[]
+        end
+        _scan_unsafe!(out, src, a -> _lowered_callee(src.code, a))
     end
     # A `ccall` already says this method leaves the language; its own argument conversion is not a
     # second thing to fix.
