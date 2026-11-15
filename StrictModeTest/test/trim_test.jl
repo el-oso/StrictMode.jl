@@ -66,14 +66,14 @@ end
     @test !StrictModeTest.juliac_patches()
     @test !StrictModeTest._JULIAC_PATCHED[]
 
-    # juliac does not ship these at the same path on every Julia: they are under
-    # `share/julia/juliac` on 1.12 and 1.13.0-rc3, and absent there on rc4. Where they exist, check
+    # Where juliac keeps these depends on the Julia: `share/julia/juliac` through 1.12, and the JuliaC
+    # app's own `src/scripts` from 1.13, when that app is installed. Where they exist, check
     # that the stub naming the reason for the default is still in them; where they do not, check the
     # behaviour that actually protects a user — `_apply_juliac_patches` warns rather than throwing,
     # so enabling the option on such a Julia degrades to stock-Base verification instead of breaking
     # the caller.
-    dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
-    base_patch = joinpath(dir, "juliac-trim-base.jl")
+    dir = StrictModeTest._juliac_patch_dir()
+    base_patch = isnothing(dir) ? "" : joinpath(dir, "juliac-trim-base.jl")
     if isfile(base_patch)
         @test occursin("current_logger_for_env", read(base_patch, String))   # the reason the default is off
         @test isfile(joinpath(dir, "juliac-trim-stdlib.jl"))
@@ -175,18 +175,24 @@ end
         # `nothing` means it declined to answer — the child failed, or ran without the patches.
         r = StrictModeTest._trim_validate_subprocess([(abs, Any[Int]), (sqrt, Any[Float64])])
         if isnothing(r)
-            # Declining is legitimate only when there is nothing to isolate — juliac ships no patch
-            # files on some builds (1.13.0-rc4). Any other cause is a real failure, so the child's
-            # own stderr goes into the message rather than leaving a bare `false`.
-            patch = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac-trim-base.jl")
-            @test !isfile(patch) ||
+            # Declining is legitimate only when there is nothing to isolate: no juliac patch files
+            # could be found. Any other cause is a real failure, so the child's own stderr goes into
+            # the message rather than leaving a bare `false`.
+            dir = StrictModeTest._juliac_patch_dir()
+            @test isnothing(dir) ||
                 error(
-                "subprocess declined although $patch exists; child stderr:\n" *
+                "subprocess declined although $dir exists; child stderr:\n" *
                     StrictModeTest._TRIM_CHILD_STDERR[]
             )
         else
             @test length(r) == 2                    # one child, both verdicts
             @test all(v -> v == (true, String[], Tuple{String, Int}[]), r)
+            # A throw with string interpolation: stock Base on 1.13 rejects it on `_str_sizehint`, and
+            # juliac's patches resolve it. Only the patched program is what juliac compiles.
+            r19 = StrictModeTest._trim_validate_subprocess(
+                [(Base.setindex_shape_check, Any[Vector{Float64}, Int, Int])]
+            )
+            @test !isnothing(r19) && only(r19)[1]
         end
 
         # The point of the whole change: applying juliac's patches stubs

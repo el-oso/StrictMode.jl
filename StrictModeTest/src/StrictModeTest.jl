@@ -40,6 +40,7 @@ using TypeContracts   # its TrimDiagnostics parses the trim verifier's output
 using ExplicitImports: ExplicitImports   # the layer check's access half; reused, not re-implemented
 using PrecompileTools: @setup_workload, @compile_workload
 using Serialization: serialize, deserialize   # issue #19: patched trim verification runs in a child
+using TOML: TOML   # reads the juliac app's manifest, to find the patches it applies
 
 export @test_noalloc, @test_noboxing, @test_typestable, @test_trim_compatible, @test_steady_state
 export @test_no_gc_pause, @test_allocated_zero, @test_reaches

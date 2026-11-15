@@ -377,23 +377,49 @@ in-process verification with a warning naming the reason.
 """
 set_juliac_patches!(b::Bool) = (_JULIAC_PATCHES[] = b)
 
+# The directory holding the trim patches that `juliac` applies, or `nothing`. Through Julia 1.12
+# juliac ships with Julia, in `share/julia/juliac`. From 1.13 it is the JuliaC.jl app, which
+# applies its OWN copies from the package's `src/scripts`; they differ from the copies Julia keeps
+# under `share/julia/test/trimming` and between JuliaC versions, so the app's pinned version is
+# read from its manifest rather than any JuliaC this session can load.
+function _juliac_patch_dir()
+    shipped = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
+    isdir(shipped) && return shipped
+    for depot in DEPOT_PATH
+        manifest = joinpath(depot, "environments", "apps", "JuliaC", "Manifest.toml")
+        isfile(manifest) || continue
+        entry = only(TOML.parsefile(manifest)["deps"]["JuliaC"])
+        haskey(entry, "path") && return joinpath(dirname(manifest), entry["path"], "src", "scripts")
+        slug = Base.version_slug(Base.UUID(entry["uuid"]), Base.SHA1(entry["git-tree-sha1"]))
+        for d in DEPOT_PATH
+            root = joinpath(d, "packages", "JuliaC", slug)
+            isdir(root) && return joinpath(root, "src", "scripts")
+        end
+    end
+    return nothing
+end
+
 # Returns whether the patches are actually in effect. The subprocess path reports this back, so a
-# verdict reached against STOCK Base is never presented as a patched one — the patch files are
-# absent on some Julia builds (1.13.0-rc4 ships none), and a silent fallback there would relabel
+# verdict reached against STOCK Base is never presented as a patched one. The patch files are not
+# on every machine (from 1.13 they belong to the JuliaC app), and a silent fallback would relabel
 # exactly the false FAILs issue #19 is about.
 function _apply_juliac_patches()
     _JULIAC_PATCHES[] || return false
     _JULIAC_PATCHED[] && return true             # already applied in this process
     _JULIAC_PATCHED[] = true                     # set first: a failed attempt must not retry per call
-    dir = joinpath(Sys.BINDIR, "..", "share", "julia", "juliac")
     files = ("juliac-trim-base.jl", "juliac-trim-stdlib.jl")
     try
+        dir = _juliac_patch_dir()
+        isnothing(dir) && error(
+            "juliac's patch files were not found: neither Julia's own juliac directory nor an " *
+                "installed JuliaC app (`]app add JuliaC`) in any depot"
+        )
         for f in files
             p = joinpath(dir, f)
             isfile(p) || error("$p not found")
             Base.include(Main, p)
         end
-        @info "StrictModeTest: applied juliac's trim patches ($(join(files, ", "))) so the " *
+        @info "StrictModeTest: applied juliac's trim patches ($(join(files, ", ")) from $dir) so the " *
             "verifier checks the same program `juliac --trim=safe` compiles. These mutate " *
             "process-global compiler state and are not reversible; set_juliac_patches!(false) " *
             "skips them at the cost of reinstating a false-FAIL class (issue #19)."
@@ -569,7 +595,7 @@ function _trim_validate_subprocess(sigs::Vector)
         r = open(deserialize, out_path)
         r isa Tuple{Bool, Vector} || return nothing
         patched, results = r
-        # The child ran, but without the patches — juliac ships none on some builds (1.13.0-rc4).
+        # The child ran, but without the patches: none could be found (`_juliac_patch_dir`).
         patched || return nothing
         length(results) == length(sigs) || return nothing
         return results
