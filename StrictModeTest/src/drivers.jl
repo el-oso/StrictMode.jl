@@ -642,7 +642,8 @@ _kw_entries(@nospecialize(f)) =
 function _positional_entry(@nospecialize(f), sig)
     Base.isdispatchtuple(sig) || return AllocEntry(
         sig, :positional, :unproven,
-        "the signature names no concrete argument types — list them with `types = (…)`"
+        "the signature names no concrete argument types — prove it at the types a caller uses " *
+            "with `test_signatures([(f, (T1, T2, …))])` or `@test_noalloc f(args…)`"
     )
     fs = try
         _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,))
