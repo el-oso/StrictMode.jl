@@ -137,3 +137,12 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "test_coverage says so when nothing is in scope" begin
+    using StrictMode, StrictModeTest, Test
+    module NoExports
+    helper(x::Int) = x * 2
+    end
+    # No exported function: `require = :public` judges nothing, which must not read as covered.
+    @test_logs (:warn, r"0 checks") match_mode = :any test_coverage(NoExports; require = :public)
+end
