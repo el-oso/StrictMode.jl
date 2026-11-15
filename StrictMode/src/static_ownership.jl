@@ -74,16 +74,24 @@ function _mi_typekey_dict_lookup(mi::Core.MethodInstance)
     return any(_is_type_or_symbol_key, ps[2:end])
 end
 
-function _typekey_lookup_by_sig(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+# `code` memoizes each signature's optimized statements (`nothing` when unreadable) across a
+# whole module sweep: the callee trees of a module's specializations overlap heavily, and inferring
+# a shared callee once per root repeated the same inference about six times over (measured on
+# LinearAlgebra: 3906 inferences for 653 distinct signatures).
+function _typekey_lookup_by_sig(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any},
+        code::IdDict{Any, Any} = IdDict{Any, Any}())
     sig in seen && return false
     push!(seen, sig)
-    cts = try
-        Base.code_typed_by_type(sig; optimize = true)
-    catch
-        return false
+    stmts = get!(code, sig) do
+        cts = try
+            Base.code_typed_by_type(sig; optimize = true)
+        catch
+            nothing
+        end
+        (isnothing(cts) || isempty(cts)) ? nothing : first(cts)[1].code
     end
-    isempty(cts) && return false
-    for st in first(cts)[1].code
+    isnothing(stmts) && return false
+    for st in stmts
         if Meta.isexpr(st, :foreigncall)
             # `IdDict` (unlike hash-based `Dict`) inlines `get`/`get!`/`getindex` straight to a
             # `jl_eqtable_*` ccall — no `:invoke` to a named accessor survives to match against,
@@ -102,20 +110,22 @@ function _typekey_lookup_by_sig(@nospecialize(sig), depth::Int, seen::Base.IdSet
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             mi isa Core.MethodInstance || continue
             _mi_typekey_dict_lookup(mi) && return true
-            depth > 0 && _typekey_lookup_by_sig(mi.specTypes, depth - 1, seen) && return true
+            depth > 0 && _typekey_lookup_by_sig(mi.specTypes, depth - 1, seen, code) && return true
         end
     end
     return false
 end
 
-function _interprocedural_typekey_lookup(@nospecialize(f), @nospecialize(types::Tuple))
+function _interprocedural_typekey_lookup(@nospecialize(f), @nospecialize(types::Tuple),
+        code::IdDict{Any, Any} = IdDict{Any, Any}())
     sig = Base.signature_type(f, Tuple{types...})
-    return _typekey_lookup_by_sig(sig, _FAST_ALLOC_DEPTH[], Base.IdSet{Any}())
+    return _typekey_lookup_by_sig(sig, _FAST_ALLOC_DEPTH[], Base.IdSet{Any}(), code)
 end
 
-function _static_ownership_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
+function _static_ownership_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg,
+        code::IdDict{Any, Any} = IdDict{Any, Any}())
     sites = _registry_lookup_sites(f, types)
-    interprocedural = isempty(sites) && _interprocedural_typekey_lookup(f, types)
+    interprocedural = isempty(sites) && _interprocedural_typekey_lookup(f, types, code)
     (isempty(sites) && !interprocedural) && return StrictFinding(md, fn, sg, :static_ownership, :pass, "", 0, "", "")
     m = try
         which(f, types)
@@ -157,17 +167,19 @@ static_ownership_suggestions(my_accessor, (Type{Float64},))
 audit(MyPkg; static_ownership_suggest = true)
 ```
 """
-function static_ownership_suggestions(@nospecialize(f), @nospecialize(types::Tuple))
+function static_ownership_suggestions(@nospecialize(f), @nospecialize(types::Tuple);
+        _code::IdDict{Any, Any} = IdDict{Any, Any}())
     md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
-    finding = _static_ownership_finding(f, types, md, fn, sg)
+    finding = _static_ownership_finding(f, types, md, fn, sg, _code)
     return finding.status === :info ? StrictFinding[finding] : StrictFinding[]
 end
 
 function static_ownership_suggestions(mod::Module; only = nothing, exempt = ())
     out = StrictFinding[]
+    code = IdDict{Any, Any}()
     _module_specializations(mod; only, exempt) do f, tt
         try
-            append!(out, static_ownership_suggestions(f, tt))
+            append!(out, static_ownership_suggestions(f, tt; _code = code))
         catch err
             err isa StrictViolation && rethrow()
         end
