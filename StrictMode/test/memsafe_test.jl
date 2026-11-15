@@ -245,3 +245,12 @@ end
     @test StrictMode._carries_array(MemsafeWorkspace)
     @test !StrictMode._carries_array(Float64)
 end
+
+@testitem "the memsafe probe refuses to start a probe from inside its own child" begin
+    using StrictMode
+    # The child `include`s the file defining the kernel; a file that also runs the probe would
+    # start children without end.
+    withenv(StrictMode._MEMSAFE_CHILD_ENV => "1") do
+        @test_throws "also runs the memsafe probe" StrictMode.memsafe_report(sum, [1.0])
+    end
+end

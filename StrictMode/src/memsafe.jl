@@ -30,6 +30,9 @@
 
 using Serialization: serialize, deserialize
 
+# Set in the environment of a memsafe child process, so the probe can tell it is running in one.
+const _MEMSAFE_CHILD_ENV = "STRICTMODE_MEMSAFE_CHILD"
+
 # --- guard-page buffer construction -------------------------------------------------------------
 
 # The harness needs three things from the operating system: a page-aligned anonymous allocation, a
@@ -405,10 +408,13 @@ function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_
     # reports an unrelated script error rather than a memory-safety verdict. The guard-page hit
     # itself may arrive either as a fatal signal or as a catchable `ReadOnlyMemoryError` depending
     # on the host; the parent distinguishes both from an unrelated error, so neither is caught here.
+    #
+    # `StrictMode.deserialize` is the package's own import, so the environment under test need not
+    # list `Serialization`.
     return """
-    using StrictMode, Serialization
+    using StrictMode
     $mod_stmt
-    __args = deserialize($(repr(args_path)))
+    __args = StrictMode.deserialize($(repr(args_path)))
     __f = getfield($lookup_mod, $(repr(fname)))
     __hit = StrictMode._canary_probe(__f, __args; align=$align_arg)
     println(stdout, isnothing(__hit) ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * __hit)
@@ -421,6 +427,13 @@ function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_
 end
 
 function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int} = nothing)
+    # The child `include`s the file that defines `f`. When that file also runs this probe, every child
+    # would start another, without end, so a child refuses to start one.
+    haskey(ENV, _MEMSAFE_CHILD_ENV) && error(
+        "StrictMode memsafe: the file that defines `$(nameof(f))` also runs the memsafe probe, and the " *
+            "probe `include`s that file in its child process. Move the probe call out of the file " *
+            "that defines the function, or pass `using_module = TheDefiningPackage`."
+    )
     fname = nameof(f)
     if using_module === nothing
         # A function is reachable in a fresh child regardless of which module it ended up in
@@ -449,7 +462,10 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
     script = _memsafe_child_script(kernel_file, fname, args_path, using_module, align)
     try
         serialize(args_path, args)
-        cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`
+        cmd = addenv(
+            `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`,
+            _MEMSAFE_CHILD_ENV => "1"
+        )
         outbuf, errbuf = IOBuffer(), IOBuffer()
         proc = run(pipeline(cmd; stdout = outbuf, stderr = errbuf); wait = false)
         wait(proc)

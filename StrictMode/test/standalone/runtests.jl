@@ -120,3 +120,11 @@ boxscore(::BoxMetric, t::Tuple) = (
         boxscore(bm, hetero)
     end
 end
+
+@testset "memsafe probe runs in an environment that does not list Serialization" begin
+    # The probe's child process loads only this environment. It must read its arguments through
+    # StrictMode's own import, or every probe errors where `Serialization` is not a direct dep.
+    include(joinpath(@__DIR__, "..", "memsafe_kernels.jl"))
+    r = StrictMode.memsafe_report(memsafe_inbounds_kernel!, zeros(3), [1.0, 2.0, 3.0])
+    @test isnothing(r.violation)
+end
