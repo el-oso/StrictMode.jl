@@ -119,9 +119,13 @@ end
 
 @testitem "memsafe_report errors clearly on a closure/anonymous function (no source file)" begin
     using StrictMode
+    # Only a call that needs the subprocess needs a source file: `@inbounds` makes this one need it.
     captured = 3.0
-    closure_kernel(x) = x + captured
-    @test_throws ErrorException memsafe_report(closure_kernel, 1.0)
+    closure_kernel(v) = @inbounds v[1] + captured
+    @test_throws ErrorException memsafe_report(closure_kernel, [1.0])
+    # A closure whose reads are all bounds-checked is checked in this process.
+    checked_closure(v) = v[1] + captured
+    @test isnothing(memsafe_report(checked_closure, [1.0]).violation)
 end
 
 @testitem "_guarded_array is exact-flush and warns when a wider align forces slack" begin
@@ -251,6 +255,21 @@ end
     # The child `include`s the file defining the kernel; a file that also runs the probe would
     # start children without end.
     withenv(StrictMode._MEMSAFE_CHILD_ENV => "1") do
-        @test_throws "also runs the memsafe probe" StrictMode.memsafe_report(sum, [1.0])
+        @test_throws "also runs the memsafe probe" StrictMode._memsafe_probe_subprocess(
+            sum, ([1.0],); using_module = nothing
+        )
     end
+end
+
+@testitem "memsafe starts a subprocess only when a read could skip the bounds check" setup = [MemsafeFixtures] begin
+    using StrictMode
+    # A bounds-checked read past an end raises in this process, so only `@inbounds`, a pointer or a
+    # `ccall` in the reached code needs the guard-page subprocess.
+    checked!(out::Vector{Float64}, a::Vector{Float64}) = (for i in eachindex(out, a); out[i] = 2a[i]; end; out)
+    T2 = (Vector{Float64}, Vector{Float64})
+    @test !StrictMode._may_read_unchecked(checked!, T2)
+    @test StrictMode._may_read_unchecked(memsafe_inbounds_kernel!, T2)
+    # A write past the end is found in this process, with no subprocess.
+    r = memsafe_report(memsafe_oob_write_kernel!, [1.0, 2.0, 3.0])
+    @test occursin("WRITE", something(r.violation, ""))
 end
