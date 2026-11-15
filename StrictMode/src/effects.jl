@@ -1008,6 +1008,7 @@ escape is a false positive. Those land in `undetermined` instead: a frame whose 
 elsewhere has to be asked about where the handle is created.
 """
 function _escaping_scoped(@nospecialize(sig))
+    sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
     isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
     irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)

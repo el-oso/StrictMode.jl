@@ -307,3 +307,27 @@ end
     @test inner[at("64(%rsp), %ymm2")]
     @test depth[at("%xmm3")] == 0                  # epilogue
 end
+
+@testitem "compiled-output checks and the escape scan read past a keyword forwarder" begin
+    using StrictMode
+    # A method with keywords compiles its positional entry to a body that calls `#f#N`.
+    @noinline function kwfwd_kernel!(y::Vector{Float64}, x::Vector{Float64}; scale = 1.0)
+        @inbounds @simd for i in eachindex(y, x)
+            y[i] = y[i] * x[i] * scale
+        end
+        return nothing
+    end
+    V = Vector{Float64}
+    kwfwd_kernel!(rand(64), rand(64))
+    f, ts = StrictMode._forwarded_call(kwfwd_kernel!, (V, V))
+    @test f !== kwfwd_kernel!
+    @test StrictMode._vectorized(kwfwd_kernel!, (V, V)) == StrictMode._vectorized(f, ts)
+
+    # A body that calls an ordinary function last is not a forwarder to it.
+    @noinline inner_read(v::Vector{Float64}) = v[1]
+    outer_kw(v::Vector{Float64}; k = 1) = inner_read(v) + k
+    outer_kw([1.0])
+    body = Base.signature_type(first(StrictMode._forwarded_call(outer_kw, (V,))),
+        Tuple{last(StrictMode._forwarded_call(outer_kw, (V,)))...})
+    @test StrictMode._forwarded_sig(body) === body
+end

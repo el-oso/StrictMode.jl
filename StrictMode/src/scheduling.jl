@@ -5,44 +5,77 @@
 # escape hatches). All of these use only Base + InteractiveUtils — no AllocCheck/JET backend.
 
 # Best-effort: did the method's LLVM IR contain SIMD vector ops? (`<N x double>` & friends.)
-# A method with a default argument compiles its shorter call form to a forwarder: a body that calls
-# the same function with the default filled in and returns the result. The checks below read the
-# body they are handed, so on that form they inspected no loop at all, and `@assert_no_spill` passed
+#
+# A compiler-generated forwarder stands between a call and the code it runs in two cases: a method
+# with a default argument compiles its shorter call form to a body that calls the same function
+# with the default filled in, and a method with keyword arguments compiles its positional entry to a
+# body that calls the method's keyword body (`#f#N`) with the defaults. The checks read the body
+# they are handed, so on either form they inspected no loop at all, and `@assert_no_spill` passed
 # for want of anything to spill. The signature the forwarder calls is the one to read. The body must
-# make no other call, so one that does real work before forwarding is read as itself.
-function _forwarded_types(@nospecialize(f), @nospecialize(types::Tuple))
+# make no other call, so one that does real work before forwarding is read as itself, and so is a
+# wrapper a user wrote — the checks inspect the leaf compiled body.
+function _forwarded_sig(@nospecialize(sig))
     for _ in 1:8                       # a chain of trailing defaults forwards once per default
         cts = try
-            Base.code_typed(f, types; optimize = true)
+            Base.code_typed_by_type(sig; optimize = true)
         catch
-            return types
+            return sig
         end
-        length(cts) == 1 || return types
+        length(cts) == 1 || return sig
         code = first(cts[1]).code
         ret = code[end]
-        (ret isa Core.ReturnNode && isdefined(ret, :val)) || return types
+        (ret isa Core.ReturnNode && isdefined(ret, :val)) || return sig
         # The one call the forwarder makes. Its result is returned, or — when the callee's return
         # type is a singleton such as `Nothing`, which a `!` kernel usually returns — inference
         # replaces the returned value with that constant and the call's result goes unused.
         calls = [j for (j, s) in enumerate(code) if Meta.isexpr(s, :invoke) || Meta.isexpr(s, :foreigncall)]
-        length(calls) == 1 || return types
+        length(calls) == 1 || return sig
         j = only(calls)
         st = code[j]
-        Meta.isexpr(st, :invoke) || return types
+        Meta.isexpr(st, :invoke) || return sig
         v = ret.val
         (v == Core.SSAValue(j) || !(v isa Core.SSAValue || v isa Core.Argument || v isa Core.SlotNumber)) ||
-            return types
+            return sig
         mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
-        mi isa Core.MethodInstance || return types
-        ps = mi.specTypes.parameters
-        (!isempty(ps) && ps[1] === Core.Typeof(f)) || return types
-        types = Tuple(ps[2:end])
+        mi isa Core.MethodInstance || return sig
+        target = mi.specTypes
+        callee = target.parameters[1]
+        callee === sig.parameters[1] || _is_kwbody_of(callee, sig) || return sig
+        sig = target
     end
-    return types
+    return sig
 end
 
+# Whether `callee` is the keyword body (`#f#N`) of the method `sig` dispatches to, recognized by its
+# name. `Base.bodyfunction` is not used: it returns the last function a method calls, so on a body
+# method it names an ordinary callee, and following that reads the callee with the caller's own
+# values arriving as arguments — the escape analysis then sees a handle passed in rather than made.
+function _is_kwbody_of(@nospecialize(callee), @nospecialize(sig))
+    (callee isa DataType && isdefined(callee, :instance)) || return false
+    cn = nameof(callee.instance)
+    startswith(string(cn), "#") || return false
+    m = try
+        Base.which(sig)
+    catch
+        return false
+    end
+    return m isa Method && _demangle(cn) === m.name
+end
+
+# The function and argument types a check should read for the call `f(types...)`.
+function _forwarded_call(@nospecialize(f), @nospecialize(types::Tuple))
+    sig = Base.signature_type(f, Tuple{types...})
+    fsig = _forwarded_sig(sig)
+    fsig === sig && return (f, types)
+    ft = fsig.parameters[1]
+    (ft isa DataType && isdefined(ft, :instance)) || return (f, types)
+    return (ft.instance, Tuple(fsig.parameters[2:end]))
+end
+
+_forwarded_types(@nospecialize(f), @nospecialize(types::Tuple)) = last(_forwarded_call(f, types))
+
 function _vectorized(@nospecialize(f), @nospecialize(types::Tuple))
-    types = _forwarded_types(f, types)
+    f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
@@ -207,7 +240,7 @@ Base.@kwdef struct KernelReport
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
-    types = _forwarded_types(f, types)
+    f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
@@ -218,7 +251,7 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
-    types = _forwarded_types(f, types)
+    f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_native(io, f, types; debuginfo = :none)

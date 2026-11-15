@@ -241,7 +241,7 @@ end
 # `_native_asm` (scheduling.jl) defaults to the platform's native syntax (Intel on this Julia); the
 # mca path specifically needs AT&T (`llvm-mca`'s assembler defaults to AT&T parsing).
 function _native_asm_att(@nospecialize(f), @nospecialize(types::Tuple))
-    types = _forwarded_types(f, types)
+    f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
         InteractiveUtils.code_native(io, f, types; debuginfo = :none, syntax = :att)
