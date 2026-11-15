@@ -115,3 +115,21 @@ end
 
     @test StrictMode._code(:reaches) === :SM0015
 end
+
+@testitem "stop cuts a hub that was inlined into its caller" begin
+    using StrictMode
+    leaf_a(x) = x + 1
+    leaf_b(x) = x + 2
+    @noinline far_leaf(x) = x * 3
+    @inline hub_in(k, x) = k == 1 ? leaf_a(x) : leaf_b(x)
+    @inline hub_out(x) = far_leaf(x)          # inlined, with an out-of-line callee
+    via_in(k, x) = hub_in(k, x)
+    via_out(x) = hub_out(x)
+    via_in(1, 1); via_out(1)
+    R(f, t, s) = reach_report(f, t; stop = s)
+    @test StrictMode.reaches(R(via_in, (Int, Int), ()), leaf_a)
+    @test !StrictMode.reaches(R(via_in, (Int, Int), (hub_in,)), leaf_a)
+    @test StrictMode.reaches(R(via_in, (Int, Int), (hub_in,)), hub_in)   # recorded, not entered
+    @test StrictMode.reaches(R(via_out, (Int,), ()), far_leaf)
+    @test !StrictMode.reaches(R(via_out, (Int,), (hub_out,)), far_leaf)
+end

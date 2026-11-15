@@ -72,16 +72,43 @@ function _reach_record!(r::_Reach, key::Tuple{Module, Symbol}, depth::Int, inlin
     return nothing
 end
 
-# Every callee inlined into this body whose statements survive.
-function _reach_inlined!(r::_Reach, di, depth::Int)
+# Every callee inlined into this body whose statements survive. A hub named in `stop` is recorded
+# and not entered, inlined or not: what was inlined into it stays out, as its out-of-line callees do.
+function _reach_inlined!(r::_Reach, di, depth::Int, stop)
     di isa Core.DebugInfo || return nothing
     for e in di.edges
         e isa Core.DebugInfo || continue
         m = e.def isa Core.MethodInstance ? e.def.def : e.def
-        m isa Method && _reach_record!(r, _reach_key(m), depth, true)
-        _reach_inlined!(r, e, depth)
+        if m isa Method
+            key = _reach_key(m)
+            _reach_record!(r, key, depth, true)
+            key in stop && continue
+        end
+        _reach_inlined!(r, e, depth, stop)
     end
     return nothing
+end
+
+# Whether statement `pc` of a body came from inlining a hub named in `stop`, read from the inlining
+# chain its debug info records: `(line, edge, pc within that edge)` per level.
+function _reach_inlined_through(di, pc::Int, stop)
+    for _ in 1:64
+        di isa Core.DebugInfo || return false
+        t = try
+            Core.Compiler.getdebugidx(di, pc)
+        catch
+            return false
+        end
+        eidx = Int(t[2])
+        (1 <= eidx <= length(di.edges)) || return false
+        e = di.edges[eidx]
+        e isa Core.DebugInfo || return false
+        m = e.def isa Core.MethodInstance ? e.def.def : e.def
+        m isa Method && _reach_key(m) in stop && return true
+        di = e
+        pc = Int(t[3])
+    end
+    return false
 end
 
 function _reach_argtype(ci::Core.CodeInfo, @nospecialize(sig), @nospecialize(a))
@@ -134,10 +161,11 @@ end
 function _reach_scan!(
         r::_Reach, ci::Core.CodeInfo, @nospecialize(sig), depth::Int, stop, queue::Vector{Any}
     )
-    _reach_inlined!(r, ci.debuginfo, depth)
+    _reach_inlined!(r, ci.debuginfo, depth, stop)
     for i in eachindex(ci.code)
         st = ci.code[i]
         st isa Expr || continue
+        isempty(stop) || !_reach_inlined_through(ci.debuginfo, i, stop) || continue
         if st.head === :invoke
             mi = _invoke_mi(st.args[1])
             if !(mi isa Core.MethodInstance && mi.def isa Method)
