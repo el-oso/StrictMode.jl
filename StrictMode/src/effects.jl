@@ -1225,11 +1225,15 @@ const _CONFINE_PURE_BUILTINS = (
     :apply_type, :compilerbarrier, :donotdelete, :getindex,
 )
 
-# The allocation a store's container was made from in this frame, walking back through the steps
-# that reach an array's memory; `nothing` when it was not made here.
-function _confine_fresh(code, @nospecialize(x))
+# The allocations made in this frame that a store's container can be, walking back through aliases and
+# the steps that reach an array's memory, or `nothing` when any of them was not made here. A phi gives
+# every allocation that flows into it, so each is tracked once a handle is stored through the phi; a
+# value already on the walk (a loop's phi reaching itself) adds nothing.
+function _confine_fresh(code, @nospecialize(x), seen::Set{Int} = Set{Int}())
     for _ in 1:16
         x isa Core.SSAValue || return nothing
+        x.id in seen && return Int[]
+        push!(seen, x.id)
         s = code[x.id]
         if s isa Core.PiNode
             x = s.val
@@ -1237,18 +1241,22 @@ function _confine_fresh(code, @nospecialize(x))
         elseif s isa Core.SSAValue
             x = s                                       # an alias
             continue
+        elseif s isa Core.PhiNode
+            isempty(s.values) && return nothing
+            ids = Int[x.id]
+            for k in eachindex(s.values)
+                isassigned(s.values, k) || return nothing
+                sub = _confine_fresh(code, s.values[k], seen)
+                isnothing(sub) && return nothing
+                append!(ids, sub)
+            end
+            return ids
         end
-        if s isa Core.PhiNode
-            # A merge of containers that were all made here is one of them.
-            all(k -> isassigned(s.values, k) && !isnothing(_confine_fresh(code, s.values[k])), eachindex(s.values)) &&
-                !isempty(s.values) && return x.id
-            return nothing
-        end
-        Meta.isexpr(s, :new) && return x.id
-        Meta.isexpr(s, :foreigncall) && startswith(string(_fcall_name(s)), "jl_alloc") && return x.id
+        Meta.isexpr(s, :new) && return Int[x.id]
+        Meta.isexpr(s, :foreigncall) && startswith(string(_fcall_name(s)), "jl_alloc") && return Int[x.id]
         Meta.isexpr(s, :call) || return nothing
         nm = _callee_name(s.args[1])
-        nm === :memorynew && return x.id
+        nm === :memorynew && return Int[x.id]
         if nm === :memoryrefnew || nm === :memoryref
             x = s.args[2]
         elseif nm === :getfield && length(s.args) >= 3 && _field_sym(s.args[3]) in (:ref, :mem)
@@ -1271,7 +1279,15 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
     # A thrown value reaches whichever frame catches it, here or in a caller this scan came through, so
     # it is only on the throw path — which does not count, as `ignore_throw` decides for allocation —
     # when no frame in the chain catches.
-    catches = get(st, :catching, false) || any(s -> s isa Core.EnterNode || Meta.isexpr(s, :enter), code)
+    # A handler that only rethrows (`finally`, `@lock`) keeps nothing: it catches only when it reads
+    # the exception it caught.
+    exc = BitSet(i for i in eachindex(code) if Meta.isexpr(code[i], :the_exception))
+    catches = get(st, :catching, false) || (!isempty(exc) && any(code) do s
+        uses = s isa Expr ? s.args : (s isa Core.PhiNode || s isa Core.PhiCNode) ? s.values :
+            s isa Core.UpsilonNode && isdefined(s, :val) ? Any[s.val] : s isa Core.PiNode ? Any[s.val] :
+            (s isa Core.ReturnNode && isdefined(s, :val)) ? Any[s.val] : Any[]
+        any(u -> u isa Core.SSAValue && u.id in exc, uses) && !(Meta.isexpr(s, :call) && _callee_name(s.args[1]) === :rethrow)
+    end)
     returns = false
     changed = true
     while changed
@@ -1313,9 +1329,9 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                         stored = any(k -> k != pos, hit)
                         fid = 1 <= pos <= length(data) ? _confine_fresh(code, data[pos]) : nothing
                         (stored && isnothing(fid)) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
-                        # The container made here now holds it, so the container is tracked from here on.
+                        # The containers made here now hold it, so each is tracked from here on.
                         if stored
-                            add(fid)
+                            foreach(add, fid)
                             data[pos] isa Core.SSAValue && add(data[pos].id)
                         end
                     elseif nm === :throw

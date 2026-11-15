@@ -226,8 +226,13 @@ end
     PN = (Ptr{Int}, Int)
     reads(f) = !isempty(first(StrictMode._foreign_sites(f, PN, (1,))))
     clear(f) = (r = StrictMode._foreign_sites(f, PN, (1,)); isempty(r[1]) && isempty(r[2]))
-    for f in (F.r_hof, F.r_gen, F.r_iter, F.r_ref, F.r_vec, F.r_state, F.r_kw, F.r_memcpy, F.r_write, F.r_recur)
+    for f in (F.r_hof, F.r_iter, F.r_ref, F.r_state, F.r_kw, F.r_write)
         @test reads(f)
+    end
+    # Reached only through a value the scan assumes is foreign — a Base splat it cannot resolve, a
+    # buffer C may have filled, a recursive result not yet settled: reported, as uncertain.
+    for f in (F.r_gen, F.r_vec, F.r_memcpy, F.r_recur)
+        @test !clear(f)
     end
     # A reassigned captured variable lives in a `Core.Box`, typed `Any`: not resolvable, so not cleared.
     @test !clear(F.r_box)
@@ -242,4 +247,41 @@ end
     end
     t = @elapsed r = StrictMode._foreign_sites(getfield(m, :f1), PN, (1,))
     @test isempty(r[1]) && t < 60
+end
+
+@testitem "overloads behind Base functions, aliases, and assumptions are judged correctly" begin
+    using StrictMode
+    module ForeignR3
+    struct H; p::Ptr{UInt8}; end
+    Base.show(io::IO, h::H) = print(io, unsafe_string(h.p))
+    struct Peek <: Number; v::Float64; end
+    Peek(x::UInt) = Peek(unsafe_load(Ptr{Float64}(x)))
+    fp_print(p::Ptr{UInt8}, n) = (io = IOBuffer(); print(io, H(p)); 1)
+    fp_string(p::Ptr{UInt8}, n) = string(H(p))
+    fp_convert(p::Ptr{Float64}, n) = convert(Peek, UInt(p)).v
+    fp_setmem(p::Ptr{Float64}, n) = (a = unsafe_wrap(Array, p, n); d = zeros(n); d[:] = a; d[1])
+    fp_alias(p::Ptr{Float64}, n) = (r = Ref{Ptr{Float64}}(); v = r; v[] = p; unsafe_load(r[]))
+    fp_cond(p::Ptr{Float64}, n) = (a = Ref{Ptr{Float64}}(); b = Ref{Ptr{Float64}}(); v = n > 0 ? a : b; v[] = p; unsafe_load(a[]))
+    fp_nested2(p::Ptr{Float64}, n) = (d = Dict(1 => Ref{Ptr{Float64}}()); d[1][] = p; unsafe_load(d[1][]))
+    ff_push(p::Ptr{Float64}, n) = (v = Ptr{Float64}[]; push!(v, p); length(v))
+    ff_vect(p::Ptr{Float64}, n) = (v = [p]; length(v))
+    ff_free(p::Ptr{Float64}, n) = (p == C_NULL && return 0; ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), p, 0, n); 1)
+    ff_ntuple(p::Ptr{Float64}, n) = ntuple(i -> p + 8i, 3)
+    ff_outcopy(p::Ptr{Float64}, n) = (src = zeros(n); unsafe_copyto!(p, pointer(src), n); 1)
+    ff_refmem(p::Ptr{Float64}, n) = (a = unsafe_wrap(Array, p, n); r = Ref(a); 1)
+    end
+    F = ForeignR3
+    sites(f, T) = StrictMode._foreign_sites(f, (Ptr{T}, Int), (1,))
+    certain(f, T) = !isempty(first(sites(f, T)))
+    cleared(f, T) = (r = sites(f, T); isempty(r[1]) && isempty(r[2]))
+    @test certain(F.fp_print, UInt8)                  # Base `print` into a package `show`
+    @test !cleared(F.fp_string, UInt8)                # the same through `string`: at least a warning
+    @test certain(F.fp_convert, Float64)              # Base `convert` into a package constructor
+    for f in (F.fp_setmem, F.fp_alias, F.fp_cond, F.fp_nested2)
+        @test certain(f, Float64)
+    end
+    # No certain read: an assumed value, a C call on the address, a write into foreign memory.
+    for f in (F.ff_push, F.ff_vect, F.ff_free, F.ff_ntuple, F.ff_outcopy, F.ff_refmem)
+        @test !certain(f, Float64)
+    end
 end

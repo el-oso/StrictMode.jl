@@ -769,3 +769,29 @@ end
     @test esc(Leaves2.e_freshret)         # stored into a fresh Ref that is returned
     @test !esc(Leaves2.c_w)               # stored into a struct made here and used here
 end
+
+@testitem ":noescape tracks every container a phi merges, ends on loops, and ignores finally" begin
+    using StrictMode
+    module Leaves3
+    mutable struct H; buf::Vector{Float64}; end
+    mutable struct W; h::Any; end
+    const G = Ref{Any}(nothing)
+    const L = ReentrantLock()
+    mk() = H(zeros(4))
+    @noinline opaque(x) = x
+    @noinline use(h) = (h.buf[1] = 1.0; nothing)
+    @noinline usei(h, i) = (h.buf[i] = 1.0; nothing)
+    p_phi2(c) = (h = mk(); use(h); w1 = W(nothing); w2 = W(nothing); w = opaque(c) ? w1 : w2;
+                 b = h.buf; w.h = b; G[] = w1; 1)
+    f_loopw(n) = (h = mk(); w = W(nothing);
+                  for i in 1:n; if opaque(i) % 2 == 0; w = W(nothing); end; end;
+                  w.h = h; use(w.h::H); 1)
+    f_atlock(i) = (h = mk(); @lock L usei(h, i); 1)
+    end
+    StrictMode.register_scoped!(Leaves3.H)
+    r(f, T) = StrictMode._escaping_scoped(Tuple{typeof(f), T})
+    Leaves3.p_phi2(true); Leaves3.f_loopw(3); Leaves3.f_atlock(1)
+    @test !isempty(r(Leaves3.p_phi2, Bool).escaped)                  # w1 is one of the merged containers
+    @test r(Leaves3.f_loopw, Int) isa NamedTuple                      # a loop's phi ends the walk
+    @test isempty(r(Leaves3.f_atlock, Int).escaped)                   # `@lock` only rethrows
+end
