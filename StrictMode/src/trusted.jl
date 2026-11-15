@@ -147,25 +147,43 @@ function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
     return join(parts, "; ")
 end
 
+function _foreign_reason(c::Vector{String}, u::Vector{String})
+    parts = String[]
+    isempty(c) || push!(parts, "reads foreign memory outside a trust boundary ($(length(c)) site(s)): " * join(c, "; "))
+    isempty(u) || push!(parts, "cannot rule out a read of foreign memory ($(length(u)) site(s)): " * join(u, "; "))
+    return join(parts, "; ")
+end
+
 function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report)
     sites = _untrusted_deref_sites(f, types)
     isnothing(sites) &&
         return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature"; tier)
     certain, erased = sites
+    fc, fu = _foreign_sites(f, types, _foreign_positions(f))
     m = try
         which(f, types)
     catch
         nothing
     end
+    reason = join(filter(!isempty, [_trusted_reason(certain, erased), _foreign_reason(fc, fu)]), "; ")
     return _mkfinding(
-        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased),
-        _trusted_reason(certain, erased),
+        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased) || !isempty(fc) || !isempty(fu),
+        reason,
         isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line);
         tier
     )
 end
 
-function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple))
+function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple); foreign = _foreign_positions(f))
+    fc, fu = _foreign_sites(f, types, foreign)
+    if !isempty(fc)
+        _fail(
+            :trusted, target, _foreign_reason(fc, fu) * ": validate and copy the data in a function " *
+                "registered with `trust_boundary!`, and read only what it returns."
+        )
+    elseif !isempty(fu)
+        _fail(:trusted, target, _foreign_reason(fc, fu) * "."; gates = false)
+    end
     sites = _untrusted_deref_sites(f, types)
     if isnothing(sites)
         _fail(:trusted, target, "no typed IR for this signature, so the guarantee is unchecked")
@@ -188,6 +206,156 @@ function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
+# ── foreign raw pointers ───────────────────────────────────────────────────────────────────────────
+#
+# A C entry point takes `Ptr`, not `Untrusted`, because its signature is the C ABI. Its foreign
+# arguments are named by position instead, and followed as data: a value derived from one (pointer
+# arithmetic, a conversion, an array `unsafe_wrap`ped around it, a struct holding it) is foreign too,
+# and a READ of foreign memory outside a registered trust boundary is the violation. Handing a foreign
+# pointer to C is not a read.
+
+const _FOREIGN_ENTRIES = IdDict{Any, Tuple{Vararg{Int}}}()
+const _FOREIGN_LOCK = ReentrantLock()
+
+"""
+    trust_foreign!(f, positions) -> f
+
+Declare which arguments of `f` are raw pointers from foreign code, for [`@assert_trusted`](@ref)
+and every sweep of `:trusted`: argument `k` for each `k` in `positions`. Use it on a C entry point
+(`Base.@ccallable`), whose signature must stay `Ptr`.
+"""
+function trust_foreign!(@nospecialize(f), positions)
+    ps = Tuple(Int(k) for k in positions)
+    all(>=(1), ps) || throw(ArgumentError("trust_foreign!: positions are argument numbers, from 1; got $positions"))
+    @lock _FOREIGN_LOCK (_FOREIGN_ENTRIES[f] = ps)
+    clear_cache!()
+    return f
+end
+
+_foreign_positions(@nospecialize(f)) = @lock _FOREIGN_LOCK get(_FOREIGN_ENTRIES, f, ())
+
+# Calls that carry foreign data on without reading it: the result is foreign too.
+const _FOREIGN_CARRY = (
+    +, -, Core.bitcast, reinterpret, convert, Base.unsafe_convert, Base.cconvert, unsafe_wrap,
+    pointer, view, reshape, oftype, Core.typeassert, getfield, getproperty, Core.tuple, UInt, Int,
+    UInt64, Int64, identity,
+)
+# Calls that look at foreign data without reading the memory behind it.
+const _FOREIGN_INERT = (
+    ==, !=, ===, !==, <, <=, >, >=, isequal, length, size, axes, eachindex, firstindex, lastindex,
+    typeof, isa, isnothing, Base.isdone, string,
+)
+
+# The reads of foreign memory in one body: `(certain, uncertain, returns_foreign)`. `certain` names
+# each read and the chain of package calls that reached it; `uncertain` names a dynamic call or a
+# callee too deep to read that was handed a foreign value.
+function _foreign_reads(@nospecialize(sig), positions, chain::Vector{String}, depth::Int, memo::Dict{Any, Any})
+    key = (sig, positions)
+    haskey(memo, key) && return something(memo[key], (String[], String[], false))
+    memo[key] = nothing                                   # in progress: a recursive call reads nothing new
+    certain = String[]
+    uncertain = String[]
+    cts = try
+        _code_typed_by_type(sig; optimize = false)
+    catch
+        Any[]
+    end
+    if length(cts) != 1
+        push!(uncertain, join([chain; "no single typed body for $(sig)"], " → "))
+        r = (certain, uncertain, true)
+        memo[key] = r
+        return r
+    end
+    ci = first(cts[1])
+    code = ci.code
+    slots = BitSet(k + 1 for k in positions)              # slot 1 is the function itself
+    tset = BitSet()
+    tainted(@nospecialize(a)) = (a isa Core.SSAValue && a.id in tset) || (a isa Core.SlotNumber && a.id in slots) ||
+        (a isa Core.Argument && a.n in slots)
+    here(what) = join([chain; what], " → ")
+    returns = false
+    changed = true
+    while changed
+        changed = false
+        for (i, st0) in enumerate(code)
+            st, lhs = Meta.isexpr(st0, :(=)) ? (st0.args[2], st0.args[1]) : (st0, nothing)
+            out = false
+            if st isa Core.ReturnNode
+                isdefined(st, :val) && tainted(st.val) && (returns = true)
+                continue
+            elseif st isa Core.SSAValue || st isa Core.SlotNumber || st isa Core.Argument
+                out = tainted(st)
+            elseif st isa Core.PiNode
+                out = isdefined(st, :val) && tainted(st.val)
+            elseif st isa Core.PhiNode
+                out = any(k -> isassigned(st.values, k) && tainted(st.values[k]), eachindex(st.values))
+            elseif Meta.isexpr(st, :new)
+                out = any(tainted, @view st.args[2:end])
+            elseif Meta.isexpr(st, :foreigncall)
+                out = false                               # handed to C, which is where it came from
+            elseif Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)
+                callee, args = _call_callee_and_args(ci, st)
+                hit = Int[k for k in eachindex(args) if tainted(args[k])]
+                if !isempty(hit)
+                    if isnothing(callee)
+                        changed |= _note!(uncertain, here("a dynamic call handed foreign data"))
+                        out = true
+                    elseif callee in _TRUST_BOUNDARIES
+                        out = false
+                    elseif callee isa Type || any(c -> c === callee, _FOREIGN_CARRY)
+                        out = true
+                    elseif any(c -> c === callee, _FOREIGN_INERT)
+                        out = false
+                    elseif callee isa Function && !_sw_is_base(parentmodule(callee)) &&
+                            Base.moduleroot(parentmodule(callee)) !== StrictMode
+                        if depth >= _FOREIGN_DEPTH
+                            changed |= _note!(uncertain, here("`$(nameof(callee))` (deeper than $_FOREIGN_DEPTH calls, not read)"))
+                            out = true
+                        else
+                            csig = Tuple{Core.Typeof(callee), Any[_unopt_arg_type(ci, a) for a in args]...}
+                            c, u, r = _foreign_reads(csig, Tuple(hit), [chain; string(nameof(callee))], depth + 1, memo)
+                            for s in c; changed |= _note!(certain, s); end
+                            for s in u; changed |= _note!(uncertain, s); end
+                            out = r
+                        end
+                    else
+                        changed |= _note!(certain, here("`$(nameof(callee))` reads foreign memory"))
+                        out = false
+                    end
+                end
+            end
+            if out
+                if !isnothing(lhs) && lhs isa Core.SlotNumber
+                    lhs.id in slots || (push!(slots, lhs.id); changed = true)
+                end
+                i in tset || (push!(tset, i); changed = true)
+            end
+        end
+    end
+    r = (certain, uncertain, returns)
+    memo[key] = r
+    return r
+end
+
+const _FOREIGN_DEPTH = 8
+_note!(v::Vector{String}, s::String) = (s in v) ? false : (push!(v, s); true)
+
+# The foreign-pointer half of `:trusted` for one signature: `(certain, uncertain)`, both empty when
+# no position is declared.
+function _foreign_sites(@nospecialize(f), @nospecialize(types::Tuple), positions)
+    isempty(positions) && return (String[], String[])
+    for k in positions
+        k <= length(types) || throw(ArgumentError(
+            "`foreign` names argument $k, but the call has $(length(types)) argument(s)"
+        ))
+    end
+    c, u, _ = _foreign_reads(Tuple{Core.Typeof(f), types...}, Tuple(positions), String[string(_callable_name(f))], 0, Dict{Any, Any}())
+    return (c, u)
+end
+
+_assert_trusted_foreign(target, @nospecialize(f), @nospecialize(types::Tuple), foreign) =
+    _assert_trusted(target, f, types; foreign = Tuple(Int(k) for k in foreign))
+
 """
     @assert_trusted f(args...)
 
@@ -208,15 +376,31 @@ copies what it returns.
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
 the bare call.
 
+A C entry point keeps `Ptr` in its signature, so its foreign arguments are named by position with
+`foreign = (k, …)`, or once for every check and sweep with [`trust_foreign!`](@ref). A value derived
+from one — pointer arithmetic, a conversion, an `unsafe_wrap`ped array, a struct holding it — is
+foreign too, and is followed into the package's own callees. Reading foreign memory (`unsafe_load`,
+`unsafe_string`, indexing a wrapped array, any Base function given it) outside a registered trust
+boundary throws. Handing it to C, comparing it, or asking a wrapped array's length is not a read. A
+dynamic call or a callee too deep to read warns rather than throws.
+
 ```julia
 @assert_trusted parse_header(u)         # ok: registered with trust_boundary!
 @assert_trusted peek_length(u)          # throws: reads the payload without validating it
 ```
+```julia
+Base.@ccallable c_sum(p::Ptr{Float64}, n::Cint)::Float64 = …
+@assert_trusted c_sum(p, n) foreign = (1,)
+```
 """
 macro assert_trusted(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call(args, (:types, :foreign))
     isempty(pos) && throw(ArgumentError("@assert_trusted needs a call expression"))
     call = pos[1]
-    checked = _guarantee_expr(call, _assert_trusted; types = get(opts, :types, nothing))
+    checked = if haskey(opts, :foreign)
+        _guarantee_expr(call, _assert_trusted_foreign, esc(opts[:foreign]); types = get(opts, :types, nothing))
+    else
+        _guarantee_expr(call, _assert_trusted; types = get(opts, :types, nothing))
+    end
     return _gate(checked, esc(call))
 end

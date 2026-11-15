@@ -938,6 +938,9 @@ function test_history_invariant(@nospecialize(f), args...; movers)
     msg = r.status === :different ?
         "the result is not the same bits after $(r.movers) state mover(s) ran in this process (first " *
         "difference at $(r.difference)): it depends on what ran before it" :
+        r.status === :first_call ?
+        "the first call gives different bits from the calls after it (at $(r.difference)): it leaves " *
+        "state behind that changes the result" :
         "two calls with nothing between them already differ (at $(r.difference)), so whether the " *
         "result depends on what ran before it cannot be established"
     throw(StrictMode.StrictViolation(:history, r.target, msg))

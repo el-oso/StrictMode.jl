@@ -781,10 +781,13 @@ end
 # comments LLVM's register allocator emits next to the spilling instruction — these are present
 # regardless of assembly syntax (AT&T vs Intel; `code_native`'s default varies by platform/Julia
 # version), unlike a register-name regex tied to one syntax's operand punctuation. A line only
-# counts if it also names a vector register (xmm/ymm/zmm) — a scalar (GPR) spill from ordinary
-# stack traffic is not what this guarantee is about.
-const _SPILL_RELOAD_RE = r"#.*\b(?:Spill|Reload)\b"
-const _VEC_REG_RE = r"\b(?:xmm|ymm|zmm)\d+\b"
+# counts if it also names a vector register — a scalar (GPR) spill from ordinary stack traffic is not
+# what this guarantee is about. The comment marker and the register names are per architecture: x86
+# writes `#` and names `xmm`/`ymm`/`zmm`; AArch64 writes `//` (`;` on macOS) and names its
+# floating-point and vector registers `b`/`h`/`s`/`d`/`q`/`v`, SVE's `z` and SME's `za`.
+const _SPILL_RELOAD_RE = r"(?:#|//|;).*\b(?:Spill|Reload)\b"
+_vec_reg_re(arch::Symbol) = arch === :aarch64 ? r"\b(?:[bhsdqvz]\d+|za\w*)\b" : r"\b(?:xmm|ymm|zmm)\d+\b"
+const _VEC_REG_RE = _vec_reg_re(Sys.ARCH)
 
 """
     SpillReport
@@ -801,13 +804,13 @@ struct SpillReport
 end
 
 # The loop each line of `asm` sits in, read from LLVM's block annotations: a block starts at a label
-# (`.LBB0_3:`) or a fall-through marker (`# %bb.4:`), and the comment lines that open it name its loop
+# (`.LBB0_3:`, `LBB0_3:` on macOS) or a fall-through marker (`# %bb.4:`, `//` or `;` on AArch64), and the comment lines that open it name its loop
 # — `=>This Loop Header: Depth=N` or `=>  This Inner Loop Header: Depth=N` for a header, and
 # `in Loop: Header=BB0_3 Depth=N` for a block inside one. "Inner" marks an innermost loop. Returns the
 # depth of each line (0 outside every loop) and whether it is in an innermost loop.
 function _asm_loop_depths(lines::AbstractVector{<:AbstractString})
-    label = r"^\s*\.L(BB\d+_\d+):"
-    fallthrough = r"^\s*# %bb\.\d+:"
+    label = r"^\s*\.?L(BB\d+_\d+):"
+    fallthrough = r"^\s*(?:#|//|;) %bb\.\d+:"
     innermost = Set{String}()
     cur = ""
     for l in lines
@@ -849,7 +852,7 @@ end
     spill_report(f, types) -> SpillReport
 
 Read the native assembly for `f` specialized on `types` and count vector-register spill/reload
-events (LLVM's `# ... Spill`/`# ... Reload` annotations on a line naming an xmm/ymm/zmm register).
+events (LLVM's `# ... Spill`/`# ... Reload` annotations on a line naming a vector register: `xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64).
 A nonzero count means the kernel needs more live vector registers than the target ISA provides —
 the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/
 reload instead of running from registers. Complements [`register_report`](@ref) (which reads
@@ -929,7 +932,7 @@ end
 
 Fail if `f(args...)` compiled to code that **spills a vector register to the stack**
 (**best-effort**): StrictMode scans the post-register-allocation `code_native` output for LLVM's
-`# ... Spill`/`# ... Reload` annotations on a line naming a vector (xmm/ymm/zmm) register. This is
+`# ... Spill`/`# ... Reload` annotations on a line naming a vector register (`xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64). This is
 the codegen analogue of [`@assert_noalloc`](@ref) — a kernel can be type-stable, allocation-free,
 and vectorized, and still be "correct but slower" because it needs more live vector registers than
 the target ISA provides (LLVM's portable register allocator has no choice but to spill). A

@@ -484,7 +484,7 @@ end
     StrictMode.clear_cache!()
 end
 
-@testitem ":noescape cannot decide a wrapped handle, which is why it reports" begin
+@testitem ":noescape follows a wrapped handle" begin
     using StrictMode
 
     # The ordinary shape in a workspace library: borrow a fixed-size block, take the corner you
@@ -509,15 +509,12 @@ end
     @test passes((n::Int) -> (v = borrow(n); v.m + 1))
     @test !passes((n::Int) -> (v = borrow(n); SINK[] = v; n))
 
-    # A wrapped handle is not. The view is scalar-replaced out of existence while the handle it was
-    # built from stays marked unconfined, so a frame that merely TAKES a view reports a failure —
-    # with the view never used at all, so this is not about what a callee does with it.
-    @test !passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); 0))
-    @test !passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); size(w, 1)))
+    # A view of it is followed as the handle itself: taking one is not an escape, keeping one is.
+    @test passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); 0))
+    @test passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); size(w, 1)))
+    @test !passes((n::Int) -> (v = borrow(n); w = view(v, 1:2, 1:2); SINK[] = w; 0))
 
-    # Which is the whole reason this guarantee reports instead of gating: the verdict above is
-    # indistinguishable from a real leak, so gating would fail correct code wherever a borrow is
-    # wrapped before use.
+    # It still reports rather than gates: a handle made by a call that did not inline is undecided.
     @test !StrictMode._guarantee_gates(:noescape)
 
     empty!(StrictMode._SCOPED_TYPES)
@@ -655,4 +652,59 @@ end
     own(f) = only(StrictMode.findings(f, (Vector{Symbol},); guarantees = (:owned,)))
     @test StrictMode._failed(own(OwnedClosure.m1))     # the lookup is in a closure sort runs
     @test own(OwnedClosure.c1).status === :pass
+end
+
+@testitem ":noescape follows a handle into the callees that use it" begin
+    using StrictMode
+    module Confine
+    mutable struct Arena; buf::Vector{Float64}; end
+    struct Handle; a::Arena; off::Int; end
+    const SINK = Ref{Any}()
+    const VSINK = Ref{Vector{Float64}}()
+    @noinline fill_through!(h::Handle) = (h.a.buf[h.off] = 1.0; nothing)
+    @noinline deep!(h::Handle) = fill_through!(h)
+    @noinline viewer!(h::Handle) = (v = view(h.a.buf, 1:1); v[1] = 2.0; sum(v))
+    @noinline stash!(h::Handle) = (SINK[] = h; nothing)
+    @noinline stash_buf!(h::Handle) = (VSINK[] = h.a.buf; nothing)
+    @noinline passback(h::Handle) = h
+    @noinline retbuf(h::Handle) = h.a.buf
+    @noinline task!(h::Handle) = (t = Threads.@spawn (h.a.buf[1] = 3.0); wait(t); nothing)
+    @noinline ptrleak(h::Handle) = pointer(h.a.buf)
+    ok(a::Arena) = (h = Handle(a, 1); fill_through!(h); nothing)
+    ok_deep(a::Arena) = (h = Handle(a, 1); deep!(h); nothing)
+    ok_view(a::Arena) = (h = Handle(a, 1); viewer!(h))
+    bad(a::Arena) = (h = Handle(a, 1); stash!(h); nothing)
+    bad_buf(a::Arena) = (h = Handle(a, 1); stash_buf!(h); nothing)
+    ret(a::Arena) = (h = Handle(a, 1); passback(h))
+    retb(a::Arena) = (h = Handle(a, 1); retbuf(h))
+    tsk(a::Arena) = (h = Handle(a, 1); task!(h))
+    ptr(a::Arena) = (h = Handle(a, 1); ptrleak(h))
+    @noinline f(h::Handle, n::Int) = n <= 0 ? (SINK[] = h; nothing) : g(h, n - 1)
+    @noinline g(h::Handle, n::Int) = (h.a.buf[1] = n; f(h, n - 1))
+    @noinline only_g(h::Handle) = g(h, 3)
+    both(a::Arena) = (h = Handle(a, 1); f(h, 2); h2 = Handle(a, 2); only_g(h2); nothing)
+    gonly(a::Arena) = (h = Handle(a, 1); only_g(h); nothing)
+    end
+    StrictMode.register_scoped!(Confine.Handle)
+    a = Confine.Arena(zeros(2))
+    for f in (Confine.ok, Confine.ok_deep, Confine.ok_view, Confine.bad, Confine.bad_buf, Confine.ret,
+              Confine.retb, Confine.tsk, Confine.ptr, Confine.both, Confine.gonly)
+        f(a)
+    end
+    escapes(f) = !isempty(StrictMode._escaping_scoped(Tuple{typeof(f), Confine.Arena}).escaped)
+    # Written through, in the callee or two calls down: confined.
+    @test !escapes(Confine.ok)
+    @test !escapes(Confine.ok_deep)
+    @test !escapes(Confine.ok_view)
+    # Kept, returned, handed to a task, or turned into a raw pointer that is returned: escapes.
+    @test escapes(Confine.bad)
+    @test escapes(Confine.bad_buf)
+    @test escapes(Confine.ret)
+    @test escapes(Confine.retb)
+    @test escapes(Confine.tsk)
+    @test escapes(Confine.ptr)
+    # Mutual recursion: `g` is read while `f` is still pending, and `f` escapes on another branch. A
+    # verdict for `g` resting on the pending assumption must not be reused for a later handle.
+    @test escapes(Confine.both)
+    @test escapes(Confine.gonly)
 end

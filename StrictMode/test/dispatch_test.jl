@@ -218,3 +218,29 @@ end
     # And it can be turned off, for a sweep that does not want the extra typed-IR read.
     @test isempty(filter(f -> f.guarantee === :dispatch, audit(Dyn; sweep = true, dispatch_suggest = false)))
 end
+
+@testitem "two returns of different concrete types are named as the cause" begin
+    using StrictMode
+    module ReturnUnion
+    # A per-task workspace kept for one element type and handed to another: the stored buffers
+    # come back as ComplexF64, fresh ones as the caller's type.
+    const WS = Base.OncePerTask{Base.RefValue{NTuple{2, Matrix{ComplexF64}}}}(
+        () -> Ref((zeros(ComplexF64, 0, 0), zeros(ComplexF64, 0, 0)))
+    )
+    @inline function ws(::Type{T}, n::Int) where {T}
+        r = WS()
+        size(r[][1], 1) >= n && return r[]
+        A = zeros(T, n, n); B = zeros(T, n, n)
+        r[] = (A, B)
+        return (A, B)
+    end
+    stable(n::Int) = (r = WS(); r[])
+    end
+    ReturnUnion.ws(ComplexF32, 3); ReturnUnion.stable(3)
+    f = only(StrictMode.findings(ReturnUnion.ws, (Type{ComplexF32}, Int); guarantees = (:typestable,)))
+    @test StrictMode._failed(f)
+    @test f.code === :SM0108
+    @test occursin("Matrix{ComplexF32}", f.reason) && occursin("Matrix{ComplexF64}", f.reason)
+    @test !occursin("Task.storage", f.reason)          # the accessor's own field read is not the cause
+    @test only(StrictMode.findings(ReturnUnion.stable, (Int,); guarantees = (:typestable,))).status === :pass
+end

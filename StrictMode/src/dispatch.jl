@@ -178,6 +178,12 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     for T in ci.ssavaluetypes
         _unwrap_lattice(T) === Core.Box && return (:captured_variable, "a local captured by a closure")
     end
+    # Two paths returning different concrete types: the union is the whole cause, and any abstract
+    # read elsewhere in the body (one a Base accessor narrows straight away, say) is not.
+    rtypes = _returned_types(ci)
+    if length(rtypes) >= 2 && all(isconcretetype, rtypes)
+        return (:return_union, join(("`" * string(T) * "`" for T in rtypes), " on one path and ") * " on another")
+    end
     for st in ci.code
         # A non-const global read is its OWN statement, a bare `GlobalRef` typed `Any` — not an
         # argument of the call that consumes it.
@@ -233,6 +239,31 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     return nothing
 end
 
+# The concrete types the body returns, following a returned phi to its incoming values. Empty when a
+# returned value is not concrete, since then the union is not the whole story.
+function _returned_types(ci::Core.CodeInfo)
+    out = Any[]
+    tys = ci.ssavaluetypes
+    tys isa Vector || return out
+    function add!(@nospecialize(v), depth::Int)
+        if v isa Core.SSAValue && ci.code[v.id] isa Core.PhiNode && depth < 4
+            p = ci.code[v.id]
+            for k in eachindex(p.values)
+                isassigned(p.values, k) && add!(p.values[k], depth + 1)
+            end
+            return
+        end
+        T = v isa Core.SSAValue ? Core.Compiler.widenconst(tys[v.id]) :
+            (v isa Core.Argument || v isa Core.SlotNumber || v isa GlobalRef) ? Any :
+            Core.Typeof(v isa QuoteNode ? v.value : v)
+        T in out || push!(out, T)
+    end
+    for st in ci.code
+        (st isa Core.ReturnNode && isdefined(st, :val)) && add!(st.val, 0)
+    end
+    return out
+end
+
 # A `global x::Int` declares a concrete type, so reading it is stable even though the binding is not
 # `const`. Only an untyped (or abstractly typed) non-const binding is a cause.
 function _untyped_nonconst_global(gr::GlobalRef)
@@ -272,6 +303,7 @@ end
 
 # The reason text a `:typestable` finding carries when a cause is recognized.
 _cause_reason(cause::Symbol, subject::AbstractString) =
+    cause === :return_union ? "returns $subject" :
     cause === :captured_variable ? "boxes $subject (Core.Box): every read of it infers as Any" :
     cause === :runtime_type_parameter ? "builds a type from a runtime value: $subject" :
     cause === :nonconst_global ? "reads the non-const global `$subject` (inferred Any)" :

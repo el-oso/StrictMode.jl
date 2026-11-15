@@ -9,7 +9,7 @@ using LLVM_full_jll
 
 function StrictMode._be_mca_cpus()
     err = IOBuffer()
-    run(pipeline(`$(LLVM_full_jll.llvm_mca_path) -mcpu=help`; stdout = devnull, stderr = err))
+    run(pipeline(`$(LLVM_full_jll.llvm_mca()) -mcpu=help`; stdout = devnull, stderr = err))
     text = String(take!(err))   # `-mcpu=help`'s listing goes to stderr, not stdout
     return [String(m[1]) for m in eachmatch(r"^\s{2}(\S+)\s+- Select the"m, text)]
 end
@@ -20,7 +20,7 @@ function StrictMode._be_mca_run(sanitized_asm::AbstractString, mcpu::AbstractStr
         write(io, sanitized_asm)
         close(io)
         out, err = IOBuffer(), IOBuffer()
-        proc = run(pipeline(`$(LLVM_full_jll.llvm_mca_path) -mcpu=$mcpu $path`; stdout = out, stderr = err); wait = false)
+        proc = run(pipeline(`$(LLVM_full_jll.llvm_mca()) -mcpu=$mcpu $path`; stdout = out, stderr = err); wait = false)
         wait(proc)
         proc.exitcode == 0 || error("llvm-mca exited $(proc.exitcode): " * String(take!(err)))
         return String(take!(out))

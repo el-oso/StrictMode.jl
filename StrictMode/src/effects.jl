@@ -1050,7 +1050,7 @@ elsewhere has to be asked about where the handle is created.
 """
 function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
-    isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
+    isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[], why = String[])
     EA = Core.Compiler.EscapeAnalysis
     irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
@@ -1058,6 +1058,8 @@ function _escaping_scoped(@nospecialize(sig))
     st = EA.analyze_escapes(
         ir, length(ir.argtypes), Core.Compiler.SimpleInferenceLattice.instance, Returns(false)
     )
+    cmemo = Dict{Any, Any}()
+    whys = String[]
     bad = String[]
     undet = String[]
     for i in eachindex(ir.stmts.type)
@@ -1068,6 +1070,9 @@ function _escaping_scoped(@nospecialize(sig))
         name = string(T)
         if s.head === :new
             EA.has_no_escape(st[Core.SSAValue(i)]) && continue
+            ok, why = _confined_new(ir, i, cmemo)
+            ok && continue
+            isempty(why) || why in whys || push!(whys, "$(name): $why")
             name in bad || push!(bad, name)
         elseif s.head === :invoke || s.head === :call
             name in undet || push!(undet, name)
@@ -1089,7 +1094,7 @@ function _escaping_scoped(@nospecialize(sig))
         T = Core.Compiler.widenconst(ir.stmts.type[v.id])
         _is_scoped_type(T) && !(string(T) in bad) && push!(bad, string(T))
     end
-    return (; escaped = bad, undetermined = undet)
+    return (; escaped = bad, undetermined = undet, why = whys)
 end
 
 # `:noescape`'s verdict for one signature, shared by BOTH tiers through
@@ -1101,6 +1106,7 @@ function _noescape_finding(
     r = _escaping_scoped(Tuple{typeof(f), types...})
     reason = !isempty(r.escaped) ?
         "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
+        (isempty(r.why) ? "" : " (" * join(r.why, "; ") * ")") *
         " — it is returned, stored, or captured, or handed to a function this analysis " *
         "cannot see through" :
         !isempty(r.undetermined) ?
@@ -1179,4 +1185,146 @@ function _owned_deep(@nospecialize(sig))
     end
     @lock _OWNED_DEEP_LOCK (_OWNED_DEEP_MEMO[key] = v)
     return v
+end
+
+# ── confinement across calls ─────────────────────────────────────────────────────────────────────
+#
+# The compiler's escape analysis gives up on a handle once it reaches an array through it: an
+# `@inbounds h.buf[i] = x`, even in a callee it is shown, marks the handle as escaping everywhere. A
+# handle that is only written THROUGH is the common case of a borrowed buffer, so before reporting an
+# escape the handle is followed here, into every callee, Base included. The value and everything
+# derived from it that can hold a reference or a pointer is tracked. It escapes when it is returned, stored into an
+# object it does not own (a global, a field of something else, a Box), handed to C or to a task, or
+# passed to a call that cannot be read — a dynamic call, a callee past `_CONFINE_DEPTH`, or past the
+# body budget. A call on the throw path does not count, as `ignore_throw` decides for allocation.
+
+const _CONFINE_DEPTH = 64
+const _CONFINE_BUDGET = 1000
+# C functions that read or write through a pointer and never keep it.
+const _CONFINE_C_NONRETAINING = (:memmove, :memcpy, :memset, :memcmp)
+const _GLOBAL_STORES = (:setglobal!, :swapglobal!, :setglobalonce!, :replaceglobal!)
+
+_carries(@nospecialize(T)) = _may_ref(T) || _holds_ptr(Core.Compiler.widenconst(T))
+
+function _confine_callee(@nospecialize(x))
+    x isa GlobalRef && return (isdefined(x.mod, x.name) && isconst(x.mod, x.name)) ? getglobal(x.mod, x.name) : nothing
+    x isa QuoteNode && return x.value
+    (x isa Core.SSAValue || x isa Core.Argument || x isa Expr) && return nothing
+    return x
+end
+
+# Records why the scan stopped: the first reason, and the statement it was read at.
+_esc!(st::Dict{Symbol, Any}, why::String, i::Int) = (haskey(st, :why) || (st[:why] = why); (true, false))
+
+# `(escapes, returns)` for `ir` with the values in `seed` (SSA ids) and `args` (argument numbers)
+# tracked. `returns` is whether a tracked value is returned, which a caller reads as its call result
+# being tracked and the top frame reads as an escape.
+function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, Any})
+    code = ir.stmts.stmt
+    types = ir.stmts.type
+    tset = copy(seed)
+    tracked(@nospecialize(a)) = (a isa Core.SSAValue && a.id in tset) || (a isa Core.Argument && a.n in args)
+    returns = false
+    changed = true
+    while changed
+        changed = false
+        add(i) = (i in tset) ? nothing : (push!(tset, i); changed = true)
+        for i in eachindex(code)
+            s = code[i]
+            if s isa Core.ReturnNode
+                isdefined(s, :val) && tracked(s.val) && (returns = true)
+            elseif s isa Core.SSAValue || s isa Core.Argument
+                tracked(s) && add(i)                                 # an alias
+            elseif s isa Core.PiNode
+                isdefined(s, :val) && tracked(s.val) && add(i)
+            elseif s isa Core.PhiNode || s isa Core.PhiCNode
+                any(k -> isassigned(s.values, k) && tracked(s.values[k]), eachindex(s.values)) && add(i)
+            elseif s isa Core.UpsilonNode
+                isdefined(s, :val) && tracked(s.val) && add(i)
+            elseif Meta.isexpr(s, :new) || Meta.isexpr(s, :splatnew)
+                any(tracked, @view s.args[2:end]) && add(i)          # a struct holding it is tracked
+            elseif Meta.isexpr(s, :foreigncall)
+                any(tracked, s.args) && !(_fcall_name(s) in _CONFINE_C_NONRETAINING) &&
+                    return _esc!(st, "handed to C: $(_fcall_name(s))", i)                # C may keep it
+            elseif Meta.isexpr(s, :call) || Meta.isexpr(s, :invoke)
+                isinv = s.head === :invoke
+                fx = isinv ? s.args[2] : s.args[1]
+                data = isinv ? s.args[3:end] : s.args[2:end]
+                hit = Int[k for k in eachindex(data) if tracked(data[k])]
+                isempty(hit) && continue
+                f = _confine_callee(fx)
+                nm = _callee_name(fx)
+                if f isa Core.Builtin || f isa Core.IntrinsicFunction
+                    if nm in _GLOBAL_STORES
+                        return _esc!(st, "stored into a global", i)
+                    elseif !isnothing(nm) && haskey(_STORE_OPS, nm)
+                        pos = _STORE_OPS[nm]
+                        # Stored into an object it does not own: the container is not tracked.
+                        cont = 1 <= pos <= length(data) && tracked(data[pos])
+                        (!cont && any(k -> k != pos, hit)) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
+                    elseif nm === :throw
+                        # the throw path does not count, as `ignore_throw` decides for allocation
+                    else
+                        _carries(types[i]) && add(i)
+                    end
+                elseif isinv
+                    mi = s.args[1] isa Core.CodeInstance ? s.args[1].def : s.args[1]
+                    (mi isa Core.MethodInstance && mi.def isa Method) || return _esc!(st, "an invoke with no method", i)
+                    startswith(String(mi.def.name), "throw") && continue
+                    # Building an exception is the throw path too.
+                    (p1 = mi.specTypes.parameters[1]; p1 isa DataType && p1 <: Type && p1.parameters[1] isa Type &&
+                        p1.parameters[1] <: Exception) && continue
+                    depth >= _CONFINE_DEPTH && return _esc!(st, "deeper than the depth limit: `$(mi.def.name)`", i)
+                    st[:budget] = st[:budget] - 1
+                    st[:budget] < 0 && return _esc!(st, "past the body budget at `$(mi.def.name)`", i)
+                    key = (mi, Tuple(hit))
+                    r = get(st[:memo], key, nothing)
+                    if r === :pending
+                        # A recursive call to a callee still being read: assume for now that it does
+                        # not escape and returns what it was given. Its own reading covers the same body,
+                        # so an escape there is still found; but a result that rests on the assumption is
+                        # not saved for reuse until the callee it assumed about has been settled.
+                        push!(get!(() -> Set{Any}(), st, :assumed), key)
+                        r = (false, true)
+                    elseif isnothing(r)
+                        outer = get!(() -> Set{Any}(), st, :assumed)
+                        st[:assumed] = Set{Any}()
+                        st[:memo][key] = :pending
+                        cirs = try
+                            Base.code_ircode_by_type(mi.specTypes; optimize_until = _INLINING_PASS)
+                        catch
+                            Any[]
+                        end
+                        r = length(cirs) == 1 ?
+                            _confine(first(cirs[1]), BitSet(), BitSet(k + 1 for k in hit), depth + 1, st) : (true, false)
+                        used = delete!(st[:assumed], key)
+                        if isempty(used) || r[1]
+                            st[:memo][key] = r          # an escape holds whatever was assumed
+                        else
+                            delete!(st[:memo], key)
+                        end
+                        st[:assumed] = union(outer, used)
+                    end
+                    r[1] && (get!(st, :chain, String[]); pushfirst!(st[:chain], string(mi.def.name)); return (true, returns))
+                    r[2] && _carries(types[i]) && add(i)
+                else
+                    return _esc!(st, "a dynamic call to `$nm`", i)                                 # a dynamic call
+                end
+            elseif s isa Expr && !(s.head in (:gc_preserve_begin, :gc_preserve_end, :boundscheck, :leave, :pop_exception)) &&
+                    any(tracked, s.args)
+                return _esc!(st, "a statement form this scan does not read: $(s.head)", i)                                     # a form this scan does not read
+            end
+        end
+    end
+    return (false, returns)
+end
+
+# Whether the handle built at statement `i` of `ir` stays in the frame.
+# `memo` is shared by the handles of one frame: a callee's verdict depends only on which of its
+# arguments are tracked.
+function _confined_new(ir, i::Int, memo::Dict{Any, Any} = Dict{Any, Any}())
+    st = Dict{Symbol, Any}(:budget => _CONFINE_BUDGET, :memo => memo)
+    esc, ret = _confine(ir, BitSet(i), BitSet(), 0, st)
+    why = esc ? join([get(st, :chain, String[]); get(st, :why, "")], " → ") : ret ? "returned" : ""
+    return (!esc && !ret, why)
 end

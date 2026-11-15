@@ -282,6 +282,7 @@ function _assert_noescape(
         _fail(
             :noescape, target,
             "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
+                (isempty(r.why) ? "" : " (" * join(r.why, "; ") * ")") *
                 ". It is returned, stored to a global or a field, captured by a closure, or " *
                 "handed to a function this analysis cannot see through — the escape state of an " *
                 "unanalyzed callee is assumed, not computed, so these cannot be told apart. " *

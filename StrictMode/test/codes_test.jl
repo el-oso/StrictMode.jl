@@ -13,9 +13,12 @@
     @test only(f for f in fs if f.guarantee === :noalloc).code === :SM0002
 
     # A guarantee with no narrowed cause falls back to its own code.
-    plain(x::Float64) = x > 0 ? 1 : "s"
+    plain(x::Float64) = Base.inferencebarrier(x) + 1
     pf = only(StrictMode.findings(plain, (Float64,); guarantees = (:typestable,)))
     @test pf.code === :SM0001
+    # Two returns of different concrete types are a cause of their own.
+    two(x::Float64) = x > 0 ? 1 : "s"
+    @test only(StrictMode.findings(two, (Float64,); guarantees = (:typestable,))).code === :SM0108
 
     # The code is in the serialized record, which is the point: a saved report stays lookup-able.
     @test occursin("\"code\":\"SM0104\"", format_findings(fs; format = :json))

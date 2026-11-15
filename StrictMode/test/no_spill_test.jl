@@ -97,3 +97,32 @@ end
             Vector{StrictMode.StrictFinding}
     end
 end
+
+@testitem "spills are read from AArch64 assembly too" begin
+    using StrictMode
+    # Apple M-series `code_native` of a loop with 48 live accumulators: `;` comments, labels without
+    # the leading dot, and FP/vector registers named `d`/`q`.
+    asm = """
+    ; %bb.0:                                ; %top
+    \tstp\td15, d14, [sp, #-144]!          ; 16-byte Folded Spill
+    \tstp\tx28, x27, [sp, #64]             ; 16-byte Folded Spill
+    LBB0_4:                                 ; %L55
+                                            ; =>This Inner Loop Header: Depth=1
+    \tldp\td11, d12, [sp, #168]            ; 16-byte Folded Reload
+    ; %bb.5:                                ; %L120
+                                            ;   in Loop: Header=BB0_4 Depth=1
+    \tstr\tq3, [sp, #176]                  ; 16-byte Folded Spill
+    \tb\tLBB0_4
+    ; %bb.6:                                ; %L300
+    \tldp\td15, d14, [sp], #144            ; 16-byte Folded Reload
+    """
+    lines = split(asm, '\n')
+    re = StrictMode._vec_reg_re(:aarch64)
+    spill = [occursin(StrictMode._SPILL_RELOAD_RE, l) && occursin(re, l) for l in lines]
+    depth, inner = StrictMode._asm_loop_depths(lines)
+    @test count(spill) == 4                                   # the x-register spill is not a vector one
+    @test count(spill .& (depth .> 0)) == 2                   # two of them inside the loop
+    @test count(spill .& inner) == 2
+    # The x86 pattern reads none of it: the blind spot this closes.
+    @test !any(l -> occursin(StrictMode._vec_reg_re(:x86_64), l), lines)
+end

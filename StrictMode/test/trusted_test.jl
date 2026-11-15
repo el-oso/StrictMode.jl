@@ -102,3 +102,42 @@ end
     fo = only(findings(TrustedFixtures.reads_other_field, (Vector{Any},); guarantees = (:trusted,)))
     @test !StrictMode._failed(fo)
 end
+
+@testitem "foreign raw pointers are followed, and reading them needs a trust boundary" begin
+    using StrictMode
+    module Foreign
+    struct View; p::Ptr{Float64}; n::Int; end
+    validated_copy(p::Ptr{Float64}, n::Int) = (n < 0 && error("bad"); [unsafe_load(p, i) for i in 1:n])
+    @noinline helper(p::Ptr{Float64}, n) = unsafe_load(p, n)
+    @noinline pass_on(p::Ptr{Float64}, n) = (q = p + 8; helper(q, n))
+    c_bad(p::Ptr{Float64}, n::Cint)::Float64 = unsafe_load(p, 1)
+    c_wrap(p::Ptr{Float64}, n::Cint)::Float64 = (a = unsafe_wrap(Array, p, Int(n)); a[1])
+    c_wraplen(p::Ptr{Float64}, n::Cint)::Int = (a = unsafe_wrap(Array, p, Int(n)); length(a))
+    c_deep(p::Ptr{Float64}, n::Cint)::Float64 = pass_on(p, Int(n))
+    c_struct(p::Ptr{Float64}, n::Cint)::Float64 = (v = View(p, Int(n)); unsafe_load(v.p))
+    c_ok(p::Ptr{Float64}, n::Cint)::Float64 = (x = validated_copy(p, Int(n)); sum(x))
+    c_cnull(p::Ptr{Float64}, n::Cint)::Int = p == C_NULL ? 0 : Int(n)
+    end
+    StrictMode.trust_boundary!(Foreign.validated_copy)
+    sig = (Ptr{Float64}, Cint)
+    reads(f) = !isempty(first(StrictMode._foreign_sites(f, sig, (1,))))
+    @test reads(Foreign.c_bad)
+    @test reads(Foreign.c_wrap)                  # indexing an unsafe_wrap'ped array
+    @test reads(Foreign.c_deep)                  # through two package callees and pointer arithmetic
+    @test reads(Foreign.c_struct)                # through a struct holding the pointer
+    @test !reads(Foreign.c_wraplen)              # a length is not a read of the memory
+    @test !reads(Foreign.c_ok)                   # read only inside the registered boundary
+    @test !reads(Foreign.c_cnull)
+    # With no position declared there is nothing to follow: a Ptr is not Untrusted by itself.
+    @test isempty(first(StrictMode._foreign_sites(Foreign.c_bad, sig, ())))
+
+    buf = [1.0, 2.0, 3.0]; p = pointer(buf)
+    GC.@preserve buf begin
+        @test_throws "c_deep → pass_on → helper" (@assert_trusted Foreign.c_deep(p, Cint(2)) foreign = (1,))
+        @test (@assert_trusted Foreign.c_ok(p, Cint(2)) foreign = (1,)) == 3.0
+    end
+    # Declared once, it holds for every sweep.
+    StrictMode.trust_foreign!(Foreign.c_wrap, (1,))
+    @test StrictMode._failed(only(StrictMode.findings(Foreign.c_wrap, sig; guarantees = (:trusted,))))
+    @test_throws ArgumentError StrictMode._foreign_sites(Foreign.c_bad, sig, (3,))
+end

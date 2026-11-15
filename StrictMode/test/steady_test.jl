@@ -147,3 +147,16 @@ end
     end
     @test sort([f.func for f in state_branch_report(Kinds)]) == ["inner_ref", "nonconst", "once_branch", "qualified"]
 end
+
+@testitem "history_report tells a first-call difference from nondeterminism" begin
+    using StrictMode
+    module FirstCall
+    const SEEN = Ref(false)
+    f(x::Vector{Float64}) = (r = SEEN[] ? foldr(+, x) : foldl(+, x); SEEN[] = true; r)
+    end
+    x = [1.0e8, 1.0, -1.0e8, 1.0e-8, 3.0, 1.0e-3]
+    r = history_report(FirstCall.f, x; movers = (() -> nothing,))
+    @test r.status === :first_call
+    @test occursin("FIRST call", sprint(show, MIME"text/plain"(), r))
+    @test history_report(() -> rand(); movers = (() -> nothing,)).status === :nondeterministic
+end

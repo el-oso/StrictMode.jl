@@ -9,8 +9,9 @@
 
 What [`history_report`](@ref) measured. `status` is `:same` (the same bits after the movers),
 `:different` (different bits after the movers, with the same bits between two calls run back to
-back), or `:nondeterministic` (two calls back to back already differ, so a difference after the
-movers cannot be put down to them). `difference` names where the first differing bit was found.
+back), `:first_call` (the first call differs from the second and third, which agree: the first call
+leaves state behind that changes the result), or `:nondeterministic` (every call differs, so a
+difference after the movers cannot be put down to them). `difference` names where the first differing bit was found.
 """
 struct HistoryReport
     target::String
@@ -32,6 +33,11 @@ function Base.show(io::IO, ::MIME"text/plain", r::HistoryReport)
         print(
             io, "DIFFERENT bits after ", r.movers, " state mover(s), at ", r.difference,
             ": the result depends on what ran before it in this process"
+        )
+    elseif r.status === :first_call
+        print(
+            io, "the FIRST call differs from the calls after it, at ", r.difference,
+            ": the first call leaves state behind that changes the result"
         )
     else
         print(
@@ -91,8 +97,10 @@ It calls `f` twice back to back on fresh copies of the arguments, as a control, 
 in `movers` (calls that change state the package keeps between calls — a thread count, a tuning
 knob, a large call that grows a pool or moves a measured threshold), then `f` once more, and
 compares the result and the arguments afterwards, bit for bit. When the two control calls already
-differ — a result built from `rand()`, an `objectid`, a timer, a reduction whose order varies — the
-status is `:nondeterministic`: the movers cannot be judged.
+differ, a third call tells why. If it repeats the second, the status is `:first_call`: the first
+call left state behind that changes the result, such as a workspace created on first use. If it
+differs again — a result built from `rand()`, an `objectid`, a timer, a reduction whose order
+varies — the status is `:nondeterministic`, and the movers cannot be judged.
 
 The arguments are copied with `deepcopy` before each call, so state a call keeps in its own
 arguments starts fresh each time; a mover that should move such state must change the original
@@ -114,7 +122,7 @@ function history_report(@nospecialize(f), args...; movers = ())
     call() = (a = deepcopy(args); r = f(a...); (r, a))
     # The result, then each argument as the call left it, so a difference is named by where it is.
     function differ(x, y)
-        d = _first_difference(x[1], y[1], "the result")
+        local d = _first_difference(x[1], y[1], "the result")
         isnothing(d) || return d
         for k in eachindex(x[2])
             d = _first_difference(x[2][k], y[2][k], "argument $k")
@@ -125,7 +133,14 @@ function history_report(@nospecialize(f), args...; movers = ())
     first_run = call()
     control = call()
     d = differ(first_run, control)
-    isnothing(d) || return HistoryReport(target, :nondeterministic, length(movers), d)
+    if !isnothing(d)
+        # A third call tells the two apart: when it repeats the second, only the first call differed,
+        # so the first call left state behind that changes the result. When it differs again, the
+        # result is not a function of its inputs at all.
+        third = call()
+        repeat = isnothing(differ(control, third))
+        return HistoryReport(target, repeat ? :first_call : :nondeterministic, length(movers), d)
+    end
     for m in movers
         m()
     end
