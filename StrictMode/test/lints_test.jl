@@ -101,3 +101,14 @@ end
     @test all(f -> occursin("does not end in `!`", f.reason), mixed)
     @test all(f -> occursin("`mix!`", f.suggestion), mixed)
 end
+
+@testitem "bang_report sees a write through a raw pointer" begin
+    using StrictMode
+    module BangPtr
+    ptrset!(x::Vector{Float64}) = (GC.@preserve x unsafe_store!(pointer(x), 1.0); x)
+    end
+    x = [0.0]
+    BangPtr.ptrset!(x)
+    @test x[1] == 1.0
+    @test !any(f -> occursin("no argument is written", string(f)), StrictMode.bang_report(BangPtr))
+end
