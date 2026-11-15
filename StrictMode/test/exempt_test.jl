@@ -302,3 +302,35 @@ end
     end[1]
     @test !any(l -> l.level === Base.CoreLogging.Warn, logs)
 end
+
+@testitem "an allocation barrier excuses allocation only; its other causes are reported at it" begin
+    using StrictMode, Test
+    module BarrierRule
+    const OPT = Base.OncePerTask{Vector{Float64}}(() -> zeros(16))
+    @noinline acc(::Type{Float64}) = OPT()            # a task-local lookup on every call
+    entry(x::Vector{Float64}) = (w = acc(Float64); w[1] = x[1]; w[1])
+    const D = Dict{Symbol, Vector{Float64}}(:a => zeros(4))
+    @noinline own_lookup() = D[:a]
+    mixed(x::Vector{Float64}) = (w = acc(Float64); v = own_lookup(); w[1] + v[1])
+    end
+    x = [1.0]
+    BarrierRule.entry(x); BarrierRule.mixed(x)
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        StrictMode.register_alloc_barrier!(BarrierRule.acc)
+        owned(f, T) = only(StrictMode.findings(f, T; guarantees = (:owned,)))
+        # Reported once, at the barrier.
+        @test StrictMode._failed(owned(BarrierRule.acc, (Type{Float64},)))
+        # A caller whose only cause is inside the barrier points there: neither failed nor passed.
+        e = owned(BarrierRule.entry, (Vector{Float64},))
+        @test e.status === :info && occursin("reaches `acc`", e.reason)
+        # A cause of the caller's own is still judged.
+        @test StrictMode._failed(owned(BarrierRule.mixed, (Vector{Float64},)))
+        # The macro says the same at the call site.
+        @test_logs (:info, r"reaches `acc`") @assert_owned BarrierRule.entry(x)
+        @test_throws "per task or per thread" @assert_owned BarrierRule.acc(Float64)
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS); union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
+    end
+end

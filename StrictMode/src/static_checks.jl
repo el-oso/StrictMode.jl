@@ -19,11 +19,22 @@
 _noalloc_mode(static_opt::Union{Nothing, Bool}) =
     isnothing(static_opt) ? :heuristic : static_opt ? :static : :empirical
 
+# The macro form of `_barrier_note`: a call site whose only cause for `g` lies inside a registered
+# allocation barrier says so, once per site and barrier, rather than passing as if it had been checked.
+function _barrier_info(g::Symbol, target, barrier::Union{Nothing, Symbol})
+    isnothing(barrier) && return nothing
+    @info "StrictMode @assert_$g $target: reaches `$barrier`, a registered allocation barrier; its " *
+        ":$g finding is reported there." _id = Symbol(g, '|', target, '|', barrier) maxlog = 1
+    return nothing
+end
+
 # The scan half on its own, with no thunk: the caller already has the value.
 function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
+    else
+        _barrier_info(:noalloc, target, sig.barrier_box)
     end
     return nothing
 end
@@ -42,6 +53,8 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
         sig = _alloc_signals(f, types)
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
+        else
+            _barrier_info(:noalloc, target, sig.barrier_box)
         end
         return val
     end
@@ -130,6 +143,8 @@ function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
     if sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig))
+    else
+        _barrier_info(:noboxing, target, sig.barrier_box)
     end
     return nothing
 end
@@ -174,10 +189,15 @@ function _assert_owned(
         _fail(
             :owned, target,
             "hot path resolves a runtime AbstractDict lookup (static-ownership violation): give " *
-                "the type a const-dispatched accessor (Ref-per-concrete-type) instead of a runtime " *
-                "keyed lookup.";
+                "the type a const-dispatched accessor (one const owner per concrete type) instead of " *
+                "a runtime keyed lookup. Where the buffer must be per task or per thread, a shared " *
+                "const owner races and the lookup is the price of that state: exempt the accessor " *
+                "with `@strict_exempt` from :owned, say why, and register it as an allocation " *
+                "barrier so its callers point here.";
             gates = gates
         )
+    else
+        _barrier_info(:owned, target, sig.barrier_dict)
     end
     return nothing
 end

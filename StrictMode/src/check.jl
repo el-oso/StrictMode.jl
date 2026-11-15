@@ -47,6 +47,16 @@ const _GUARANTEES = (
     :no_threadid_state, :concurrency_safe,
 )
 
+# A caller whose only cause for `g` lies inside a registered allocation barrier. The barrier excuses
+# allocation alone, so that cause is judged at the barrier, once; the caller is pointed there rather
+# than failed again, or passed as if it had been checked.
+_barrier_note(md, fn, sg, g::Symbol, barrier::Symbol, file, line; tier::Symbol = :report) =
+    StrictFinding(
+        md, fn, sg, g, :info, file, line,
+        "reaches `$barrier`, a registered allocation barrier; its :$g finding is reported there",
+        "", tier, _code(g, nothing)
+    )
+
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
 # same answer whichever tier asks, so `StrictModeTest` delegates here for these instead of keeping
 # a second copy. Returns `nothing` for a guarantee this does not cover.
@@ -56,6 +66,8 @@ function _compiled_output_finding(
     )
     if g === :owned
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
+        s.dictlookup || isnothing(s.barrier_dict) ||
+            return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
         return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
@@ -186,7 +198,9 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             )
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
-            if !fail && !isnothing(sig.exempt)
+            if !fail && isnothing(sig.exempt) && !isnothing(sig.barrier_box)
+                push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
+            elseif !fail && !isnothing(sig.exempt)
                 # Its only allocation is in a callee exempted from `:noalloc`: a note, so the
                 # excusal stays visible without being reported again at every caller.
                 push!(
@@ -201,6 +215,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             end
         elseif g === :noboxing
             fail = sig.boxing || !isnothing(sig.abscontainer)
+            if !fail && !isnothing(sig.barrier_box)
+                push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
+                continue
+            end
             push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))
         elseif g === :trim_compatible
             r = _trim_report(f, types)
