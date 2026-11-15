@@ -48,6 +48,8 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:alias_guard, nothing) => :SM0308,
     (:resource, nothing) => :SM0309,
     (:conversion, nothing) => :SM0310,
+    (:state_branch, nothing) => :SM0311,
+    (:history, nothing) => :SM0016,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -69,6 +71,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0013 => "the method writes mutable state indexed by `Threads.threadid()`, which a migrating task invalidates",
     :SM0014 => "the method writes, or cannot be shown not to write, the argument a concurrent caller would share",
     :SM0015 => "a function the call is declared to reach is not in its call graph after optimization",
+    :SM0016 => "the call's result bits change after other calls have run in the same process",
     :SM0101 => "a closure captured a local that is reassigned, so it is held in a `Core.Box`",
     :SM0102 => "a non-`const` global is read, and its type can change between reads",
     :SM0103 => "a struct field is declared with an abstract type",
@@ -92,6 +95,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0308 => "the method mutates and takes arguments that could overlap, and never asks whether they do",
     :SM0309 => "a registered resource, or a value borrowed from one, outlives the scope that owns it",
     :SM0310 => "the method converts its own numeric data to another type",
+    :SM0311 => "a branch condition reads mutable global state, so which code runs depends on what ran before",
 )
 
 # The code for a verdict, or `nothing` when the kind is not in the table. A guarantee with a known

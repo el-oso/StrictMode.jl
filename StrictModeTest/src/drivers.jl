@@ -911,3 +911,35 @@ function test_waits_yield(@nospecialize(f), @nospecialize(types::Tuple))
     target = string(f) * StrictMode._sig_string(types)
     throw(StrictMode.StrictViolation(:waits_yield, target, join(bad, "\n  ")))
 end
+
+"""
+    test_history_invariant(f, args...; movers) -> StrictMode.HistoryReport
+
+Prove that `f(args...)` gives the same bits after the calls in `movers` have run in the same
+process, and throw a `StrictMode.StrictViolation` when it does not. See
+[`StrictMode.history_report`](@ref), which this runs.
+
+`movers` must not be empty: with nothing run in between, the two calls are the same call and the
+comparison proves nothing.
+
+```julia
+test_history_invariant(gemm!, C, A, B; movers = (() -> gemm!(Cbig, Abig, Bbig),))
+```
+"""
+function test_history_invariant(@nospecialize(f), args...; movers)
+    isempty(movers) && throw(
+        ArgumentError(
+            "test_history_invariant: `movers` is empty, so nothing ran between the two calls and the " *
+                "comparison would prove nothing; pass the calls that move the package's state"
+        )
+    )
+    r = StrictMode.history_report(f, args...; movers)
+    r.same && return r
+    throw(
+        StrictMode.StrictViolation(
+            :history, r.target,
+            "the result is not the same bits after $(r.movers) state mover(s) ran in this process " *
+                "($(r.first_bytes) B then $(r.after_bytes) B serialized): it depends on what ran before it"
+        )
+    )
+end

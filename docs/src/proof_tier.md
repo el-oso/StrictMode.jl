@@ -42,6 +42,7 @@ The macro you write picks the engine. There is no mode to switch.
 | `@assert_reaches f(x) g` | `@test_reaches f(x) g` — `g` is in the call graph after optimization; fails on a graph it could not read in full too |
 | `route_parity(f => T, g => T)` | `test_route_parity(f => T, g => T)` — two entries reach the same functions, both graphs read in full |
 | `spin_wait_report(f, types)` | `test_waits_yield(f, types)` — every task the call spawns waits by yielding; fails on what it could not judge |
+| `history_report(f, args...; movers)` | `test_history_invariant(f, args...; movers)` — the same bits after other calls moved the package's state, in one process |
 | `allocated_bytes(f, args)` | `@test_allocated_zero f(x)` — the call allocates nothing, measured |
 | `threaded_speedup_report(pkg, call)` | `test_threaded_speedup(pkg, call)` — threading does not lose to the serial path, measured in fresh processes |
 | `threadcount_invariant_report(pkg, call)` | `test_threadcount_invariant(pkg, call; witness)` — the same bits at every thread count, with a witness that the threaded path ran |
@@ -106,6 +107,7 @@ test_no_unsafe
 test_specializations
 test_route_parity
 test_waits_yield
+test_history_invariant
 test_threaded_speedup
 test_threadcount_invariant
 alloc_entry_report

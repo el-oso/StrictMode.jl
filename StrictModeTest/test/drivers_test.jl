@@ -181,3 +181,22 @@ end
     @test_throws "bound task" StrictModeTest.test_waits_yield(Waits.async_spin, ())
     @test_throws "spawns no task" StrictModeTest.test_waits_yield(Waits.no_spawn, ())
 end
+
+@testitem "test_history_invariant fails a result that moves with process history" begin
+    using StrictMode, StrictModeTest
+    module HistGate
+    const FLOOR = Threads.Atomic{Int}(1000)
+    @noinline mt_work() = FLOOR[]
+    mysum(x::Vector{Float64}) = length(x) < mt_work() ? foldl(+, x) : foldr(+, x)
+    bigcall() = (FLOOR[] = 1; nothing)
+    end
+    x = [1.0e8, 1.0, -1.0e8, 1.0e-8, 3.0, 1.0e-3]
+    try
+        @test_throws "depends on what ran before" StrictModeTest.test_history_invariant(
+            HistGate.mysum, x; movers = (HistGate.bigcall,)
+        )
+    finally
+        HistGate.FLOOR[] = 1000
+    end
+    @test_throws "movers` is empty" StrictModeTest.test_history_invariant(HistGate.mysum, x; movers = ())
+end

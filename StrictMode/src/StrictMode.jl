@@ -54,6 +54,7 @@ export @assert_reaches, reach_report, ReachReport, ReachedFunction, route_parity
 export latency_report, LatencyReport
 export threaded_speedup_report, ThreadedSpeedupReport
 export threadcount_invariant_report, ThreadcountInvariantReport
+export history_report, HistoryReport, state_branch_report
 export @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report
 export @strict, @kernel, @strict_function, @strict_stable, @strict_exempt, @strict_policy
 export @strict_contract, @verify_strict, @explain
@@ -113,6 +114,7 @@ include("dispatch.jl")
 include("audit.jl")
 include("golden.jl")
 include("migration.jl")
+include("history.jl")
 
 # The proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` gating API live in the
 # companion `StrictModeTest` package. Nothing here calls them, and nothing here is a stub they fill.

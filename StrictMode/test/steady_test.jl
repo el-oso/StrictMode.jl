@@ -90,3 +90,28 @@ end
     bad = steady_state_report(n -> sum(Vector{Float64}(undef, n)), 4)
     @test !StrictMode.steady(bad) && bad.bytes > 0
 end
+
+@testitem "history_report and state_branch_report find a result that depends on process history" begin
+    using StrictMode
+    module HistDep
+    const FLOOR = Threads.Atomic{Int}(1000)                  # a measured threshold a big call moves
+    @noinline mt_work() = FLOOR[]
+    fwd(x) = foldl(+, x); bwd(x) = foldr(+, x)                # two rounding orders
+    mysum(x::Vector{Float64}) = length(x) < mt_work() ? fwd(x) : bwd(x)
+    bigcall() = (FLOOR[] = 1; nothing)
+    clean(x::Vector{Float64}) = fwd(x)
+    end
+    x = [1.0e8, 1.0, -1.0e8, 1.0e-8, 3.0, 1.0e-3]
+    @test HistDep.fwd(x) != HistDep.bwd(x)                    # the control: the routes do round differently
+    try
+        @test !history_report(HistDep.mysum, x; movers = (HistDep.bigcall,)).same
+        HistDep.FLOOR[] = 1000
+        @test history_report(HistDep.clean, x; movers = (HistDep.bigcall,)).same
+    finally
+        HistDep.FLOOR[] = 1000
+    end
+    # The branch is found through the callee that reads the atomic.
+    fs = state_branch_report(HistDep)
+    @test [f.func for f in fs] == ["mysum"]
+    @test occursin("`FLOOR`", only(fs).reason) && only(fs).status === :info
+end
