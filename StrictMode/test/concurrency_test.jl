@@ -147,7 +147,9 @@ end
     using StrictMode
     using Base.Threads: threadid
     function accum_tid!(buf::Vector{Int})
-        @inbounds buf[threadid()] += 1   # task-migration hazard
+        i = threadid()
+        yield()                          # the task may now run on another thread
+        @inbounds buf[i] += 1           # task-migration hazard: `i` names a thread it may have left
         return buf
     end
     @test !isempty(StrictMode.threadid_state_findings(accum_tid!, (Vector{Int},)))
@@ -249,7 +251,7 @@ end
     @test StrictMode._code(:no_threadid_state) === :SM0013
 
     tls = [0.0]
-    dirty() = (tls[Threads.threadid()] += 1.0)
+    dirty() = (i = Threads.threadid(); yield(); tls[i] += 1.0)
     cleankern(x) = x + 1.0
     gref = Ref(1.0)
     unprovable(x) = x + gref[]        # no task state, and the compiler cannot say so
@@ -421,7 +423,7 @@ end
         @atomic TidAtomics.FLAT[i] = 0
     end
     TidAtomics.rmw()
-    @test !isempty(StrictMode.threadid_state_findings(TidAtomics.rmw, ()))
+    @test !isempty(StrictMode._threadid_writes(TidAtomics.rmw, ()))
 
     # An atomic write that neither store table names must not be cleared as read-only either.
     for n in (:setglobal!, :swapglobal!, :atomic_pointerset, :atomic_pointermodify)
@@ -531,7 +533,7 @@ end
         )
         f()
     end
-    scan(f) = StrictMode.threadid_state_findings(f, ())
+    scan(f) = StrictMode._threadid_writes(f, ())
 
     # Every one of these writes state the running task may not own after a migration.
     for (name, f) in (
@@ -912,7 +914,7 @@ end
     reads_only(n) = read_x(OTX()) + n
     writes_a_copy(n) = (copy_x(OTX())[1] = 1.0; nothing)
     through_helper(4); reads_only(1); writes_a_copy(1)
-    nf(f) = length(StrictMode.threadid_state_findings(f, (Int,)))
+    nf(f) = length(StrictMode._threadid_writes(f, (Int,)))
     # The threadid is in the caller and the write in the callee: neither alone shows it.
     @test nf(through_helper) >= 1
     @test nf(reads_only) == 0
@@ -926,4 +928,36 @@ end
     ev_notify(e) = notify(e)
     @test pool_balance_report(ev_wait, (Threads.Event,)).balanced
     @test pool_balance_report(ev_notify, (Threads.Event,)).balanced
+end
+
+@testitem ":no_threadid_state flags per-thread state held across a suspension point, only" begin
+    using StrictMode
+    module HeldAcross
+    const OPT = Base.OncePerThread{Vector{Float64}}(() -> zeros(8))
+    held_yield(n::Int) = (v = OPT(); v[1] = Float64(n); yield(); v[2] = v[1]; nothing)
+    no_suspend(n::Int) = (v = OPT(); v[1] = Float64(n); v[2] = v[1]; nothing)
+    @noinline pause() = (yield(); nothing)
+    held_callee(n::Int) = (v = OPT(); v[1] = Float64(n); pause(); v[2] = v[1]; nothing)
+    refetched(n::Int) = (v = OPT(); v[1] = Float64(n); yield(); w = OPT(); w[2] = 1.0; nothing)
+    @noinline grow!(v, n) = (length(v) < n && resize!(v, n); v)
+    grow_use(n::Int) = (v = grow!(OPT(), n); v[1] = 1.0; nothing)
+    grow_yield_use(n::Int) = (v = grow!(OPT(), n); pause(); v[1] = 1.0; nothing)
+    const OPK = Base.OncePerTask{Vector{Float64}}(() -> zeros(8))
+    # A per-thread or per-task buffer by a run-time choice: the per-thread one can reach the yield.
+    merged(c::Bool) = (v = c ? OPT() : OPK(); v[1] = 1.0; pause(); v[2] = v[1]; nothing)
+    end
+    fs = (HeldAcross.held_yield, HeldAcross.no_suspend, HeldAcross.held_callee,
+          HeldAcross.refetched, HeldAcross.grow_use, HeldAcross.grow_yield_use)
+    foreach(f -> f(8), fs)
+    flagged(f) = any(v -> v.certain, StrictMode.threadid_state_findings(f, (Int,)))
+    # Tasks are not preempted: per-thread state is shared only if it is still in use after the task
+    # could have been suspended.
+    @test flagged(HeldAcross.held_yield)
+    @test !flagged(HeldAcross.no_suspend)
+    @test flagged(HeldAcross.held_callee)
+    @test !flagged(HeldAcross.refetched)
+    @test !flagged(HeldAcross.grow_use)
+    @test flagged(HeldAcross.grow_yield_use)
+    HeldAcross.merged(true); HeldAcross.merged(false)
+    @test any(v -> v.certain, StrictMode.threadid_state_findings(HeldAcross.merged, (Bool,)))
 end

@@ -163,7 +163,7 @@ end
     # One implementation serves both tiers through `_compiled_output_finding`, because no backend
     # has anything to say about a `Threads.threadid()`-indexed store. A second copy could only drift.
     tls = [0.0]
-    dirty() = (tls[Threads.threadid()] += 1.0)
+    dirty() = (i = Threads.threadid(); yield(); tls[i] += 1.0)   # held across a yield
     clean(x::Float64) = x + 1.0
     dirty(); clean(1.0)
 

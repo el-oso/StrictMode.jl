@@ -800,8 +800,9 @@ end
 
 # ── Phase 2 lints (lower priority) ─────────────────────────────────────────────────────────────
 
-# `:no_threadid_state` — flag `Threads.threadid()`-indexed MUTABLE state. Under Julia's task
-# migration a task can move between threads mid-run, so `state[threadid()]` is a race hazard. We
+# `:no_threadid_state` — flag `Threads.threadid()`-indexed MUTABLE state that is still in use after a
+# point where the task can be suspended (`_held_across_suspension`, below): only there can another
+# task run on this thread, or this one move to another. The write scan here finds the state; we
 # taint the `threadid()` result (+ integer arithmetic on it, + a `memoryrefnew(mem, tid_idx)`
 # handle built from it) and flag any store whose container/index is threadid-derived.
 #
@@ -813,10 +814,8 @@ end
 # — because the mark carries through a `_PROJECT_OPS` read whose result can hold a reference. A
 # scalar copied out of a slot does not carry it: an `Int` can never be a store's container.
 #
-# Three documented limits. It does NOT track a threadid stashed into another array and reused
-# later. It does not follow `:invoke`, so a write inside a callee the optimizer left out of line is
-# missed, and no other signature catches that one either — the taint is in the caller and the store
-# is in the callee. And a lock STRIPED by thread (`lock(locks[threadid()])`) is reported: the
+# Two documented limits. It does NOT track a threadid stashed into another array and reused later.
+# And a lock STRIPED by thread (`lock(locks[threadid()])`) is reported: the
 # inlined fast path writes a field of a lock chosen by `threadid()`, which is literally what this
 # flags. It is not a data race, since a `ReentrantLock` is owned by the task rather than the
 # thread, but striping locks that way buys nothing under migration, so the report is a lead.
@@ -846,6 +845,16 @@ function _is_threadid_foreigncall(st)
 end
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
+    out, code, tainted, fr = _threadid_scan(f, types)
+    isempty(out) && return out
+    return _held_across_suspension(code, tainted, out, fr)
+end
+
+# Every write to threadid-indexed state in the body, whether or not the state is still in use after a
+# suspension point. `threadid_state_findings` keeps them only when it is.
+_threadid_writes(@nospecialize(f), @nospecialize(types::Tuple)) = first(_threadid_scan(f, types))
+
+function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
         _code_typed(f, types; optimize = true)
     catch err
@@ -882,9 +891,12 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
                 mark(tid, true); continue
             elseif st isa Core.PiNode
                 isdefined(st, :val) && _op_tainted(st.val, tid, ()) && mark(tid, true)
+                isdefined(st, :val) && _op_tainted(st.val, tidref, ()) && mark(tidref, true)
                 continue
             elseif st isa Core.PhiNode
+                # A merge of a per-thread reference with anything else may still be the per-thread one.
                 _any_phi_tainted(st, tid, ()) && mark(tid, true)
+                _any_phi_tainted(st, tidref, ()) && mark(tidref, true)
                 continue
             end
             # `:invoke_modify` as above: `@atomic BUF[Threads.threadid()].value += 1` is the
@@ -957,7 +969,99 @@ function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
             end
         end
     end
-    return out
+    return (out, code, union(tid, tidref), fr)
+end
+
+# Per-thread state is shared only by tasks that RUN on the same thread, and Julia moves a task, or lets
+# another run, only where it can be suspended: tasks are not preempted. A write to per-thread state is
+# therefore a hazard when the state is still in use after such a point, and safe when it is claimed
+# and released with none in between. So a body with writes is reported only when one of its
+# threadid-derived values is defined before a suspension point and used after it, along a path of the
+# control-flow graph; the writes are listed with that cause. Reported for certain when the suspension
+# was read, and conservatively when a callee could not be read in full.
+const _SUSPEND_NAMES = (:yield, :yieldto, :wait, :_wait, :wait_forever, :sleep, :fetch, :take!, :lock)
+
+const _SUSPEND_MEMO = Dict{Any, Symbol}()   # callee signature => :yes, :maybe or :no
+const _SUSPEND_LOCK = ReentrantLock()
+
+function _sig_may_suspend(@nospecialize(sig))
+    hit = @lock _SUSPEND_LOCK get(_SUSPEND_MEMO, sig, nothing)
+    isnothing(hit) || return hit
+    r = try
+        _reach(sig, Set{Tuple{Module, Symbol}}())
+    catch
+        nothing
+    end
+    v = if isnothing(r)
+        :maybe
+    elseif any(k -> k[2] in _SUSPEND_NAMES && _sw_is_base(k[1]), keys(r.found))
+        :yes
+    else
+        (r.unread > 0 || r.dynamic > 0) ? :maybe : :no
+    end
+    @lock _SUSPEND_LOCK (_SUSPEND_MEMO[sig] = v)
+    return v
+end
+
+function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vector{_ConcViol}, fr::_Frame)
+    cfg = Core.Compiler.compute_basic_blocks(code)
+    blk = [Core.Compiler.block_for_inst(cfg, i) for i in eachindex(code)]
+    nb = length(cfg.blocks)
+    # `breach[a]`: the blocks reachable from block `a` along at least one edge.
+    breach = map(1:nb) do a
+        seenb = falses(nb); stack = copy(cfg.blocks[a].succs)
+        while !isempty(stack)
+            b = pop!(stack); seenb[b] && continue; seenb[b] = true
+            append!(stack, cfg.blocks[b].succs)
+        end
+        seenb
+    end
+    reaches(i, j) = (blk[i] == blk[j] && i < j) || breach[blk[i]][blk[j]]
+    uses = Dict{Int, Vector{Int}}()
+    function adduses!(@nospecialize(x), at::Int)
+        if x isa Core.SSAValue
+            x.id in tainted && push!(get!(Vector{Int}, uses, x.id), at)
+        elseif x isa Expr
+            foreach(a -> adduses!(a, at), x.args)
+        elseif x isa Core.PiNode
+            adduses!(x.val, at)
+        elseif x isa Core.PhiNode
+            for j in eachindex(x.values)
+                isassigned(x.values, j) && adduses!(x.values[j], at)
+            end
+        elseif x isa Core.ReturnNode && isdefined(x, :val)
+            adduses!(x.val, at)
+        end
+    end
+    for (i, st) in enumerate(code)
+        adduses!(st, i)
+    end
+    for (s, st) in enumerate(code)
+        (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) || continue
+        isinv = st.head === :invoke
+        nm = _resolve_callee_name(isinv ? st.args[2] : st.args[1], code)
+        kind = if !isnothing(nm) && nm in _SUSPEND_NAMES
+            :yes
+        elseif isinv
+            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+            # A once-guard's one-time init locks, and so could suspend, but it is Base's own path to
+            # the per-thread slot rather than a use of state the caller holds.
+            !(mi isa Core.MethodInstance) ? :maybe : _mi_is_barrier(mi) ? :no : _sig_may_suspend(mi.specTypes)
+        else
+            :no
+        end
+        kind === :no && continue
+        for d in tainted
+            reaches(d, s) || continue
+            any(u -> reaches(s, u), get(uses, d, Int[])) || continue
+            what = isnothing(nm) ? "a call" : "`$(_demangle(nm))`"
+            msg = "holds per-thread (`Threads.threadid()`-indexed) state across $what, which " *
+                (kind === :yes ? "can suspend the task" : "may suspend the task (not read in full)") *
+                ": another task can then run on this thread and use the same state"
+            return [_ConcViol(msg, fr.file, fr.line, kind === :yes, false); writes]
+        end
+    end
+    return _ConcViol[]
 end
 
 # Whether the callee `mi` writes its argument `k`, by the concurrency scan's own reading of a write
@@ -1031,10 +1135,14 @@ end
 """
     @assert_no_threadid_state f(args...)
 
-Fail if `f` writes **mutable state indexed by `Threads.threadid()`** (best-effort, value-free IR
-scan). Because a Julia task can migrate between OS threads mid-execution, `buffer[threadid()] = …`
-is a data-race hazard — two tasks can hit the same slot. Prefer a per-task buffer or a captured
-task-local id.
+Fail if `f` writes **mutable state indexed by `Threads.threadid()`** and that state is still in use
+after a point where the task can be suspended (best-effort, value-free IR scan). Julia does not
+preempt a task: it moves one to another thread, or lets another run on its thread, only where it can
+be suspended — a `yield`, `wait`, `sleep`, `fetch`, `take!`, a lock that may block, or a call that
+reaches one. So `i = threadid(); yield(); buf[i] += 1` is a data race, two tasks writing the same
+slot, while `buf[threadid()] += 1` with no such point in between is not. Callees are followed for
+the suspension point, as for the write; one the scan could not read in full is reported without
+gating. Prefer a per-task buffer, looked up where the task starts and passed down.
 
 Detects a store to `buf[threadid()]`, and a store into an object loaded out of such a slot —
 `buf[threadid()].field = …`, `buf[threadid()][i] = …`, `rand(rngs[threadid()])`. A scalar read out
