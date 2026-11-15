@@ -196,3 +196,50 @@ end
     # The chain names the package method that read it.
     @test occursin("getproperty", only(first(StrictMode._foreign_sites(F.e_prop, P, (1,)))))
 end
+
+@testitem "a read is found through Base, containers, keywords, C and recursion" begin
+    using StrictMode
+    module ForeignDeep
+    mutable struct State; p::Ptr{Int}; State() = new(C_NULL); end
+    struct It; p::Ptr{Int}; n::Int; end
+    Base.iterate(it::It, i = 1) = i > it.n ? nothing : (unsafe_load(it.p, i), i + 1)
+    Base.length(it::It) = it.n
+    kwf(; ptr) = unsafe_load(ptr)
+    r_rec(p, n) = n == 0 ? unsafe_wrap(Array, p, 4) : (a = r_rec(p, n - 1); a[1]; a)
+    r_hof(p::Ptr{Int}, n) = sum(i -> unsafe_load(p, i), 1:n)
+    r_gen(p::Ptr{Int}, n) = sum(unsafe_load(p, i) for i in 1:n)
+    r_iter(p::Ptr{Int}, n) = collect(It(p, n))
+    r_ref(p::Ptr{Int}, n) = (r = Ref{Ptr{Int}}(); r[] = p; unsafe_load(r[]))
+    r_vec(p::Ptr{Int}, n) = (v = Ptr{Int}[]; push!(v, p); unsafe_load(v[1]))
+    r_state(p::Ptr{Int}, n) = (s = State(); s.p = p; unsafe_load(s.p))
+    r_box(p::Ptr{Int}, n) = (q = p; q = q + 8; g() = unsafe_load(q); g())
+    r_kw(p::Ptr{Int}, n) = kwf(; ptr = p)
+    r_memcpy(p::Ptr{Int}, n) = (b = zeros(Int, n); ccall(:memcpy, Ptr{Cvoid}, (Ptr{Int}, Ptr{Int}, Csize_t), b, p, 8n); b[1])
+    r_write(p::Ptr{Int}, n) = unsafe_write(IOBuffer(), p, n)
+    r_recur(p::Ptr{Int}, n) = length(r_rec(p, 2))
+    n_ptrarith(p::Ptr{Int}, n) = (a = unsafe_wrap(Array, p, n); pointer(a) + 8 == C_NULL)
+    n_lin(p::Ptr{Int}, n) = length(LinearIndices(unsafe_wrap(Array, p, n)))
+    n_fill(p::Ptr{Int}, n) = (fill!(unsafe_wrap(Array, p, n), 0); nothing)
+    n_throw(p::Ptr{Int}, n) = p == C_NULL ? throw(ArgumentError("null: $p")) : 1
+    end
+    F = ForeignDeep
+    PN = (Ptr{Int}, Int)
+    reads(f) = !isempty(first(StrictMode._foreign_sites(f, PN, (1,))))
+    clear(f) = (r = StrictMode._foreign_sites(f, PN, (1,)); isempty(r[1]) && isempty(r[2]))
+    for f in (F.r_hof, F.r_gen, F.r_iter, F.r_ref, F.r_vec, F.r_state, F.r_kw, F.r_memcpy, F.r_write, F.r_recur)
+        @test reads(f)
+    end
+    # A reassigned captured variable lives in a `Core.Box`, typed `Any`: not resolvable, so not cleared.
+    @test !clear(F.r_box)
+    for f in (F.n_ptrarith, F.n_lin, F.n_fill, F.n_throw)
+        @test clear(f)
+    end
+    # Bounded: functions that all call each other give an answer, uncertain past the body budget.
+    m = Module(:AllCall)
+    for i in 1:7
+        calls = join(["(n > $j ? f$j(p + $j, n - 1) : 0)" for j in 1:7 if j != i], " + ")
+        Core.eval(m, Meta.parse("f$i(p::Ptr{Int}, n::Int) = $calls"))
+    end
+    t = @elapsed r = StrictMode._foreign_sites(getfield(m, :f1), PN, (1,))
+    @test isempty(r[1]) && t < 60
+end

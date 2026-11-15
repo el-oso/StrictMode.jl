@@ -234,21 +234,59 @@ end
 
 _foreign_positions(@nospecialize(f)) = @lock _FOREIGN_LOCK get(_FOREIGN_ENTRIES, f, ())
 
-# Two kinds of foreign value. A POINTER is the foreign address, or something holding it: an integer
-# made from it, a `Ref`, a struct. Arithmetic, comparison and conversion only carry it on; reading
-# through it (`unsafe_load`, `unsafe_string`, …) is the read. MEMORY is an array wrapped around the
-# address (`unsafe_wrap`): anything but asking its size, or taking a view or a pointer of it, reads it.
+# Two kinds of foreign value. An ADDRESS is the foreign pointer, or something holding it: an integer
+# made from it, a `Ref`, a struct. MEMORY is an array wrapped around it (`unsafe_wrap`). A read of the
+# foreign memory is what the check reports, and the rule is the safe one: a call is cleared only when it
+# is known not to read. A package method, and a Base method not on the lists below, is read like any
+# body down to the primitive loads (`pointerref`, `memoryrefget`), so a read hidden in a closure handed
+# to `sum`, an iterator, a broadcast or a task is found. A body that cannot be read — no single method,
+# a dynamic call, past the depth or the body budget — is reported as uncertain, never cleared.
 const _FK_PTR = Int8(1)
 const _FK_MEM = Int8(2)
 
-# Base functions that read through a foreign pointer.
-const _FOREIGN_PTR_READS = (unsafe_load, unsafe_string, unsafe_pointer_to_objref, Base.unsafe_copyto!, unsafe_read)
-# Base functions that ask a foreign array about its shape without reading its elements.
+# Base functions that only carry an address on: the result is an address too.
+const _FOREIGN_ADDR_OPS = (
+    +, -, *, %, rem, div, ÷, mod, &, |, xor, <<, >>, >>>, ==, !=, <, <=, >, >=, isequal, isless,
+    iszero, isone, UInt, Int, UInt64, Int64, UInt32, Int32, UInt8, convert, reinterpret, oftype, identity,
+    Base.unsafe_convert, Base.cconvert, Base.bitcast, string, repr, hash, print, println, show,
+    Ref, getindex, unsafe_store!, unsafe_read,
+)
+# Base functions that read the memory behind an address.
+const _FOREIGN_ADDR_READS = (
+    unsafe_load, unsafe_string, unsafe_pointer_to_objref, Base.unsafe_copyto!, unsafe_write,
+    Base.unsafe_swap!, Base.unsafe_modify!, Base.unsafe_replace!, Base.memcmp,
+)
+const _FOREIGN_READ_INTRINSICS = (:pointerref, :atomic_pointerref, :atomic_pointerswap,
+    :atomic_pointermodify, :atomic_pointerreplace, :memoryrefget, :arrayref, :memoryrefswap!,
+    :memoryrefmodify!, :memoryrefreplace!)
+# Base functions that ask a foreign array about its shape, or write to it, without reading it.
 const _FOREIGN_MEM_META = (
     length, size, axes, eachindex, firstindex, lastindex, isempty, ndims, eltype, sizeof, strides, stride,
+    LinearIndices, CartesianIndices, keys, checkbounds, similar, setindex!, fill!,
 )
-# Base functions that give another handle on the same foreign memory without reading it.
-const _FOREIGN_MEM_VIEWS = (view, reshape, vec, pointer, Base.unsafe_convert, Base.cconvert)
+# Base functions that give another handle on the same foreign memory, or its address.
+const _FOREIGN_MEM_VIEWS = (view, reshape, vec, reinterpret)
+const _FOREIGN_MEM_ADDR = (pointer, Base.unsafe_convert, Base.cconvert)
+# Builtins that only read or rearrange their arguments: the result has their kind.
+const _FOREIGN_PURE_BUILTINS = (:getfield, :tuple, :typeassert, :ifelse, :svec, :memoryrefnew, :memoryref,
+    :fieldtype, :apply_type, :compilerbarrier, :donotdelete, :getglobal, :nfields, :sizeof, :typeof)
+const _FOREIGN_STORE_BUILTINS = (:setfield!, :memoryrefset!, :swapfield!, :modifyfield!, :replacefield!,
+    :setfieldonce!, :memoryrefsetonce!, :arrayset)
+
+const _FOREIGN_DEPTH = 32
+const _FOREIGN_BUDGET = 1000
+_note!(v::Vector{String}, s::String) = (s in v) ? false : (push!(v, s); true)
+
+# The most foreign value a body that was not read can return: an address for a number or a pointer,
+# which can still hold one, and memory for anything else.
+function _assumed_kind(@nospecialize(sig))
+    rt = try
+        last(only(_code_typed_by_type(sig; optimize = false)))
+    catch
+        Any
+    end
+    return (rt isa Type && isbitstype(rt) && (rt <: Number || rt <: Ptr)) ? _FK_PTR : _FK_MEM
+end
 
 # The method a call resolves to, or `nothing` when it is not exactly one.
 function _foreign_method(@nospecialize(sig))
@@ -261,21 +299,27 @@ function _foreign_method(@nospecialize(sig))
     return ms[1].method
 end
 
-# `(certain, uncertain, returned_kind)` for the body `sig` names, with `kinds` the foreign kind of
-# each argument position (0 is the callable itself). `certain` names each read and the chain of
-# package calls that reached it; `uncertain` names a call that could not be resolved to one method.
+# The function a signature calls, when its type has a single instance.
+_sig_function(@nospecialize(sig)) = (fT = sig.parameters[1]; fT isa DataType && isdefined(fT, :instance) ? fT.instance : nothing)
+
+# `(certain, uncertain, returned_kind, stores)` for the body `sig` names, with `kinds` the foreign kind
+# of each argument position (0 is the callable itself). `stores` maps an argument position to the kind of
+# foreign value the body stored into it, so a caller's container is marked by a write in a callee.
 function _foreign_reads(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, depth::Int, st::Dict{Symbol, Any})
     memo = st[:memo]
     key = (sig, kinds)
     hit = get(memo, key, nothing)
     if hit === :pending
-        # A recursive call to a body still being read: assume for now that it reads nothing and
-        # returns the most foreign of its inputs. Its own reading covers the same body, so a read
-        # there is still found; a result that rests on this is not saved until it is settled.
+        # A recursive call to a body still being read: assume it returns the most foreign value its
+        # return type can hold (an address for a number or a pointer, memory otherwise) and stores
+        # nothing new. Its own reading covers the same body, so a read there is still found; a result
+        # resting on this is not saved until it is settled.
         push!(st[:assumed], key)
-        return (String[], String[], maximum(last, kinds; init = Int8(0)))
+        return (String[], String[], _assumed_kind(sig), Dict{Int, Int8}())
     end
     isnothing(hit) || return hit
+    st[:budget] -= 1
+    st[:budget] < 0 && return (String[], [join([chain; "past the body budget ($_FOREIGN_BUDGET bodies)"], " → ")], _assumed_kind(sig), Dict{Int, Int8}())
     outer = st[:assumed]
     st[:assumed] = Set{Any}()
     memo[key] = :pending
@@ -289,6 +333,7 @@ end
 function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, depth::Int, st::Dict{Symbol, Any})
     certain = String[]
     uncertain = String[]
+    stores = Dict{Int, Int8}()
     here(what) = join([chain; what], " → ")
     cts = try
         _code_typed_by_type(sig; optimize = false)
@@ -297,7 +342,7 @@ function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, 
     end
     if length(cts) != 1
         push!(uncertain, here("no single typed body for $(sig)"))
-        return (certain, uncertain, _FK_MEM)
+        return (certain, uncertain, _FK_MEM, stores)
     end
     ci = first(cts[1])
     code = ci.code
@@ -305,17 +350,52 @@ function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, 
     m = _foreign_method(sig)
     nargs = isnothing(m) ? nslots : Int(m.nargs)
     isva = !isnothing(m) && m.isva
+    argslot(k) = (s = k + 1; isva && s > nargs ? nargs : s)
     slotk = Dict{Int, Int8}()
     for (k, kd) in kinds
-        s = k + 1
-        isva && s > nargs && (s = nargs)               # past the last named argument: the vararg tuple
+        s = argslot(k)
         1 <= s <= nslots && (slotk[s] = max(get(slotk, s, Int8(0)), kd))
     end
     ssak = Dict{Int, Int8}()
     kind(@nospecialize(a)) = a isa Core.SSAValue ? get(ssak, a.id, Int8(0)) :
         (a isa Core.SlotNumber || a isa Core.Argument) ? get(slotk, a isa Core.SlotNumber ? a.id : a.n, Int8(0)) : Int8(0)
-    returns = Int8(0)
     changed = true
+    # A container a foreign value was stored into becomes foreign itself. Walking back from a field or
+    # element reference reaches the object written; an argument slot is reported to the caller.
+    function mark!(@nospecialize(c), kd::Int8)
+        for _ in 1:8
+            if c isa Core.SlotNumber || c isa Core.Argument
+                s = c isa Core.SlotNumber ? c.id : c.n
+                get(slotk, s, Int8(0)) < kd && (slotk[s] = kd; changed = true)
+                2 <= s <= nargs && (get(stores, s - 1, Int8(0)) < kd) && (stores[s - 1] = kd; changed = true)
+                return
+            elseif c isa Core.SSAValue
+                get(ssak, c.id, Int8(0)) < kd && (ssak[c.id] = kd; changed = true)
+                s = code[c.id]
+                if s isa Core.SSAValue || s isa Core.SlotNumber || s isa Core.Argument
+                    c = s                                   # a copy of the variable that holds it
+                    continue
+                elseif s isa Core.PiNode
+                    c = s.val
+                    continue
+                elseif s isa GlobalRef
+                    _note!(uncertain, here("foreign data stored into the global `$(s.name)`")) && (changed = true)
+                    return
+                end
+                callee, args = _call_callee_and_args(ci, s)
+                if (callee === Base.cconvert || callee === Base.unsafe_convert) && length(args) >= 2
+                    c = args[2]                             # the object a C argument was converted from
+                    continue
+                end
+                (callee === Core.memoryrefnew || callee === Core.getfield || callee === Base.getproperty) && !isempty(args) || return
+                c = args[1]
+            else
+                c isa GlobalRef && _note!(uncertain, here("foreign data stored into the global `$(c.name)`")) && (changed = true)
+                return                                      # a literal holds nothing
+            end
+        end
+    end
+    returns = Int8(0)
     while changed
         changed = false
         for (i, st0) in enumerate(code)
@@ -333,14 +413,25 @@ function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, 
             elseif Meta.isexpr(s, :new) || Meta.isexpr(s, :splatnew)
                 out = maximum(kind, @view(s.args[2:end]); init = Int8(0))
             elseif Meta.isexpr(s, :foreigncall)
-                # Handed back to C is not a read, except to Julia's own runtime, which reads it.
+                # Handed back to C is not a read, except to Julia's own runtime, which reads it. What C
+                # returns from foreign data is foreign, and so is any buffer it was handed beside it,
+                # since C may copy the foreign data into it (`memcpy`).
                 fn = string(_fcall_name(s))
-                any(a -> kind(a) > 0, s.args) && startswith(fn, "jl_") &&
-                    (changed |= _note!(certain, here("`$fn` (Julia runtime) reads foreign memory")))
+                fk = maximum(kind, s.args; init = Int8(0))
+                if fk > 0
+                    startswith(fn, "jl_") && (changed |= _note!(certain, here("`$fn` (Julia runtime) reads foreign memory")))
+                    for a in s.args
+                        (a isa Core.SSAValue || a isa Core.SlotNumber) && kind(a) < _FK_MEM && mark!(a, _FK_MEM)
+                    end
+                    out = fk
+                end
             elseif Meta.isexpr(s, :call) || Meta.isexpr(s, :invoke)
-                out, c, u = _foreign_call(ci, s, kind, here, chain, depth, st)
+                out, c, u, sto = _foreign_call(ci, s, kind, here, chain, depth, st)
                 for x in c; changed |= _note!(certain, x); end
                 for x in u; changed |= _note!(uncertain, x); end
+                for (a, kd) in sto
+                    mark!(a, kd)
+                end
             end
             if out > 0
                 if lhs isa Core.SlotNumber
@@ -350,61 +441,70 @@ function _foreign_body(@nospecialize(sig), kinds::Tuple, chain::Vector{String}, 
             end
         end
     end
-    return (certain, uncertain, returns)
+    return (certain, uncertain, returns, stores)
 end
 
-# One call statement: `(result_kind, certain, uncertain)`.
+# One call statement: `(result_kind, certain, uncertain, stores)`, `stores` naming each argument
+# expression the call stored a foreign value into, with its kind.
 function _foreign_call(ci, s::Expr, kind, here, chain, depth::Int, st::Dict{Symbol, Any})
+    none = Pair{Any, Int8}[]
     isinv = s.head === :invoke
     fx = isinv ? s.args[2] : s.args[1]
     args = Vector{Any}(isinv ? s.args[3:end] : s.args[2:end])
     callee = _unopt_callee(ci, fx)
     selfk = kind(fx)
-    if callee === Core.kwcall && length(args) >= 2       # keyword call: the callee is its second argument
-        fx = args[2]; callee = _unopt_callee(ci, fx); selfk = kind(fx); args = args[3:end]
-    end
     ks = Int8[kind(a) for a in args]
-    (selfk == 0 && all(iszero, ks)) && return (Int8(0), String[], String[])
-    nm = string(_callable_name(isnothing(callee) ? _unopt_arg_type(ci, fx) : callee))
+    (selfk == 0 && all(iszero, ks)) && return (Int8(0), String[], String[], none)
+    mk = max(selfk, maximum(ks; init = Int8(0)))
     if callee isa Core.Builtin || callee isa Core.IntrinsicFunction
-        if callee === Core.Intrinsics.pointerref || callee === Core.memoryrefget || nameof(callee) === :arrayref
-            return (Int8(0), [here("`$nm` reads foreign memory")], String[])
-        elseif callee === Core._apply_iterate || callee === Core.invoke || callee === Core._call_latest
-            return (_FK_MEM, String[], [here("`$nm` calls a function this scan does not resolve")])
-        elseif callee === (===) || callee === Core.isa || callee === Core.isdefined
-            return (Int8(0), String[], String[])
+        nm = nameof(callee)
+        nm in _FOREIGN_READ_INTRINSICS && return (Int8(0), [here("`$nm` reads foreign memory")], String[], none)
+        if nm in _FOREIGN_STORE_BUILTINS
+            # The value stored is every argument after the container; the container takes its kind.
+            vk = length(ks) >= 2 ? maximum(@view ks[2:end]) : Int8(0)
+            return (Int8(0), String[], String[], vk > 0 ? Pair{Any, Int8}[args[1] => vk] : none)
         end
-        return (max(selfk, maximum(ks)), String[], String[])
+        # Comparing, testing a type, or throwing (an error message that names the address) is not a read.
+        (nm === :(===) || nm === :isa || nm === :isdefined || nm === :throw) && return (Int8(0), String[], String[], none)
+        (callee isa Core.IntrinsicFunction || nm in _FOREIGN_PURE_BUILTINS) && return (mk, String[], String[], none)
+        return (_FK_MEM, String[], [here("the builtin `$nm` is handed foreign data")], none)
     end
-    callee in _TRUST_BOUNDARIES && return (Int8(0), String[], String[])
+    callee in _TRUST_BOUNDARIES && return (Int8(0), String[], String[], none)
     argT = Any[_unopt_arg_type(ci, a) for a in args]
     csig = Tuple{isnothing(callee) ? _unopt_arg_type(ci, fx) : Core.Typeof(callee), argT...}
+    fobj = isnothing(callee) ? _sig_function(csig) : callee
+    nm = string(_callable_name(isnothing(fobj) ? csig.parameters[1] : fobj))
     m = _foreign_method(csig)
-    if isnothing(m)
-        return (_FK_MEM, String[], [here("$nm (no single method for its argument types) is handed foreign data")])
+    isnothing(m) && return (_FK_MEM, String[], [here("$nm (no single method for its argument types) is handed foreign data")], none)
+    # A keyword call into a listed Base function is judged as that function.
+    lf = fobj
+    if fobj === Core.kwcall && length(args) >= 2
+        lf = _unopt_callee(ci, args[2])
+        kind(args[1]) == 0 || (lf = nothing)              # a foreign value passed by keyword: read the body
     end
-    if !_sw_is_base(m.module)
-        depth >= _FOREIGN_DEPTH && return (_FK_MEM, String[], [here("`$nm` (deeper than $_FOREIGN_DEPTH calls, not read)")])
-        kinds = Tuple(sort!([(0 => selfk); [k => ks[k] for k in eachindex(ks)]]; by = first))
-        kinds = Tuple(p for p in kinds if last(p) > 0)
-        c, u, r = _foreign_reads(csig, kinds, [chain; nm], depth + 1, st)
-        return (r, c, u)
+    lks = fobj === Core.kwcall ? ks[3:end] : ks
+    lmem = any(==(_FK_MEM), lks) || selfk == _FK_MEM
+    if _sw_is_base(m.module) && !isnothing(lf)
+        any(f -> f === lf, _FOREIGN_ADDR_READS) && return (Int8(0), [here("`$nm` reads foreign memory")], String[], none)
+        lf === unsafe_wrap && return (_FK_MEM, String[], String[], none)
+        if lmem
+            any(f -> f === lf, _FOREIGN_MEM_ADDR) && return (_FK_PTR, String[], String[], none)
+            any(f -> f === lf, _FOREIGN_MEM_VIEWS) && return (_FK_MEM, String[], String[], none)
+            any(f -> f === lf, _FOREIGN_MEM_META) && return (Int8(0), String[], String[], none)
+            # Any other Base function handed the foreign array itself reads its elements.
+            return (Int8(0), [here("`$nm` reads foreign memory")], String[], none)
+        else
+            any(f -> f === lf, _FOREIGN_ADDR_OPS) && return (_FK_PTR, String[], String[], none)
+            lf isa Type && lf <: Ptr && return (_FK_PTR, String[], String[], none)
+        end
     end
-    # A Base method, judged by what it does with each kind of foreign value.
-    anymem = selfk == _FK_MEM || any(==(_FK_MEM), ks)
-    any(f -> f === callee, _FOREIGN_PTR_READS) && return (Int8(0), [here("`$nm` reads foreign memory")], String[])
-    callee === unsafe_wrap && return (_FK_MEM, String[], String[])
-    if anymem
-        any(f -> f === callee, _FOREIGN_MEM_META) && return (Int8(0), String[], String[])
-        any(f -> f === callee, _FOREIGN_MEM_VIEWS) && return (_FK_MEM, String[], String[])
-        return (Int8(0), [here("`$nm` reads foreign memory")], String[])
-    end
-    # Only the address: arithmetic, comparison, conversion carry it on.
-    return (_FK_PTR, String[], String[])
+    # Anything else is read: its own body decides.
+    depth >= _FOREIGN_DEPTH && return (_FK_MEM, String[], [here("`$nm` (deeper than $_FOREIGN_DEPTH calls, not read)")], none)
+    kinds = Tuple(p for p in sort!([(0 => selfk); [k => ks[k] for k in eachindex(ks)]]; by = first) if last(p) > 0)
+    c, u, r, sto = _foreign_reads(csig, kinds, [chain; nm], depth + 1, st)
+    stored = Pair{Any, Int8}[(k == 0 ? fx : args[k]) => kd for (k, kd) in sto if (k == 0 || k <= length(args))]
+    return (r, c, u, stored)
 end
-
-const _FOREIGN_DEPTH = 32
-_note!(v::Vector{String}, s::String) = (s in v) ? false : (push!(v, s); true)
 
 # The foreign-pointer half of `:trusted` for one signature: `(certain, uncertain)`, both empty when
 # no position is declared.
@@ -417,8 +517,8 @@ function _foreign_sites(@nospecialize(f), @nospecialize(types::Tuple), positions
     end
     # A declared position holding an array is foreign memory already; anything else is an address.
     kinds = Tuple(sort!([k => (types[k] <: AbstractArray ? _FK_MEM : _FK_PTR) for k in positions]; by = first))
-    st = Dict{Symbol, Any}(:memo => Dict{Any, Any}(), :assumed => Set{Any}())
-    c, u, _ = _foreign_reads(Tuple{Core.Typeof(f), types...}, kinds, String[string(_callable_name(f))], 0, st)
+    st = Dict{Symbol, Any}(:memo => Dict{Any, Any}(), :assumed => Set{Any}(), :budget => _FOREIGN_BUDGET)
+    c, u, _, _ = _foreign_reads(Tuple{Core.Typeof(f), types...}, kinds, String[string(_callable_name(f))], 0, st)
     return (c, u)
 end
 

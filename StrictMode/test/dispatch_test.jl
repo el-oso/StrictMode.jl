@@ -260,3 +260,12 @@ end
     @test code(Narrowed.fb, (Narrowed.B,)) === :SM0103     # the abstract field
     @test code(Narrowed.fa, (String, Bool)) === :SM0108    # a returned argument has its declared type
 end
+
+@testitem "narrowing a small concrete union keeps the union as the cause" begin
+    using StrictMode
+    module SmallUnion
+    f5(x::Union{Int, Float64}) = x isa Int ? x : "s"
+    end
+    SmallUnion.f5(1)
+    @test only(StrictMode.findings(SmallUnion.f5, (Union{Int, Float64},); guarantees = (:typestable,))).code === :SM0108
+end

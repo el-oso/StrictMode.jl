@@ -741,3 +741,31 @@ end
         @test !isempty(StrictMode._escaping_scoped(Tuple{typeof(f)}).escaped)
     end
 end
+
+@testitem ":noescape reads throwing callees, called closures, and containers made in the frame" begin
+    using StrictMode
+    module Leaves2
+    mutable struct H; buf::Vector{Float64}; end
+    mutable struct W; h::Any; end
+    struct HErr <: Exception; h::H; end
+    const G = Ref{Any}(nothing)
+    const GV = Any[]
+    mk() = H(zeros(4))
+    @noinline use(h) = (h.buf[1] = 1.0; nothing)
+    @noinline thrower(h) = throw(HErr(h))
+    @noinline logfail(h) = (push!(GV, h); error("x"))
+    @noinline callit(g) = g()
+    e_logfail() = (h = mk(); use(h); logfail(h); 1)
+    e_catchcallee() = (h = mk(); try; thrower(h); catch e; G[] = e; end; 1)
+    e_closure() = (h = mk(); g = @noinline(() -> (G[] = h; nothing)); callit(g); 1)
+    e_freshret() = (h = mk(); r = Ref{Any}(); r[] = h; r)
+    c_w() = (h = mk(); w = W(nothing); w.h = h; use(w.h::H); 1)
+    end
+    StrictMode.register_scoped!(Leaves2.H)
+    esc(f) = (try; f(); catch; end; !isempty(StrictMode._escaping_scoped(Tuple{typeof(f)}).escaped))
+    @test esc(Leaves2.e_logfail)          # a callee that stores the handle and then throws
+    @test esc(Leaves2.e_catchcallee)      # thrown in a callee, caught here
+    @test esc(Leaves2.e_closure)          # a closure holding the handle, called
+    @test esc(Leaves2.e_freshret)         # stored into a fresh Ref that is returned
+    @test !esc(Leaves2.c_w)               # stored into a struct made here and used here
+end

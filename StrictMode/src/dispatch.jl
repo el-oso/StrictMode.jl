@@ -252,7 +252,9 @@ function _returned_types(ci::Core.CodeInfo)
             src = ci.code[v.id].val
             S = src isa Core.SSAValue ? Core.Compiler.widenconst(tys[src.id]) :
                 src isa Core.Argument && ci.slottypes isa Vector ? Core.Compiler.widenconst(ci.slottypes[src.n]) : Any
-            isconcretetype(S) || (narrowed = true)
+            # Narrowing a small union of concrete types is the union itself; narrowing an abstract
+            # value (`Any`, an abstract field) makes the abstract declaration the cause.
+            all(isconcretetype, Base.uniontypes(S)) || (narrowed = true)
         end
         if v isa Core.SSAValue && ci.code[v.id] isa Core.PhiNode && depth < 4
             p = ci.code[v.id]

@@ -1228,12 +1228,21 @@ const _CONFINE_PURE_BUILTINS = (
 # The allocation a store's container was made from in this frame, walking back through the steps
 # that reach an array's memory; `nothing` when it was not made here.
 function _confine_fresh(code, @nospecialize(x))
-    for _ in 1:8
+    for _ in 1:16
         x isa Core.SSAValue || return nothing
         s = code[x.id]
         if s isa Core.PiNode
             x = s.val
             continue
+        elseif s isa Core.SSAValue
+            x = s                                       # an alias
+            continue
+        end
+        if s isa Core.PhiNode
+            # A merge of containers that were all made here is one of them.
+            all(k -> isassigned(s.values, k) && !isnothing(_confine_fresh(code, s.values[k])), eachindex(s.values)) &&
+                !isempty(s.values) && return x.id
+            return nothing
         end
         Meta.isexpr(s, :new) && return x.id
         Meta.isexpr(s, :foreigncall) && startswith(string(_fcall_name(s)), "jl_alloc") && return x.id
@@ -1259,9 +1268,10 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
     types = ir.stmts.type
     tset = copy(seed)
     tracked(@nospecialize(a)) = (a isa Core.SSAValue && a.id in tset) || (a isa Core.Argument && a.n in args)
-    # A frame that can catch receives what it throws back as `the_exception`, so a thrown value is
-    # only on the throw path when nothing here catches it.
-    catches = any(s -> s isa Core.EnterNode || Meta.isexpr(s, :enter), code)
+    # A thrown value reaches whichever frame catches it, here or in a caller this scan came through, so
+    # it is only on the throw path — which does not count, as `ignore_throw` decides for allocation —
+    # when no frame in the chain catches.
+    catches = get(st, :catching, false) || any(s -> s isa Core.EnterNode || Meta.isexpr(s, :enter), code)
     returns = false
     changed = true
     while changed
@@ -1289,6 +1299,7 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                 fx = isinv ? s.args[2] : s.args[1]
                 data = isinv ? s.args[3:end] : s.args[2:end]
                 hit = Int[k for k in eachindex(data) if tracked(data[k])]
+                tracked(fx) && pushfirst!(hit, 0)              # a closure or callable holding it, called
                 isempty(hit) && continue
                 f = _confine_callee(fx)
                 nm = _callee_name(fx)
@@ -1300,8 +1311,13 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                         # leaves with that memory's owner. Writing plain data through it does not.
                         pos = _STORE_OPS[nm]
                         stored = any(k -> k != pos, hit)
-                        fresh = 1 <= pos <= length(data) && !isnothing(_confine_fresh(code, data[pos]))
-                        (stored && !fresh) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
+                        fid = 1 <= pos <= length(data) ? _confine_fresh(code, data[pos]) : nothing
+                        (stored && isnothing(fid)) && return _esc!(st, "stored into an object it does not own (`$nm`)", i)
+                        # The container made here now holds it, so the container is tracked from here on.
+                        if stored
+                            add(fid)
+                            data[pos] isa Core.SSAValue && add(data[pos].id)
+                        end
                     elseif nm === :throw
                         catches && return _esc!(st, "thrown in a frame that catches it", i)
                         # otherwise the throw path, which does not count, as `ignore_throw` decides
@@ -1316,15 +1332,13 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                 elseif isinv
                     mi = s.args[1] isa Core.CodeInstance ? s.args[1].def : s.args[1]
                     (mi isa Core.MethodInstance && mi.def isa Method) || return _esc!(st, "an invoke with no method", i)
-                    # A call that only throws is the throw path, unless this frame catches it.
-                    (types[i] === Union{} && !catches) && continue
                     depth >= _CONFINE_DEPTH && return _esc!(st, "deeper than the depth limit: `$(mi.def.name)`", i)
                     st[:budget] = st[:budget] - 1
                     st[:budget] < 0 && return _esc!(st, "past the body budget at `$(mi.def.name)`", i)
                     # A position past the last named argument lands in the vararg tuple.
                     m = mi.def
                     pos = BitSet(m.isva ? min(k + 1, Int(m.nargs)) : k + 1 for k in hit)
-                    key = (mi, Tuple(pos))
+                    key = (mi, Tuple(pos), catches)
                     r = get(st[:memo], key, nothing)
                     if r === :pending
                         # A recursive call to a callee still being read: assume for now that it does
@@ -1342,8 +1356,11 @@ function _confine(ir, seed::BitSet, args::BitSet, depth::Int, st::Dict{Symbol, A
                         catch
                             Any[]
                         end
+                        was = get(st, :catching, false)
+                        st[:catching] = catches
                         r = length(cirs) == 1 ?
                             _confine(first(cirs[1]), BitSet(), pos, depth + 1, st) : (true, false)
+                        st[:catching] = was
                         used = delete!(st[:assumed], key)
                         if isempty(used) || r[1]
                             st[:memo][key] = r          # an escape holds whatever was assumed
