@@ -522,42 +522,12 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
     end
 end
 
-# Could a read past an argument's end go unnoticed in this process? Only through code that skips
-# Julia's bounds checks: `@inbounds`, a pointer, a `ccall` or an `unsafe_*` call. Everything else
-# raises a `BoundsError` on such a read, so the in-process call already reports it. Every method
-# the call reaches is read, except the methods Base and Core define: those are trusted, as the
-# language is. A method another module adds to a Base function is read. The answer is `true`
-# whenever it cannot be established, so doubt costs a subprocess, never a missed read.
-function _may_read_unchecked(@nospecialize(f), @nospecialize(types::Tuple))
-    r = try
-        _reach(Base.signature_type(f, Tuple{types...}), Set{Tuple{Module, Symbol}}())
-    catch
-        return true
-    end
-    (r.unread > 0 || r.dynamic > 0 || isempty(r.methods)) && return true
-    for m in r.methods
-        root = Base.moduleroot(m.module)
-        (root === Base || root === Core) && continue
-        isempty(_unsafe_constructs(m)) || return true
-    end
-    return false
-end
-
-# A store past an end is found in this process, from the canary. A read past an end needs the
-# subprocess, because a read fault ends the process it happens in, and it runs only when a read
-# could skip the bounds check.
-function _memsafe_probe(@nospecialize(f), args::Tuple; using_module, align)
-    hit = _canary_probe(f, args; align)
-    isnothing(hit) || return "out-of-bounds WRITE detected: $hit."
-    _may_read_unchecked(f, map(Core.Typeof, args)) || return nothing
-    return _memsafe_probe_subprocess(f, args; using_module, align)
-end
-
 # --- public API -----------------------------------------------------------------------------------
 
 const _ISOLATE_REMOVED = "StrictMode @assert_memsafe: the `isolate` option was removed — the probe " *
-    "decides for itself: it runs in a subprocess whenever a read past an end could skip the bounds " *
-    "check, since such a read disturbs no canary. Drop `isolate=`."
+    "always runs in a subprocess. An in-process probe can only use the canary, and a load past the " *
+    "end disturbs no canary, so its clean verdict was indistinguishable from no overrun at all in " *
+    "exactly the case this harness exists for. Drop `isolate=`."
 
 """
     MemsafeReport
@@ -599,18 +569,10 @@ whether an out-of-bounds access was detected. Non-execution guarantees elsewhere
 (`check`/`findings`) are value-free by design; this one needs real argument values to build the
 guarded buffers, so it stays a `@golden`-style value-based function/macro pair instead.
 
-The call first runs **in this process**, with a writable, poisoned canary after each array. An
-out-of-bounds WRITE disturbs the canary and is reported with the argument and the byte offset; a
-bounds-checked READ past an end raises its own `BoundsError`. Neither needs a subprocess.
-
-A read can go past an end unnoticed only through code that skips bounds checks: `@inbounds`, a
-pointer, a `ccall` or an `unsafe_*` call. When any method the call reaches outside Base and Core
-uses one — or the call graph cannot be read in full — the probe also runs in a **subprocess**
-behind `PROT_NONE` guard pages, where the read faults and is observed through the child's exit
-instead of killing your session.
-
-The canary spans four pages past each array, so a store that lands further than that is not
-caught in-process and may corrupt this session.
+The probe always runs in a **subprocess**: a fatal out-of-bounds READ (a SIGSEGV) is then observed
+through the child's exit signal instead of killing your session, and that read is the motivating
+bug class. An out-of-bounds WRITE is localized by a poisoned canary the child reads back before it
+touches the guard pages, since a write fault's own backtrace is destroyed.
 
 - `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
   — the default (the element's own size) places the guard pages flush against the data.
@@ -654,7 +616,7 @@ function memsafe_report(
             "got Sys.KERNEL = $(Sys.KERNEL)."
     )
     target = _func_name(f) * _sig_string(map(typeof, args))
-    violation = _memsafe_probe(f, args; using_module, align)
+    violation = _memsafe_probe_subprocess(f, args; using_module, align)
     return MemsafeReport(target, violation, [d for (_, _, d) in _unguarded_args(args)])
 end
 
@@ -678,7 +640,7 @@ function _assert_memsafe(target, @nospecialize(f), args::Tuple; align, using_mod
         class === :struct && @warn "StrictMode @assert_memsafe: $d. The guarantee covers only the " *
             "`Array` arguments of `$target`." maxlog = 3
     end
-    violation = _memsafe_probe(f, args; using_module, align)
+    violation = _memsafe_probe_subprocess(f, args; using_module, align)
     isnothing(violation) || _fail(:memsafe, target, violation)
     return nothing
 end
@@ -693,8 +655,7 @@ Fail if `f(args...)` performs an **out-of-bounds array access** — a `PROT_NONE
 safety rather than allocation. See [`memsafe_report`](@ref) for the full semantics of `align` and
 `using_module`, and its scope/platform limitations.
 
-The probe runs on guard-page-backed **copies** of every `Array` argument, in this process and, when
-a read could skip the bounds check, in a subprocess too (see [`memsafe_report`](@ref)); the real
+The probe runs in a subprocess, on guard-page-backed **copies** of every `Array` argument; the real
 call then runs once more, in this process, on the original arguments, so `f`'s return value and any
 argument mutation are exactly as if you had called it plainly. Each argument expression is
 evaluated once; `f` itself runs twice (probe, then real) — precedented by

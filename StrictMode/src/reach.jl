@@ -57,9 +57,6 @@ const _REACH_MAX_METHODS = 4
 
 mutable struct _Reach
     found::Dict{Tuple{Module, Symbol}, ReachedFunction}
-    # The methods themselves: the bodies read, each method an invoke or a narrowed dispatch names,
-    # and each method inlined into a read body.
-    methods::Base.IdSet{Method}
     bodies::Int
     unread::Int
     dynamic::Int
@@ -84,7 +81,6 @@ function _reach_inlined!(r::_Reach, di, depth::Int, stop)
         e isa Core.DebugInfo || continue
         m = e.def isa Core.MethodInstance ? e.def.def : e.def
         if m isa Method
-            push!(r.methods, m)
             key = _reach_key(m)
             _reach_record!(r, key, depth, true)
             key in stop && continue
@@ -157,7 +153,6 @@ function _reach_dispatch!(
     end
     for match in ms
         m = match.method
-        push!(r.methods, m)
         (!_sw_is_base(m.module) || _sw_carries_user_function(match.spec_types)) &&
             push!(queue, (match.spec_types, depth))
     end
@@ -178,7 +173,6 @@ function _reach_scan!(
                 r.dynamic += 1
                 continue
             end
-            push!(r.methods, mi.def)
             key = _reach_key(mi.def)
             _reach_record!(r, key, depth, false)
             key in stop || !_sw_follows(mi) || push!(queue, (mi.specTypes, depth))
@@ -201,7 +195,7 @@ end
 
 # Breadth first, so a function's depth is its nearest occurrence.
 function _reach(@nospecialize(sig), stop)
-    r = _Reach(Dict{Tuple{Module, Symbol}, ReachedFunction}(), Base.IdSet{Method}(), 0, 0, 0)
+    r = _Reach(Dict{Tuple{Module, Symbol}, ReachedFunction}(), 0, 0, 0)
     seen = Set{Any}()
     queue = Any[(sig, 0)]
     while !isempty(queue)
@@ -222,8 +216,6 @@ function _reach(@nospecialize(sig), stop)
             ci = first(pr)
             ci isa Core.CodeInfo || continue
             read = true
-            mi = ci.parent
-            mi isa Core.MethodInstance && mi.def isa Method && push!(r.methods, mi.def)
             r.bodies += 1
             _reach_scan!(r, ci, s, d + 1, stop, queue)
         end
