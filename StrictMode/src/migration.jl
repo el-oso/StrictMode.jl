@@ -46,14 +46,27 @@ const _MIGRATION_MAP = (
     "@kernel" => "@test_kernel",
 )
 
+# A guard around a check needs no replacement. `proofs_loaded()` is the tempting one, and it is a
+# trap: it is false at a package's own precompile, where StrictModeTest cannot load, so a block of
+# `src/` gated on it never runs at all.
+const _NO_GATE_NEEDED = "removed — delete the guard: every StrictMode macro is already a bare call " *
+    "when `checks_enabled()` is false. Do not gate on `proofs_loaded()`, which is false at precompile"
+
+# `proofs_loaded()` names the tier a session is in. In `src/` or `ext/` it can only be read at the
+# package's own precompile, where it is false, so a check wrapped in it is a check that never runs.
+const _UNOPENED_GATES = (
+    "proofs_loaded" => "a guard that is false at this package's own precompile, so the block never " *
+        "runs there. Gate on `checks_enabled()`, or not at all: the macros already compile away",
+)
+
 # Names 0.4 DELETED. Unlike the macros above these are a hard break wherever they appear — a
 # `UndefVarError` at load — so `src/` is scanned for them too. Measured on the consumers to hand:
 # three of eight gate a block of `src/` on `analysis_mode()`/`backend_available()`/`fail_mode()`,
 # which stops those packages precompiling at all rather than merely stopping them gating.
 const _REMOVED_API = (
     "analysis_mode" => "removed — one engine per package; `checks_enabled()` is the on/off switch",
-    "backend_available" => "proofs_loaded()",
-    "trimcheck_available" => "proofs_loaded()",
+    "backend_available" => _NO_GATE_NEEDED,
+    "trimcheck_available" => _NO_GATE_NEEDED,
     "BackendUnavailable" => "removed — a proof cannot find its backend missing",
     "check_signatures" => "StrictModeTest.test_signatures",
     "check_compiled" => "StrictModeTest.test_compiled (or StrictMode.audit(mod; sweep = true) to report)",
@@ -77,6 +90,9 @@ stands**: it runs at the annotated package's own precompile, where `StrictModeTe
 by construction, so reporting is the only thing it can do. It is the copies in test and benchmark
 suites — where the proofs *are* available and gating is the whole point — that silently became
 non-gating.
+
+`src/` and `ext/` are scanned for one more thing: a `proofs_loaded()` guard. It is false at the
+package's own precompile, so a check block wrapped in it never runs there.
 
 `@assert_no_scalar_loops` has no proving counterpart (its check is a best-effort LLVM-IR pattern
 match with no authoritative oracle), so it is reported for visibility with no replacement.
@@ -173,6 +189,7 @@ function migration_report(
     # Deleted names are fatal wherever they appear, so every directory is scanned for them.
     broken = vcat((_scan(joinpath(root, d), _REMOVED_API) for d in (srcdirs..., dirs...))...)
     stale_docs = _scan_md(_REMOVED_API)
+    unopened = vcat((_scan(joinpath(root, d), _UNOPENED_GATES) for d in srcdirs)...)
     # Reporting macros are only a problem where the PROOF was available — a `src/` annotation
     # correctly reports, since StrictModeTest is not loadable at that package's own precompile.
     disarmed = vcat((_scan(joinpath(root, d), _MIGRATION_MAP) for d in dirs)...)
@@ -180,6 +197,13 @@ function migration_report(
     if !isempty(broken)
         println(io, "StrictMode 0.4: $(length(broken)) use(s) of DELETED API — these will not load.\n")
         for (path, n, from, to) in broken
+            println(io, "  ", path, ":", n, "  ", from, "  →  ", to)
+        end
+        println(io)
+    end
+    if !isempty(unopened)
+        println(io, "StrictMode: $(length(unopened)) guard(s) in source that are false at precompile.\n")
+        for (path, n, from, to) in unopened
             println(io, "  ", path, ":", n, "  ", from, "  →  ", to)
         end
         println(io)
@@ -210,5 +234,5 @@ function migration_report(
     end
     # The documentation count is deliberately NOT added: the return value is the number of sites
     # that change behavior, and a stale example changes none.
-    return length(broken) + length(disarmed)
+    return length(broken) + length(disarmed) + length(unopened)
 end

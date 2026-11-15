@@ -169,6 +169,21 @@ end
     @test n == 3                              # 2 deleted names in src/, 1 in test/
 end
 
+@testitem "migration_report flags a proofs_loaded guard in src/, the gate that never opens" begin
+    using StrictMode
+    # `proofs_loaded()` is false at a package's own precompile, so a check block wrapped in it never
+    # runs there. It is the tempting replacement for the deleted `backend_available()`.
+    root = mktempdir()
+    mkpath(joinpath(root, "src"))
+    write(joinpath(root, "src", "P.jl"), "if StrictMode.proofs_loaded()\n    @verify_strict Foo begin end\nend\n")
+    buf = IOBuffer()
+    n = migration_report(root; io = buf)
+    out = String(take!(buf))
+    @test n == 1
+    @test occursin("false at precompile", out) && occursin("src/P.jl:1", out)
+    @test occursin("delete the guard", StrictMode._NO_GATE_NEEDED)
+end
+
 @testitem "audit returns findings and renders nothing; the old kwargs name their replacement" begin
     using StrictMode
     StrictMode.clear_declarations!()
@@ -378,7 +393,7 @@ end
     @test occursin(StrictMode._removed_name_regex("set_ignore_barrier!", "StrictModeTest.set_ignore_barrier!"), "set_ignore_barrier!(true)")
     # The lookbehind belongs only to entries whose replacement is their own qualified spelling.
     @test !occursin(StrictMode._removed_name_regex("divergence_report", "StrictModeTest.divergence_report"), "StrictModeTest.divergence_report(x)")
-    @test occursin(StrictMode._removed_name_regex("backend_available", "proofs_loaded()"), "StrictMode.backend_available()")
+    @test occursin(StrictMode._removed_name_regex("backend_available", StrictMode._NO_GATE_NEEDED), "StrictMode.backend_available()")
 
     # The skip list is relative to the package root, so a checkout that merely SITS under a
     # directory called `deps` or `build` still has its own markdown read.
