@@ -170,29 +170,57 @@ function _is_boxing(@nospecialize(inst))
     return false
 end
 
-# Barrier-aware wrapper around `_raw_allocs`. Filtering AllocCheck's own per-instance backtraces to
-# attribute allocations to a barrier does not work in practice — measured on a real
-# `OncePerProcess`-memoized calibrator, 24 of 52 reported instances merge into generic Base
-# scheduler/lock/task internals ("multiple call sites") with no single traceable origin, even under
-# an exact type-based filter. So the exemption is granted at the STATIC-IR level instead (StrictMode's
-# `_alloc_signals` `barrier` signal): when a call is recognized as routing through a barrier AND the
-# barrier-aware scan finds nothing else allocating/boxing/an abstract-eltype container, skip
-# AllocCheck's per-instance proof entirely and report a clean, empty allocation list. This is
-# deliberately scoped to the "clean except for a recognized barrier" case; a barrier call that ALSO
-# has some other real allocation risk falls through to the normal (noisier, but honest) proof, since
-# the scan alone cannot produce AllocCheck-typed per-site instances for that case. The
-# `abscontainer` check matters: without it, a barrier call that ALSO reads an abstract-eltype
-# container (e.g. a `Vector{Real}` field) would pass here while StrictMode's own scan correctly
-# fails it — the proof must never be MORE permissive than the scan. Returns `(allocs, exempted)`.
+# Barrier-aware wrapper around `_raw_allocs`. A call that reaches a one-time-init allocation barrier
+# (StrictMode's `barrier` signal) keeps AllocCheck's all-paths proof; only the sites the barrier
+# accounts for are dropped. A site is the barrier's when its backtrace passes through the barrier's
+# own frame, or when no frame of it lies outside Base and Core: AllocCheck merges the lock and task
+# internals of a once-guard into "multiple call sites" with no caller left to name (24 of 52 sites on
+# a `OncePerProcess` calibrator), and those are the guard's. Every other site stands, so a buffer
+# grown later through the barrier's accessor is still reported where it grows: excusing the whole call
+# on the barrier signal hid exactly that, because the scan it fell back on stops two calls deep.
+# A call whose scan already finds allocation, boxing or an abstract-eltype container gets the
+# unfiltered proof, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
-    if _IGNORE_BARRIER[]
-        sig = StrictMode._alloc_signals(f, types)
-        if sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)
-            @info "StrictModeTest: `$(f)` reaches a one-time-init allocation barrier — noalloc/noboxing exempted (StrictMode's steady-state IR scan used instead of AllocCheck's all-paths proof for this call). Disable with set_ignore_barrier!(false)." maxlog = 1
-            return (Any[], true)
-        end
+    allocs = _raw_allocs(f, types)
+    _IGNORE_BARRIER[] || return (allocs, false)
+    sig = StrictMode._alloc_signals(f, types)
+    (sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)) || return (allocs, false)
+    kept = filter(a -> !_through_barrier(a) && _has_user_frame(a), allocs)
+    excused = length(allocs) - length(kept)
+    if excused > 0
+        name = something(_barrier_frame_name(allocs), :barrier)
+        @info "StrictModeTest: `$(f)` reaches `$name`, a one-time-init allocation barrier; " *
+            "$excused allocation site(s) inside it are excused, $(length(kept)) other(s) checked as " *
+            "usual. Disable with set_ignore_barrier!(false)." maxlog = 1
     end
-    return (_raw_allocs(f, types), false)
+    return (kept, isempty(kept) && excused > 0)
+end
+
+_frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)
+
+_through_barrier(@nospecialize(a)) = any(a.backtrace) do fr
+    mi = _frame_mi(fr)
+    mi isa Core.MethodInstance && StrictMode._mi_is_barrier(mi)
+end
+
+_has_user_frame(@nospecialize(a)) = any(a.backtrace) do fr
+    mi = _frame_mi(fr)
+    mi isa Core.MethodInstance && mi.def isa Method &&
+        !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
+end
+
+# The name of the first barrier frame any site passes through, for the note.
+function _barrier_frame_name(allocs)
+    for a in allocs, fr in a.backtrace
+        mi = _frame_mi(fr)
+        (mi isa Core.MethodInstance && mi.def isa Method && StrictMode._mi_is_barrier(mi)) || continue
+        ps = mi.specTypes.parameters
+        # A registered barrier is named by its function; a Base once-guard by its type, since its
+        # frame is a generated init closure.
+        StrictMode._is_registered_callee(ps[1]) && return StrictMode._demangle(mi.def.name)
+        return nameof(Base.unwrap_unionall(ps[2]))
+    end
+    return nothing
 end
 
 function _format_allocs(results; header = "call provably allocates")

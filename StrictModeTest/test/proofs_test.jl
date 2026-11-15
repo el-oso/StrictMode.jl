@@ -200,3 +200,20 @@ end
     @test only(StrictMode.findings(ExemptProof.only_grows, (Int,); guarantees = (:noalloc,))).status === :info
     @test_throws StrictViolation @test_noalloc ExemptProof.only_grows(4)
 end
+
+@testitem "a barrier excuses its own init, not a later growth through its accessor" begin
+    using StrictMode, StrictModeTest
+    module OnceGrow
+    const OPT = Base.OncePerThread{Vector{Float64}}(() -> zeros(8))
+    @noinline grow!(v, n) = (length(v) < n && resize!(v, n); v)
+    grows(n::Int) = (v = grow!(OPT(), n); v[1] = 1.0; nothing)   # resizes the per-thread buffer
+    reads(n::Int) = (v = OPT(); v[1] = Float64(n); nothing)       # its one-time init only
+    end
+    OnceGrow.grows(8); OnceGrow.reads(8)
+    # The resize sits two calls below `grows`, deeper than the value-free scan walks, so only the
+    # proof can see it; the barrier must not hand the call to the scan.
+    @test_throws StrictMode.StrictViolation StrictModeTest._test_guarantee(
+        :noalloc, (:noalloc,), "t", OnceGrow.grows, (Int,)
+    )
+    @test (StrictModeTest._test_guarantee(:noalloc, (:noalloc,), "t", OnceGrow.reads, (Int,)); true)
+end
