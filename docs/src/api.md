@@ -160,8 +160,8 @@ dispatch_suggestions
 `@assert_concurrency_safe` checks that a function treats its plan/workspace argument as read-only
 (no write of, or through, it) — the precondition for sharing one plan object safely across
 concurrent tasks. `@assert_no_threadid_state` fails on mutable state indexed by
-`Threads.threadid()`, the task-migration hazard: a task can move threads mid-run, stranding state
-keyed on the thread it started on. `pool_balance_report` is the companion diagnostic for
+`Threads.threadid()` that is still in use after a point where the task can be suspended: only there
+can the task move threads, or another run on its thread and reach the same state. `pool_balance_report` is the companion diagnostic for
 thread-pool balance questions. `spin_wait_report` reads how the tasks a call spawns wait, and
 reports a migratable one that spins without ever blocking.
 

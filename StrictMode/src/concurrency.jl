@@ -259,21 +259,12 @@ const _ATOMIC_ORDERS = Set{Symbol}(
     (:unordered, :monotonic, :acquire, :release, :acquire_release, :sequentially_consistent)
 )
 
-# The store builtins that exist only in atomic form.
-const _ATOMIC_STORES = Set{Symbol}(
-    (
-        :modifyfield!, :swapfield!, :replacefield!, :setfieldonce!,
-        :memoryrefmodify!, :memoryrefswap!, :memoryrefreplace!, :memoryrefsetonce!,
-    )
-)
-
-# Is this store atomic? Three shapes: the `:invoke_modify` head that `@atomic x.f += v` lowers to,
-# a builtin that is atomic by name, and a plain `setfield!`/`memoryrefset!` carrying a real memory
-# order — `@atomic x.f = v` becomes `setfield!(x, :f, v, :sequentially_consistent)`, where the plain
-# form has no fourth argument at all.
+# Is this store atomic? Only when it carries a real memory order: `@atomic x.f = v` becomes
+# `setfield!(x, :f, v, :sequentially_consistent)`, and `@atomic x.f += v` an `:invoke_modify` ending in
+# the same order. Neither the name nor the `:invoke_modify` head decides it: `modifyfield!(p, :n, +, 1)`
+# on a plain field lowers to `:invoke_modify` with no order, is not atomic, and two tasks running it
+# lose increments.
 function _is_atomic_store(st, nm, dataargs)
-    Meta.isexpr(st, :invoke_modify) && return true
-    nm isa Symbol && nm in _ATOMIC_STORES && return true
     for a in dataargs
         v = a isa QuoteNode ? a.value : a
         v isa Symbol && v in _ATOMIC_ORDERS && return true
@@ -379,7 +370,7 @@ function _taint_scan_ci(
                 # higher-order function, a generator, a task spawned from it — and its body is where
                 # any write happens. Reading it here does not depend on following the call that
                 # eventually runs it through Base.
-                !isempty(fields) && _recurse_closure_body(types[i], chain, depth, max_depth, memo, out, seen, fr)
+                !isempty(fields) && _recurse_closure_body(types[i], fields, chain, depth, max_depth, memo, out, seen, fr)
                 continue
             elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task
                 # `Threads.@spawn` and `Threads.@threads` lower to a closure built by `:new` and
@@ -396,8 +387,11 @@ function _taint_scan_ci(
                         _op_tainted(a, tset, targs) ||
                             !isnothing(_direct_fields(a, cset, cflds, cargs))
                     ) || continue
+                    # A closure that IS a plan value taints all of it; one built from plan values taints
+                    # the captures that received them.
+                    tflds = _op_tainted(a, tset, targs) ? nothing : _direct_fields(a, cset, cflds, cargs)
                     _recurse_task_body(
-                        _operand_type(a, types), chain, depth, max_depth, memo, out, seen, fr
+                        _operand_type(a, types), chain, depth, max_depth, memo, out, seen, fr; fields = tflds
                     )
                     break
                 end
@@ -420,11 +414,13 @@ function _taint_scan_ci(
             if nm !== nothing && haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
                 if 1 <= pos <= length(dataargs) && gtainted(dataargs[pos])
+                    gatomic = _is_atomic_store(st, nm, dataargs)
                     _record!(
                         out, seen, chain,
                         "writes process-global state (`$nm` into a mutable constant global) — every " *
-                            "concurrent call shares it; pass the buffer in, or own it per task", fr;
-                        certain = true
+                            "concurrent call shares it; pass the buffer in, or own it per task" *
+                            (gatomic ? " (the write is atomic, so it cannot tear, but the global is still shared)" : ""),
+                        fr; certain = true, deliberate = gatomic
                     )
                 end
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
@@ -611,18 +607,24 @@ function _is_mutable_global(@nospecialize(a))
         a
     end
     (v isa String || v isa Symbol || v isa Module || v isa Type || v isa Function) && return false
+    # A lock, an atomic, a condition, an event, a channel or a semaphore is how tasks synchronize: its
+    # internal writes are the synchronization, not shared data.
+    (v isa Base.AbstractLock || v isa Threads.Atomic || v isa Base.GenericCondition ||
+        v isa Base.Event || v isa Channel || v isa Base.Semaphore) && return false
     return ismutable(v)
 end
 
-# The call methods of a closure built from a plan value, each scanned with the closure itself tainted,
-# as a task's body is. A non-closure struct carries no body to read.
+# The call methods of a closure, or of any struct with a call method of its own, built from a plan
+# value. Each is scanned with only the captured fields that received a plan value tainted, so a fresh
+# buffer captured beside them stays the closure's own. A struct with no call method has no body to read.
 function _recurse_closure_body(
-        @nospecialize(T), chain::Vector{String}, depth::Int, max_depth::Int,
+        @nospecialize(T), fields::Set{Int}, chain::Vector{String}, depth::Int, max_depth::Int,
         memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
     )
     T = Core.Compiler.widenconst(T)
-    (T isa DataType && T <: Function && startswith(String(nameof(T)), "#")) || return nothing
-    key = (T, :closure)
+    # A closure, or any struct with a call method of its own: both are functions that carry state.
+    (T isa DataType && isconcretetype(T)) || return nothing
+    key = (T, :closure, fields)
     haskey(memo, key) && return nothing
     memo[key] = false
     if depth >= max_depth
@@ -652,9 +654,11 @@ function _recurse_closure_body(
             end
             isempty(cts) && continue
             fr = _Frame("closure", string(m.file), Int(m.line))
+            # Only the captures that received a plan value are the plan; a fresh buffer captured
+            # beside them is the closure's own.
             _taint_scan_ci(
-                cts[1].first, Set{Int}(1), vcat(chain, "closure"), fr, depth + 1, max_depth,
-                memo, out, seen
+                cts[1].first, Set{Int}(), vcat(chain, "closure"), fr, depth + 1, max_depth,
+                memo, out, seen; cargs = Dict{Int, Set{Int}}(1 => fields)
             )
         end
     end
@@ -671,7 +675,8 @@ end
 # than skipped: a task body that could not be read is not a task body that writes nothing.
 function _recurse_task_body(
         @nospecialize(T), chain::Vector{String}, depth::Int, max_depth::Int,
-        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
+        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame;
+        fields::Union{Nothing, Set{Int}} = nothing,
     )
     held = "spawns a task holding a plan-reachable value"
     if isnothing(T)
@@ -682,7 +687,7 @@ function _recurse_task_body(
         )
         return nothing
     end
-    key = (T, :task)
+    key = (T, :task, fields)
     haskey(memo, key) && return nothing
     memo[key] = false
     if depth >= max_depth
@@ -716,8 +721,9 @@ function _recurse_task_body(
         caller
     end
     _taint_scan_ci(
-        cts[1].first, Set{Int}(1), vcat(chain, "task closure"), fr, depth + 1, max_depth,
-        memo, out, seen
+        cts[1].first, isnothing(fields) ? Set{Int}(1) : Set{Int}(), vcat(chain, "task closure"), fr,
+        depth + 1, max_depth, memo, out, seen;
+        cargs = isnothing(fields) ? Dict{Int, Set{Int}}() : Dict{Int, Set{Int}}(1 => fields)
     )
     return nothing
 end
@@ -806,15 +812,6 @@ end
 function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
-    # Every write is atomic: a barrier, a work cursor or a published flag, which is how tasks
-    # synchronize through shared state. That is named, not warned about; a plain store to the same
-    # field is not atomic and still fails.
-    if all(v -> v.deliberate, vs)
-        @info "StrictMode @assert_concurrency_safe $target: argument $self_arg is written only by " *
-            "atomic operations ($(length(vs)) site(s)), which synchronize tasks rather than " *
-            "race them." _id = Symbol(:conc_sync, '|', target) maxlog = 1
-        return nothing
-    end
     io = IOBuffer()
     # The headline has to match what the scan actually established, or the warn path states as fact
     # the very thing the certainty split says it could not see.
@@ -823,7 +820,8 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     println(
         io,
         sure ?
-            "plan argument is mutated during apply — NOT safe to share across concurrent tasks" :
+            "writes state that concurrent tasks share (the plan argument, or a global) — NOT safe to " *
+                "run concurrently" :
             "cannot establish that the plan argument is read-only — sharing it across concurrent " *
             "tasks is unproven, not disproven",
         " ($(length(vs)) site(s)):"
@@ -1081,7 +1079,22 @@ end
 # threadid-derived values is defined before a suspension point and used after it, along a path of the
 # control-flow graph; the writes are listed with that cause. Reported for certain when the suspension
 # was read, and conservatively when a callee could not be read in full.
-const _SUSPEND_NAMES = (:yield, :yieldto, :wait, :_wait, :wait_forever, :sleep, :fetch, :take!, :lock)
+# Base functions whose call can suspend the task: they wait on another task, on IO, on a timer or on a
+# lock. Matched only where the function is Base's own — a user `lock(::Int)` is not one.
+const _SUSPEND_NAMES = (
+    :yield, :yieldto, :wait, :_wait, :wait_forever, :sleep, :fetch, :take!, :lock, :acquire,
+    :timedwait, :run, :print, :println, :write, :read, :readline, :readavailable, :readbytes!,
+    :flush, :unsafe_read, :unsafe_write, :eof, :handle_message,
+)
+
+# Runtime entry points that switch tasks.
+const _SUSPEND_FCALLS = (:jl_yield, :jl_switch, :jl_task_wait, :jl_wait_empty_begin)
+
+# Overloads of a suspending name that never yield: a `SpinLock` spins, an `IOBuffer` is memory.
+_never_suspends(nm::Symbol, @nospecialize(sig)) =
+    sig isa DataType && length(sig.parameters) >= 2 &&
+    ((nm === :lock && sig.parameters[2] <: Base.Threads.SpinLock) ||
+     (nm === :take! && sig.parameters[2] <: IOBuffer))
 
 const _SUSPEND_MEMO = Dict{Any, Symbol}()   # callee signature => :yes, :maybe or :no
 const _SUSPEND_LOCK = ReentrantLock()
@@ -1105,20 +1118,69 @@ function _sig_may_suspend(@nospecialize(sig))
     return v
 end
 
+# How a statement can suspend the task: `:yes`, `:maybe` (a call the scan cannot read in full, such as
+# dynamic dispatch) or `:no`.
+function _stmt_suspends(@nospecialize(st), code::Vector{Any})
+    if Meta.isexpr(st, :foreigncall)
+        return _fcall_name(st) in _SUSPEND_FCALLS ? :yes : :no
+    elseif Meta.isexpr(st, :invoke)
+        mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+        (mi isa Core.MethodInstance && mi.def isa Method) || return :maybe
+        m = mi.def
+        if _sw_is_base(m.module)
+            nm = _demangle(m.name)
+            nm in _SUSPEND_NAMES && return _never_suspends(nm, mi.specTypes) ? :no : :yes
+            # A Base once-guard's one-time init locks, but it is Base's own path to the per-thread
+            # slot rather than a use of state the caller holds. A user-registered barrier is not
+            # exempt: it is the caller's own code.
+            _mi_is_barrier(mi) && return :no
+        end
+        return _sig_may_suspend(mi.specTypes)
+    elseif Meta.isexpr(st, :call)
+        v = _sw_callee_value(st.args[1])
+        (v isa Core.Builtin || v isa Core.IntrinsicFunction) && return :no
+        isnothing(v) && return :maybe
+        if v isa Function && _sw_is_base(parentmodule(v))
+            nameof(v) in _SUSPEND_NAMES && return :yes
+            return :maybe
+        end
+        return :maybe                       # dynamic dispatch on a function the scan cannot resolve
+    end
+    return :no
+end
+
 function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vector{_ConcViol}, fr::_Frame)
     cfg = Core.Compiler.compute_basic_blocks(code)
     blk = [Core.Compiler.block_for_inst(cfg, i) for i in eachindex(code)]
-    nb = length(cfg.blocks)
-    # `breach[a]`: the blocks reachable from block `a` along at least one edge.
-    breach = map(1:nb) do a
-        seenb = falses(nb); stack = copy(cfg.blocks[a].succs)
+    succs(b) = cfg.blocks[b].succs
+    # Is the value defined at `d` still the value used at `u`, on a path from `s`? In SSA a definition
+    # inside a loop is a fresh value each iteration, so a path that runs through `d` again reaches a
+    # different value: `u` must be reachable from `s` without passing `d`.
+    function live_from(d::Int, s::Int, u::Int)
+        bd, bs, bu = blk[d], blk[s], blk[u]
+        if bs == bu && s < u
+            return !(bd == bs && s < d < u)
+        end
+        bd == bs && d > s && return false       # `d` redefines before control leaves `s`'s block
+        seenb = falses(length(cfg.blocks)); stack = copy(succs(bs))
         while !isempty(stack)
             b = pop!(stack); seenb[b] && continue; seenb[b] = true
-            append!(stack, cfg.blocks[b].succs)
+            if b == bu
+                (b != bd || u < d) && return true
+            end
+            b == bd && continue                 # passing the definition starts a new value
+            append!(stack, succs(b))
         end
-        seenb
+        return false
     end
-    reaches(i, j) = (blk[i] == blk[j] && i < j) || breach[blk[i]][blk[j]]
+    reaches(i, j) = (blk[i] == blk[j] && i < j) || (begin
+        seenb = falses(length(cfg.blocks)); stack = copy(succs(blk[i])); found = false
+        while !isempty(stack) && !found
+            b = pop!(stack); seenb[b] && continue; seenb[b] = true
+            found = b == blk[j]; append!(stack, succs(b))
+        end
+        found
+    end)
     uses = Dict{Int, Vector{Int}}()
     function adduses!(@nospecialize(x), at::Int)
         if x isa Core.SSAValue
@@ -1139,28 +1201,25 @@ function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vec
         adduses!(st, i)
     end
     for (s, st) in enumerate(code)
-        (Meta.isexpr(st, :call) || Meta.isexpr(st, :invoke)) || continue
-        isinv = st.head === :invoke
-        nm = _resolve_callee_name(isinv ? st.args[2] : st.args[1], code)
-        kind = if !isnothing(nm) && nm in _SUSPEND_NAMES
-            :yes
-        elseif isinv
-            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
-            # A once-guard's one-time init locks, and so could suspend, but it is Base's own path to
-            # the per-thread slot rather than a use of state the caller holds.
-            !(mi isa Core.MethodInstance) ? :maybe : _mi_is_barrier(mi) ? :no : _sig_may_suspend(mi.specTypes)
-        else
-            :no
-        end
+        kind = _stmt_suspends(st, code)
         kind === :no && continue
         for d in tainted
-            reaches(d, s) || continue
-            any(u -> reaches(s, u), get(uses, d, Int[])) || continue
+            d == s && continue
+            ds = get(uses, d, Int[])
+            # Held across the call: used after it, or handed to it — a callee that suspends while it
+            # holds the state is the same hazard one frame down.
+            held = (s in ds && reaches(d, s)) || (reaches(d, s) && any(u -> u != s && live_from(d, s, u), ds))
+            held || continue
+            nm = Meta.isexpr(st, :invoke) ? _resolve_callee_name(st.args[2], code) :
+                Meta.isexpr(st, :call) ? _resolve_callee_name(st.args[1], code) : _fcall_name(st)
             what = isnothing(nm) ? "a call" : "`$(_demangle(nm))`"
             msg = "holds per-thread (`Threads.threadid()`-indexed) state across $what, which " *
                 (kind === :yes ? "can suspend the task" : "may suspend the task (not read in full)") *
                 ": another task can then run on this thread and use the same state"
-            return [_ConcViol(msg, fr.file, fr.line, kind === :yes, false); writes]
+            # The writes are certain, but the hazard is as certain as its suspension and no more.
+            sure = kind === :yes
+            return [_ConcViol(msg, fr.file, fr.line, sure, false);
+                [_ConcViol(w.message, w.file, w.line, sure && w.certain, w.deliberate) for w in writes]]
         end
     end
     return _ConcViol[]
@@ -1230,7 +1289,8 @@ function _assert_no_threadid_state(target, @nospecialize(f), @nospecialize(types
         v.file != "" && print(io, "\n        at ", v.file, ":", v.line)
         i < length(vs) && println(io)
     end
-    _fail(:no_threadid_state, target, String(take!(io)))
+    # Raises only where the suspension was read; one through a callee it could not read warns.
+    _fail(:no_threadid_state, target, String(take!(io)); gates = any(v -> v.certain, vs))
     return nothing
 end
 
@@ -1351,6 +1411,16 @@ function _threadid_state_finding(
             "signature"; tier, file = tloc[1], line = tloc[2]
     )
     fail = !isempty(vs)
+    if fail && !any(v -> v.certain, vs)
+        # The suspension was not read in full: a lead, not a verdict.
+        return StrictFinding(
+            md, fn, sg, :no_threadid_state, :info, vs[1].file, vs[1].line,
+            "cannot rule out threadid-indexed state held across a suspension ($(length(vs)) site(s)): " *
+                join((v.message for v in vs), "; "),
+            "index by a captured task-local id, or give each task its own buffer", tier,
+            _code(:no_threadid_state)
+        )
+    end
     return _mkfinding(
         md, fn, sg, :no_threadid_state, fail,
         fail ?
@@ -1435,14 +1505,11 @@ function _concurrency_safe_finding(
         )
     end
     certain = any(v -> v.certain && !v.deliberate, vs)
-    sync = all(v -> v.deliberate, vs)
     return StrictFinding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
         vs[1].file, vs[1].line,
         (
             certain ? "argument $self is written during the call ($(length(vs)) site(s)): " :
-            sync ? "argument $self is written only by atomic operations, which synchronize " *
-                "tasks ($(length(vs)) site(s)): " :
                 "cannot prove argument $self is read-only ($(length(vs)) site(s)): "
         ) *
             join((v.message for v in vs), "; "),

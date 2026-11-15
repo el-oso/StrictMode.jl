@@ -217,8 +217,8 @@ function _assert_owned(
         _fail(
             :owned, target,
             "not established: the walk stopped at its depth limit ($depth out-of-line levels) with a " *
-                "callee of the package still unread. Assert :owned on the function that does the lookup, " *
-                "or pass `depth = n`.";
+                "callee of the package still unread. Assert :owned closer to where any lookup would " *
+                "happen, or pass `depth = n`.";
             gates = false
         )
     else

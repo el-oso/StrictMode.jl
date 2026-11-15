@@ -873,8 +873,12 @@ it. That is a stall no allocation or type guarantee can see, and it is read from
 bodies [`StrictMode.spin_wait_report`](@ref) reads.
 
 A task that yields while it waits passes this gate even when it never blocks; `spin_wait_report`
-still reports that it keeps a CPU busy. A task the scan could not read fails, because a wait that
-was not read is not a wait that yields.
+still reports that it keeps a CPU busy. The gate fails on what it could not judge: a task it could
+not read, a bound task (`@async`, `Task`), a call inside a task it did not follow, and a call that
+spawns no task it could find.
+
+It recognizes a wait by the operation the loop polls with — `yield`, a safepoint, `pause()`, a
+fence — so a loop with no such operation, such as `while !flag; end`, is not recognized as a wait.
 
 ```julia
 test_waits_yield(gemm!, (Matrix{Float64}, Matrix{Float64}, Matrix{Float64}))
@@ -894,6 +898,15 @@ function test_waits_yield(@nospecialize(f), @nospecialize(types::Tuple))
         bad, "spawned task(s) could not be read, so how they wait is not established: " *
             join(r.unread, ", ")
     )
+    # Each of these is a part of the call the scan did not judge, and a gate does not pass on what it
+    # did not check.
+    r.bound > 0 && push!(
+        bad, "$(r.bound) bound task(s) (`@async`, `Task`) were not judged; a bound task that spins " *
+            "holds the thread it is bound to"
+    )
+    r.unfollowed > 0 && push!(bad, "$(r.unfollowed) call(s) inside the tasks were not followed")
+    (r.tasks == 0 && r.bound == 0 && isempty(r.unread)) &&
+        push!(bad, "the call spawns no task the scan could find, so nothing was proven")
     isempty(bad) && return r
     target = string(f) * StrictMode._sig_string(types)
     throw(StrictMode.StrictViolation(:waits_yield, target, join(bad, "\n  ")))

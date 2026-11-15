@@ -461,7 +461,7 @@ end
         e
     end
     @test err isa StrictMode.StrictViolation
-    @test occursin("is mutated", sprint(showerror, err))
+    @test occursin("writes state that concurrent tasks share", sprint(showerror, err))
 
     # The uncertain case warns, and the warning says what the scan actually established.
     @test_logs (:warn, r"cannot establish that the plan argument is read-only") match_mode = :any (
@@ -1006,7 +1006,7 @@ end
     @test !certain(PtrCopy.reads)
 end
 
-@testitem "atomic writes to shared state read as synchronization; a plain store does not" begin
+@testitem "an atomic write to shared state warns; a plain store fails" begin
     using StrictMode, Test
     module SyncWrites
     mutable struct Sync; @atomic bar::Int; plain::Int; end
@@ -1020,7 +1020,9 @@ end
     viaview(h::Holder) = (v = view(h.buf, 2:3); GC.@preserve v unsafe_store!(pointer(v), 1.0, 1); nothing)
     end
     p = SyncWrites.Pool(SyncWrites.Sync(0, 0)); SyncWrites.barrier(p); SyncWrites.plainbump(p)
-    @test_logs (:info, r"synchronize tasks") StrictMode._assert_concurrency_safe("t", SyncWrites.barrier, (SyncWrites.Pool,))
+    # Atomic writes cannot tear, but two independent calls sharing the object still race on what
+    # they mean, and the scan cannot tell those from one cooperating call: reported, not raised.
+    @test_logs (:warn,) match_mode = :any StrictMode._assert_concurrency_safe("t", SyncWrites.barrier, (SyncWrites.Pool,))
     @test only(StrictMode.findings(SyncWrites.barrier, (SyncWrites.Pool,); guarantees = (:concurrency_safe,))).status === :info
     @test_throws StrictMode.StrictViolation StrictMode._assert_concurrency_safe("t", SyncWrites.plainbump, (SyncWrites.Pool,))
     buf = zeros(4)
@@ -1031,4 +1033,48 @@ end
     certain(f) = any(v -> v.certain, StrictMode.concurrency_findings(f, (SyncWrites.Holder,)))
     @test certain(SyncWrites.nested)        # a pointer two plain-data structs deep
     @test certain(SyncWrites.viaview)       # a pointer taken through a view
+end
+
+@testitem "review of 0.5.13: atomics, globals, suspensions and closures read correctly" begin
+    using StrictMode, Test
+    module Rev
+    using Base.Threads: threadid
+    mutable struct Plan; w::Vector{Float64}; buf::Vector{Float64}; end
+    mutable struct P1; n::Int; end
+    bumpn(p::P1) = (for _ in 1:3; modifyfield!(p, :n, +, 1); end; nothing)          # plain: a race
+    const LK = ReentrantLock(); const CNT = Threads.Atomic{Int}(0)
+    withlock(p::Plan) = (@lock LK p.w[1])                                           # synchronization
+    counted(p::Plan) = (Threads.atomic_add!(CNT, 1); p.w[1])                         # synchronization
+    fresh_out(p::Plan) = (out = zeros(8); ts = map(i -> Threads.@spawn(out[i] = p.w[i]), 1:8); foreach(wait, ts); sum(out))
+    struct Spawner; p::Plan; end
+    (s::Spawner)(i) = Threads.@spawn (s.p.buf[1] = i)
+    callable(p::Plan) = (ts = map(Spawner(p), 1:2); foreach(wait, ts); nothing)
+    const BUF = zeros(Int, 64); const VB = [zeros(8) for _ in 1:64]
+    struct CB; f::Function; end
+    dyn(cb::CB) = (i = threadid(); cb.f(); BUF[i] += 1; nothing)                     # may suspend
+    io_print() = (i = threadid(); println(devnull, "x"); BUF[i] += 1; nothing)       # suspends in Base
+    @noinline g5(v) = (yield(); v[1] += 1; nothing)
+    handed() = (g5(VB[threadid()]); nothing)                                          # held by the callee
+    fresh(n::Int) = (for _ in 1:n; yield(); i = threadid(); BUF[i] += 1; end; nothing)  # new value each time
+    const SL = Threads.SpinLock()
+    spin() = (i = threadid(); Base.lock(SL); Base.unlock(SL); BUF[i] += 1; nothing)   # never yields
+    end
+    p = Rev.Plan(ones(8), zeros(2))
+    Rev.bumpn(Rev.P1(0)); Rev.withlock(p); Rev.counted(p); Rev.fresh_out(p); Rev.callable(p)
+    cb = Rev.CB(() -> nothing)
+    Rev.dyn(cb); Rev.io_print(); Rev.handed(); Rev.fresh(2); Rev.spin()
+    fails(f, T) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, T))
+    @test fails(Rev.bumpn, (Rev.P1,))                                  # a plain modifyfield! is not atomic
+    @test isempty(StrictMode.concurrency_findings(Rev.withlock, (Rev.Plan,)))
+    @test isempty(StrictMode.concurrency_findings(Rev.counted, (Rev.Plan,)))
+    @test !fails(Rev.fresh_out, (Rev.Plan,))                           # writes only its own fresh buffer
+    @test fails(Rev.callable, (Rev.Plan,))                             # a callable struct is read too
+    tid(f, T) = (vs = StrictMode.threadid_state_findings(f, T); isempty(vs) ? :pass : any(v -> v.certain, vs) ? :fail : :maybe)
+    @test tid(Rev.dyn, (Rev.CB,)) === :maybe
+    @test tid(Rev.io_print, ()) === :fail
+    @test tid(Rev.handed, ()) === :fail
+    @test tid(Rev.fresh, (Int,)) === :pass
+    @test tid(Rev.spin, ()) === :pass
+    # A suspension the scan could not read warns rather than raising.
+    @test_logs (:warn,) match_mode = :any StrictMode._assert_no_threadid_state("t", Rev.dyn, (Rev.CB,))
 end

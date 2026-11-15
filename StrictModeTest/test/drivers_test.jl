@@ -171,8 +171,13 @@ end
     @noinline polite_worker() = (while !FLAG[]; yield(); end; nothing)
     spin_start() = (t = Threads.@spawn spin_worker(); FLAG[] = true; wait(t); FLAG[] = false; nothing)
     polite_start() = (FLAG[] = true; t = Threads.@spawn polite_worker(); wait(t); FLAG[] = false; nothing)
+    async_spin() = (t = @async spin_worker(); FLAG[] = true; wait(t); FLAG[] = false; nothing)
+    no_spawn() = 1 + 1
     end
-    Waits.spin_start(); Waits.polite_start()
+    Waits.spin_start(); Waits.polite_start(); Waits.async_spin(); Waits.no_spawn()
     @test_throws "never yields" StrictModeTest.test_waits_yield(Waits.spin_start, ())
     @test StrictModeTest.test_waits_yield(Waits.polite_start, ()) isa StrictMode.SpinWaitReport
+    # What the scan did not judge fails too: a bound task, and a call that spawns no task at all.
+    @test_throws "bound task" StrictModeTest.test_waits_yield(Waits.async_spin, ())
+    @test_throws "spawns no task" StrictModeTest.test_waits_yield(Waits.no_spawn, ())
 end
