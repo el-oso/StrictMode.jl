@@ -12,8 +12,10 @@
 # body that calls the method's keyword body (`#f#N`) with the defaults. The checks read the body
 # they are handed, so on either form they inspected no loop at all, and `@assert_no_spill` passed
 # for want of anything to spill. The signature the forwarder calls is the one to read. The body must
-# make no other call, so one that does real work before forwarding is read as itself, and so is a
-# wrapper a user wrote — the checks inspect the leaf compiled body.
+# make no other call, and do nothing else either: no branch or loop, and no statement other than a
+# pure read (`_FORWARDER_PURE`). Work that inlines makes no call — a loop of intrinsics, a store
+# into a global — so counting calls alone read such a body as a forwarder and checked its callee
+# instead. A body that does any real work, and a wrapper a user wrote, is read as itself.
 function _forwarded_sig(@nospecialize(sig))
     for _ in 1:8                       # a chain of trailing defaults forwards once per default
         cts = try
@@ -31,6 +33,7 @@ function _forwarded_sig(@nospecialize(sig))
         calls = [j for (j, s) in enumerate(code) if Meta.isexpr(s, :invoke) || Meta.isexpr(s, :foreigncall)]
         length(calls) == 1 || return sig
         j = only(calls)
+        all(k -> k == j || k == length(code) || _forwarder_trivial(code[k]), eachindex(code)) || return sig
         st = code[j]
         Meta.isexpr(st, :invoke) || return sig
         v = ret.val
@@ -44,6 +47,20 @@ function _forwarded_sig(@nospecialize(sig))
         sig = target
     end
     return sig
+end
+
+# Statements a compiler-generated forwarder can hold besides its one call: values, renames, and the
+# side-effect-free reads that unpack a keyword `NamedTuple` or build an argument tuple.
+const _FORWARDER_PURE = (:getfield, :tuple, :isdefined, :(===), :typeassert, :isa, :fieldtype)
+
+function _forwarder_trivial(@nospecialize(s))
+    (isnothing(s) || s isa Core.SSAValue || s isa Core.Argument || s isa Core.PiNode ||
+        s isa QuoteNode || s isa GlobalRef) && return true
+    s isa Expr || return false                    # a GotoNode, GotoIfNot or PhiNode is control flow
+    s.head === :call || return false
+    c = s.args[1]
+    c isa GlobalRef || return false
+    return (c.mod === Core || c.mod === Base) && c.name in _FORWARDER_PURE
 end
 
 # Whether `callee` is the keyword body (`#f#N`) of the method `sig` dispatches to, recognized by its

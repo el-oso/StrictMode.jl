@@ -117,3 +117,16 @@ end
     @test length(fs) == 1
     @test occursin("Vector{Float64}", only(fs).signature)
 end
+
+@testitem "unsafe_report sees an unsafe call whose result is assigned" begin
+    using StrictMode
+    module Assigned
+    slotassign(a) = (p = pointer(a); x = unsafe_load(p); x)
+    cc(n) = (r = ccall(:jl_cpu_threads, Cint, ()); r + n)
+    gf(p::Ptr{Float64}) = getfield(Base, :unsafe_load)(p)
+    end
+    uc(f) = StrictMode._unsafe_constructs(only(methods(f)))
+    @test uc(Assigned.slotassign) == [:pointer, :unsafe_load]
+    @test uc(Assigned.cc) == [:ccall]
+    @test uc(Assigned.gf) == [:unsafe_load]
+end

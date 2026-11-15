@@ -24,13 +24,27 @@ _noalloc_mode(static_opt::Union{Nothing, Bool}) =
 function _barrier_info(g::Symbol, target, barrier::Union{Nothing, Symbol})
     isnothing(barrier) && return nothing
     @info "StrictMode @assert_$g $target: reaches `$barrier`, a registered allocation barrier; its " *
-        ":$g finding is reported there." _id = Symbol(g, '|', target, '|', barrier) maxlog = 1
+        (g === :owned ? "dictionary lookup" : "boxing") * " is reported there, under " *
+        ":$g." _id = Symbol(g, '|', target, '|', barrier) maxlog = 1
     return nothing
+end
+
+# A scan that read no body has no verdict to give, and saying nothing would read as a pass. True
+# when it reported, so the caller stops there.
+function _unread_fail(g::Symbol, target, sig; gates::Bool = _guarantee_gates(g))
+    sig.unread || return false
+    _fail(
+        g, target,
+        "no typed body could be read for this signature (no method matches, or its generator raised)";
+        gates
+    )
+    return true
 end
 
 # The scan half on its own, with no thunk: the caller already has the value.
 function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
+    _unread_fail(:noalloc, target, sig) && return nothing
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
     else
@@ -51,6 +65,7 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if mode === :heuristic
         sig = _alloc_signals(f, types)
+        _unread_fail(:noalloc, target, sig) && return val
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
         else
@@ -141,6 +156,7 @@ end
 
 function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
+    _unread_fail(:noboxing, target, sig) && return nothing
     if sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig))
     else
@@ -185,6 +201,7 @@ function _assert_owned(
         depth::Int = _FAST_ALLOC_DEPTH[], gates::Bool = _guarantee_gates(:owned)
     )
     sig = _alloc_signals(f, types; depth = depth)
+    _unread_fail(:owned, target, sig; gates) && return nothing
     if sig.dictlookup
         _fail(
             :owned, target,

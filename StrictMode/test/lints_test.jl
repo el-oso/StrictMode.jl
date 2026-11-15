@@ -167,3 +167,44 @@ end
     @test !any(StrictMode._failed, StrictMode.findings(GenRaises.g, (Ptr{Float64}, Float32); guarantees = G))
     @test isempty(StrictMode._conversions(GenRaises.g, (Ptr{Any}, Float32)))
 end
+
+@testitem "a constructor and an anonymous closure answer to their own and their owner's names" begin
+    using StrictMode
+    module Names8
+    struct Box3; v::Vector{Float64}; end
+    Box3(n::Int) = Box3(zeros(n))
+    struct Par{T}; x::T; end
+    outer2(v, k) = sum(map(i -> v[i] * k, 1:3))
+    end
+    Names8.outer2([1.0, 2, 3], 2.0)
+    @test StrictMode._callable_name(Names8.Box3) === :Box3
+    @test StrictMode._callable_name(Names8.Par{Float64}) === :Par
+    @test StrictMode._name_matcher([:Box3])(Names8.Box3)
+    inscope(only) = sort([string(m.name) for m in first(StrictMode.module_methods(Names8; only))])
+    @test any(startswith("#outer2"), inscope([:outer2]))
+    @test !any(startswith("#outer2"), inscope([:Box3]))
+end
+
+@testitem "every guarantee fails on a body that cannot be read, in findings and the macros" begin
+    using StrictMode
+    module Unread5
+    @generated gen(x) = (x <: Integer || error("only integers"); :(x + 1))
+    nomethod(x::Int) = x
+    end
+    Unread5.gen(1)
+    @test all(StrictMode._failed, StrictMode.findings(Unread5.gen, (Float64,); guarantees = StrictMode._GUARANTEES))
+    @test all(StrictMode._failed, StrictMode.findings(Unread5.nomethod, (String,); guarantees = (:typestable, :owned)))
+    @test_throws StrictMode.StrictViolation StrictMode._assert_owned("t", Unread5.gen, (Float64,))
+end
+
+@testitem "a call checked but not performed fails when no method matches it" begin
+    using StrictMode
+    macro checked_only(c); StrictMode._strict_expr(c; execute = false); end
+    module NoMethod4
+    f(x::Int) = x
+    const G = Ref{Any}(1)
+    unstable(x::Int) = G[]
+    end
+    @test_throws "no method matches this call" @checked_only NoMethod4.f("s")
+    @test_throws "not concrete" @checked_only NoMethod4.unstable(1)
+end

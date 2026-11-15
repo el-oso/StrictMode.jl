@@ -193,7 +193,12 @@ function migration_report(
     # Deleted names are fatal wherever they appear, so every directory is scanned for them.
     broken = vcat((_scan(joinpath(root, d), _REMOVED_API) for d in (srcdirs..., dirs...))...)
     stale_docs = _scan_md(_REMOVED_API)
-    unopened = vcat((_scan(joinpath(root, d), _UNOPENED_GATES) for d in srcdirs)...)
+    # Only a guard counts: `if`, `elseif`, `&&` or `||` around the call. A docstring or comment that
+    # names `proofs_loaded()` in prose is not one.
+    unopened = filter(vcat((_scan(joinpath(root, d), _UNOPENED_GATES) for d in srcdirs)...)) do (path, n, _, _)
+        line = readlines(joinpath(root, path))[n]
+        occursin(r"\b(if|elseif)\b[^#]*proofs_loaded\(\)|proofs_loaded\(\)\s*(&&|\|\|)|(&&|\|\|)\s*!?\s*(StrictMode\.)?proofs_loaded\(\)", line)
+    end
     # Reporting macros are only a problem where the PROOF was available — a `src/` annotation
     # correctly reports, since StrictModeTest is not loadable at that package's own precompile.
     disarmed = vcat((_scan(joinpath(root, d), _MIGRATION_MAP) for d in dirs)...)

@@ -331,3 +331,18 @@ end
         Tuple{last(StrictMode._forwarded_call(outer_kw, (V,)))...})
     @test StrictMode._forwarded_sig(body) === body
 end
+
+@testitem "a body that does real work before forwarding is read as itself" begin
+    using StrictMode
+    module FakeFwd
+    @noinline function kern!(y::Vector{Float64}, x::Vector{Float64}, a::Float64)
+        @simd for i in eachindex(x, y); @inbounds y[i] = a * x[i]; end; return nothing
+    end
+    function kern!(y::Vector{Float64}, x::Vector{Float64}, r::Base.RefValue{Float64})
+        s = r[]; for i in 1:100_000; s = s * 0.5 + i; end; r[] = s     # inlined work, no call
+        return kern!(y, x, 2.0)
+    end
+    end
+    sig = Base.signature_type(FakeFwd.kern!, Tuple{Vector{Float64}, Vector{Float64}, Base.RefValue{Float64}})
+    @test StrictMode._forwarded_sig(sig) == sig
+end

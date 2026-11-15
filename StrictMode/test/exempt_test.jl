@@ -334,3 +334,20 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "a package's :noalloc exemption covers that package's methods only" begin
+    using StrictMode
+    module Scoped6
+    using StrictMode
+    struct Stack; v::Vector{Int}; end
+    @strict_exempt :noalloc reason = "debug" Base.string(s::Stack) = "Stack"
+    shower(n::Int) = length(string(n))
+    @noinline mine(n::Int) = zeros(n)
+    @strict_exempt :noalloc reason = "setup" :mine
+    uses_mine(n::Int) = (mine(n); nothing)
+    end
+    Scoped6.shower(3); Scoped6.uses_mine(3)
+    nf(f) = only(StrictMode.findings(f, (Int,); guarantees = (:noalloc,)))
+    @test StrictMode._failed(nf(Scoped6.shower))          # an unrelated `string` is not excused
+    @test nf(Scoped6.uses_mine).status === :info           # its own callee is
+end

@@ -53,7 +53,8 @@ const _GUARANTEES = (
 _barrier_note(md, fn, sg, g::Symbol, barrier::Symbol, file, line; tier::Symbol = :report) =
     StrictFinding(
         md, fn, sg, g, :info, file, line,
-        "reaches `$barrier`, a registered allocation barrier; its :$g finding is reported there",
+        "reaches `$barrier`, a registered allocation barrier; its " *
+            (g === :owned ? "dictionary lookup" : "boxing") * " is reported there, under :$g",
         "", tier, _code(g, nothing)
     )
 
@@ -157,6 +158,13 @@ end
 # Per-guarantee findings from cheap Base-only analysis (`_alloc_signals`, `return_types`,
 # `_inlined_survives`).
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
+    # A verdict read from no body is not a verdict, for any guarantee: "could not check" must not
+    # render as a pass. The scan is memoized, so asking it here costs nothing the guarantees below
+    # would not pay anyway.
+    if _alloc_signals(f, types).unread
+        why = "no typed body could be read for this signature (no method matches, or its generator raised)"
+        return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
+    end
     sig = (:typestable in guarantees || :noalloc in guarantees || :noboxing in guarantees) ?
         _alloc_signals(f, types) : nothing
     # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-
@@ -237,14 +245,6 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             )
         else
             throw(ArgumentError("unknown guarantee :$g; expected one of $(_GUARANTEES)"))
-        end
-    end
-    # A verdict read from no body is not a verdict: "could not check" must not render as a pass.
-    if !isnothing(sig) && sig.unread
-        why = "no typed body could be read for this signature (its generator may have raised)"
-        for (i, x) in pairs(out)
-            x.guarantee in (:typestable, :noalloc, :noboxing) || continue
-            out[i] = _unevaluated(md, fn, sg, x.guarantee, why; file = x.file, line = x.line)
         end
     end
     return out

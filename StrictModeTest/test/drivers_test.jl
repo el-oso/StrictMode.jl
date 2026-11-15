@@ -146,3 +146,13 @@ end
     # No exported function: `require = :public` judges nothing, which must not read as covered.
     @test_logs (:warn, r"0 checks") match_mode = :any test_coverage(NoExports; require = :public)
 end
+
+@testitem "test_coverage stays quiet when every method in scope is declared" begin
+    using StrictMode, StrictModeTest, Test
+    module FullCov
+    hid(x::Int) = x + 1
+    end
+    FullCov.hid(1)
+    StrictMode.register_strict!(FullCov.hid, (Int,); mod = FullCov)
+    @test_logs StrictModeTest.test_coverage(FullCov)
+end

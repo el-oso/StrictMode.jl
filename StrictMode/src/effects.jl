@@ -910,7 +910,9 @@ function _mi_exempt_name(mi::Core.MethodInstance)
     name = _demangle(mi.def.name)
     ps = mi.specTypes.parameters
     types = length(ps) > 1 ? Tuple(ps[2:end]) : ()
-    for e in es
+    root = Base.moduleroot(mi.def.module)
+    for (mod, e) in es
+        (isnothing(mod) || mod === root) || continue
         _covers(e, name, types, :noalloc) && return name
     end
     return nothing

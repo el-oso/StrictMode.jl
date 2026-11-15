@@ -248,14 +248,35 @@ end
 # `exemptions()` walks each loaded package's store, so the result is kept until the world advances
 # (a package load or a method definition, which is how a package's stored exemptions appear) or
 # this session records one.
-const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Vector{Exemption}}}((typemax(UInt), -1, Exemption[]))
+# Bumped by every `_exempt!`. A module's exemption goes to that module's own store, which changes
+# neither the world counter nor `STRICT_EXEMPT`, so neither can tell the memo below it is stale.
+const _EXEMPT_GEN = Ref(0)
+
+# The `:noalloc` exemptions, each with the package root that declared it, or `nothing` for one this
+# session declared. A package's exemption covers that package's methods only: matched by name alone,
+# exempting a method of `Base.string` excused every caller of every `string`.
+const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Int, Vector{Tuple{Union{Nothing, Module}, Exemption}}}}(
+    (typemax(UInt), -1, -1, Tuple{Union{Nothing, Module}, Exemption}[])
+)
 function _noalloc_exemptions()
     w = Base.get_world_counter()
     n = length(STRICT_EXEMPT)
+    gen = _EXEMPT_GEN[]
     m = _NOALLOC_EXEMPT_MEMO[]
-    (m[1] == w && m[2] == n) && return m[3]
-    v = filter(e -> isnothing(e.guarantees) || :noalloc in e.guarantees, exemptions())
-    _NOALLOC_EXEMPT_MEMO[] = (w, n, v)
+    (m[1] == w && m[2] == n && m[3] == gen) && return m[4]
+    covers(e) = isnothing(e.guarantees) || :noalloc in e.guarantees
+    v = Tuple{Union{Nothing, Module}, Exemption}[]
+    for mod in _store_modules()
+        s = _store_for(mod, _LOCAL_EXEMPT)
+        s isa AbstractVector || continue
+        for e in s
+            covers(e) && push!(v, (mod, e))
+        end
+    end
+    for e in STRICT_EXEMPT
+        covers(e) && push!(v, (nothing, e))
+    end
+    _NOALLOC_EXEMPT_MEMO[] = (w, n, gen, v)
     return v
 end
 
@@ -301,6 +322,7 @@ function _exempt!(
     store = isnothing(mod) ? STRICT_EXEMPT : _local_store!(mod, _LOCAL_EXEMPT, Exemption[])
     e in store || push!(store, e)
     # The allocation scan reads `:noalloc` exemptions, so a verdict cached before this one is stale.
+    _EXEMPT_GEN[] += 1
     clear_cache!()
     return nothing
 end
@@ -729,7 +751,11 @@ end
 # with a call method, which a sweep meets in the method table like any function — has no `nameof`,
 # and is named by its type, as it is in a stack trace.
 _callable_name(@nospecialize(f)) = f isa Function ? nameof(f) :
-    _is_closure_type(f) ? _closure_owner(f) : nameof(Core.Typeof(f))
+    _is_closure_type(f) ? _closure_owner(f) :
+    f isa Type ? _type_name(f) :                        # a constructor answers to its type's name
+    nameof(Core.Typeof(f))
+
+_type_name(T::Type) = (U = Base.unwrap_unionall(T); U isa DataType ? nameof(U) : Symbol(string(T)))
 
 # A closure that captures a variable has no singleton instance, so a filter by name meets its TYPE.
 # The type is named `#inner#outer##N` for a closure `inner` defined in `outer`; it answers to
@@ -738,8 +764,13 @@ _is_closure_type(@nospecialize(T)) =
     T isa DataType && T <: Function && !isdefined(T, :instance) && startswith(String(nameof(T)), "#")
 function _closure_owner(T::DataType)
     s = String(nameof(T))
-    m = match(r"^#[^#]+#([^#]+)##\d+$", s)
-    return isnothing(m) ? _demangle(nameof(T)) : Symbol(m.captures[1]::AbstractString)
+    # `#inner#outer##N`: a named closure `inner` defined in `outer`.
+    m = match(r"^#[^#]+#([^#]+)##\d+", s)
+    isnothing(m) || return Symbol(m.captures[1]::AbstractString)
+    # `#outer##N`, and `#outer##N#outer##M` when nested: an anonymous or `do` closure in `outer`.
+    m = match(r"^#([^#]+)##\d+", s)
+    isnothing(m) || return Symbol(m.captures[1]::AbstractString)
+    return _demangle(nameof(T))
 end
 
 # Build a `f -> Bool` predicate from an `only`/`exempt` spec, so a mixed hot/cold library can be

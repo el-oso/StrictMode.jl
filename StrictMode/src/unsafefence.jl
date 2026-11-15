@@ -27,7 +27,8 @@ _is_unsafe_name(nm::Symbol) = nm in _UNSAFE_NAMES || startswith(String(nm), "uns
 _render_construct(nm::Symbol) = nm === :inbounds ? "`@inbounds`" : "`" * String(nm) * "`"
 
 # The function a lowered call names, resolved without inference: a `GlobalRef`, a constant, or
-# `M.name` on a module, which lowers to `getproperty(M, :name)` in a statement of its own.
+# `M.name` on a module, which lowers to `getproperty(M, :name)` (or is written `getfield(M, :name)`)
+# in a statement of its own.
 function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
     depth > 8 && return nothing
     a isa GlobalRef && return isdefined(a.mod, a.name) ? getglobal(a.mod, a.name) : nothing
@@ -35,7 +36,7 @@ function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
     if a isa Core.SSAValue
         s = code[a.id]
         if Meta.isexpr(s, :call) && length(s.args) == 3 &&
-                _lowered_callee(code, s.args[1], depth + 1) === getproperty
+                _lowered_callee(code, s.args[1], depth + 1) in (getproperty, getfield)
             M = _lowered_callee(code, s.args[2], depth + 1)
             nm = s.args[3] isa QuoteNode ? s.args[3].value : s.args[3]
             return (M isa Module && nm isa Symbol && isdefined(M, nm)) ? getglobal(M, nm) : nothing
@@ -51,6 +52,8 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
     # mean the same thing about this method.
     any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
     for st in ci.code
+        # Lowered code writes `p = pointer(a)` as an assignment around the call.
+        Meta.isexpr(st, :(=)) && (st = st.args[2])
         st isa Expr || continue
         if st.head === :foreigncall
             push!(out, :ccall)

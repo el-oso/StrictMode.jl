@@ -426,3 +426,10 @@ end
     write(joinpath(d, "test", "ok.jl"), "using StrictModeTest\ncheck_signatures([(f, (Int,))])\n")
     @test migration_report(d; io = IOBuffer()) == 2
 end
+
+@testitem "migration_report counts a proofs_loaded guard, not a mention of it" begin
+    using StrictMode
+    root = mktempdir(); mkpath(joinpath(root, "src"))
+    write(joinpath(root, "src", "P.jl"), "\"\"\"\nUnlike `proofs_loaded()`, this documents.\n\"\"\"\nf() = 1\n")
+    @test migration_report(root; io = IOBuffer()) == 0
+end

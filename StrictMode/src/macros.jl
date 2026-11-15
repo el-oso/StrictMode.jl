@@ -283,10 +283,22 @@ end
 # The type-stability layer for a call that is checked rather than performed. Nothing here has to
 # const-fold, so it asks inference for the return type directly instead of through `promote_op`.
 # Several matching methods are promoted together, which is what `promote_op` reports for them.
+#
+# It fails through `_fail` directly, not `_stable_violation`: that one stays silent while a package
+# precompiles, which is right for a call some other code happens to compile there, and is exactly
+# when a `@verify_strict` block runs. A listed call no method matches cannot run at all, and its
+# empty result would otherwise reduce to `Union{}`, which reads as stable.
 @noinline function _check_stable_once(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = Base.return_types(f, types)
+    isempty(rts) && _fail(
+        :typestable, target,
+        "no method matches this call, so it cannot run: $(f)(" * join(types, ", ") * ")";
+        gates = true
+    )
     T = length(rts) == 1 ? only(rts) : reduce(Base.promote_type, rts; init = Union{})
-    _is_typestable_return(T) || _stable_violation(target, T)
+    _is_typestable_return(T) || _fail(
+        :typestable, target, "return type is not concrete for this signature: inferred $T"
+    )
     return nothing
 end
 
@@ -299,8 +311,9 @@ end
 # verdict reports for the reason `_guarantee_gates` gives: the scan reads typed IR and cannot see
 # what LLVM later elides.
 @noinline function _strict_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _assert_owned(target, f, types; gates = false)
     sig = _alloc_signals(f, types)
+    _unread_fail(:noalloc, target, sig; gates = false) && return nothing
+    _assert_owned(target, f, types; gates = false)
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(
             :noalloc, target,

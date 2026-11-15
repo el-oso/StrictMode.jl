@@ -205,14 +205,28 @@ function test_coverage(mod::Module; require::Symbol = :all, only = nothing, exem
     fs = require === :all ? StrictMode._coverage_all_findings(mod; only, exempt) :
         require === :public ? StrictMode._coverage_findings(mod; only, exempt) :
         throw(ArgumentError("test_coverage: require must be :all or :public, got $(require)"))
-    # No method in scope renders exactly like full coverage, so say so, as the registry does.
-    isempty(fs) && @warn "test_coverage($(nameof(mod)); require = :$require): no methods are in " *
+    # No method in scope renders exactly like full coverage, so say so, as the registry does. The
+    # findings name only what is undeclared, so it is the scope that is counted, not them.
+    _coverage_scope_empty(mod, require; only, exempt) &&
+        @warn "test_coverage($(nameof(mod)); require = :$require): no methods are in " *
         "scope (0 checks) — this result proves nothing. `require = :public` judges exported " *
         "functions only; `require = :all` judges every method the module defines."
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
     throw(StrictMode.StrictViolation(:test_coverage, string(nameof(mod)), msg))
+end
+
+function _coverage_scope_empty(mod::Module, require::Symbol; only, exempt)
+    require === :all && return isempty(first(StrictMode.module_methods(mod; only, exempt)))
+    keep_only = StrictMode._name_matcher(only)
+    drop = StrictMode._name_matcher(exempt)
+    return !any(names(mod)) do nm
+        isdefined(mod, nm) || return false
+        f = getfield(mod, nm)
+        (f isa Function && parentmodule(f) === mod) || return false
+        (isnothing(drop) || !drop(f)) && (isnothing(keep_only) || keep_only(f))
+    end
 end
 
 """
