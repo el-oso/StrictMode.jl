@@ -918,3 +918,12 @@ end
     @test nf(reads_only) == 0
     @test nf(writes_a_copy) == 0
 end
+
+@testitem "pool_balance_report does not count an event wait as an acquire" begin
+    using StrictMode
+    # A worker waits on an `Event` and a driver notifies it: a signal, not a resource held.
+    ev_wait(e) = wait(e)
+    ev_notify(e) = notify(e)
+    @test pool_balance_report(ev_wait, (Threads.Event,)).balanced
+    @test pool_balance_report(ev_notify, (Threads.Event,)).balanced
+end

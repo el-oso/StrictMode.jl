@@ -1063,8 +1063,11 @@ end
 # per-control-flow-path matching, so it cannot see a `put!` that is skipped on an *error* path
 # (the real resource-leak case) — for that, use the runtime test-assert `@test`-in-a-try/finally
 # in your suite. This catches the coarse "forgot the `put!` entirely / obvious imbalance" mistake.
-const _POOL_TAKE = Set{Symbol}((:take!, :acquire, :lock, :wait))
-const _POOL_PUT = Set{Symbol}((:put!, :release, :unlock, :notify))
+# `wait`/`notify` are not counted: on a `Threads.Event` or a `Condition` they signal rather than
+# hold anything, and the two halves normally live in different functions — a worker waits, the
+# driver notifies — so counting them reported every worker loop as unbalanced.
+const _POOL_TAKE = Set{Symbol}((:take!, :acquire, :lock))
+const _POOL_PUT = Set{Symbol}((:put!, :release, :unlock))
 
 """
     pool_balance_report(f, types) -> NamedTuple
