@@ -140,7 +140,7 @@ end
     write(joinpath(clean, "test", "runtests.jl"), "@test_noalloc already_migrated(x)\n")
     b2 = IOBuffer()
     @test migration_report(clean; io = b2) == 0
-    @test occursin("nothing to change", String(take!(b2)))
+    @test occursin("stopped gating", String(take!(b2)))
 end
 
 @testitem "migration_report flags DELETED api anywhere, including src/" begin
@@ -412,4 +412,17 @@ end
     # Documentation changes no behavior, so it is reported without being counted: the return value
     # is the number of sites whose behavior changed.
     @test n == 1
+end
+
+@testitem "migration_report accepts a moved name called bare where StrictModeTest is loaded" begin
+    using StrictMode
+    d = mktempdir(); mkpath(joinpath(d, "test"))
+    write(joinpath(d, "test", "ok.jl"), "using StrictModeTest\nset_ignore_barrier!(false)\n")
+    @test migration_report(d; io = IOBuffer()) == 0
+    # Without StrictModeTest in the file, the bare name does not resolve.
+    write(joinpath(d, "test", "bad.jl"), "using StrictMode\nset_ignore_barrier!(false)\n")
+    @test migration_report(d; io = IOBuffer()) == 1
+    # A renamed function stays wrong whatever the file loads.
+    write(joinpath(d, "test", "ok.jl"), "using StrictModeTest\ncheck_signatures([(f, (Int,))])\n")
+    @test migration_report(d; io = IOBuffer()) == 2
 end

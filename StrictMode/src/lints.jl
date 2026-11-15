@@ -228,7 +228,7 @@ function _has_alias_guard(m::Method)
     names_guard(nm, args) = nm isa Symbol && (nm in _ALIAS_ORACLES || _is_arg_identity(nm, args))
     if isdefined(m, :generator)
         cis = try
-            Base.code_typed_by_type(m.sig; optimize = false)
+            _code_typed_by_type(m.sig; optimize = false)
         catch
             return nothing
         end
@@ -400,10 +400,12 @@ function _conversions(@nospecialize(f), @nospecialize(types::Tuple))
     end
     isempty(own) && return out
     ci = try
-        Base.code_typed(f, types; optimize = true)[1].first
+        _code_typed(f, types; optimize = true)[1].first
     catch
         return out
     end
+    # A generator that raises yields its `Method` in place of the code, so there is nothing to read.
+    ci isa Core.CodeInfo || return out
     sts = ci.ssavaluetypes
     sts isa Vector || return out
     for (i, st) in enumerate(ci.code)

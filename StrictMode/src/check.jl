@@ -221,5 +221,13 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             throw(ArgumentError("unknown guarantee :$g; expected one of $(_GUARANTEES)"))
         end
     end
+    # A verdict read from no body is not a verdict: "could not check" must not render as a pass.
+    if !isnothing(sig) && sig.unread
+        why = "no typed body could be read for this signature (its generator may have raised)"
+        for (i, x) in pairs(out)
+            x.guarantee in (:typestable, :noalloc, :noboxing) || continue
+            out[i] = _unevaluated(md, fn, sg, x.guarantee, why; file = x.file, line = x.line)
+        end
+    end
     return out
 end

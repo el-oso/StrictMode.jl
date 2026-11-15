@@ -36,7 +36,7 @@ function _union_split_findings(@nospecialize(f), @nospecialize(types::Tuple))
     limit = Core.Compiler.InferenceParams().max_union_splitting
     sig = Base.signature_type(f, Tuple{types...})
     ci = try
-        first(code_typed(f, Tuple{types...}; optimize = true))[1]
+        first(_code_typed(f, Tuple{types...}; optimize = true))[1]
     catch
         return out                      # unanalyzable here is the caller's problem to report
     end

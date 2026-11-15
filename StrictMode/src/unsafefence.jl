@@ -82,7 +82,7 @@ function _unsafe_constructs(m::Method)
     out = Set{Symbol}()
     if isdefined(m, :generator)
         cis = try
-            Base.code_typed_by_type(m.sig; optimize = false)
+            _code_typed_by_type(m.sig; optimize = false)
         catch
             return Symbol[]
         end

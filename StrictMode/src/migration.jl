@@ -113,9 +113,13 @@ function migration_report(
         for (dir, _, files) in walkdir(sub), file in files
             endswith(file, ".jl") || continue
             path = joinpath(dir, file)
+            # A name that moved to StrictModeTest is correct bare in a file that loads StrictModeTest,
+            # so it is reported only in a file that never names that package.
+            loads_test = occursin("StrictModeTest", read(path, String))
             for (n, line) in enumerate(eachline(path))
                 startswith(lstrip(line), '#') && continue
                 for (from, to) in pairs
+                    loads_test && to == "StrictModeTest." * from && continue
                     # Word-boundary match so `@assert_noalloc` does not also count
                     # `@assert_noallocations`, and `@strict` does not match `@strict_function`.
                     # The LEADING boundary is only added for bare identifiers: `\b` before `@`
@@ -209,7 +213,7 @@ function migration_report(
         println(io)
     end
     if isempty(disarmed)
-        println(io, "StrictMode 0.4 migration: nothing to change under $(join(dirs, ", "))/.")
+        println(io, "StrictMode 0.4 migration: no call site under $(join(dirs, ", "))/ stopped gating.")
     else
         println(io, "StrictMode 0.4: $(length(disarmed)) call site(s) that no longer gate.\n")
         for (path, n, from, to) in disarmed

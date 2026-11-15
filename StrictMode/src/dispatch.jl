@@ -163,7 +163,7 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
         (sig0.boxing || sig0.unionphi) || return nothing
     end
     cis = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch
         return nothing
     end
@@ -355,7 +355,7 @@ function _dispatch_sites(@nospecialize(f), @nospecialize(types::Tuple), limit::I
     dynamic = Tuple{String, String}[]
     cliff = Tuple{String, String}[]
     cis = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch
         return (dynamic, cliff)
     end

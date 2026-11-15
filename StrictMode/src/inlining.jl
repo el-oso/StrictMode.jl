@@ -22,7 +22,7 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
         return nothing
     end
     wrapper = _inline_wrapper(f)
-    cts = Base.code_typed(wrapper, types; optimize = true)
+    cts = _code_typed(wrapper, types; optimize = true)
     isempty(cts) && return nothing
     for stmt in first(cts).first.code
         if Meta.isexpr(stmt, :invoke)
@@ -133,7 +133,7 @@ _is_base_core(m::Module) = (r = Base.moduleroot(m); r === Base || r === Core)
 # Walk `f`'s optimized IR; aggregate every non-inlined callee by Method.
 function _noninlined_callees(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch
         return _NonInlinedCallee[]
     end

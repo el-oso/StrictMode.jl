@@ -728,7 +728,19 @@ end
 # The name a callable answers to. A function has one; a callable object — an instance of a struct
 # with a call method, which a sweep meets in the method table like any function — has no `nameof`,
 # and is named by its type, as it is in a stack trace.
-_callable_name(@nospecialize(f)) = f isa Function ? nameof(f) : nameof(Core.Typeof(f))
+_callable_name(@nospecialize(f)) = f isa Function ? nameof(f) :
+    _is_closure_type(f) ? _closure_owner(f) : nameof(Core.Typeof(f))
+
+# A closure that captures a variable has no singleton instance, so a filter by name meets its TYPE.
+# The type is named `#inner#outer##N` for a closure `inner` defined in `outer`; it answers to
+# `outer`, whose implementation it is.
+_is_closure_type(@nospecialize(T)) =
+    T isa DataType && T <: Function && !isdefined(T, :instance) && startswith(String(nameof(T)), "#")
+function _closure_owner(T::DataType)
+    s = String(nameof(T))
+    m = match(r"^#[^#]+#([^#]+)##\d+$", s)
+    return isnothing(m) ? _demangle(nameof(T)) : Symbol(m.captures[1]::AbstractString)
+end
 
 # Build a `f -> Bool` predicate from an `only`/`exempt` spec, so a mixed hot/cold library can be
 # scoped without a growing hand-listed set: a `Function` is used as-is, a `Regex` matches the
@@ -822,11 +834,17 @@ function module_methods(mod::Module; only = nothing, exempt = (), include_exempt
         any(s -> _in_module_tree(m.module, s), scope) || return nothing
         reason = _census_skip(m)
         isnothing(reason) || return bump!(reason)
-        f = try
-            _method_function(m).instance
+        F = try
+            _method_function(m)
         catch
-            nothing                     # no singleton instance: filters that need the function
-        end                             # cannot speak for it, so it stays in the census
+            nothing
+        end
+        f = isdefined(F, :instance) ? F.instance : nothing
+        # A capturing closure has no instance. A filter by name still answers for it through its
+        # type; a filter that is the caller's own function expects a function, so it cannot, and the
+        # closure stays in the census.
+        isnothing(f) && _is_closure_type(F) && !(only isa Function) && !(exempt isa Function) &&
+            (f = F)
         if !isnothing(f)
             ((!include_exempt && _is_exempt(f)) || (!isnothing(exemptpred) && exemptpred(f))) &&
                 return bump!(:exempt)

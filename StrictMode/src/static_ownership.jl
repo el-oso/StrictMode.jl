@@ -34,7 +34,7 @@ end
 # (acceptable: it's advisory, a wrong hint costs a glance, not a build break).
 function _registry_lookup_sites(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
-        Base.code_typed(f, types; optimize = false)
+        _code_typed(f, types; optimize = false)
     catch
         return _RegistrySite[]
     end
@@ -84,7 +84,7 @@ function _typekey_lookup_by_sig(@nospecialize(sig), depth::Int, seen::Base.IdSet
     push!(seen, sig)
     stmts = get!(code, sig) do
         cts = try
-            Base.code_typed_by_type(sig; optimize = true)
+            _code_typed_by_type(sig; optimize = true)
         catch
             nothing
         end

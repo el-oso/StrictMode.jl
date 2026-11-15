@@ -167,7 +167,7 @@ function _mi_codeinfo(mi::Core.MethodInstance)
     f = params[1].instance
     argts = Tuple(params[2:end])
     cts = try
-        Base.code_typed(f, argts; optimize = true)
+        _code_typed(f, argts; optimize = true)
     catch
         return nothing
     end
@@ -601,7 +601,7 @@ function _recurse_task_body(
         return nothing
     end
     cts = try
-        Base.code_typed_by_type(Tuple{T}; optimize = true)
+        _code_typed_by_type(Tuple{T}; optimize = true)
     catch err
         _record!(
             out, seen, chain,
@@ -677,7 +677,7 @@ Powers [`@assert_concurrency_safe`](@ref); see that macro for the guarantee's sc
 """
 function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch err
         throw(_UnanalyzableSignature(:concurrency_safe, f, types, sprint(showerror, err)))
     end
@@ -847,7 +847,7 @@ end
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch err
         throw(_UnanalyzableSignature(:no_threadid_state, f, types, sprint(showerror, err)))
     end
@@ -979,7 +979,7 @@ end
 # caller's store into the returned value writes the argument.
 function _returns_argument(mi::Core.MethodInstance, k::Int)
     cts = try
-        Base.code_typed_by_type(mi.specTypes; optimize = true)
+        _code_typed_by_type(mi.specTypes; optimize = true)
     catch
         return false
     end
@@ -1084,7 +1084,7 @@ match" must not render alike. The other two checks in this file raise for the sa
 """
 function pool_balance_report(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
-        Base.code_typed(f, types; optimize = false)   # keep source-level `take!`/`put!` names
+        _code_typed(f, types; optimize = false)   # keep source-level `take!`/`put!` names
     catch err
         throw(_UnanalyzableSignature(:pool_balanced, f, types, sprint(showerror, err)))
     end

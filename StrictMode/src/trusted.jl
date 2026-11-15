@@ -107,7 +107,7 @@ end
 function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     f in _TRUST_BOUNDARIES && return (Symbol[], Symbol[])
     cts = try
-        Base.code_typed(f, types; optimize = false)
+        _code_typed(f, types; optimize = false)
     catch
         return nothing
     end

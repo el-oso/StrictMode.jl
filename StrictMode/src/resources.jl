@@ -134,7 +134,7 @@ end
 function _resource_escapes(@nospecialize(f), @nospecialize(types::Tuple))
     shapes = Set{String}()
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch
         return shapes
     end

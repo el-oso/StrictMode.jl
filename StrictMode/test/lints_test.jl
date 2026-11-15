@@ -135,3 +135,35 @@ end
     @test StrictMode._callable_name(WithFunctor.Scale()) === :Scale
     @test first(StrictMode._reach_key(WithFunctor.Scale())) === WithFunctor
 end
+
+@testitem "a sweep filtered by name scopes a capturing closure by the function it is in" begin
+    using StrictMode
+    module ClosureScope
+    wanted(x) = x + 1
+    function other(p::Ptr{Float64}, n)
+        helper(i) = unsafe_load(p, i)       # captures `p`: no singleton instance
+        s = 0.0
+        for i in 1:n
+            s += helper(i)
+        end
+        s
+    end
+    end
+    @test isempty(unsafe_report(ClosureScope; only = [:wanted]))
+    @test [f.func for f in unsafe_report(ClosureScope; only = [:other])] == ["helper"]
+    @test isempty(unsafe_report(ClosureScope; exempt = [:other]))
+end
+
+@testitem "a body that cannot be read is :fail, and conversion_report does not crash on it" begin
+    using StrictMode
+    module GenRaises
+    @generated g(p::Ptr{T}, a::Float32) where {T} = T === Any ? error("no body for Any") : :(a)
+    end
+    GenRaises.g(Ptr{Float64}(0), 1f0)
+    G = (:typestable, :noalloc, :noboxing)
+    fs = StrictMode.findings(GenRaises.g, (Ptr{Any}, Float32); guarantees = G)
+    @test all(StrictMode._failed, fs)
+    @test all(f -> occursin("no typed body", f.reason), fs)
+    @test !any(StrictMode._failed, StrictMode.findings(GenRaises.g, (Ptr{Float64}, Float32); guarantees = G))
+    @test isempty(StrictMode._conversions(GenRaises.g, (Ptr{Any}, Float32)))
+end

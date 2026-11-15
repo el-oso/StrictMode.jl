@@ -240,7 +240,7 @@ function _sw_reach(@nospecialize(sig))
             continue
         end
         cts = try
-            Base.code_typed_by_type(s; optimize = true)
+            _code_typed_by_type(s; optimize = true)
         catch
             Any[]
         end
@@ -309,7 +309,7 @@ isempty(r.findings) && isempty(r.unread)
 function spin_wait_report(@nospecialize(f), @nospecialize(types::Tuple))
     target = string(f isa Function || f isa Type ? f : typeof(f)) * _sig_string(types)
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch err
         throw(ArgumentError("spin_wait_report: could not analyze $target: $(sprint(showerror, err))"))
     end

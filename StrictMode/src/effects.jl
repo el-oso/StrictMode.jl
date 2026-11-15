@@ -297,6 +297,9 @@ Location is the method's definition site.
 const _AllocSignals = @NamedTuple{
     alloc::Bool, boxing::Bool, dictlookup::Bool, abscontainer::Any,
     barrier::Bool, unionphi::Bool, exempt::Union{Nothing, Symbol}, file::String, line::Int,
+    # No typed body could be read for the signature, so every other field is empty for want of a
+    # body, not because the body is clean.
+    unread::Bool,
 }
 
 # The scan of `f`'s OWN body, memoized on the same terms as the callee recursion below: identity on
@@ -329,7 +332,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch
         Any[]
     end
@@ -345,7 +348,10 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     end
     file = isnothing(m) ? "" : string(m.file)
     line = isnothing(m) ? 0 : Int(m.line)
-    return (; alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, file, line)
+    return (;
+        alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, file, line,
+        unread = isempty(cts),
+    )
 end
 
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
@@ -533,7 +539,7 @@ end
 
 function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     cts = try
-        Base.code_typed_by_type(sig; optimize = true)
+        _code_typed_by_type(sig; optimize = true)
     catch
         return (false, false, false, nothing, false, false, nothing)
     end
@@ -1061,3 +1067,10 @@ function _noescape_finding(
         tier
     )
 end
+
+# `code_typed` with only the results that carry code. When a `@generated` method's generator raises
+# for a signature, Julia returns that `Method` in place of the `CodeInfo`. Every reader here treats
+# an empty result as a body it could not read; a `Method` read as code crashed the analysis instead.
+_code_typed(args...; kw...) = filter(p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; kw...))
+_code_typed_by_type(args...; kw...) =
+    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; kw...))

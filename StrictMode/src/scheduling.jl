@@ -17,7 +17,7 @@
 function _forwarded_sig(@nospecialize(sig))
     for _ in 1:8                       # a chain of trailing defaults forwards once per default
         cts = try
-            Base.code_typed_by_type(sig; optimize = true)
+            _code_typed_by_type(sig; optimize = true)
         catch
             return sig
         end
@@ -91,7 +91,7 @@ end
 function _invoke_callees(@nospecialize(f), @nospecialize(types::Tuple))
     out = String[]
     cts = try
-        Base.code_typed(f, Tuple{types...}; optimize = true)
+        _code_typed(f, Tuple{types...}; optimize = true)
     catch
         return out
     end

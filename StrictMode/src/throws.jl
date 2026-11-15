@@ -13,7 +13,7 @@
 function _thrown_types(@nospecialize(f), @nospecialize(types::Tuple))
     out = Set{Type}()
     cts = try
-        Base.code_typed(f, types; optimize = false)
+        _code_typed(f, types; optimize = false)
     catch
         return out
     end

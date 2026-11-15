@@ -207,7 +207,7 @@ function _reach(@nospecialize(sig), stop)
             continue
         end
         cts = try
-            Base.code_typed_by_type(s; optimize = true, debuginfo = :source)
+            _code_typed_by_type(s; optimize = true, debuginfo = :source)
         catch
             Any[]
         end
@@ -263,7 +263,7 @@ function reach_report(
     )
     target = _reach_target(f, types)
     cts = try
-        Base.code_typed(f, types; optimize = true)
+        _code_typed(f, types; optimize = true)
     catch err
         throw(ArgumentError("reach_report: could not analyze $target: $(sprint(showerror, err))"))
     end
