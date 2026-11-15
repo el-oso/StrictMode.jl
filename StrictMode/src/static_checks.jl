@@ -213,6 +213,14 @@ function _assert_owned(
                 "barrier so its callers point here.";
             gates = gates
         )
+    elseif sig.truncated
+        _fail(
+            :owned, target,
+            "not established: the walk stopped at its depth limit ($depth out-of-line levels) with a " *
+                "callee of the package still unread. Assert :owned on the function that does the lookup, " *
+                "or pass `depth = n`.";
+            gates = false
+        )
     else
         _barrier_info(:owned, target, sig.barrier_dict)
     end

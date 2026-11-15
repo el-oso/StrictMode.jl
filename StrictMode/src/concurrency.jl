@@ -453,7 +453,7 @@ function _taint_scan_ci(
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
                     # and so is a raw pointer read out of one (`ptr_or_offset`), though it is bits
                     isref = (nm === :memoryrefnew || nm === :memoryref) ? true :
-                        (_may_ref(types[i]) || Core.Compiler.widenconst(types[i]) <: Ptr)
+                        (_may_ref(types[i]) || _holds_ptr(Core.Compiler.widenconst(types[i])))
                     if _op_tainted(src, tset, targs)
                         settaint(isref)
                     else
@@ -589,6 +589,16 @@ function _operand_type(@nospecialize(a), types)
     return (T isa DataType && isconcretetype(T)) ? T : nothing
 end
 
+# Whether a value of type `T` can carry a raw pointer: a `Ptr`, or a plain-data struct with one in a
+# field. Such a value is a copy, yet a store through the pointer it holds writes the memory it was
+# read from, so it carries the taint as a reference does.
+function _holds_ptr(@nospecialize(T), depth::Int = 0)
+    T isa DataType || return false
+    T <: Ptr && return true
+    (depth < 4 && isbitstype(T)) || return false
+    return any(F -> _holds_ptr(F, depth + 1), fieldtypes(T))
+end
+
 # A constant global holding a mutable value, as optimized code spells it: the value itself, quoted
 # or bare, or a `GlobalRef` to a constant binding. A string or symbol is not shared state.
 function _is_mutable_global(@nospecialize(a))
@@ -619,7 +629,7 @@ function _recurse_closure_body(
         _record!(
             out, seen, chain,
             "builds a closure holding a plan-reachable value at recursion depth $depth (≥ " *
-                "max_depth=$max_depth) — not followed; flagged conservatively", caller
+                "max_depth=$max_depth) — not read, so not established; pass a larger `max_depth` to check it", caller
         )
         return nothing
     end
@@ -678,8 +688,8 @@ function _recurse_task_body(
     if depth >= max_depth
         _record!(
             out, seen, chain,
-            "$held at recursion depth $depth (≥ max_depth=$max_depth) — not followed; flagged " *
-                "conservatively", caller
+            "$held at recursion depth $depth (≥ max_depth=$max_depth) — not read, so not " *
+                "established; pass a larger `max_depth` to check it", caller
         )
         return nothing
     end
@@ -728,7 +738,7 @@ function _recurse(
         _record!(
             out, seen, chain,
             "hands a plan-reachable value to `$label` at recursion depth $depth (≥ max_depth=$max_depth) — " *
-                "not followed; flagged conservatively", _Frame(label, string(m.file), Int(m.line))
+                "not read, so not established; pass a larger `max_depth` to check it", _Frame(label, string(m.file), Int(m.line))
         )
         memo[key] = false
         return false
@@ -796,6 +806,15 @@ end
 function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
+    # Every write is atomic: a barrier, a work cursor or a published flag, which is how tasks
+    # synchronize through shared state. That is named, not warned about; a plain store to the same
+    # field is not atomic and still fails.
+    if all(v -> v.deliberate, vs)
+        @info "StrictMode @assert_concurrency_safe $target: argument $self_arg is written only by " *
+            "atomic operations ($(length(vs)) site(s)), which synchronize tasks rather than " *
+            "race them." _id = Symbol(:conc_sync, '|', target) maxlog = 1
+        return nothing
+    end
     io = IOBuffer()
     # The headline has to match what the scan actually established, or the warn path states as fact
     # the very thing the certainty split says it could not see.
@@ -1416,11 +1435,14 @@ function _concurrency_safe_finding(
         )
     end
     certain = any(v -> v.certain && !v.deliberate, vs)
+    sync = all(v -> v.deliberate, vs)
     return StrictFinding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
         vs[1].file, vs[1].line,
         (
             certain ? "argument $self is written during the call ($(length(vs)) site(s)): " :
+            sync ? "argument $self is written only by atomic operations, which synchronize " *
+                "tasks ($(length(vs)) site(s)): " :
                 "cannot prove argument $self is read-only ($(length(vs)) site(s)): "
         ) *
             join((v.message for v in vs), "; "),

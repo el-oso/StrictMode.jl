@@ -69,6 +69,13 @@ function _compiled_output_finding(
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
         s.dictlookup || isnothing(s.barrier_dict) ||
             return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
+        (!s.dictlookup && s.truncated) && return StrictFinding(
+            md, fn, sg, g, :info, s.file, s.line,
+            "not established: the walk stopped at its depth limit ($(_FAST_ALLOC_DEPTH[]) out-of-line " *
+                "levels) with a callee of the package still unread",
+            "assert :owned on the function that does the lookup, or raise " *
+                "`StrictMode._FAST_ALLOC_DEPTH[]`", tier, _code(g, nothing)
+        )
         return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true

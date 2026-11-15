@@ -156,3 +156,23 @@ end
     StrictMode.register_strict!(FullCov.hid, (Int,); mod = FullCov)
     @test_logs StrictModeTest.test_coverage(FullCov)
 end
+
+@testitem "test_waits_yield fails a wait that never yields, and passes one that does" begin
+    using StrictMode, StrictModeTest
+    module Waits
+    const FLAG = Threads.Atomic{Bool}(false)
+    @noinline function spin_worker()                    # pause() only: no other task can run here
+        for _ in 1:(1 << 20)
+            FLAG[] && return nothing
+            ccall(:jl_cpu_pause, Cvoid, ())
+        end
+        nothing
+    end
+    @noinline polite_worker() = (while !FLAG[]; yield(); end; nothing)
+    spin_start() = (t = Threads.@spawn spin_worker(); FLAG[] = true; wait(t); FLAG[] = false; nothing)
+    polite_start() = (FLAG[] = true; t = Threads.@spawn polite_worker(); wait(t); FLAG[] = false; nothing)
+    end
+    Waits.spin_start(); Waits.polite_start()
+    @test_throws "never yields" StrictModeTest.test_waits_yield(Waits.spin_start, ())
+    @test StrictModeTest.test_waits_yield(Waits.polite_start, ()) isa StrictMode.SpinWaitReport
+end

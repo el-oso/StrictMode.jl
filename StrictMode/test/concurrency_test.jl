@@ -984,3 +984,51 @@ end
     # A job that receives its own buffer writes nothing shared.
     @test isempty(StrictMode.concurrency_findings(Spawned.job!, (Vector{Float64}, Vector{Float64})))
 end
+
+@testitem "a pointer copied out of the plan inside a plain-data struct still writes the plan" begin
+    using StrictMode
+    module PtrCopy
+    struct Job; Cp::Ptr{Float64}; n::Int; end
+    mutable struct Pool; job::Job; end
+    @noinline store!(j::Job, i) = (unsafe_store!(j.Cp, 1.0, i); nothing)
+    direct(p::Pool) = (unsafe_store!(p.job.Cp, 1.0, 1); nothing)
+    via_callee(p::Pool) = (j = p.job; store!(j, 1); nothing)
+    reads(p::Pool) = unsafe_load(p.job.Cp, 1)
+    end
+    buf = zeros(4)
+    GC.@preserve buf begin
+        p = PtrCopy.Pool(PtrCopy.Job(pointer(buf), 4))
+        PtrCopy.direct(p); PtrCopy.via_callee(p); PtrCopy.reads(p)
+    end
+    certain(f) = any(v -> v.certain, StrictMode.concurrency_findings(f, (PtrCopy.Pool,)))
+    @test certain(PtrCopy.direct)
+    @test certain(PtrCopy.via_callee)
+    @test !certain(PtrCopy.reads)
+end
+
+@testitem "atomic writes to shared state read as synchronization; a plain store does not" begin
+    using StrictMode, Test
+    module SyncWrites
+    mutable struct Sync; @atomic bar::Int; plain::Int; end
+    mutable struct Pool; sync::Sync; end
+    barrier(p::Pool) = (s = p.sync; @atomic s.bar += 1; nothing)
+    plainbump(p::Pool) = (s = p.sync; s.plain += 1; nothing)
+    struct Inner; p::Ptr{Float64}; end
+    struct Outer; in::Inner; end
+    mutable struct Holder; o::Outer; buf::Vector{Float64}; end
+    nested(h::Holder) = (unsafe_store!(h.o.in.p, 1.0, 1); nothing)
+    viaview(h::Holder) = (v = view(h.buf, 2:3); GC.@preserve v unsafe_store!(pointer(v), 1.0, 1); nothing)
+    end
+    p = SyncWrites.Pool(SyncWrites.Sync(0, 0)); SyncWrites.barrier(p); SyncWrites.plainbump(p)
+    @test_logs (:info, r"synchronize tasks") StrictMode._assert_concurrency_safe("t", SyncWrites.barrier, (SyncWrites.Pool,))
+    @test only(StrictMode.findings(SyncWrites.barrier, (SyncWrites.Pool,); guarantees = (:concurrency_safe,))).status === :info
+    @test_throws StrictMode.StrictViolation StrictMode._assert_concurrency_safe("t", SyncWrites.plainbump, (SyncWrites.Pool,))
+    buf = zeros(4)
+    GC.@preserve buf begin
+        h = SyncWrites.Holder(SyncWrites.Outer(SyncWrites.Inner(pointer(buf))), zeros(4))
+        SyncWrites.nested(h); SyncWrites.viaview(h)
+    end
+    certain(f) = any(v -> v.certain, StrictMode.concurrency_findings(f, (SyncWrites.Holder,)))
+    @test certain(SyncWrites.nested)        # a pointer two plain-data structs deep
+    @test certain(SyncWrites.viaview)       # a pointer taken through a view
+end

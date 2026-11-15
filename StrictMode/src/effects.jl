@@ -310,6 +310,9 @@ const _AllocSignals = @NamedTuple{
     # A registered barrier the call reaches whose own dictionary lookup, or boxing, is reported at the
     # barrier rather than here (`nothing` when there is none).
     barrier_dict::Union{Nothing, Symbol}, barrier_box::Union{Nothing, Symbol},
+    # The walk reached its depth limit with a callee outside Base still unread, so a verdict that
+    # depends on what lies below it (`:owned`) is not established.
+    truncated::Bool,
 }
 
 # The scan of `f`'s OWN body, memoized on the same terms as the callee recursion below: identity on
@@ -348,8 +351,8 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     end
     seen = Base.IdSet{Any}()
     push!(seen, sig)
-    alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box =
-        isempty(cts) ? (false, false, false, nothing, false, false, nothing, nothing, nothing) :
+    alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated =
+        isempty(cts) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
         _scan_ci(first(cts)[1], sig, depth, seen)
     m = try
         which(f, types)
@@ -360,7 +363,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     line = isnothing(m) ? 0 : Int(m.line)
     return (;
         alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, file, line,
-        unread = isempty(cts), barrier_dict, barrier_box,
+        unread = isempty(cts), barrier_dict, barrier_box, truncated,
     )
 end
 
@@ -530,11 +533,11 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, false, nothing, false, false, nothing, nothing, nothing)
+    sig in seen && return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -543,7 +546,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     end
     memo === nothing || return memo
     r = _signals_by_type_uncached(sig, depth, seen)
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -551,9 +554,9 @@ function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.Id
     cts = try
         _code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, false, nothing, false, false, nothing, nothing, nothing)
+        return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     end
-    isempty(cts) && return (false, false, false, nothing, false, false, nothing, nothing, nothing)
+    isempty(cts) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     return _scan_ci(first(cts)[1], sig, depth, seen)
 end
 
@@ -748,6 +751,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     # are pointed there rather than failed again for the same cause.
     barrier_dict = nothing
     barrier_box = nothing
+    truncated = false                 # a callee outside Base was left unread at the depth limit
     # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
     # Computed on demand: the analysis costs about as much as the whole rest of the scan, and it can
     # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
@@ -821,7 +825,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
                         barrier = true
                         if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            _, b2, d2, _, _, _, _, bd2, bb2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
@@ -842,7 +846,8 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # more so: it is a top-level-only signal, never propagated from a callee
                         # (widening it to callees and to dict value types over-flags `IdDict`, #17).
                         if depth > 0 && (!alloc || !boxing || !dictlookup)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)
                             # A callee exempted from `:noalloc` has its allocation excused here
@@ -861,6 +866,11 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
                             up2 && (unionphi = true)
+                        elseif depth <= 0 && !dictlookup && mi.def isa Method &&
+                                !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
+                            # The walk ends here with a callee of the user's own unread: whatever it
+                            # does is not in this verdict, so `:owned` reports it as not checked.
+                            truncated = true
                         end
                     end
                 end
@@ -898,7 +908,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
             end
         end
     end
-    return (alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box)
+    return (alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated)
 end
 
 # The name of the function `mi` calls, when an exemption in scope covers `:noalloc` for it at the

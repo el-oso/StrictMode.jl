@@ -47,7 +47,7 @@ export @test_no_gc_pause, @test_allocated_zero, @test_reaches
 export @test_strict, @test_kernel
 export test_signatures, test_compiled, test_registered, test_coverage, test_exemptions
 export test_calls, test_layers, test_latency, test_no_unsafe, test_specializations
-export test_threaded_speedup, test_threadcount_invariant, test_route_parity
+export test_threaded_speedup, test_threadcount_invariant, test_route_parity, test_waits_yield
 export proof_audit
 export alloc_entry_report, AllocEntryReport, AllocEntry
 export proof_findings, AnalysisError

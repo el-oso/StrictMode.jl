@@ -860,3 +860,41 @@ function test_route_parity(a::Pair, b::Pair; kwargs...)
         )
     )
 end
+
+"""
+    test_waits_yield(f, types) -> StrictMode.SpinWaitReport
+
+Prove that every task the call `f(types...)` spawns waits by **yielding**, and throw a
+`StrictMode.StrictViolation` naming each one that does not.
+
+A worker that waits by spinning on `pause()`, a safepoint or a fence, and never yields, keeps its
+thread from running any other task for as long as it spins: every task queued there waits behind
+it. That is a stall no allocation or type guarantee can see, and it is read from the same task
+bodies [`StrictMode.spin_wait_report`](@ref) reads.
+
+A task that yields while it waits passes this gate even when it never blocks; `spin_wait_report`
+still reports that it keeps a CPU busy. A task the scan could not read fails, because a wait that
+was not read is not a wait that yields.
+
+```julia
+test_waits_yield(gemm!, (Matrix{Float64}, Matrix{Float64}, Matrix{Float64}))
+```
+"""
+function test_waits_yield(@nospecialize(f), @nospecialize(types::Tuple))
+    r = StrictMode.spin_wait_report(f, types)
+    bad = String[]
+    for x in r.findings
+        :yield in x.polls && continue
+        push!(
+            bad, "`$(x.target)` waits by $(join(x.polls, ", ")) and never yields, so no other task " *
+                "can run on its thread while it waits"
+        )
+    end
+    isempty(r.unread) || push!(
+        bad, "spawned task(s) could not be read, so how they wait is not established: " *
+            join(r.unread, ", ")
+    )
+    isempty(bad) && return r
+    target = string(f) * StrictMode._sig_string(types)
+    throw(StrictMode.StrictViolation(:waits_yield, target, join(bad, "\n  ")))
+end

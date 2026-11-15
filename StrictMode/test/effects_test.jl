@@ -627,3 +627,19 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem ":owned does not pass where its walk stopped short" begin
+    using StrictMode, Test
+    module OwnedDepth
+    @noinline m1() = m2(); @noinline m2() = m3(); @noinline m3() = m4(); @noinline m4() = Dict(:a => 1)[:a]
+    @noinline s3() = 1.0; @noinline s2() = s3() + 1; @noinline s1() = s2() + 1
+    end
+    OwnedDepth.m1(); OwnedDepth.s1()
+    own(f) = only(StrictMode.findings(f, (); guarantees = (:owned,)))
+    # A lookup four out-of-line levels down is past the default depth: not a pass.
+    @test own(OwnedDepth.m1).status === :info
+    @test occursin("not established", own(OwnedDepth.m1).reason)
+    @test StrictMode._failed(own(OwnedDepth.m3))               # within reach, it fails
+    @test own(OwnedDepth.s1).status === :pass                   # read to the end, it passes
+    @test_logs (:warn, r"not established") match_mode = :any StrictMode._assert_owned("t", OwnedDepth.m1, ())
+end
