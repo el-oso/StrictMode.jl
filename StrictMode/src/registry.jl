@@ -275,7 +275,7 @@ end
 # The coarse question the module sweeps ask: is this function opted out of everything? A narrow
 # exemption must NOT answer yes here — it would silence guarantees it never claimed.
 function _is_exempt(@nospecialize(f))
-    name = _demangle(nameof(f))
+    name = _demangle(_callable_name(f))
     for e in exemptions()
         e.func === name && isnothing(e.types) && isnothing(e.guarantees) && return true
     end
@@ -284,7 +284,7 @@ end
 
 # The precise question a verdict asks: is THIS signature opted out of THIS guarantee?
 function _is_exempt(@nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
-    name = _demangle(nameof(f))
+    name = _demangle(_callable_name(f))
     for e in exemptions()
         _covers(e, name, types, g) && return true
     end
@@ -396,7 +396,7 @@ function _split_exempt(@nospecialize(f), @nospecialize(types), gs)
 end
 
 function _matching_exemption(@nospecialize(f), @nospecialize(types), g::Symbol)
-    name = _demangle(nameof(f))
+    name = _demangle(_callable_name(f))
     for e in exemptions()
         _covers(e, name, types, g) && return e
     end
@@ -725,15 +725,20 @@ function _demangle(nm::Symbol)
     return m === nothing ? nm : Symbol(m.captures[1]::AbstractString)
 end
 
+# The name a callable answers to. A function has one; a callable object — an instance of a struct
+# with a call method, which a sweep meets in the method table like any function — has no `nameof`,
+# and is named by its type, as it is in a stack trace.
+_callable_name(@nospecialize(f)) = f isa Function ? nameof(f) : nameof(Core.Typeof(f))
+
 # Build a `f -> Bool` predicate from an `only`/`exempt` spec, so a mixed hot/cold library can be
 # scoped without a growing hand-listed set: a `Function` is used as-is, a `Regex` matches the
 # (demangled) function name, and a collection matches by name / function. `nothing` → no filter.
 function _name_matcher(spec)
     spec === nothing && return nothing
     spec isa Function && return spec
-    spec isa Regex && return f -> occursin(spec, string(_demangle(nameof(f))))
+    spec isa Regex && return f -> occursin(spec, string(_demangle(_callable_name(f))))
     set = Set{Symbol}(_asname(x) for x in spec)
-    return f -> _demangle(nameof(f)) in set
+    return f -> _demangle(_callable_name(f)) in set
 end
 
 # --- the census: every method a module defines ------------------------------------------------

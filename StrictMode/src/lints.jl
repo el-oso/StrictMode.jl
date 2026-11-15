@@ -216,31 +216,57 @@ function _aliasable_arity(m::Method)
     return count(_could_be_array(Base.unwrap_unionall(P)) for P in sig.parameters[2:end])
 end
 
-# Does this method's own body ask whether two of its arguments overlap? Read from UNOPTIMIZED IR,
-# because the guard is a call the author wrote and optimization folds `mightalias` into comparisons
-# that no longer carry its name. `nothing` when the IR could not be read — which a caller must not
-# read as "no guard".
+# Does this method's own body ask whether two of its arguments overlap? Read from the method's
+# LOWERED code, because the guard is a call the author wrote and optimization folds `mightalias`
+# into comparisons that no longer carry its name. Lowered code needs no inference. Inferring at the
+# declared signature cost seconds on a large kernel, returned the code of every method that
+# signature matches — crediting a generic method with a guard its specific sibling wrote — and could
+# leave `Base.unalias` unresolved, reporting a guarded method as unguarded. A `@generated` method has
+# no lowered body of its own and is inferred, keeping only its own result. `nothing` when the code
+# could not be read — which a caller must not read as "no guard".
 function _has_alias_guard(m::Method)
-    cis = try
-        Base.code_typed_by_type(m.sig; optimize = false)
+    names_guard(nm, args) = nm isa Symbol && (nm in _ALIAS_ORACLES || _is_arg_identity(nm, args))
+    if isdefined(m, :generator)
+        cis = try
+            Base.code_typed_by_type(m.sig; optimize = false)
+        catch
+            return nothing
+        end
+        isempty(cis) && return nothing
+        for pair in cis
+            ci = pair isa Pair ? pair.first : pair
+            ci isa Core.CodeInfo || continue
+            mi = ci.parent
+            (mi isa Core.MethodInstance && mi.def !== m) && continue
+            for st in ci.code
+                callee, args = _call_callee_and_args(ci, st)
+                isnothing(callee) && continue
+                nm = try
+                    nameof(callee)
+                catch
+                    continue
+                end
+                names_guard(nm, args) && return true
+            end
+        end
+        return false
+    end
+    src = try
+        Base.uncompressed_ast(m)
     catch
         return nothing
     end
-    isempty(cis) && return nothing
-    for pair in cis
-        ci = pair isa Pair ? pair.first : pair
-        ci isa Core.CodeInfo || continue
-        for st in ci.code
-            callee, args = _call_callee_and_args(ci, st)
-            isnothing(callee) && continue
-            nm = try
-                nameof(callee)
-            catch
-                continue
-            end
-            nm isa Symbol || continue
-            (nm in _ALIAS_ORACLES || _is_arg_identity(nm, args)) && return true
+    for st in src.code
+        s = Meta.isexpr(st, :(=)) ? st.args[2] : st
+        (Meta.isexpr(s, :call) && !isempty(s.args)) || continue
+        callee = _lowered_callee(src.code, s.args[1])
+        isnothing(callee) && continue
+        nm = try
+            nameof(callee)
+        catch
+            continue
         end
+        names_guard(nm, s.args[2:end]) && return true
     end
     return false
 end

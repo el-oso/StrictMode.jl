@@ -112,3 +112,26 @@ end
     @test x[1] == 1.0
     @test !any(f -> occursin("no argument is written", string(f)), StrictMode.bang_report(BangPtr))
 end
+
+@testitem "alias_guard_report credits a guard only to the method that wrote it" begin
+    using StrictMode
+    module GuardSiblings
+    fill_from!(a::AbstractVector, b::AbstractVector) = (a .= b; a)
+    fill_from!(a::Vector{Float64}, b::Vector{Float64}) = (copyto!(a, Base.unalias(a, b)); a)
+    end
+    fs = filter(f -> f.func == "fill_from!", alias_guard_report(GuardSiblings))
+    @test length(fs) == 1
+    @test occursin("AbstractVector", only(fs).signature)
+end
+
+@testitem "a module sweep names a callable object by its type" begin
+    using StrictMode
+    module WithFunctor
+    struct Scale end
+    (::Scale)(x) = 2x
+    end
+    ms, _ = StrictMode.module_methods(WithFunctor)
+    @test any(m -> m.sig <: Tuple{WithFunctor.Scale, Any}, ms)
+    @test StrictMode._callable_name(WithFunctor.Scale()) === :Scale
+    @test first(StrictMode._reach_key(WithFunctor.Scale())) === WithFunctor
+end

@@ -63,7 +63,8 @@ mutable struct _Reach
 end
 
 _reach_key(m::Method) = (m.module, _demangle(m.name))
-_reach_key(@nospecialize(f)) = (parentmodule(f), _demangle(nameof(f)))
+_reach_key(@nospecialize(f)) =
+    (parentmodule(f isa Function ? f : Core.Typeof(f)), _demangle(_callable_name(f)))
 
 function _reach_record!(r::_Reach, key::Tuple{Module, Symbol}, depth::Int, inlined::Bool)
     old = get(r.found, key, nothing)
