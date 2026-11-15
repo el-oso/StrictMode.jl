@@ -130,15 +130,10 @@ checker reports where that cast appears — which helps only when somebody runs 
 does the same work, `unsafe_trust` is the cast, and the check rides the same registry sweep as
 every other guarantee.
 
-A C entry point keeps `Ptr` in its signature, so there the foreign arguments are named by position
-with [`trust_foreign!`](@ref) or `@assert_trusted f(p, n) foreign = (1,)`, and the check follows
-everything derived from them.
-
 ```@docs
 Untrusted
 unsafe_trust
 trust_boundary!
-trust_foreign!
 @assert_noescape
 register_scoped!
 @assert_noalias

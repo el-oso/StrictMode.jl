@@ -65,7 +65,7 @@ export findings, audit, audit_changed, format_findings, findings_diff, nfailures
 export inline_suggestions, migration_report
 export static_ownership_suggestions
 export dispatch_report, DispatchReport, dispatch_suggestions
-export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!, trust_foreign!
+export @assert_trusted, Untrusted, unsafe_trust, trust_boundary!
 export unsafe_report, throw_report
 export bang_report, specialization_report, alias_guard_report, resource_leak_report
 export conversion_report
