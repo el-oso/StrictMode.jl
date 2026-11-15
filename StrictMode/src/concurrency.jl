@@ -93,24 +93,33 @@ function _direct_fields(@nospecialize(op), cset::BitSet, cflds::Dict{Int, Set{In
     return nothing
 end
 
+# The SSA values an element reference is built from — the array, its `ref` or `mem` field, and the
+# `memoryrefnew` into it — walked back from the reference. Only those steps: a `getfield` of any
+# other field leaves the array for the object that holds it, which the element store does not touch.
+function _ref_chain(@nospecialize(x), code::Vector{Any})
+    ids = Int[]
+    for _ in 1:8
+        x isa Core.SSAValue || break
+        push!(ids, x.id)
+        s = code[x.id]
+        (Meta.isexpr(s, :call) && length(s.args) >= 2) || break
+        c = s.args[1]
+        nm = c isa GlobalRef ? c.name : nothing
+        if nm === :memoryrefnew
+        elseif nm === :getfield && length(s.args) >= 3 && _field_sym(s.args[3]) in (:ref, :mem)
+        else
+            break
+        end
+        x = s.args[2]
+    end
+    return ids
+end
+
+_field_sym(@nospecialize(f)) = f isa QuoteNode ? f.value : f
+
 # Which field a projection reads, as a 1-based position, or `nothing` when it is not a constant
 # field read (a runtime index, a `getindex` on a container with no fields). `getfield(x, :name)`
 # needs the source type to turn the name into a position.
-# The memory a reference points into, walked back through the `memoryrefnew` and `getfield(_, :ref)`
-# that build it: an element store taints the memory, not the transient reference to it.
-function _ref_memory(@nospecialize(x), code::Vector{Any})
-    for _ in 1:8
-        x isa Core.SSAValue || return x
-        s = code[x.id]
-        (Meta.isexpr(s, :call) && length(s.args) >= 2) || return x
-        c = s.args[1]
-        nm = c isa GlobalRef ? c.name : nothing
-        (nm === :memoryrefnew || nm === :getfield) || return x
-        x = s.args[2]
-    end
-    return x
-end
-
 function _proj_field_index(dataargs, pos::Int, @nospecialize(srcT))
     length(dataargs) >= pos + 1 || return nothing
     f = dataargs[pos + 1]
@@ -204,8 +213,8 @@ const _STORE_OPS = Dict(
     :memoryrefswap! => 1, :memoryrefmodify! => 1, :memoryrefreplace! => 1,
     :memoryrefsetonce! => 1,
 )
-# Value-carrying: the result holds its operands, so it is tainted if any is. `vect` is an array literal.
-const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse, :vect))
+# Value-carrying: the result holds its operands, so it is tainted if any is.
+const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))
 
 # Is this dynamic callee a builtin or intrinsic that cannot mutate? A builtin cannot dispatch, so
 # it is not the unresolved call the conservative record is for — but `_STORE_OPS` and
@@ -336,6 +345,12 @@ function _taint_scan_ci(
     # each received a plan value, so reading that field back is direct and reading any other is not.
     cset = BitSet()
     cflds = Dict{Int, Set{Int}}()
+    # A third level: an array whose ELEMENTS are plan values — an array literal or a fresh array a
+    # plan buffer was stored into. Reading an element back is the plan; storing into the array is
+    # the method's own write, so it is not reported.
+    eset = BitSet()
+    einset(@nospecialize(a)) = a isa Core.SSAValue && a.id in eset
+    setelem(j) = (j in eset) ? false : (push!(eset, j); changed = true; true)
     returns_tainted = false
     # Values reachable from a mutable constant global. Every caller shares it, so a store into one
     # is shared state whatever argument the check was told is shared.
@@ -350,10 +365,12 @@ function _taint_scan_ci(
             settaint(b) = (b && !(i in tset)) ? (push!(tset, i); changed = true; true) : false
 
             if st isa Core.PiNode
+                isdefined(st, :val) && einset(st.val) && setelem(i)
                 isdefined(st, :val) && gtainted(st.val) && !(i in gset) && (push!(gset, i); changed = true)
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) && settaint(true)
                 continue
             elseif st isa Core.PhiNode || st isa Core.PhiCNode
+                st isa Core.PhiNode && any(k -> isassigned(st.values, k) && einset(st.values[k]), eachindex(st.values)) && setelem(i)
                 _any_phi_tainted(st, tset, targs) && settaint(true)
                 continue
             elseif st isa Core.UpsilonNode
@@ -379,7 +396,7 @@ function _taint_scan_ci(
                 # freshly-built sibling field is not.
                 fields = Set{Int}()
                 for (k, a) in enumerate(@view st.args[2:end])
-                    (_op_tainted(a, tset, targs) || !isnothing(_direct_fields(a, cset, cflds, cargs))) &&
+                    (_op_tainted(a, tset, targs) || einset(a) || !isnothing(_direct_fields(a, cset, cflds, cargs))) &&
                         push!(fields, k)
                 end
                 # Report a change only when one happened. Setting the flag unconditionally keeps the
@@ -452,12 +469,10 @@ function _taint_scan_ci(
                             cflds[c] = union(flds, Set{Int}(idx)); push!(cset, c); changed = true
                         end
                     end
-                elseif (nm === :memoryrefset! || nm === :memoryset!) && length(dataargs) >= 2 &&
-                        _op_tainted(dataargs[2], tset, targs)
-                    m = _ref_memory(dataargs[1], code)
-                    if m isa Core.SSAValue && !(m.id in tset)
-                        push!(tset, m.id); changed = true
-                    end
+                elseif (nm === :memoryrefset! || nm === :memoryset! || nm === :setindex! || nm === :arrayset) &&
+                        length(dataargs) >= 2 && _op_tainted(dataargs[nm === :arrayset ? 3 : 2], tset, targs)
+                    tgt = dataargs[nm === :arrayset ? 2 : 1]
+                    tgt isa Core.SSAValue && !(tgt.id in tset) && foreach(setelem, _ref_chain(tgt, code))
                 end
                 if 1 <= pos <= length(dataargs) && gtainted(dataargs[pos])
                     gatomic = _is_atomic_store(st, nm, dataargs)
@@ -494,6 +509,16 @@ function _taint_scan_ci(
                     end
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
                     # and so is a raw pointer read out of one (`ptr_or_offset`), though it is bits
+                    if einset(src) && !_op_tainted(src, tset, targs)
+                        # Walking toward an element keeps the element level; reading one is the plan.
+                        if nm === :memoryrefnew || nm === :memoryref ||
+                                (nm === :getfield && length(dataargs) >= 2 && _field_sym(dataargs[2]) in (:ref, :mem))
+                            setelem(i)
+                        elseif nm in (:memoryrefget, :getindex, :arrayref, :unsafe_load)
+                            settaint(_may_ref(types[i]) || _holds_ptr(Core.Compiler.widenconst(types[i])))
+                        end
+                        continue
+                    end
                     isref = (nm === :memoryrefnew || nm === :memoryref) ? true :
                         (_may_ref(types[i]) || _holds_ptr(Core.Compiler.widenconst(types[i])))
                     if _op_tainted(src, tset, targs)
@@ -520,6 +545,12 @@ function _taint_scan_ci(
                         end
                     end
                 end
+                continue
+            end
+
+            # An array literal holding a plan value: its elements are the plan, the array is not.
+            if nm === :vect
+                any(a -> _op_tainted(a, tset, targs), dataargs) && setelem(i)
                 continue
             end
 
@@ -999,9 +1030,9 @@ function _is_threadid_foreigncall(st)
 end
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
-    out, code, tid, tidref, fr = _threadid_scan(f, types)
+    out, code, tid, tidref, fr, argtype = _threadid_scan(f, types)
     isempty(out) && return out
-    return _held_across_suspension(code, tid, tidref, out, fr)
+    return _held_across_suspension(code, tid, tidref, out, fr; argtype)
 end
 
 # Every write to threadid-indexed state in the body, whether or not the state is still in use after a
@@ -1052,6 +1083,11 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
                 _any_phi_tainted(st, tid, ()) && mark(tid, true)
                 _any_phi_tainted(st, tidref, ()) && mark(tidref, true)
                 continue
+            elseif Meta.isexpr(st, :new)
+                # A struct built around a per-thread reference reaches it: an owner wrapper
+                # `Owner(per_thread_arena)` handed on is the arena handed on.
+                any(a -> _op_tainted(a, tidref, ()), @view st.args[2:end]) && mark(tidref, true)
+                continue
             end
             # `:invoke_modify` as above: `@atomic BUF[Threads.threadid()].value += 1` is the
             # canonical shape of this hazard and the one most likely to be written atomically, and
@@ -1065,6 +1101,11 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
             nm === nothing && continue
             if nm in _TID_CARRY
                 any(a -> _op_tainted(a, tid, ()), dataargs) && mark(tid, true)
+                continue
+            end
+            # A tuple holding a per-thread reference reaches it, as a struct built around one does.
+            if nm === :tuple && any(a -> _op_tainted(a, tidref, ()), dataargs)
+                mark(tidref, true)
                 continue
             end
             # A handle built from a threadid-derived INDEX. This is the seed; it no longer ends the
@@ -1123,7 +1164,15 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
             end
         end
     end
-    return (out, code, tid, tidref, fr)
+    # The type an argument of a call statement has here, which a despecialized callee (`print_to_string`
+    # takes `Vararg{Any}`) no longer records.
+    function argtype(@nospecialize(a))
+        a isa Core.SSAValue && return Core.Compiler.widenconst(sts[a.id])
+        a isa Core.Argument && return ci.slottypes isa Vector ? Core.Compiler.widenconst(ci.slottypes[a.n]) : Any
+        a isa GlobalRef && return (isdefined(a.mod, a.name) && isconst(a.mod, a.name)) ? Core.Typeof(getglobal(a.mod, a.name)) : Any
+        return Core.Typeof(a isa QuoteNode ? a.value : a)
+    end
+    return (out, code, tid, tidref, fr, argtype)
 end
 
 # Per-thread state is shared only by tasks that RUN on the same thread, and Julia moves a task, or lets
@@ -1191,7 +1240,7 @@ end
 
 # How a statement can suspend the task: `:yes`, `:maybe` (a call the scan cannot read in full, such as
 # dynamic dispatch or an operation on an abstract object) or `:no`.
-function _stmt_suspends(@nospecialize(st), code::Vector{Any})
+function _stmt_suspends(@nospecialize(st), code::Vector{Any}, argtype = _ -> Any)
     if Meta.isexpr(st, :foreigncall)
         return _fcall_name(st) in _SUSPEND_FCALLS ? :yes : :no
     elseif Meta.isexpr(st, :invoke)
@@ -1200,11 +1249,20 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any})
         m = mi.def
         if _sw_is_base(m.module)
             nm = _demangle(m.name)
-            nm in _STRING_BUILDERS && return :no
+            # Building a string runs the `show` of each argument, which for a type outside Base is
+            # user code that may suspend; only an all-Base argument list is known not to.
+            # Judged by the argument types at this call, since a despecialized builder has lost them.
+            site = Tuple{Any[argtype(a) for a in st.args[2:end]]...}
+            nm in _STRING_BUILDERS && return _carries_user_type(site) ? _sig_may_suspend(site) : :no
             nm in _SUSPEND_STRONG && return :yes
             if nm in _SUSPEND_ON
                 ps = mi.specTypes.parameters
-                return length(ps) >= 2 ? _suspends_on(ps[2]) : :maybe
+                length(ps) >= 2 || return :maybe
+                on = _suspends_on(ps[2])
+                # Writing a value to an inert target still runs that value's `show`, which for a
+                # type outside Base is user code.
+                (on === :no && any(_carries_user_type, site.parameters[3:end])) && return _sig_may_suspend(site)
+                return on
             end
             # A Base once-guard's one-time init locks, but it is Base's own path to the per-thread
             # slot rather than a use of state the caller holds. A user-registered barrier is not
@@ -1231,7 +1289,8 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any})
 end
 
 function _held_across_suspension(
-        code::Vector{Any}, tid::BitSet, tidref::BitSet, writes::Vector{_ConcViol}, fr::_Frame,
+        code::Vector{Any}, tid::BitSet, tidref::BitSet, writes::Vector{_ConcViol}, fr::_Frame;
+        argtype = _ -> Any,
     )
     tainted = union(tid, tidref)
     cfg = Core.Compiler.compute_basic_blocks(code)
@@ -1288,7 +1347,7 @@ function _held_across_suspension(
         adduses!(st, i)
     end
     for (s, st) in enumerate(code)
-        kind = _stmt_suspends(st, code)
+        kind = _stmt_suspends(st, code, argtype)
         kind === :no && continue
         for d in tainted
             d == s && continue

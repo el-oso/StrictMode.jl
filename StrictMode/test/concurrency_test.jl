@@ -1125,3 +1125,70 @@ end
     @test fails(Held.write_gd)                 # a vector inside an immutable const global
     @test !fails(Held.locked_gd)               # its lock is synchronization
 end
+
+@testitem "an array holding plan values is not the plan, and its elements are" begin
+    using StrictMode
+    module Elems
+    mutable struct Plan; buf::Vector{Float64}; w::Vector{Float64}; end
+    mutable struct Work; slots::Vector{Vector{Float64}}; n::Int; end
+    mkwork() = Work(Vector{Vector{Float64}}(undef, 2), 0)
+    ro_lit(p::Plan) = (bs = [p.buf, p.w]; s = 0.0; for b in bs; s += sum(b); end; s)
+    ro_undef(p::Plan) = (bs = Vector{Vector{Float64}}(undef, 2); bs[1] = p.buf; bs[2] = zeros(2); sum(bs[2]))
+    ro_push(p::Plan) = (bs = [p.buf]; push!(bs, zeros(2)); length(bs))
+    ro_work(p::Plan) = (w = mkwork(); w.slots[1] = p.buf; w.n = 1; w.n)
+    wr_lit(p::Plan) = (bs = [p.buf, p.w]; for b in bs; b[1] = 0.0; end; nothing)
+    wr_undef(p::Plan) = (bs = Vector{Vector{Float64}}(undef, 2); bs[1] = p.buf; bs[2] = zeros(2); bs[1][1] = 3.0; nothing)
+    end
+    p = Elems.Plan(zeros(2), ones(2))
+    fs = (Elems.ro_lit, Elems.ro_undef, Elems.ro_push, Elems.ro_work, Elems.wr_lit, Elems.wr_undef)
+    foreach(f -> f(p), fs)
+    fails(f) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, (Elems.Plan,)))
+    @test !fails(Elems.ro_lit)
+    @test !fails(Elems.ro_undef)
+    @test !fails(Elems.ro_push)
+    @test !fails(Elems.ro_work)
+    @test fails(Elems.wr_lit)
+    @test fails(Elems.wr_undef)
+    @test (@assert_concurrency_safe Elems.ro_lit(p)) == Elems.ro_lit(p)
+end
+
+@testitem "building a string runs the show of a package type, which may suspend" begin
+    using StrictMode
+    module Shows
+    using Base.Threads
+    const BUF = zeros(Int, 64)
+    struct Y end
+    Base.show(io::IO, ::Y) = (yield(); print(io, "y"))
+    struct Z; a::Int; end
+    held(::Int) = (i = threadid(); s = string(Y()); BUF[i] += length(s); nothing)
+    plain(x::Int) = (i = threadid(); s = string(x, "a", 2.0); BUF[i] += length(s); nothing)
+    zplain(z::Z) = (i = threadid(); s = string(z); BUF[i] += length(s); nothing)
+    end
+    Shows.held(1); Shows.plain(1); Shows.zplain(Shows.Z(1))
+    tid(f, t) = only(StrictMode.findings(f, t; guarantees = (:no_threadid_state,))).status
+    # A yielding `show` is never cleared. On 1.13 `string` inlines to `print` and the yield is read
+    # (:fail); on 1.12 `print_to_string` stays out of line and is not read in full (:info).
+    @test tid(Shows.held, (Int,)) === (VERSION >= v"1.13-" ? :fail : :info)
+    @test tid(Shows.plain, (Int,)) === :pass
+    @test tid(Shows.zplain, (Shows.Z,)) === (VERSION >= v"1.13-" ? :pass : :info)
+end
+
+@testitem "per-thread state wrapped in a struct or tuple is still per-thread" begin
+    using StrictMode
+    module Wrapped
+    mutable struct Ar; depth::Int; end
+    struct Owner; a::Ar; end
+    const A = Base.OncePerThread{Ar}(() -> Ar(0))
+    @noinline body(o::Owner) = (o.a.depth += 1; yield(); o.a.depth -= 1; nothing)
+    @noinline calm(o::Owner) = (o.a.depth += 1; o.a.depth -= 1; nothing)
+    @noinline body2(t) = (t[1].depth += 1; yield(); nothing)
+    root() = body(Owner(A()))
+    root_calm() = calm(Owner(A()))
+    tup() = body2((A(), 1))
+    end
+    Wrapped.root(); Wrapped.root_calm(); Wrapped.tup()
+    tid(f) = only(StrictMode.findings(f, (); guarantees = (:no_threadid_state,))).status
+    @test tid(Wrapped.root) === :info         # handed on in a wrapper to a callee that suspends
+    @test tid(Wrapped.tup) === :info
+    @test tid(Wrapped.root_calm) === :pass    # the callee cannot suspend
+end

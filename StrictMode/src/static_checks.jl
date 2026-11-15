@@ -219,7 +219,7 @@ function _assert_owned(
         _fail(
             :owned, target,
             "not established: the package's own call graph below this call is larger than the walk " *
-                "reads ($(_OWNED_DEEP_BUDGET) bodies). Assert :owned on a smaller part of the call.";
+                "reads ($(_OWNED_DEEP_BUDGET) bodies), or holds a body it cannot read. Assert :owned on a smaller part of the call.";
             gates = false
         )
     else

@@ -75,7 +75,7 @@ function _compiled_output_finding(
         deep === :budget && return StrictFinding(
             md, fn, sg, g, tier === :proof ? :fail : :info, s.file, s.line,
             "not established: the package's own call graph below this call is larger than the walk " *
-                "reads ($(_OWNED_DEEP_BUDGET) bodies)",
+                "reads ($(_OWNED_DEEP_BUDGET) bodies), or holds a body it cannot read",
             "assert :owned on a smaller part of the call", tier, _code(g, nothing)
         )
         return _mkfinding(md, fn, sg, g, s.dictlookup || deep === :lookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)

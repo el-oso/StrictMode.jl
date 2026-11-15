@@ -392,12 +392,14 @@ end
 # over its stdin through `StrictMode.deserialize`, so the environment under test need not list
 # `Serialization`.
 
-# The files whose edit makes a child stale: the kernel file, the project and manifest, and every source
-# file of a loaded package that is not an immutable registry install or a stdlib. The child checks
+# The files whose edit makes a child stale: the kernel file and every file it `include`d, the project
+# and manifest, and every source file of a loaded package that is not an immutable registry install or
+# a stdlib. The child checks
 # them before each probe, so a probe after an edit checks the code on disk, as a fresh child would.
 function _memsafe_watched(kernel_file::AbstractString)
     files = String[]
     isempty(kernel_file) || push!(files, kernel_file)
+    append!(files, _MEMSAFE_INCLUDED)
     proj = Base.active_project()
     if !isnothing(proj)
         push!(files, proj)
@@ -414,7 +416,13 @@ function _memsafe_watched(kernel_file::AbstractString)
     end
     return files
 end
-_memsafe_stamp(files) = maximum(f -> isfile(f) ? mtime(f) : 0.0, files; init = 0.0)
+# Each file's own modification time, change time and size: an edit restoring an older modification
+# time (`cp -p`, `rsync -t`, a backup) still moves the change time, which no user call can set.
+_memsafe_stamp(files) = [isfile(f) ? (s = stat(f); (s.mtime, s.ctime, s.size)) : (0.0, 0.0, -1) for f in files]
+
+# The files `include`d while the child loads the kernel, recorded as Julia includes them.
+const _MEMSAFE_INCLUDED = String[]
+_memsafe_track_includes!() = (push!(Base.include_callbacks, (_, p) -> push!(_MEMSAFE_INCLUDED, p)); nothing)
 
 # The child's loop. No `try`/`catch` around a probe: a genuine exception from the kernel must end the
 # child so the parent reports it as an error rather than as a memory-safety verdict.
@@ -470,6 +478,7 @@ function _memsafe_spawn(key, kernel_file::String, using_module::Union{Nothing, S
         "using $using_module; const __strictmode_m = $using_module"
     script = """
     using StrictMode
+    StrictMode._memsafe_track_includes!()
     $load
     StrictMode._memsafe_serve(__strictmode_m, $(repr(kernel_file)))
     """

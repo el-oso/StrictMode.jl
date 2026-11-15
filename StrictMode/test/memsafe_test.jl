@@ -269,3 +269,17 @@ end
     @test isnothing(memsafe_report(memsafe_inbounds_kernel!, zeros(3), x; reuse = false).violation)
     @test isnothing(StrictMode._MEMSAFE_WORKER[])                   # reuse = false keeps none
 end
+
+@testitem "a reused memsafe child notices an edit to a file the kernel includes" begin
+    using StrictMode
+    dir = mktempdir()
+    good = "helper!(out, a) = (for i in eachindex(out, a); out[i] = 2a[i]; end; nothing)\n"
+    bad = "helper!(out, a) = (out[1] = unsafe_load(pointer(a), length(a) + 600); nothing)\n"
+    write(joinpath(dir, "helper.jl"), good)
+    write(joinpath(dir, "k.jl"), "include(\"helper.jl\")\nincl_kern!(out, a) = helper!(out, a)\n")
+    include(joinpath(dir, "k.jl"))
+    x = [1.0, 2.0, 3.0]
+    @test isnothing(memsafe_report(incl_kern!, zeros(3), x).violation)
+    write(joinpath(dir, "helper.jl"), bad)
+    @test !isnothing(memsafe_report(incl_kern!, zeros(3), x).violation)
+end

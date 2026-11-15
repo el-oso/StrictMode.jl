@@ -109,6 +109,22 @@ function _sw_carries_user_function(@nospecialize(T))
     return any(_sw_carries_user_function, T.parameters)
 end
 
+# Whether a signature can reach code outside Base: a type defined outside Base, at any parameter depth,
+# whose methods a Base function may call (`show` from `string`, `getindex` from `sum`), or an abstract
+# type, which may be one.
+function _carries_user_type(@nospecialize(T), depth::Int = 0)
+    depth > 8 && return true
+    T = Base.unwrap_unionall(T)
+    T isa Union && return _carries_user_type(T.a, depth + 1) || _carries_user_type(T.b, depth + 1)
+    T isa DataType || return false
+    T <: Tuple || isconcretetype(T) || T <: Type || return true
+    _sw_is_base(parentmodule(T)) || return true
+    return any(T.parameters) do p
+        p isa Core.TypeofVararg && return !isdefined(p, :T) || _carries_user_type(p.T, depth + 1)
+        return p isa Type && _carries_user_type(p, depth + 1)
+    end
+end
+
 # A callee outside Base is entered. One in Base is entered only when it was handed user code to
 # run, since that is the one way a Base method reaches back into the analyzed package.
 _sw_follows(mi::Core.MethodInstance) =

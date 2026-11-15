@@ -1129,7 +1129,8 @@ _code_typed_by_type(args...; kw...) =
 # `:owned`'s walk to the end of the package's own code, for a call whose ordinary walk stopped at the
 # depth limit. A lookup can only sit in the package's code or in a Base dictionary accessor that code
 # calls, and Base is not entered, so following the package's own callees to the end — each body once —
-# settles it: `:lookup`, `:clean`, or `:budget` when even this walk ran out of bodies. A registered
+# settles it: `:lookup`, `:clean`, or `:budget` when even this walk ran out of bodies. A body that
+# cannot be read is not clean, so it ends the walk as `:budget`, "not established". A registered
 # barrier is not entered; its own causes are reported where it is checked.
 const _OWNED_DEEP_BUDGET = 2000
 const _OWNED_DEEP_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
@@ -1158,15 +1159,20 @@ function _owned_deep(@nospecialize(sig))
         cts = try
             _code_typed_by_type(s; optimize = true)
         catch
-            continue
+            Any[]
         end
-        isempty(cts) && continue
+        if isempty(cts)
+            v = :budget
+            break
+        end
         for st in first(cts[1]).code
             Meta.isexpr(st, :invoke) || continue
             mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
+            # A Base function is entered only when it was handed the package's code or types to run —
+            # a closure given to `sort` or `map`, a package type whose methods it calls.
             root = Base.moduleroot(mi.def.module)
-            (root === Base || root === Core) && continue
+            (root === Base || root === Core) && !_carries_user_type(mi.specTypes) && continue
             (_mi_is_strictmode(mi) || _mi_is_barrier(mi)) && continue
             push!(queue, mi.specTypes)
         end

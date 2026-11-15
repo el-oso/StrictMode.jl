@@ -643,3 +643,16 @@ end
     @test own(OwnedDepth.s1).status === :pass                   # read to the end, it passes
     @test_throws StrictMode.StrictViolation StrictMode._assert_owned("t", OwnedDepth.m1, ())
 end
+
+@testitem ":owned enters a Base function that runs the package's closure" begin
+    using StrictMode
+    module OwnedClosure
+    const D = Dict(:a => 1, :b => 2)
+    @noinline m4(v) = sort(v; by = x -> D[x]); @noinline m3(v) = m4(v); @noinline m2(v) = m3(v); @noinline m1(v) = m2(v)
+    @noinline c4(v) = sort(v; by = x -> x); @noinline c3(v) = c4(v); @noinline c2(v) = c3(v); @noinline c1(v) = c2(v)
+    end
+    v = [:a, :b]; OwnedClosure.m1(v); OwnedClosure.c1(copy(v))
+    own(f) = only(StrictMode.findings(f, (Vector{Symbol},); guarantees = (:owned,)))
+    @test StrictMode._failed(own(OwnedClosure.m1))     # the lookup is in a closure sort runs
+    @test own(OwnedClosure.c1).status === :pass
+end
