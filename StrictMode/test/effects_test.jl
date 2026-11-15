@@ -628,7 +628,7 @@ end
     end
 end
 
-@testitem ":owned does not pass where its walk stopped short" begin
+@testitem ":owned follows the package's own code past its depth limit" begin
     using StrictMode, Test
     module OwnedDepth
     @noinline m1() = m2(); @noinline m2() = m3(); @noinline m3() = m4(); @noinline m4() = Dict(:a => 1)[:a]
@@ -636,10 +636,10 @@ end
     end
     OwnedDepth.m1(); OwnedDepth.s1()
     own(f) = only(StrictMode.findings(f, (); guarantees = (:owned,)))
-    # A lookup four out-of-line levels down is past the default depth: not a pass.
-    @test own(OwnedDepth.m1).status === :info
-    @test occursin("not established", own(OwnedDepth.m1).reason)
+    # A lookup four out-of-line levels down is past the ordinary walk; the package's own code is
+    # followed to the end, so it is found.
+    @test StrictMode._failed(own(OwnedDepth.m1))
     @test StrictMode._failed(own(OwnedDepth.m3))               # within reach, it fails
     @test own(OwnedDepth.s1).status === :pass                   # read to the end, it passes
-    @test_logs (:warn, r"not established") match_mode = :any StrictMode._assert_owned("t", OwnedDepth.m1, ())
+    @test_throws StrictMode.StrictViolation StrictMode._assert_owned("t", OwnedDepth.m1, ())
 end

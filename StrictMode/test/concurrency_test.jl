@@ -1052,7 +1052,18 @@ end
     const BUF = zeros(Int, 64); const VB = [zeros(8) for _ in 1:64]
     struct CB; f::Function; end
     dyn(cb::CB) = (i = threadid(); cb.f(); BUF[i] += 1; nothing)                     # may suspend
-    io_print() = (i = threadid(); println(devnull, "x"); BUF[i] += 1; nothing)       # suspends in Base
+    io_print() = (i = threadid(); println(devnull, "x"); BUF[i] += 1; nothing)       # devnull never blocks
+    locked() = (i = threadid(); Base.lock(LK); Base.unlock(LK); BUF[i] += 1; nothing)  # a lock can block
+    strbuild(x::Int) = (i = threadid(); s = "v=$x"; BUF[i] += length(s); nothing)    # an IOBuffer only
+    latest_yield() = (i = threadid(); Base.invokelatest(yield); BUF[i] += 1; nothing)
+    function refetch(n::Int)
+        b = VB[threadid()]
+        while n > 0
+            b[1] += 1; n -= 1
+            yield()
+            b = VB[threadid()]                  # a fresh value after every yield
+        end
+    end
     @noinline g5(v) = (yield(); v[1] += 1; nothing)
     handed() = (g5(VB[threadid()]); nothing)                                          # held by the callee
     fresh(n::Int) = (for _ in 1:n; yield(); i = threadid(); BUF[i] += 1; end; nothing)  # new value each time
@@ -1063,6 +1074,7 @@ end
     Rev.bumpn(Rev.P1(0)); Rev.withlock(p); Rev.counted(p); Rev.fresh_out(p); Rev.callable(p)
     cb = Rev.CB(() -> nothing)
     Rev.dyn(cb); Rev.io_print(); Rev.handed(); Rev.fresh(2); Rev.spin()
+    Rev.locked(); Rev.strbuild(1); Rev.latest_yield(); Rev.refetch(2)
     fails(f, T) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, T))
     @test fails(Rev.bumpn, (Rev.P1,))                                  # a plain modifyfield! is not atomic
     @test isempty(StrictMode.concurrency_findings(Rev.withlock, (Rev.Plan,)))
@@ -1071,10 +1083,45 @@ end
     @test fails(Rev.callable, (Rev.Plan,))                             # a callable struct is read too
     tid(f, T) = (vs = StrictMode.threadid_state_findings(f, T); isempty(vs) ? :pass : any(v -> v.certain, vs) ? :fail : :maybe)
     @test tid(Rev.dyn, (Rev.CB,)) === :maybe
-    @test tid(Rev.io_print, ()) === :fail
-    @test tid(Rev.handed, ()) === :fail
+    @test tid(Rev.io_print, ()) === :pass
+    @test tid(Rev.locked, ()) === :fail
+    @test tid(Rev.strbuild, (Int,)) === :pass
+    @test tid(Rev.latest_yield, ()) === :fail
+    @test tid(Rev.refetch, (Int,)) === :pass
+    @test tid(Rev.handed, ()) === :maybe          # whether the callee still holds it is not read
     @test tid(Rev.fresh, (Int,)) === :pass
     @test tid(Rev.spin, ()) === :pass
     # A suspension the scan could not read warns rather than raising.
     @test_logs (:warn,) match_mode = :any StrictMode._assert_no_threadid_state("t", Rev.dyn, (Rev.CB,))
+end
+
+@testitem "a plan value stored into a container, or a global's inner data, is followed" begin
+    using StrictMode
+    module Held
+    mutable struct Plan; buf::Vector{Float64}; w::Vector{Float64}; end
+    mutable struct Out; ref::Vector{Float64}; ok::Bool; end
+    struct Guarded; l::ReentrantLock; v::Vector{Int}; end
+    const GD = Guarded(ReentrantLock(), [1, 2, 3])
+    function boxed(p::Plan)                       # a reassigned capture lives in a Core.Box
+        out = zeros(2); out = p.buf
+        t = Threads.@spawn (out[1] = 1.0); wait(t); nothing
+    end
+    lit(p::Plan) = (bs = [p.buf, zeros(2)]; t = Threads.@spawn (bs[1][1] = 1.0); wait(t); nothing)
+    fresh_lit(p::Plan) = (bs = [zeros(2), zeros(2)]; t = Threads.@spawn (bs[1][1] = p.w[1]); wait(t); nothing)
+    wrapper_ok(p::Plan) = (o = Out(zeros(1), false); o.ref = p.buf; o.ok = true; o.ok)
+    wrapper_through(p::Plan) = (o = Out(zeros(1), false); o.ref = p.buf; o.ref[1] = 2.0; nothing)
+    write_gd(p::Plan) = (GD.v[1] = 3; nothing)
+    locked_gd(p::Plan) = (lock(GD.l); x = p.w[1]; unlock(GD.l); x)
+    end
+    p = Held.Plan(zeros(2), ones(2))
+    fs = (Held.boxed, Held.lit, Held.fresh_lit, Held.wrapper_ok, Held.wrapper_through, Held.write_gd, Held.locked_gd)
+    foreach(f -> f(p), fs)
+    fails(f) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, (Held.Plan,)))
+    @test fails(Held.boxed)
+    @test fails(Held.lit)
+    @test !fails(Held.fresh_lit)
+    @test !fails(Held.wrapper_ok)              # a field of the fresh struct, not the plan
+    @test fails(Held.wrapper_through)
+    @test fails(Held.write_gd)                 # a vector inside an immutable const global
+    @test !fails(Held.locked_gd)               # its lock is synchronization
 end

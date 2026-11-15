@@ -200,3 +200,16 @@ end
     end
     @test_throws "movers` is empty" StrictModeTest.test_history_invariant(HistGate.mysum, x; movers = ())
 end
+
+@testitem "test_waits_yield judges the tasks of a Threads.@threads loop" begin
+    using StrictMode, StrictModeTest
+    module ThreadsWait
+    const FLAG = Threads.Atomic{Bool}(true)
+    spin(v::Vector{Float64}) =
+        (Threads.@threads for i in eachindex(v); while !FLAG[]; ccall(:jl_cpu_pause, Cvoid, ()); end; v[i] = i; end; nothing)
+    plain(v::Vector{Float64}) = (Threads.@threads for i in eachindex(v); v[i] = i; end; nothing)
+    end
+    ThreadsWait.spin(zeros(4)); ThreadsWait.plain(zeros(4))
+    @test_throws "never yields" StrictModeTest.test_waits_yield(ThreadsWait.spin, (Vector{Float64},))
+    @test StrictModeTest.test_waits_yield(ThreadsWait.plain, (Vector{Float64},)) isa StrictMode.SpinWaitReport
+end

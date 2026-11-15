@@ -96,6 +96,21 @@ end
 # Which field a projection reads, as a 1-based position, or `nothing` when it is not a constant
 # field read (a runtime index, a `getindex` on a container with no fields). `getfield(x, :name)`
 # needs the source type to turn the name into a position.
+# The memory a reference points into, walked back through the `memoryrefnew` and `getfield(_, :ref)`
+# that build it: an element store taints the memory, not the transient reference to it.
+function _ref_memory(@nospecialize(x), code::Vector{Any})
+    for _ in 1:8
+        x isa Core.SSAValue || return x
+        s = code[x.id]
+        (Meta.isexpr(s, :call) && length(s.args) >= 2) || return x
+        c = s.args[1]
+        nm = c isa GlobalRef ? c.name : nothing
+        (nm === :memoryrefnew || nm === :getfield) || return x
+        x = s.args[2]
+    end
+    return x
+end
+
 function _proj_field_index(dataargs, pos::Int, @nospecialize(srcT))
     length(dataargs) >= pos + 1 || return nothing
     f = dataargs[pos + 1]
@@ -189,7 +204,8 @@ const _STORE_OPS = Dict(
     :memoryrefswap! => 1, :memoryrefmodify! => 1, :memoryrefreplace! => 1,
     :memoryrefsetonce! => 1,
 )
-const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))   # value-carrying: taint result if any operand tainted
+# Value-carrying: the result holds its operands, so it is tainted if any is. `vect` is an array literal.
+const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse, :vect))
 
 # Is this dynamic callee a builtin or intrinsic that cannot mutate? A builtin cannot dispatch, so
 # it is not the unresolved call the conservative record is for — but `_STORE_OPS` and
@@ -264,12 +280,21 @@ const _ATOMIC_ORDERS = Set{Symbol}(
 # the same order. Neither the name nor the `:invoke_modify` head decides it: `modifyfield!(p, :n, +, 1)`
 # on a plain field lowers to `:invoke_modify` with no order, is not atomic, and two tasks running it
 # lose increments.
+# Where each store builtin takes its (first) memory order, counted in its data arguments. Only that
+# position is read: a field named `release`, or a stored value `:acquire`, is not an order.
+const _ORDER_POSITION = Dict{Symbol, Int}(
+    :setfield! => 4, :swapfield! => 4, :modifyfield! => 5, :replacefield! => 5, :setfieldonce! => 4,
+    :setglobal! => 4, :swapglobal! => 4, :modifyglobal! => 5, :replaceglobal! => 5,
+    :memoryrefset! => 3, :memoryrefswap! => 3, :memoryrefmodify! => 4, :memoryrefreplace! => 4,
+    :memoryrefsetonce! => 3,
+)
+
 function _is_atomic_store(st, nm, dataargs)
-    for a in dataargs
-        v = a isa QuoteNode ? a.value : a
-        v isa Symbol && v in _ATOMIC_ORDERS && return true
-    end
-    return false
+    pos = get(_ORDER_POSITION, nm, 0)
+    1 <= pos <= length(dataargs) || return false
+    a = dataargs[pos]
+    v = a isa QuoteNode ? a.value : a
+    return v isa Symbol && v in _ATOMIC_ORDERS
 end
 
 # ── the scan ──────────────────────────────────────────────────────────────────────────────────
@@ -413,6 +438,27 @@ function _taint_scan_ci(
             # store into a tainted container → violation
             if nm !== nothing && haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
+                # A plan value stored into a fresh container makes the container hold it — a reassigned
+                # local's `Core.Box`, a struct field, an array literal's memory — so a later read back
+                # out of it is the plan. A field store records WHICH field, as building the struct does;
+                # an element store taints the memory, since elements are not told apart.
+                if nm === :setfield! && length(dataargs) >= 3 && dataargs[1] isa Core.SSAValue &&
+                        _op_tainted(dataargs[3], tset, targs) && !(dataargs[1].id in tset)
+                    idx = _proj_field_index(dataargs, 1, _operand_type(dataargs[1], types))
+                    if !isnothing(idx)
+                        c = dataargs[1].id
+                        flds = get(cflds, c, Set{Int}())
+                        if !(idx in flds)
+                            cflds[c] = union(flds, Set{Int}(idx)); push!(cset, c); changed = true
+                        end
+                    end
+                elseif (nm === :memoryrefset! || nm === :memoryset!) && length(dataargs) >= 2 &&
+                        _op_tainted(dataargs[2], tset, targs)
+                    m = _ref_memory(dataargs[1], code)
+                    if m isa Core.SSAValue && !(m.id in tset)
+                        push!(tset, m.id); changed = true
+                    end
+                end
                 if 1 <= pos <= length(dataargs) && gtainted(dataargs[pos])
                     gatomic = _is_atomic_store(st, nm, dataargs)
                     _record!(
@@ -443,7 +489,7 @@ function _taint_scan_ci(
                 pos = _PROJECT_OPS[nm]
                 if 1 <= pos <= length(dataargs)
                     src = dataargs[pos]
-                    if gtainted(src) && _may_ref(types[i]) && !(i in gset)
+                    if gtainted(src) && _may_ref(types[i]) && !_is_sync_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
                         push!(gset, i); changed = true
                     end
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
@@ -609,10 +655,18 @@ function _is_mutable_global(@nospecialize(a))
     (v isa String || v isa Symbol || v isa Module || v isa Type || v isa Function) && return false
     # A lock, an atomic, a condition, an event, a channel or a semaphore is how tasks synchronize: its
     # internal writes are the synchronization, not shared data.
-    (v isa Base.AbstractLock || v isa Threads.Atomic || v isa Base.GenericCondition ||
-        v isa Base.Event || v isa Channel || v isa Base.Semaphore) && return false
-    return ismutable(v)
+    _is_sync_object(v) && return false
+    # Mutable state anywhere inside the value counts: an immutable struct or tuple holding a vector.
+    return _holds_mutable(v)
 end
+
+_is_sync_object(@nospecialize(v)) =
+    v isa Base.AbstractLock || v isa Threads.Atomic || v isa Base.GenericCondition ||
+    v isa Base.Event || v isa Channel || v isa Base.Semaphore
+
+# A type whose objects are how tasks synchronize; a value of it read out of a global is not shared data.
+_is_sync_type(@nospecialize(T)) = T isa Type && (T <: Base.AbstractLock || T <: Threads.Atomic ||
+    T <: Base.GenericCondition || T <: Base.Event || T <: Channel || T <: Base.Semaphore)
 
 # The call methods of a closure, or of any struct with a call method of its own, built from a plan
 # value. Each is scanned with only the captured fields that received a plan value tainted, so a fresh
@@ -945,9 +999,9 @@ function _is_threadid_foreigncall(st)
 end
 
 function threadid_state_findings(@nospecialize(f), @nospecialize(types::Tuple))
-    out, code, tainted, fr = _threadid_scan(f, types)
+    out, code, tid, tidref, fr = _threadid_scan(f, types)
     isempty(out) && return out
-    return _held_across_suspension(code, tainted, out, fr)
+    return _held_across_suspension(code, tid, tidref, out, fr)
 end
 
 # Every write to threadid-indexed state in the body, whether or not the state is still in use after a
@@ -1069,7 +1123,7 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
             end
         end
     end
-    return (out, code, union(tid, tidref), fr)
+    return (out, code, tid, tidref, fr)
 end
 
 # Per-thread state is shared only by tasks that RUN on the same thread, and Julia moves a task, or lets
@@ -1079,26 +1133,41 @@ end
 # threadid-derived values is defined before a suspension point and used after it, along a path of the
 # control-flow graph; the writes are listed with that cause. Reported for certain when the suspension
 # was read, and conservatively when a callee could not be read in full.
-# Base functions whose call can suspend the task: they wait on another task, on IO, on a timer or on a
-# lock. Matched only where the function is Base's own — a user `lock(::Int)` is not one.
-const _SUSPEND_NAMES = (
-    :yield, :yieldto, :wait, :_wait, :wait_forever, :sleep, :fetch, :take!, :lock, :acquire,
-    :timedwait, :run, :print, :println, :write, :read, :readline, :readavailable, :readbytes!,
-    :flush, :unsafe_read, :unsafe_write, :eof, :handle_message,
-)
-
 # Runtime entry points that switch tasks.
 const _SUSPEND_FCALLS = (:jl_yield, :jl_switch, :jl_task_wait, :jl_wait_empty_begin)
 
-# Overloads of a suspending name that never yield: a `SpinLock` spins, an `IOBuffer` is memory.
-_never_suspends(nm::Symbol, @nospecialize(sig)) =
-    sig isa DataType && length(sig.parameters) >= 2 &&
-    ((nm === :lock && sig.parameters[2] <: Base.Threads.SpinLock) ||
-     (nm === :take! && sig.parameters[2] <: IOBuffer))
+# Base waits that suspend the task whenever they run: on another task, a timer or a condition.
+const _SUSPEND_STRONG = (:yield, :yieldto, :wait, :_wait, :wait_forever, :sleep, :fetch, :timedwait)
+
+# Base operations that suspend only on some objects: a lock that can block, IO on a device or a
+# stream, a channel. On an `IOBuffer`, `devnull` or a `SpinLock` they never do.
+const _SUSPEND_ON = (
+    :lock, :take!, :acquire, :run, :print, :println, :write, :read, :readline, :readavailable,
+    :readbytes!, :flush, :unsafe_read, :unsafe_write, :eof, :handle_message, :handle_message_nothrow,
+)
+
+# Building a string writes only to an `IOBuffer`.
+const _STRING_BUILDERS = (:print_to_string, :string, :sprint, :repr, :_str_sizehint)
+
+# Builtins that call a function given as an argument, whatever it does.
+const _CALLING_BUILTINS = (:invokelatest, :_apply_iterate, :_call_latest, :invoke, :invoke_in_world)
+
+_inert_target(@nospecialize(T)) =
+    T isa Type && (T <: Base.Threads.SpinLock || T <: Base.GenericIOBuffer || T <: Base.DevNull)
+
+# `:yes`, `:maybe` or `:no` for a Base operation in `_SUSPEND_ON`, from the type of the object it acts
+# on: a concrete object it cannot block on is `:no`, an abstract one is `:maybe`.
+function _suspends_on(@nospecialize(T))
+    T isa Type || return :maybe
+    _inert_target(T) && return :no
+    return isconcretetype(T) ? :yes : :maybe
+end
 
 const _SUSPEND_MEMO = Dict{Any, Symbol}()   # callee signature => :yes, :maybe or :no
 const _SUSPEND_LOCK = ReentrantLock()
 
+# Whether a callee can suspend, from the Base functions its call graph reaches. The graph names a
+# function, not the object it acts on, so an operation in `_SUSPEND_ON` reached there is `:maybe`.
 function _sig_may_suspend(@nospecialize(sig))
     hit = @lock _SUSPEND_LOCK get(_SUSPEND_MEMO, sig, nothing)
     isnothing(hit) || return hit
@@ -1109,17 +1178,19 @@ function _sig_may_suspend(@nospecialize(sig))
     end
     v = if isnothing(r)
         :maybe
-    elseif any(k -> k[2] in _SUSPEND_NAMES && _sw_is_base(k[1]), keys(r.found))
+    elseif any(k -> k[2] in _SUSPEND_STRONG && _sw_is_base(k[1]), keys(r.found))
         :yes
+    elseif any(k -> k[2] in _SUSPEND_ON && _sw_is_base(k[1]), keys(r.found)) || r.unread > 0 || r.dynamic > 0
+        :maybe
     else
-        (r.unread > 0 || r.dynamic > 0) ? :maybe : :no
+        :no
     end
     @lock _SUSPEND_LOCK (_SUSPEND_MEMO[sig] = v)
     return v
 end
 
 # How a statement can suspend the task: `:yes`, `:maybe` (a call the scan cannot read in full, such as
-# dynamic dispatch) or `:no`.
+# dynamic dispatch or an operation on an abstract object) or `:no`.
 function _stmt_suspends(@nospecialize(st), code::Vector{Any})
     if Meta.isexpr(st, :foreigncall)
         return _fcall_name(st) in _SUSPEND_FCALLS ? :yes : :no
@@ -1129,7 +1200,12 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any})
         m = mi.def
         if _sw_is_base(m.module)
             nm = _demangle(m.name)
-            nm in _SUSPEND_NAMES && return _never_suspends(nm, mi.specTypes) ? :no : :yes
+            nm in _STRING_BUILDERS && return :no
+            nm in _SUSPEND_STRONG && return :yes
+            if nm in _SUSPEND_ON
+                ps = mi.specTypes.parameters
+                return length(ps) >= 2 ? _suspends_on(ps[2]) : :maybe
+            end
             # A Base once-guard's one-time init locks, but it is Base's own path to the per-thread
             # slot rather than a use of state the caller holds. A user-registered barrier is not
             # exempt: it is the caller's own code.
@@ -1138,18 +1214,26 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any})
         return _sig_may_suspend(mi.specTypes)
     elseif Meta.isexpr(st, :call)
         v = _sw_callee_value(st.args[1])
-        (v isa Core.Builtin || v isa Core.IntrinsicFunction) && return :no
-        isnothing(v) && return :maybe
-        if v isa Function && _sw_is_base(parentmodule(v))
-            nameof(v) in _SUSPEND_NAMES && return :yes
+        if v isa Core.Builtin || v isa Core.IntrinsicFunction
+            nameof(v) in _CALLING_BUILTINS || return :no
+            # It calls whatever it is handed: a known wait suspends, anything else may.
+            for a in @view st.args[2:end]
+                g = _sw_callee_value(a)
+                g isa Function && _sw_is_base(parentmodule(g)) && nameof(g) in _SUSPEND_STRONG && return :yes
+            end
             return :maybe
         end
-        return :maybe                       # dynamic dispatch on a function the scan cannot resolve
+        isnothing(v) && return :maybe
+        v isa Function && _sw_is_base(parentmodule(v)) && nameof(v) in _SUSPEND_STRONG && return :yes
+        return :maybe                       # dynamic dispatch the scan cannot resolve
     end
     return :no
 end
 
-function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vector{_ConcViol}, fr::_Frame)
+function _held_across_suspension(
+        code::Vector{Any}, tid::BitSet, tidref::BitSet, writes::Vector{_ConcViol}, fr::_Frame,
+    )
+    tainted = union(tid, tidref)
     cfg = Core.Compiler.compute_basic_blocks(code)
     blk = [Core.Compiler.block_for_inst(cfg, i) for i in eachindex(code)]
     succs(b) = cfg.blocks[b].succs
@@ -1181,6 +1265,9 @@ function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vec
         end
         found
     end)
+    # Where each tainted value is used. A phi uses its incoming value on the edge it arrives by, so the
+    # use is placed at that edge's last statement, not at the phi: a value that arrives only on the
+    # loop's entry edge is not used after a suspension the back edge carries.
     uses = Dict{Int, Vector{Int}}()
     function adduses!(@nospecialize(x), at::Int)
         if x isa Core.SSAValue
@@ -1191,7 +1278,7 @@ function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vec
             adduses!(x.val, at)
         elseif x isa Core.PhiNode
             for j in eachindex(x.values)
-                isassigned(x.values, j) && adduses!(x.values[j], at)
+                isassigned(x.values, j) && adduses!(x.values[j], Int(x.edges[j]))
             end
         elseif x isa Core.ReturnNode && isdefined(x, :val)
             adduses!(x.val, at)
@@ -1206,23 +1293,31 @@ function _held_across_suspension(code::Vector{Any}, tainted::BitSet, writes::Vec
         for d in tainted
             d == s && continue
             ds = get(uses, d, Int[])
-            # Held across the call: used after it, or handed to it — a callee that suspends while it
-            # holds the state is the same hazard one frame down.
-            held = (s in ds && reaches(d, s)) || (reaches(d, s) && any(u -> u != s && live_from(d, s, u), ds))
-            held || continue
+            reaches(d, s) || continue
+            used_after = any(u -> u != s && live_from(d, s, u), ds)
+            # A reference to the state handed to the suspending call: Base's own wait holds what it is
+            # given, while a callee of the package may or may not still hold it when it suspends.
+            handed = !used_after && s in ds && d in tidref
+            (used_after || handed) || continue
+            how = handed && !(Meta.isexpr(st, :invoke) && _sw_is_base(_invoke_module(st))) ? :maybe : kind
             nm = Meta.isexpr(st, :invoke) ? _resolve_callee_name(st.args[2], code) :
                 Meta.isexpr(st, :call) ? _resolve_callee_name(st.args[1], code) : _fcall_name(st)
             what = isnothing(nm) ? "a call" : "`$(_demangle(nm))`"
             msg = "holds per-thread (`Threads.threadid()`-indexed) state across $what, which " *
-                (kind === :yes ? "can suspend the task" : "may suspend the task (not read in full)") *
+                (how === :yes ? "can suspend the task" : "may suspend the task (not read in full)") *
                 ": another task can then run on this thread and use the same state"
             # The writes are certain, but the hazard is as certain as its suspension and no more.
-            sure = kind === :yes
+            sure = how === :yes
             return [_ConcViol(msg, fr.file, fr.line, sure, false);
                 [_ConcViol(w.message, w.file, w.line, sure && w.certain, w.deliberate) for w in writes]]
         end
     end
     return _ConcViol[]
+end
+
+function _invoke_module(st::Expr)
+    mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+    return (mi isa Core.MethodInstance && mi.def isa Method) ? mi.def.module : Main
 end
 
 # Whether the callee `mi` writes its argument `k`, by the concurrency scan's own reading of a write

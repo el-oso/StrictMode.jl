@@ -254,3 +254,18 @@ end
         @test_throws "also runs the memsafe probe" StrictMode.memsafe_report(sum, [1.0])
     end
 end
+
+@testitem "memsafe probes share one child until a probe is not clean" setup = [MemsafeFixtures] begin
+    using StrictMode
+    x = [1.0, 2.0, 3.0]
+    @test isnothing(memsafe_report(memsafe_inbounds_kernel!, zeros(3), x).violation)
+    w = StrictMode._MEMSAFE_WORKER[]
+    @test !isnothing(w) && process_running(w.proc)
+    n = w.served
+    @test isnothing(memsafe_report(memsafe_inbounds_kernel!, zeros(3), x).violation)
+    @test StrictMode._MEMSAFE_WORKER[] === w && w.served == n + 1  # the same child served both
+    @test !isnothing(memsafe_report(memsafe_oob_read_kernel!, zeros(3), x).violation)
+    @test isnothing(StrictMode._MEMSAFE_WORKER[])                   # a fault retires it
+    @test isnothing(memsafe_report(memsafe_inbounds_kernel!, zeros(3), x; reuse = false).violation)
+    @test isnothing(StrictMode._MEMSAFE_WORKER[])                   # reuse = false keeps none
+end

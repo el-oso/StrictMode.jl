@@ -115,3 +115,35 @@ end
     @test [f.func for f in fs] == ["mysum"]
     @test occursin("`FLOOR`", only(fs).reason) && only(fs).status === :info
 end
+
+@testitem "history_report compares by bits, and tells nondeterminism from history" begin
+    using StrictMode
+    @test history_report(x -> x * 2, big(1.5); movers = (() -> nothing,)).status === :same     # BigFloat
+    @test history_report(() -> Dict(i => Float64(i) for i in 1:50); movers = (() -> nothing,)).status === :same
+    @test history_report(() -> rand(); movers = (() -> nothing,)).status === :nondeterministic
+    # State held in an argument moves only when a mover changes the original argument.
+    mutable struct Warm; on::Bool; end
+    pick(w::Warm, x) = (r = w.on ? foldr(+, x) : foldl(+, x); w.on = true; r)
+    x = [1.0e8, 1.0, -1.0e8, 1.0e-8, 3.0, 1.0e-3]
+    w = Warm(false)
+    @test history_report(pick, w, x; movers = (() -> nothing,)).status === :same
+    @test history_report(pick, w, x; movers = (() -> (w.on = true),)).status === :different
+end
+
+@testitem "state_branch_report reads every kind of package state" begin
+    using StrictMode
+    module Kinds
+    const R = Ref(10)
+    const ONCE = Base.OncePerProcess{Vector{Int}}(() -> [5])
+    NC = 3
+    struct Cfg; thr::Base.RefValue{Int}; end
+    const CFG = Cfg(Ref(4))
+    const LIMIT = 100
+    once_branch(x::Int) = x < ONCE()[1] ? 1 : 2
+    nonconst(x::Int) = x < NC ? 1 : 2
+    qualified(x::Int) = x < Kinds.R[] ? 1 : 2
+    inner_ref(x::Int) = x < CFG.thr[] ? 1 : 2
+    plain_const(x::Int) = x < LIMIT ? 1 : 2
+    end
+    @test sort([f.func for f in state_branch_report(Kinds)]) == ["inner_ref", "nonconst", "once_branch", "qualified"]
+end

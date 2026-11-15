@@ -69,15 +69,16 @@ function _compiled_output_finding(
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
         s.dictlookup || isnothing(s.barrier_dict) ||
             return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
-        # A gate does not pass on what it did not read; the reporting tier states it as a lead.
-        (!s.dictlookup && s.truncated) && return StrictFinding(
+        # The ordinary walk stopped short: follow the package's own code to the end. A gate does not
+        # pass on what it did not read, so only a walk that ran out of bodies is "not established".
+        deep = (!s.dictlookup && s.truncated) ? _owned_deep(Base.signature_type(f, Tuple{types...})) : :clean
+        deep === :budget && return StrictFinding(
             md, fn, sg, g, tier === :proof ? :fail : :info, s.file, s.line,
-            "not established: the walk stopped at its depth limit ($(_FAST_ALLOC_DEPTH[]) out-of-line " *
-                "levels) with a callee of the package still unread",
-            "assert :owned closer to where any lookup would happen, or raise " *
-                "`StrictMode._FAST_ALLOC_DEPTH[]`", tier, _code(g, nothing)
+            "not established: the package's own call graph below this call is larger than the walk " *
+                "reads ($(_OWNED_DEEP_BUDGET) bodies)",
+            "assert :owned on a smaller part of the call", tier, _code(g, nothing)
         )
-        return _mkfinding(md, fn, sg, g, s.dictlookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
+        return _mkfinding(md, fn, sg, g, s.dictlookup || deep === :lookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
     elseif g === :inlined
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0; tier)

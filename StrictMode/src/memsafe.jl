@@ -382,51 +382,137 @@ function _signal_name(sig::Integer)
     return "signal $sig"
 end
 
-function _memsafe_child_script(kernel_file::AbstractString, fname::Symbol, args_path::AbstractString, using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int})
-    mod_stmt = isnothing(using_module) ? "include($(repr(kernel_file)))" : "using $(using_module)"
-    lookup_mod = isnothing(using_module) ? "Main" : string(using_module)
-    align_arg = isnothing(align) ? "nothing" : string(align)   # an Int repr is safe to splice verbatim
-    # Plain (global) top-level bindings, not `local` — a top-level `local` in a multi-statement
-    # script only scopes to its own statement, so it doesn't survive to the next line. Harmless
-    # here: this is a throwaway one-shot process that exits right after.
-    #
-    # ONE child does both jobs, in this order:
-    #
-    #   1. CLASSIFY with the writable poisoned canary. This cannot fault, so it always completes,
-    #      and it is the only thing that can tell an out-of-bounds WRITE from a READ now that a
-    #      write fault's backtrace is destroyed (Julia 1.12+ gives `unknown function (ip: …)` and
-    #      zero frames, where the read fault still names the kernel and line).
-    #   2. DETECT with the PROT_NONE guard page, which traps either access class and kills this
-    #      process.
-    #
-    # The classification line is printed and FLUSHED before step 2, and a flushed write survives the
-    # subsequent fatal signal into the parent's pipe — measured: `termsignal=11` with the sentinel
-    # present in the captured stdout. That is what makes a single spawn sufficient; classifying in a
-    # second child would double the cost of the clean path, which is the common one.
-    #
-    # No `try`/`catch` around step 2: a genuine exception from `f` must propagate so the parent
-    # reports an unrelated script error rather than a memory-safety verdict. The guard-page hit
-    # itself may arrive either as a fatal signal or as a catchable `ReadOnlyMemoryError` depending
-    # on the host; the parent distinguishes both from an unrelated error, so neither is caught here.
-    #
-    # `StrictMode.deserialize` is the package's own import, so the environment under test need not
-    # list `Serialization`.
-    return """
-    using StrictMode
-    $mod_stmt
-    __args = StrictMode.deserialize($(repr(args_path)))
-    __f = getfield($lookup_mod, $(repr(fname)))
-    __hit = StrictMode._canary_probe(__f, __args; align=$align_arg)
-    println(stdout, isnothing(__hit) ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * __hit)
-    flush(stdout)
-    __guarded, __handles = StrictMode._guarded_args(__args; align=$align_arg)
-    __f(__guarded...)
-    print(stdout, "STRICTMODE_MEMSAFE_OK")
-    flush(stdout)
-    """
+# --- the probe child: one process serving many probes -------------------------------------------
+#
+# Starting a Julia and loading the package costs about a second per probe, and most probes are
+# clean. So one child serves probe after probe for the same kernel source, environment and Julia,
+# and is reused only after a clean probe: a fault, a canary hit, an error, a timeout or an interrupt
+# retires it, and the next probe starts a fresh one. Each probe runs in the order a fresh child would:
+# the canary probe, a flushed verdict line, then the guard-page probe. The arguments reach the child
+# over its stdin through `StrictMode.deserialize`, so the environment under test need not list
+# `Serialization`.
+
+# The files whose edit makes a child stale: the kernel file, the project and manifest, and every source
+# file of a loaded package that is not an immutable registry install or a stdlib. The child checks
+# them before each probe, so a probe after an edit checks the code on disk, as a fresh child would.
+function _memsafe_watched(kernel_file::AbstractString)
+    files = String[]
+    isempty(kernel_file) || push!(files, kernel_file)
+    proj = Base.active_project()
+    if !isnothing(proj)
+        push!(files, proj)
+        man = Base.project_file_manifest_path(proj)
+        isnothing(man) || push!(files, man)
+    end
+    immutable = [[joinpath(d, "packages") for d in DEPOT_PATH]; Sys.STDLIB; Sys.BINDIR]
+    for m in values(Base.loaded_modules)
+        p = pathof(m)
+        (isnothing(p) || any(d -> startswith(p, d), immutable)) && continue
+        for (root, _, fs) in walkdir(dirname(p)), f in fs
+            push!(files, joinpath(root, f))
+        end
+    end
+    return files
+end
+_memsafe_stamp(files) = maximum(f -> isfile(f) ? mtime(f) : 0.0, files; init = 0.0)
+
+# The child's loop. No `try`/`catch` around a probe: a genuine exception from the kernel must end the
+# child so the parent reports it as an error rather than as a memory-safety verdict.
+function _memsafe_serve(mod::Module, kernel_file::String)
+    files = _memsafe_watched(kernel_file)
+    born = _memsafe_stamp(files)
+    println(stdout, "STRICTMODE_WORKER_READY"); flush(stdout)
+    while !eof(stdin)
+        fname, args, align = deserialize(stdin)
+        if _memsafe_stamp(files) != born
+            println(stdout, "STRICTMODE_WORKER_STALE"); flush(stdout)
+            return
+        end
+        f = getfield(mod, fname)
+        hit = Base.invokelatest(_canary_probe, f, args; align)
+        println(stdout, isnothing(hit) ? "STRICTMODE_CANARY_CLEAN" : "STRICTMODE_CANARY_DIRTY " * hit)
+        flush(stdout)
+        guarded, handles = _guarded_args(args; align)
+        Base.invokelatest(f, guarded...)
+        foreach(h -> _free_guarded!(h[2]), handles)
+        println(stdout, "STRICTMODE_MEMSAFE_OK"); flush(stdout)
+    end
+    return nothing
 end
 
-function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::Union{Nothing, Symbol}, align::Union{Nothing, Int} = nothing)
+mutable struct _MemsafeWorker
+    proc::Base.Process
+    err::IOBuffer
+    key::Any
+    served::Int
+end
+const _MEMSAFE_WORKER = Ref{Union{Nothing, _MemsafeWorker}}(nothing)
+const _MEMSAFE_WORKER_LOCK = ReentrantLock()
+
+function _memsafe_retire!()
+    w = _MEMSAFE_WORKER[]
+    isnothing(w) && return nothing
+    process_running(w.proc) && kill(w.proc, Base.SIGKILL)
+    try
+        close(w.proc.in)
+    catch
+    end
+    _MEMSAFE_WORKER[] = nothing
+    return nothing
+end
+
+const _MEMSAFE_ATEXIT = Ref(false)
+
+function _memsafe_spawn(key, kernel_file::String, using_module::Union{Nothing, Symbol})
+    # A child idles waiting for the next probe; it must not outlive the session that started it.
+    _MEMSAFE_ATEXIT[] || (atexit(_memsafe_retire!); _MEMSAFE_ATEXIT[] = true)
+    load = isnothing(using_module) ? "include($(repr(kernel_file))); const __strictmode_m = Main" :
+        "using $using_module; const __strictmode_m = $using_module"
+    script = """
+    using StrictMode
+    $load
+    StrictMode._memsafe_serve(__strictmode_m, $(repr(kernel_file)))
+    """
+    cmd = addenv(
+        `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`,
+        _MEMSAFE_CHILD_ENV => "1"
+    )
+    err = IOBuffer()
+    proc = open(pipeline(cmd; stderr = err), "r+")
+    return _MemsafeWorker(proc, err, key, 0)
+end
+
+# The source file a child `include`s to define `f`, or "" with `using_module`.
+function _memsafe_kernel_file(@nospecialize(f), args::Tuple, using_module)
+    isnothing(using_module) || return ""
+    fname = nameof(f)
+    # A function is reachable in a fresh child regardless of which module it ended up in
+    # (`include`-ing a plain script file at top level defines into `Main`, same as the REPL) —
+    # what actually matters is whether `which` can point at a real file on disk to `include`.
+    # A closure, an anonymous function, or something `eval`'d from a string has no such file.
+    argtypes = map(typeof, args)
+    m = try
+        which(f, Tuple{argtypes...})
+    catch err
+        error("StrictMode @assert_memsafe: could not resolve a method of `$fname` for argument types $argtypes to locate its source file: $(sprint(showerror, err))")
+    end
+    kernel_file = isabspath(String(m.file)) ? String(m.file) : Base.find_source_file(String(m.file))
+    (kernel_file === nothing || !isfile(kernel_file)) && error(
+        "StrictMode @assert_memsafe: `$fname`'s source file ($(m.file)) could not be found on " *
+            "disk (a closure, an anonymous function, or a REPL/`eval`'d-from-string definition?) " *
+            "— the guarded probe needs a named function reachable in a fresh process. Move the " *
+            "definition to a file and pass `using_module = TheDefiningPackage`."
+    )
+    return kernel_file
+end
+
+# `nothing` when the probe was clean, the violation text otherwise; throws for a failure that is not
+# a memory fault. `reuse = false` gives the probe a child of its own, which a kernel whose first call
+# in a process behaves differently from later ones needs.
+function _memsafe_probe_subprocess(
+        @nospecialize(f), args::Tuple; using_module::Union{Nothing, Symbol},
+        align::Union{Nothing, Int} = nothing, timeout::Union{Nothing, Real} = nothing, reuse::Bool = true,
+    )
     # The child `include`s the file that defines `f`. When that file also runs this probe, every child
     # would start another, without end, so a child refuses to start one.
     haskey(ENV, _MEMSAFE_CHILD_ENV) && error(
@@ -435,90 +521,88 @@ function _memsafe_probe_subprocess(@nospecialize(f), args::Tuple; using_module::
             "that defines the function, or pass `using_module = TheDefiningPackage`."
     )
     fname = nameof(f)
-    if using_module === nothing
-        # A function is reachable in a fresh child regardless of which module it ended up in
-        # (`include`-ing a plain script file at top level defines into `Main`, same as the REPL) —
-        # what actually matters is whether `which` can point at a real file on disk to `include`.
-        # A closure, an anonymous function, or something `eval`'d from a string has no such file.
-        argtypes = map(typeof, args)
-        m = try
-            which(f, Tuple{argtypes...})
-        catch err
-            error("StrictMode @assert_memsafe: could not resolve a method of `$fname` for argument types $argtypes to locate its source file: $(sprint(showerror, err))")
+    kernel_file = _memsafe_kernel_file(f, args, using_module)
+    key = (kernel_file, using_module, Base.active_project(), Base.julia_cmd())
+    @lock _MEMSAFE_WORKER_LOCK begin
+        for _ in 1:2
+            w = _MEMSAFE_WORKER[]
+            if !reuse || isnothing(w) || w.key != key || !process_running(w.proc)
+                _memsafe_retire!()
+                w = _MEMSAFE_WORKER[] = _memsafe_spawn(key, kernel_file, using_module)
+            end
+            v = _memsafe_exchange(w, fname, args, align, timeout)
+            v === :stale || (reuse || _memsafe_retire!(); return v)
         end
-        kernel_file = isabspath(String(m.file)) ? String(m.file) : Base.find_source_file(String(m.file))
-        (kernel_file === nothing || !isfile(kernel_file)) && error(
-            "StrictMode @assert_memsafe: `$fname`'s source file ($(m.file)) could not be found on " *
-                "disk (a closure, an anonymous function, or a REPL/`eval`'d-from-string definition?) " *
-                "— the guarded probe needs a named function reachable in a fresh process. Move the " *
-                "definition to a file and pass `using_module = TheDefiningPackage`."
-        )
-    else
-        kernel_file = ""   # unused when using_module is given
+        error("StrictMode @assert_memsafe: the probe child found its source stale twice in a row")
     end
+end
 
-    args_path, args_io = mktemp()
-    close(args_io)
-    script = _memsafe_child_script(kernel_file, fname, args_path, using_module, align)
+function _memsafe_exchange(w::_MemsafeWorker, fname::Symbol, args::Tuple, align, timeout)
+    clean = false
+    timed_out = Ref(false)
+    timer = isnothing(timeout) ? nothing :
+        Timer(_ -> (timed_out[] = true; kill(w.proc, Base.SIGKILL)), timeout)
+    out = IOBuffer()
     try
-        serialize(args_path, args)
-        cmd = addenv(
-            `$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no -e $script`,
-            _MEMSAFE_CHILD_ENV => "1"
-        )
-        outbuf, errbuf = IOBuffer(), IOBuffer()
-        proc = run(pipeline(cmd; stdout = outbuf, stderr = errbuf); wait = false)
-        wait(proc)
-        out_s, err_s = String(take!(outbuf)), String(take!(errbuf))
+        try
+            serialize(w.proc, (fname, args, align)); flush(w.proc)
+        catch                      # the child died before or while reading: its exit gives the verdict
+        end
+        while true
+            line = readline(w.proc; keep = true)
+            isempty(line) && break                       # end of output: the child is gone
+            write(out, line)
+            occursin("STRICTMODE_WORKER_STALE", line) && return :stale
+            occursin("STRICTMODE_MEMSAFE_OK", line) && break
+        end
+        out_s = String(take!(out))
         # The canary line is printed and flushed BEFORE the guard probe, so it is present whether or
         # not the child then died on the guard page.
         canary = match(r"STRICTMODE_CANARY_DIRTY (.*)", out_s)
+        ok = occursin("STRICTMODE_MEMSAFE_OK", out_s)
+        if ok && isnothing(canary)
+            clean = true
+            w.served += 1
+            take!(w.err)
+            return nothing
+        end
+        # Stored past the end without tripping the guard page: the store landed beyond it.
+        ok && return "out-of-bounds WRITE detected: $(canary.captures[1])."
+        wait(w.proc)
+        timed_out[] && error("StrictMode @assert_memsafe: the probe did not finish within $timeout s")
+        err_s = String(take!(w.err))
+        proc = w.proc
         # A guard-page hit does not always arrive as a signal. Julia's own fault handler can turn an
         # access to protected memory into a CATCHABLE `ReadOnlyMemoryError`, and the child then dies
         # with exit code 1 and an ordinary backtrace instead of a `termsignal`. Both deliveries are
-        # the same event, and the harness must count both: treating the exception form as an
-        # unrelated script error reports a real detection as a broken probe. The write kernel takes
-        # the exception path on some Linux and macOS hosts and the signal path on others.
-        #
-        # Windows is a third delivery: no signal at all, and the access violation shows up as the
-        # process's exit STATUS. The status is compared modulo `UInt32` because the same value
-        # reaches here signed on some paths and unsigned on others, and both spell the same code.
+        # the same event. Windows is a third: no signal, and the access violation shows up as the
+        # exit STATUS, compared modulo `UInt32` because it reaches here signed on some paths.
         by_signal = !iszero(proc.termsignal)
         by_status = !by_signal && (proc.exitcode % UInt32) == _WIN_ACCESS_VIOLATION
-        by_exception = !by_signal && !by_status && !iszero(proc.exitcode) &&
-            occursin(_MEMFAULT_RE, err_s)
+        by_exception = !by_signal && !by_status && !iszero(proc.exitcode) && occursin(_MEMFAULT_RE, err_s)
         if by_signal || by_status || by_exception
             how = by_signal ? "killed by $(_signal_name(proc.termsignal))" :
                 by_status ? "terminated by an access violation (status 0xc0000005)" :
                 "stopped by a memory-access exception"
-            if canary !== nothing
-                # A store past the end. Report the canary's own localization: on Julia 1.12+ the
-                # write fault's backtrace is destroyed (`unknown function (ip: …)`, zero frames), so
-                # the child's signal report carries nothing usable and the canary is all there is.
+            if !isnothing(canary)
+                # A store past the end; the write fault's own backtrace is not usable, so the offset
+                # comes from the canary.
                 return "out-of-bounds WRITE detected: $(canary.captures[1]). (The guarded probe " *
-                    "subprocess was then $how; a write fault's own backtrace is not " *
-                    "usable, so the offset above comes from a writable poisoned canary.)"
+                    "subprocess was then $how; a write fault's own backtrace is not usable, so the " *
+                    "offset above comes from a writable poisoned canary.)"
             end
-            return "out-of-bounds READ detected — the guarded probe subprocess was $how " *
-                "and nothing was stored past any argument's end. Child's own fault " *
-                "report (names the faulting op):\n" * _indent(err_s)
-        elseif proc.exitcode != 0
-            error(
-                "StrictMode @assert_memsafe: the guarded probe errored for a reason other than a " *
-                    "memory fault (exit code $(proc.exitcode)) — this is not itself a memsafe " *
-                    "violation, fix the underlying error:\n" * _indent(err_s)
-            )
-        elseif canary !== nothing
-            # Stored past the end without tripping the guard page. Reachable when the store lands
-            # beyond the guard page rather than in it, or when the kernel writes and the guard probe
-            # happens not to fault.
-            return "out-of-bounds WRITE detected: $(canary.captures[1])."
-        elseif !occursin("STRICTMODE_MEMSAFE_OK", out_s)
-            error("StrictMode @assert_memsafe: internal error — the probe subprocess exited cleanly but did not report success.\nstdout:\n" * _indent(out_s) * "\nstderr:\n" * _indent(err_s))
+            return "out-of-bounds READ detected — the guarded probe subprocess was $how and " *
+                "nothing was stored past any argument's end. Child's own fault report (names the " *
+                "faulting op):\n" * _indent(err_s)
         end
-        return nothing
+        error(
+            "StrictMode @assert_memsafe: the guarded probe errored for a reason other than a memory " *
+                "fault (exit code $(proc.exitcode)) — this is not itself a memsafe violation, fix the " *
+                "underlying error:\n" * _indent(err_s)
+        )
     finally
-        rm(args_path; force = true)
+        isnothing(timer) || close(timer)
+        clean || _memsafe_retire!()        # reused only after a clean probe; this covers an interrupt
     end
 end
 
@@ -574,8 +658,17 @@ through the child's exit signal instead of killing your session, and that read i
 bug class. An out-of-bounds WRITE is localized by a poisoned canary the child reads back before it
 touches the guard pages, since a write fault's own backtrace is destroyed.
 
+One child serves many probes: it loads the kernel once and is reused for the next probe of the same
+kernel source, environment and Julia, but only after a clean one. Any other outcome retires it, and
+so does an edit to a watched source file, which the child checks before each probe. A probe in a
+reused child is the kernel's second or later call in that process, so a kernel that writes past an
+end only on its first call in a process is caught only on its first probe there; `reuse = false`
+gives every probe a child of its own.
+
 - `align`: alignment (bytes) for each guarded array's start pointer (internally, `_guarded_array`)
   — the default (the element's own size) places the guard pages flush against the data.
+- `timeout`: seconds after which a probe that has not finished is killed and reported as an error.
+- `reuse`: `false` starts a fresh child for this probe and retires it afterwards.
 - `using_module`: for when `f`'s defining file isn't self-contained (relies on its package's
   `using`/context) — the subprocess does `using \$using_module` and looks `f` up there, instead of
   raw-`include`-ing the source file.
@@ -604,7 +697,7 @@ isnothing(r.violation) || error(r.violation)
 function memsafe_report(
         @nospecialize(f), args...;
         align::Union{Nothing, Int} = nothing, using_module::Union{Nothing, Symbol} = nothing,
-        isolate = nothing
+        timeout::Union{Nothing, Real} = nothing, reuse::Bool = true, isolate = nothing
     )
     isnothing(isolate) || throw(ArgumentError(_ISOLATE_REMOVED))
     # The harness needs page protection and a way to see the resulting fault from the parent. The
@@ -616,11 +709,11 @@ function memsafe_report(
             "got Sys.KERNEL = $(Sys.KERNEL)."
     )
     target = _func_name(f) * _sig_string(map(typeof, args))
-    violation = _memsafe_probe_subprocess(f, args; using_module, align)
+    violation = _memsafe_probe_subprocess(f, args; using_module, align, timeout, reuse)
     return MemsafeReport(target, violation, [d for (_, _, d) in _unguarded_args(args)])
 end
 
-function _assert_memsafe(target, @nospecialize(f), args::Tuple; align, using_module)
+function _assert_memsafe(target, @nospecialize(f), args::Tuple; align, using_module, timeout = nothing, reuse = true)
     # A `view`/`Adjoint` is rejected rather than reported: the caller can materialize it and get
     # real coverage, and a gate that silently checks less than it names is the failure this
     # harness exists to remove. A struct's array fields have no such fix at the call site, so
@@ -640,7 +733,7 @@ function _assert_memsafe(target, @nospecialize(f), args::Tuple; align, using_mod
         class === :struct && @warn "StrictMode @assert_memsafe: $d. The guarantee covers only the " *
             "`Array` arguments of `$target`." maxlog = 3
     end
-    violation = _memsafe_probe_subprocess(f, args; using_module, align)
+    violation = _memsafe_probe_subprocess(f, args; using_module, align, timeout, reuse)
     isnothing(violation) || _fail(:memsafe, target, violation)
     return nothing
 end
@@ -679,7 +772,7 @@ the check proceeds over the `Array` arguments.
 macro assert_memsafe(args...)
     # `:isolate` stays in the allowed set only so it can be rejected here: dropping it would make
     # `isolate=false` parse as a positional argument and misreport as "needs a call expression".
-    pos, opts = _macro_call(args, (:isolate, :align, :using_module))
+    pos, opts = _macro_call(args, (:isolate, :align, :using_module, :timeout, :reuse))
     haskey(opts, :isolate) && throw(ArgumentError(_ISOLATE_REMOVED))
     isempty(pos) && throw(ArgumentError("@assert_memsafe needs a call expression"))
     call = pos[1]
@@ -711,7 +804,9 @@ macro assert_memsafe(args...)
         local _f = $fe
         $(_assert_memsafe)(
             $target, _f, ($(argsyms...),);
-            align = $align_expr, using_module = $using_module_expr
+            align = $align_expr, using_module = $using_module_expr,
+            timeout = $(haskey(opts, :timeout) ? esc(opts[:timeout]) : nothing),
+            reuse = $(haskey(opts, :reuse) ? esc(opts[:reuse]) : true)
         )
         _f($(argsyms...))
     end

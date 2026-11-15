@@ -934,12 +934,11 @@ function test_history_invariant(@nospecialize(f), args...; movers)
         )
     )
     r = StrictMode.history_report(f, args...; movers)
-    r.same && return r
-    throw(
-        StrictMode.StrictViolation(
-            :history, r.target,
-            "the result is not the same bits after $(r.movers) state mover(s) ran in this process " *
-                "($(r.first_bytes) B then $(r.after_bytes) B serialized): it depends on what ran before it"
-        )
-    )
+    r.status === :same && return r
+    msg = r.status === :different ?
+        "the result is not the same bits after $(r.movers) state mover(s) ran in this process (first " *
+        "difference at $(r.difference)): it depends on what ran before it" :
+        "two calls with nothing between them already differ (at $(r.difference)), so whether the " *
+        "result depends on what ran before it cannot be established"
+    throw(StrictMode.StrictViolation(:history, r.target, msg))
 end

@@ -179,6 +179,21 @@ function _sw_task(ci::Core.CodeInfo, i::Int, st::Expr, @nospecialize(sig))
     return (; T = readable ? T : nothing, migrates, why)
 end
 
+function _sw_is_threading_run(st::Expr)
+    mi = _invoke_mi(st.args[1])
+    return mi isa Core.MethodInstance && mi.def isa Method && mi.def.name === :threading_run &&
+        mi.def.module === Base.Threads
+end
+
+function _sw_threads_task(ci::Core.CodeInfo, st::Expr)
+    a = length(st.args) >= 3 ? st.args[3] : nothing
+    T = (a isa Core.SSAValue && ci.ssavaluetypes isa Vector) ? _widen_taint(ci.ssavaluetypes[a.id]) : nothing
+    readable = T isa Type && isconcretetype(T)
+    static = length(st.args) >= 4 && st.args[4] === true
+    why = readable ? "" : "a `Threads.@threads` body whose closure has no concrete type here (" * string(T) * ")"
+    return (; T = readable ? T : nothing, migrates = !static, why)
+end
+
 function _sw_scan!(r::_SwReach, ci::Core.CodeInfo, @nospecialize(sig), queue::Vector{Any})
     for i in eachindex(ci.code)
         st = ci.code[i]
@@ -195,6 +210,11 @@ function _sw_scan!(r::_SwReach, ci::Core.CodeInfo, @nospecialize(sig), queue::Ve
             elseif haskey(_SW_BLOCK_FCALLS, fn)
                 _sw_note!(r.blocks, _SW_BLOCK_FCALLS[fn])
             end
+        elseif st.head === :invoke && _sw_is_threading_run(st)
+            # `Threads.@threads` hands its loop body to `threading_run` as a closure typed `Any`
+            # there, which then runs on one task per thread. The closure is concrete where it is
+            # built, so it is read as the body of those tasks; `:static` pins them to their threads.
+            push!(r.tasks, _sw_threads_task(ci, st))
         elseif st.head === :invoke
             mi = _invoke_mi(st.args[1])
             if !(mi isa Core.MethodInstance && mi.def isa Method)

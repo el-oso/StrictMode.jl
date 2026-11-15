@@ -1125,3 +1125,52 @@ end
 _code_typed(args...; kw...) = filter(p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; kw...))
 _code_typed_by_type(args...; kw...) =
     filter(p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; kw...))
+
+# `:owned`'s walk to the end of the package's own code, for a call whose ordinary walk stopped at the
+# depth limit. A lookup can only sit in the package's code or in a Base dictionary accessor that code
+# calls, and Base is not entered, so following the package's own callees to the end — each body once —
+# settles it: `:lookup`, `:clean`, or `:budget` when even this walk ran out of bodies. A registered
+# barrier is not entered; its own causes are reported where it is checked.
+const _OWNED_DEEP_BUDGET = 2000
+const _OWNED_DEEP_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
+const _OWNED_DEEP_LOCK = ReentrantLock()
+
+function _owned_deep(@nospecialize(sig))
+    key = (sig, Base.get_world_counter())
+    hit = @lock _OWNED_DEEP_LOCK get(_OWNED_DEEP_MEMO, key, nothing)
+    isnothing(hit) || return hit
+    seen = Base.IdSet{Any}()
+    queue = Any[sig]
+    v = :clean
+    while !isempty(queue)
+        s = popfirst!(queue)
+        s in seen && continue
+        push!(seen, s)
+        if length(seen) > _OWNED_DEEP_BUDGET
+            v = :budget
+            break
+        end
+        r = _signals_by_type(s, 0, Base.IdSet{Any}())
+        if r[3]
+            v = :lookup
+            break
+        end
+        cts = try
+            _code_typed_by_type(s; optimize = true)
+        catch
+            continue
+        end
+        isempty(cts) && continue
+        for st in first(cts[1]).code
+            Meta.isexpr(st, :invoke) || continue
+            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+            (mi isa Core.MethodInstance && mi.def isa Method) || continue
+            root = Base.moduleroot(mi.def.module)
+            (root === Base || root === Core) && continue
+            (_mi_is_strictmode(mi) || _mi_is_barrier(mi)) && continue
+            push!(queue, mi.specTypes)
+        end
+    end
+    @lock _OWNED_DEEP_LOCK (_OWNED_DEEP_MEMO[key] = v)
+    return v
+end

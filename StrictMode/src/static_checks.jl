@@ -202,7 +202,9 @@ function _assert_owned(
     )
     sig = _alloc_signals(f, types; depth = depth)
     _unread_fail(:owned, target, sig; gates) && return nothing
-    if sig.dictlookup
+    # The ordinary walk stopped short: follow the package's own code to the end.
+    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(Base.signature_type(f, Tuple{types...})) : :clean
+    if sig.dictlookup || deep === :lookup
         _fail(
             :owned, target,
             "hot path resolves a runtime AbstractDict lookup (static-ownership violation): give " *
@@ -213,12 +215,11 @@ function _assert_owned(
                 "barrier so its callers point here.";
             gates = gates
         )
-    elseif sig.truncated
+    elseif deep === :budget
         _fail(
             :owned, target,
-            "not established: the walk stopped at its depth limit ($depth out-of-line levels) with a " *
-                "callee of the package still unread. Assert :owned closer to where any lookup would " *
-                "happen, or pass `depth = n`.";
+            "not established: the package's own call graph below this call is larger than the walk " *
+                "reads ($(_OWNED_DEEP_BUDGET) bodies). Assert :owned on a smaller part of the call.";
             gates = false
         )
     else
