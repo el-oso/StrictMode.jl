@@ -14,6 +14,23 @@ hard deps and adds `@test_noalloc`/`@test_noboxing`/`@test_typestable`/`@test_tr
 `test_signatures`/`test_compiled`/`test_registered`. **Which engine a call site uses is the macro
 you wrote** — decided at expansion by name, with no ambient state and nothing to switch.
 
+## Reference languages for policy
+
+When a guarantee needs a policy choice (what counts as an escape, a read, a derived pointer, a safe
+hand-off to C), take precedent from a mature system rather than inventing one:
+
+- **Memory, escape and C interop: Go first.** Like Julia, Go is garbage-collected, has no ownership
+  types, lets the compiler decide stack vs. heap by escape analysis, and talks to C through raw
+  pointers (`cgo`, `unsafe.Pointer`). Its rules are written for the problem StrictMode has. Examples:
+  a derived pointer must stay inside the original allocated object; returning what a parameter
+  points to is an escape ("leaking param content"); an external function is assumed to keep its
+  pointer arguments unless marked otherwise.
+- **Concurrency and unsafe fencing: Rust.** `Send`/`Sync` prove race freedom statically, where Go
+  only detects races at run time; `unsafe` blocks and `#![forbid(unsafe_code)]` are the model for
+  `unsafe_report`; rustc's diagnostics are the model for messages that explain the fix.
+- **Where the two disagree, Julia's own semantics decide.** These are references, not authorities:
+  a guarantee is opt-in, and safety is never traded away to match another language.
+
 ## Key architecture
 
 ```
