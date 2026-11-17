@@ -40,6 +40,7 @@ using Preferences: Preferences, @load_preference, @set_preferences!
 using TOML: TOML
 using TypeContracts: TypeContracts
 using InteractiveUtils: InteractiveUtils
+using PrecompileTools: @setup_workload, @compile_workload
 
 export @assert_noalloc, @assert_typestable, @assert_noboxing, @assert_owned, @assert_inlined
 export @assert_vectorized, @assert_no_scalar_loops, @assert_effects, @assert_trim_compatible, descend, explain_trim, kernel_report, scalar_fp_loops, register_report
@@ -115,6 +116,7 @@ include("audit.jl")
 include("golden.jl")
 include("migration.jl")
 include("history.jl")
+include("precompile.jl")
 
 # The proofs — AllocCheck, JET, TrimCheck — and the `@test_*` / `test_*` gating API live in the
 # companion `StrictModeTest` package. Nothing here calls them, and nothing here is a stub they fill.
