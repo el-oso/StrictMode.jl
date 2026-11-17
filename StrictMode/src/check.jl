@@ -184,9 +184,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         why = "no typed body could be read for this signature (no method matches, or its generator raised)"
         return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
     end
-    # `:noalloc` alone is decided by the first allocation or boxing, so its scan stops there.
-    sig = (:typestable in guarantees || :noalloc in guarantees || :noboxing in guarantees) ?
-        _alloc_signals(f, types; full = :noboxing in guarantees) : nothing
+    # `:noalloc` is decided by the first allocation or boxing, so its scan stops there; `:noboxing` reads
+    # a bounded part of the call graph and reports when that was not all of it.
+    sig = :noalloc in guarantees ? _alloc_signals(f, types; mode = :alloc) : nothing
+    boxsig = :noboxing in guarantees ? _alloc_signals(f, types; mode = :boxing) : nothing
     # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-
     # free? A resolved `:invoke` to a callee that boxes internally (e.g. the complex `_l3ws` IdDict
     # `get!`, whose abstract result is narrowed by a `::L3Workspace{T}` assert) is not the caller's
@@ -244,16 +245,16 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
                 push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))
             end
         elseif g === :noboxing
-            fail = sig.boxing || !isnothing(sig.abscontainer)
-            if !fail && sig.truncated
-                push!(out, _truncated_finding(md, fn, sg, g, sig))
+            fail = boxsig.boxing || !isnothing(boxsig.abscontainer)
+            if !fail && boxsig.truncated
+                push!(out, _truncated_finding(md, fn, sg, g, boxsig))
                 continue
             end
-            if !fail && !isnothing(sig.barrier_box)
-                push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
+            if !fail && !isnothing(boxsig.barrier_box)
+                push!(out, _barrier_note(md, fn, sg, g, boxsig.barrier_box, boxsig.file, boxsig.line))
                 continue
             end
-            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig), sig.file, sig.line))
+            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", boxsig), boxsig.file, boxsig.line))
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try
