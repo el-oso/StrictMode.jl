@@ -103,6 +103,10 @@ end
         @test StrictMode._alloc_signals(top, (Int,)).barrier
     finally
         empty!(StrictMode._ALLOC_BARRIERS)
+        let st = StrictMode._store_for(Main, :__strict_barriers__)
+            isnothing(st) || empty!(st)
+        end
+        StrictMode._BARRIER_GEN[] += 1
         StrictMode.clear_cache!()
     end
     # without the registration the same chain allocates
@@ -122,6 +126,10 @@ end
         @test !StrictMode._failed(f)
     finally
         empty!(StrictMode._ALLOC_BARRIERS)
+        let st = StrictMode._store_for(Main, :__strict_barriers__)
+            isnothing(st) || empty!(st)
+        end
+        StrictMode._BARRIER_GEN[] += 1
         StrictMode.clear_cache!()
     end
 end
@@ -200,4 +208,64 @@ end
     @test length(first(o).path) >= 0
     @test all(x -> !isempty(x.statements), o)
     @test isempty(StrictMode._signal_origin(mid, (Int,); mode = :boxing))
+end
+
+@testitem "barriers taking a type or a OncePerTask, behind positional-default chains, are stopped at" begin
+    using StrictMode
+    const GP = IdDict{Any, Any}()
+    @noinline gpack(::Type{T}) where {T} = get!(() -> (T[], T[]), GP, T)::NTuple{2, Vector{T}}
+    const OPT = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(zeros(2, 2)))
+    @noinline opt(o::Base.OncePerTask{Base.RefValue{Matrix{Float64}}, F}) where {F} = o()
+    @noinline function drv(A::Vector{Float64}, a::Bool, b::Bool, c::Bool)
+        w = gpack(Float64)
+        m = opt(OPT)
+        return length(w[1]) + length(m[]) + length(A) + (a & b & c)
+    end
+    drv(A::Vector{Float64}, a::Bool, b::Bool) = drv(A, a, b, false)
+    drv(A::Vector{Float64}, a::Bool) = drv(A, a, false)
+    drv(A::Vector{Float64}) = drv(A, true)
+    @noinline mid(A::Vector{Float64}) = drv(A) + 1
+    top(A::Vector{Float64}) = mid(A) + 1
+    A = ones(4)
+    try
+        register_alloc_barrier!(gpack)
+        register_alloc_barrier!(opt)
+        f = only(StrictMode.findings(top, (Vector{Float64},); guarantees = (:noalloc,)))
+        @test !StrictMode._failed(f)
+        @test isempty(StrictMode._signal_origin(top, (Vector{Float64},)))
+        stops = StrictMode._barrier_stops(top, (Vector{Float64},))
+        @test any(s -> occursin("gpack", string(s)), stops)
+        @test any(s -> occursin("opt", string(s)), stops)
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        let st = StrictMode._store_for(Main, :__strict_barriers__)
+            isnothing(st) || empty!(st)
+        end
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+    # not behind a barrier: the same chain allocates
+    @test !isempty(StrictMode._signal_origin(top, (Vector{Float64},)))
+end
+
+@testitem "a registered barrier is also recorded in the package that owns it" begin
+    using StrictMode
+    @noinline ws(::Type{T}) where {T} = Vector{T}(undef, 8)
+    try
+        register_alloc_barrier!(ws)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(ws)), :__strict_barriers__)
+        @test !isnothing(store) && any(g -> g === ws, store)
+        @test any(g -> g === ws, StrictMode._barrier_functions())
+        # a second registration is not a second record
+        register_alloc_barrier!(ws)
+        @test count(g -> g === ws, store) == 1
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        let st = StrictMode._store_for(Main, :__strict_barriers__)
+            isnothing(st) || empty!(st)
+        end
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
 end

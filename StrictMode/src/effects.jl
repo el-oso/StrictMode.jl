@@ -219,8 +219,43 @@ register_alloc_barrier!(_my_calibrator)
 """
 function register_alloc_barrier!(@nospecialize(f))
     push!(_ALLOC_BARRIERS, f)
+    # The registry above lives in this session. A package that registers at its own precompile loses it
+    # at the next load, so the registration is also kept in the package that owns the function, which
+    # is serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
+    try
+        store = _local_store!(parentmodule(f), _LOCAL_BARRIERS, Any[])
+        any(g -> g === f, store) || push!(store, f)
+    catch
+        # A module that is closed to writes keeps the session registration only.
+    end
+    _BARRIER_GEN[] += 1
     clear_cache!()
     return nothing
+end
+
+const _LOCAL_BARRIERS = :__strict_barriers__
+const _BARRIER_GEN = Ref(0)
+const _BARRIER_MEMO = Ref{Tuple{UInt, Int, Int, Vector{Any}}}((UInt(0), -1, -1, Any[]))
+
+# Every registered barrier in scope: this session's, and each loaded package's own.
+function _barrier_functions()
+    w = Base.get_world_counter()
+    n = length(_ALLOC_BARRIERS)
+    m = _BARRIER_MEMO[]
+    (m[1] == w && m[2] == n && m[3] == _BARRIER_GEN[]) && return m[4]
+    out = Any[]
+    for f in _ALLOC_BARRIERS
+        push!(out, f)
+    end
+    for mod in _store_modules()
+        s = _store_for(mod, _LOCAL_BARRIERS)
+        s isa AbstractVector || continue
+        for f in s
+            any(g -> g === f, out) || push!(out, f)
+        end
+    end
+    _BARRIER_MEMO[] = (w, n, _BARRIER_GEN[], out)
+    return out
 end
 
 # A registered function is only a barrier when it is ITSELF the callee (parameter 1 — Julia's
@@ -228,7 +263,7 @@ end
 # merely appears as an ordinary argument elsewhere (e.g. passed as a callback) — that distinction
 # matters here in a way it doesn't for the `Base` types below, since a registered function is an
 # arbitrary user function that could legitimately be passed around as a value.
-_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _ALLOC_BARRIERS)
+_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _barrier_functions())
 
 # `(::OncePerProcess)()` (and OncePerThread) are themselves `@inline`d away in Base —
 # the fast (already-initialized) path is inlined directly into the caller, so the only surviving
@@ -254,10 +289,11 @@ _mi_is_strictmode(mi::Core.MethodInstance) =
 # carries the function at parameter 3, and the keyword-sorted body `#f#N`, which carries it after the
 # keyword values. Both are the barrier: the allocation is the registered function's own.
 function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
-    (isempty(_ALLOC_BARRIERS) || !(mi.def isa Method)) && return false
+    bs = _barrier_functions()
+    (isempty(bs) || !(mi.def isa Method)) && return false
     ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
     name = _demangle(mi.def.name)
-    for f in _ALLOC_BARRIERS
+    for f in bs
         nameof(f) === name && any(p -> p === typeof(f), ps) && return true
     end
     return false
@@ -672,7 +708,10 @@ end
 # Where the scan finds what it reports: for every body of the call graph whose own statements set the
 # signal `mode` asks about, the callees that lead to it and the statements. `_alloc_signals` says that
 # something allocates; this says which statement, in which callee, reached from where.
-function _signal_origin(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc)
+function _signal_origin(
+        @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
+        stops::Union{Nothing, Vector{Any}} = nothing
+    )
     top = Base.signature_type(f, Tuple{types...})
     parent = IdDict{Any, Any}()
     queue = Any[top]
@@ -701,13 +740,26 @@ function _signal_origin(@nospecialize(f), @nospecialize(types::Tuple); mode::Sym
             a1 = st.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
-            (_mi_is_strictmode(mi) || _mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi))) && continue
+            _mi_is_strictmode(mi) && continue
+            if _mi_is_barrier(mi)
+                isnothing(stops) || push!(stops, mi.specTypes)
+                continue
+            end
+            isnothing(_mi_exempt_name(mi)) || continue
             _enters_user_code(mi) || continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
             push!(queue, mi.specTypes)
         end
     end
     return out
+end
+
+# The registered barriers the walk from `f` stops at, so a reader can see that one was reached and not
+# entered.
+function _barrier_stops(@nospecialize(f), @nospecialize(types::Tuple))
+    stops = Any[]
+    _signal_origin(f, types; stops)
+    return unique(stops)
 end
 
 function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol)
