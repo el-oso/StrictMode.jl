@@ -165,6 +165,15 @@ precompile:
 end
 ```
 
+Given a function NAME instead of a definition, it declares signatures of a function defined
+elsewhere — an `@generated` one, say — and defines nothing. Place it after the definitions:
+
+```julia
+@strict_function guarantees = (:vectorized, :no_spill) signatures = [
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Val{8}, Val{6}, Val{false}),
+] _microkernel!
+```
+
 That keeps every verdict at module load. To check instead whatever specializations callers
 actually create — including ones you could not have listed — see [`@strict_stable`](@ref), which
 trades load-time failure for open coverage. With checks disabled this is just the plain definition.
@@ -181,6 +190,24 @@ macro strict_function(args...)
     )
     gs = haskey(opts, :guarantees) ? esc(opts[:guarantees]) : nothing
     def = pos[1]
+    srcstr = "@strict_function at " * string(__source__.file) * ":" * string(__source__.line)
+    # A name instead of a definition: declare signatures of a function defined elsewhere — one
+    # whose definition is `@generated`, or lives in a file the declarations should not be mixed
+    # into. It defines nothing, so with checks off it expands to `nothing`.
+    if def isa Symbol || Meta.isexpr(def, :.)
+        haskey(opts, :signatures) || throw(
+            ArgumentError(
+                "@strict_function $def: naming an existing function needs `signatures = [...]`"
+            )
+        )
+        checked = :(
+            $(_verify_strict_signatures)(
+                $(esc(def)), $(esc(opts[:signatures])), $(string(def));
+                mod = @__MODULE__, source = $srcstr, guarantees = $gs
+            )
+        )
+        return _gate(checked, nothing)
+    end
     sig = _strictdef_sig(def)
     fname = sig.args[1]
     argexprs = filter(a -> !Meta.isexpr(a, :parameters), sig.args[2:end])
@@ -198,10 +225,8 @@ macro strict_function(args...)
     # here without touching the types, and `signatures = [...]` remains the way to name the concrete
     # instantiations a parametric declaration stands for.
     parametric = Meta.isexpr(def.args[1], :where)
-    # Only a macro knows the line that asked for the guarantee, so it travels with the declaration
-    # and a finding can name the requirement rather than only the breach.
-    srcstr = "@strict_function at " * string(__source__.file) * ":" * string(__source__.line)
-
+    # Only a macro knows the line that asked for the guarantee (`srcstr`), so it travels with the
+    # declaration and a finding can name the requirement rather than only the breach.
     checked = if parametric && isnothing(sigs)
         quote
             Base.@__doc__ $(esc(def))

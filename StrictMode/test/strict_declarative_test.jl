@@ -71,6 +71,28 @@ end
         @test_throws StrictViolation declared(Module(:_DeclSpill), :pk_spill!, 80)
     end
 
+    # Naming an existing function declares its signatures without defining anything, which is the
+    # form for an `@generated` definition.
+    named(mod, name) = Core.eval(
+        mod, Expr(
+            :macrocall, GlobalRef(StrictMode, Symbol("@strict_function")), LineNumberNode(1, :named),
+            :(guarantees = (:no_spill,)),
+            :(signatures = [(Vector{Float64}, Vector{Float64}, Vector{Float64})]), name,
+        )
+    )
+    gen = Module(:_DeclGen)
+    Core.eval(gen, :(@generated gsum(o::Vector{T}, a::Vector{T}, b::Vector{T}) where {T} = :(sum(a))))
+    @test isnothing(named(gen, :gsum))
+    @test haskey(StrictMode.declarations(), (gen.gsum, (Vector{Float64}, Vector{Float64}, Vector{Float64})))
+    if NoSpillFixtures.spills_observable()
+        spill = Module(:_DeclNamedSpill)
+        Core.eval(spill, :(const k! = $(NoSpillFixtures.spilly_accum_kernel!)))
+        @test_throws StrictViolation named(spill, :k!)
+    end
+    @test_throws "needs `signatures" Core.eval(
+        gen, Expr(:macrocall, GlobalRef(StrictMode, Symbol("@strict_function")), LineNumberNode(1, :n), :gsum)
+    )
+
     # A listed signature with no method is named as such.
     typo = Expr(
         :macrocall, GlobalRef(StrictMode, Symbol("@strict_function")), LineNumberNode(1, :typo),
