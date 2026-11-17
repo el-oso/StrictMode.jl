@@ -585,10 +585,22 @@ policy_sets() = _POLICY_SETS
 # The policy binding is created in `mod` itself, not in its root: a package and a submodule of it
 # may hold different policies, and `module_policy` resolves inheritance by walking up from the
 # module asked about.
-function _set_module_policy!(mod::Module, gs)
-    isdefined(mod, _LOCAL_POLICY) ?
-        Core.eval(mod, :($(_LOCAL_POLICY) = $gs)) :
-        Core.eval(mod, :(const $(_LOCAL_POLICY) = $gs))
+#
+# A module holds one policy. A later `@strict_policy` scoped with `only`/`exempt` checks its own
+# matches and leaves that policy alone; a later unscoped one would replace a constant, so it is an
+# error that says how to scope it.
+function _set_module_policy!(mod::Module, gs; scoped::Bool = false)
+    if isdefined(mod, _LOCAL_POLICY)
+        scoped && return gs
+        throw(
+            ArgumentError(
+                "@strict_policy: $mod already has a policy ($(getfield(mod, _LOCAL_POLICY))). A module " *
+                    "holds one; check further guarantees on some of its functions with " *
+                    "`@strict_policy $(gs) only = …`."
+            )
+        )
+    end
+    Core.eval(mod, :(const $(_LOCAL_POLICY) = $gs))
     return gs
 end
 
@@ -654,16 +666,20 @@ function _auto_check_module(
     # The policy is the requirement here, so its line is what a reader needs; a signature with its
     # own declaration keeps that one, which `_map_findings` has already stamped.
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
-    # Split on `_guarantee_gates` exactly as `@strict_function` does. This runs at the CONSUMER'S
-    # own precompile, where `StrictModeTest` is not loadable, so the allocation verdict here is the
-    # value-free scan — measured 8.1% false over a 120-specialization corpus (issue #17). Aborting a
-    # module load on that is issue #18, the thing that made checks-on unusable in PureBLAS; it was
-    # fixed for `@strict_function` and left in place here, where the blast radius is every
-    # definition in the module rather than one.
+    _report_at_load(fs, :strict_module, string(nameof(mod)))
+    return nothing
+end
+
+# Split on `_guarantee_gates`: a check that observes compiled output throws, an inference warns.
+# This runs at the CONSUMER'S own precompile, where `StrictModeTest` is not loadable, so the
+# allocation verdict is the value-free scan — measured 8.1% false over a 120-specialization corpus
+# (issue #17). Aborting a module load on that is issue #18, which made checks-on unusable in
+# PureBLAS.
+function _report_at_load(fs::Vector{StrictFinding}, kind::Symbol, target::AbstractString)
     gating = filter(f -> _guarantee_gates(f.guarantee), fs)
     reporting = filter(f -> !_guarantee_gates(f.guarantee), fs)
-    _run_and_report(reporting, :strict_module, string(nameof(mod)), :warn)
-    _run_and_report(gating, :strict_module, string(nameof(mod)), :error)
+    _run_and_report(reporting, kind, target, :warn)
+    _run_and_report(gating, kind, target, :error)
     return nothing
 end
 

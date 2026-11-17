@@ -44,7 +44,7 @@ _warn_parametric_decl(target) = @warn "@strict_function $target: the signature i
 function _verify_strict_def(
         @nospecialize(f), @nospecialize(types::Tuple), target;
         warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing,
-        source::AbstractString = ""
+        source::AbstractString = "", guarantees = nothing
     )
     Base.isdispatchtuple(Tuple{types...}) || return begin
         # Silent when the caller supplied `signatures =`: they have already answered which concrete
@@ -54,6 +54,8 @@ function _verify_strict_def(
             "`@strict_stable` to check every specialization instead)."
         nothing
     end
+    isnothing(guarantees) ||
+        return _verify_strict_guarantees(f, types, target, guarantees; mod, source)
     # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
     # StrictModeTest.test_registered) re-check it.
     register_strict!(f, types; mod, source)
@@ -105,12 +107,30 @@ end
 # instantiations that matter keeps the verdict at module load, where it belongs, without that.
 function _verify_strict_signatures(
         @nospecialize(f), sigs, fname::AbstractString; mod::Union{Nothing, Module} = nothing,
-        source::AbstractString = ""
+        source::AbstractString = "", guarantees = nothing
     )
     for s in sigs
         types = s isa Tuple ? s : Tuple(s)
-        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source)
+        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source, guarantees)
     end
+    return nothing
+end
+
+# `guarantees = (...)`: check exactly the named guarantees through the same funnel a module policy
+# uses, so each one gates or warns as `_guarantee_gates` says.
+function _verify_strict_guarantees(
+        @nospecialize(f), @nospecialize(types::Tuple), target, guarantees;
+        mod::Union{Nothing, Module} = nothing, source::AbstractString = ""
+    )
+    hasmethod(f, Tuple{types...}) || _fail(
+        :strict_function, target,
+        "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
+    gs = _check_guarantees(guarantees)
+    register_strict!(f, types; guarantees = gs, mod, source)
+    fs = _map_findings(_scan_findings, Any[(f, types, gs)])
+    source == "" || (fs = [x.policy == "" ? _restamp(x, source) : x for x in fs])
+    _report_at_load(fs, :strict_function, target)
     return nothing
 end
 
@@ -135,6 +155,29 @@ sigs = [(NTuple{3,Float64}, Int), (Tuple{Float64,String}, Int)]
 # the second entry infers Union{Float64,String}, so the module fails to load
 ```
 
+`guarantees = (...)` replaces that contract with the named guarantees, checked at load through the
+same funnel as [`@strict_policy`](@ref): a check that reads compiled output (`:vectorized`,
+`:no_spill`, …) stops the module loading, an inference (`:noalloc`, `:trim_compatible`, …) warns.
+With `signatures`, it is how a parametric kernel is held to a codegen guarantee at its own
+precompile:
+
+```julia
+@strict_function guarantees = (:vectorized, :no_spill) signatures = [
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Val{8}, Val{6}, Val{false}),
+] function _microkernel!(c, ldc, a, b, kc, ::Val{MR}, ::Val{NR}, ::Val{Z}) where {MR, NR, Z}
+    ...
+end
+```
+
+Given a function NAME instead of a definition, it declares signatures of a function defined
+elsewhere — an `@generated` one, say — and defines nothing. Place it after the definitions:
+
+```julia
+@strict_function guarantees = (:vectorized, :no_spill) signatures = [
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Val{8}, Val{6}, Val{false}),
+] _microkernel!
+```
+
 That keeps every verdict at module load. To check instead whatever specializations callers
 actually create — including ones you could not have listed — see [`@strict_stable`](@ref), which
 trades load-time failure for open coverage. With checks disabled this is just the plain definition.
@@ -145,11 +188,30 @@ trades load-time failure for open coverage. With checks disabled this is just th
 ```
 """
 macro strict_function(args...)
-    pos, opts = _macro_call(args, (:signatures,))
+    pos, opts = _macro_call(args, (:signatures, :guarantees))
     length(pos) == 1 || throw(
         ArgumentError("@strict_function expects one function definition, got $(length(pos))")
     )
+    gs = haskey(opts, :guarantees) ? esc(opts[:guarantees]) : nothing
     def = pos[1]
+    srcstr = "@strict_function at " * string(__source__.file) * ":" * string(__source__.line)
+    # A name instead of a definition: declare signatures of a function defined elsewhere — one
+    # whose definition is `@generated`, or lives in a file the declarations should not be mixed
+    # into. It defines nothing, so with checks off it expands to `nothing`.
+    if def isa Symbol || Meta.isexpr(def, :.)
+        haskey(opts, :signatures) || throw(
+            ArgumentError(
+                "@strict_function $def: naming an existing function needs `signatures = [...]`"
+            )
+        )
+        checked = :(
+            $(_verify_strict_signatures)(
+                $(esc(def)), $(esc(opts[:signatures])), $(string(def));
+                mod = @__MODULE__, source = $srcstr, guarantees = $gs
+            )
+        )
+        return _gate(checked, nothing)
+    end
     sig = _strictdef_sig(def)
     fname = sig.args[1]
     argexprs = filter(a -> !Meta.isexpr(a, :parameters), sig.args[2:end])
@@ -167,10 +229,8 @@ macro strict_function(args...)
     # here without touching the types, and `signatures = [...]` remains the way to name the concrete
     # instantiations a parametric declaration stands for.
     parametric = Meta.isexpr(def.args[1], :where)
-    # Only a macro knows the line that asked for the guarantee, so it travels with the declaration
-    # and a finding can name the requirement rather than only the breach.
-    srcstr = "@strict_function at " * string(__source__.file) * ":" * string(__source__.line)
-
+    # Only a macro knows the line that asked for the guarantee (`srcstr`), so it travels with the
+    # declaration and a finding can name the requirement rather than only the breach.
     checked = if parametric && isnothing(sigs)
         quote
             Base.@__doc__ $(esc(def))
@@ -180,23 +240,23 @@ macro strict_function(args...)
         quote
             Base.@__doc__ $(esc(def))
             $(_verify_strict_signatures)(
-                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr
+                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr, guarantees = $gs
             )
         end
     elseif isnothing(sigs)
         quote
             Base.@__doc__ $(esc(def))
-            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__, source = $srcstr)
+            $(_verify_strict_def)($(esc(fname)), $argtypes, $target; mod = @__MODULE__, source = $srcstr, guarantees = $gs)
         end
     else
         quote
             Base.@__doc__ $(esc(def))
             $(_verify_strict_def)(
                 $(esc(fname)), $argtypes, $target;
-                warn_abstract = false, mod = @__MODULE__, source = $srcstr
+                warn_abstract = false, mod = @__MODULE__, source = $srcstr, guarantees = $gs
             )
             $(_verify_strict_signatures)(
-                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr
+                $(esc(fname)), $(esc(sigs)), $(string(fname)); mod = @__MODULE__, source = $srcstr, guarantees = $gs
             )
         end
     end
@@ -496,6 +556,17 @@ the module sweeps take them. That is how one file holds hot kernels and cold hel
 submodule: `only = r"^kernel_"` checks the kernels and leaves the rest alone. Scoping by name
 composes with the census, where a region would be a scope the census does not model.
 
+A module holds one policy, set by its first `@strict_policy`. A later one that is scoped with
+`only` or `exempt` checks its own guarantees on its matches and leaves that policy unchanged, so
+different functions can be held to different guarantees:
+
+```julia
+@strict_policy (:typestable, :trim_compatible) only = r"_64_\$"   # the C entry points
+@strict_policy :no_spill only = [:_trsm_tile_R_f64!]               # one kernel
+```
+
+A later unscoped `@strict_policy` is an error, because it would replace the module's policy.
+
 `check = false` records the policy without checking, for a module that is checked elsewhere.
 Submodules inherit the policy ([`StrictMode.module_policy`](@ref)), and opting a cold helper out is
 [`@strict_exempt`](@ref).
@@ -508,9 +579,10 @@ macro strict_policy(args...)
     isempty(pos) && throw(ArgumentError("@strict_policy needs a guarantee or a collection of them"))
     check = get(opts, :check, true)
     spec = pos[1]
+    scoped = haskey(opts, :only) || haskey(opts, :exempt)
     return quote
         local _gs = $(_check_guarantees)($(esc(spec)))
-        $(_set_module_policy!)(@__MODULE__, _gs)
+        $(_set_module_policy!)(@__MODULE__, _gs; scoped = $scoped)
         $(check) && $(_auto_check_module)(
             @__MODULE__, _gs,
             $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line));
