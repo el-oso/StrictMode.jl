@@ -56,6 +56,15 @@ StrictMode/src/
                         `truncated`, which findings report as :fail SM0207, never :pass. A callee result
                         is memoized only when its subtree met no cut (_cut_counter): a result computed
                         below a cut is the walk's, not the body's, and made verdicts order-dependent.
+                        INFERENCE runs under _ScanInterpreter with a code cache of its own
+                        (_SCAN_CODE_CACHE): the compiler's native cache is serialized into a consumer's
+                        package image, so reading bodies through it put native code for every body the
+                        scan read into every consumer's image (8.5 MB -> 69 MB, +3.2 GB peak at 300
+                        methods). Every inference here goes through _code_typed/_return_types/
+                        _infer_effects; do not call Base.return_types or Base.code_typed directly.
+                        Do not destructure tuples whose type names a consumer's function (`for (f, t) in
+                        items`): the indexed_iterate specialization lands in the consumer's image; use
+                        getfield. _signal_origin shows which statement and callee a signal comes from.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an
