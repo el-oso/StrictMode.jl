@@ -82,6 +82,12 @@ package's top level pays for at every consumer's precompile.
 
 Each argument expression is still evaluated once, so bind them to values that are cheap to produce.
 
+`@verify_strict T guarantees = (...) begin … end` checks exactly the named guarantees on each
+listed call instead, the way [`@strict_function`](@ref)`guarantees = …` does, and registers each
+signature so `StrictModeTest.test_registered` re-proves it. Keeping only the guarantees that gate
+at load, `guarantees = (:typestable,)`, leaves the allocation verdicts — which only warn here — to
+the test environment, and with them their cost at every precompile.
+
 The interface check always runs. The per-call performance checks gate themselves on the
 `checks_enabled` preference, so a production build only pays for the interface verification.
 
@@ -93,7 +99,20 @@ k = MyKPI("yield"); xs = rand(100)
 end
 ```
 """
+macro verify_strict(T, opt, block)
+    Meta.isexpr(opt, :(=)) && opt.args[1] === :guarantees || throw(
+        ArgumentError(
+            "@verify_strict: expected `guarantees = (...)` before the block, got: $opt"
+        )
+    )
+    return _verify_strict(__source__, __module__, T, block, opt.args[2])
+end
+
 macro verify_strict(T, block)
+    return _verify_strict(__source__, __module__, T, block, nothing)
+end
+
+function _verify_strict(__source__, __module__, T, block, guarantees)
     # Forward the interface-surface check to TypeContracts.@verify. `esc` the whole macrocall so
     # our layer supplies the escape level the nested macro needs to resolve `T` in the caller.
     verify_call = esc(
@@ -110,13 +129,29 @@ macro verify_strict(T, block)
         # Already fully escaped and self-gated. The call itself is NOT performed: every check here
         # reads the argument types, this block's values are discarded, and performing one call
         # compiles its whole tree.
-        push!(out, _strict_expr(s; execute = false))
+        push!(out, isnothing(guarantees) ? _strict_expr(s; execute = false) : _verify_listed(s, guarantees, __source__))
     end
     # The interface check runs AFTER the per-call checks. Those infer each listed call at its
     # concrete types, and TypeContracts reads conformance for an unannotated member from that cached
     # result instead of inferring the contract's abstract signature.
     push!(out, verify_call, :nothing)
     return Expr(:block, out...)
+end
+
+# One listed call checked for exactly `guarantees`, through the funnel `@strict_function
+# guarantees = …` uses: each guarantee gates or warns as `_guarantee_gates` says, and the signature
+# is registered so the test-environment drivers re-prove it.
+function _verify_listed(call, guarantees, src)
+    p = _call_parts(call)
+    srcstr = "@verify_strict at " * string(src.file) * ":" * string(src.line)
+    checked = quote
+        $(p.binds...)
+        $(_verify_strict_guarantees)(
+            $(p.checkfn), $(p.types), $(string(call)), $(esc(guarantees));
+            mod = @__MODULE__, source = $srcstr
+        )
+    end
+    return _gate(checked, nothing)
 end
 
 # --- the TypeContracts verify hook --------------------------------------------------------------
