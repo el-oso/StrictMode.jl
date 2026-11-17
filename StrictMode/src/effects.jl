@@ -1009,7 +1009,8 @@ function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     return !newsdead()
 end
 
-function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
+function _scan_ci(
+        ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
         trace::Union{Nothing, Vector{Any}} = nothing
     )
     alloc = false
@@ -1434,28 +1435,44 @@ end
 # of 300 methods with a module check, the scan took the image from 8.5 MB to 58 MB and the precompile
 # from 0.5 GB to 4 GB at its peak. The results live in a cache of this module's own instead, reused
 # by the scans that follow and emptied with the other memos.
+#
+# Nothing the scan infers may be reachable from the compiler's global state either, since the
+# serializer writes what is reachable into the image. Inference reaches it three ways, and all are
+# turned off for this interpreter:
+#   - compressing an inferred body (`jl_compress_ir`) appends every object the body names and its
+#     edges do not, such as the `CodeInstance` of a call inlined from a callee, to the roots of the
+#     body's method. `may_compress` is false, so a body is kept as a `CodeInfo` and nothing is
+#     rooted.
+#   - `finish!` records a backedge from each callee to the caller's `CodeInstance`. It does so only
+#     when the result is still valid in `validation_world`, so passing `typemax(UInt)` skips it.
+#   - `codeinst_as_edge`, which makes the edge to a constant-propagated result, records the same
+#     backedges for it; this interpreter's method makes the edge and records none.
+# Measured on Julia 1.13 with a package that checks 400 signatures at its precompile: 209 of the
+# scan's `CodeInstance`s in method roots and 980 backedges to them once it was loaded; none with
+# all three off.
+#
+# Without backedges an edit cannot invalidate a cached result, so the cache answers only in the
+# world it was filled in and is emptied when inference runs in another. A world number is meaningful
+# only in the process that counted it, so the comparison is inequality, not order.
+# Giving up reuse across worlds has a cost: 87 signatures checked with a method definition before each,
+# as `@strict_function` does at a precompile, take 4.0 s against 3.1 s.
 const _CC = Base.Compiler
 
 struct _ScanCacheOwner end
 
 struct _ScanCodeCache
-    entries::IdDict{Core.MethodInstance, Vector{Core.CodeInstance}}
+    entries::IdDict{Core.MethodInstance, Core.CodeInstance}
+    world::Base.RefValue{UInt}
     lock::ReentrantLock
 end
-_ScanCodeCache() = _ScanCodeCache(IdDict{Core.MethodInstance, Vector{Core.CodeInstance}}(), ReentrantLock())
+_ScanCodeCache() = _ScanCodeCache(IdDict{Core.MethodInstance, Core.CodeInstance}(), Ref(UInt(0)), ReentrantLock())
 
 const _SCAN_CODE_CACHE = _ScanCodeCache()
 
 function _scan_cache_lookup(c::_ScanCodeCache, mi::Core.MethodInstance, worlds)
-    lo, hi = first(worlds), last(worlds)
-    @lock c.lock begin
-        cis = get(c.entries, mi, nothing)
-        isnothing(cis) && return nothing
-        for ci in Iterators.reverse(cis)
-            ci.min_world <= lo && hi <= ci.max_world && return ci
-        end
-    end
-    return nothing
+    world = first(worlds)
+    world == last(worlds) || return nothing
+    return @lock c.lock (c.world[] == world ? get(c.entries, mi, nothing) : nothing)
 end
 
 Base.haskey(wvc::_CC.WorldView{_ScanCodeCache}, mi::Core.MethodInstance) =
@@ -1474,7 +1491,14 @@ end
 
 function Base.setindex!(wvc::_CC.WorldView{_ScanCodeCache}, ci::Core.CodeInstance, mi::Core.MethodInstance)
     c = wvc.cache
-    @lock c.lock push!(get!(() -> Core.CodeInstance[], c.entries, mi), ci)
+    world = first(wvc.worlds)
+    @lock c.lock begin
+        if world != c.world[]
+            empty!(c.entries)
+            c.world[] = world
+        end
+        c.entries[mi] = ci
+    end
     return wvc
 end
 
@@ -1494,6 +1518,25 @@ _CC.get_inference_world(interp::_ScanInterpreter) = interp.world
 _CC.get_inference_cache(interp::_ScanInterpreter) = interp.inf_cache
 _CC.cache_owner(::_ScanInterpreter) = _ScanCacheOwner()
 _CC.code_cache(interp::_ScanInterpreter) = _CC.WorldView(_SCAN_CODE_CACHE, _CC.WorldRange(interp.world))
+_CC.may_compress(::_ScanInterpreter) = false
+_CC.finish!(interp::_ScanInterpreter, caller::_CC.InferenceState, ::UInt, time_before::UInt64) =
+    @invoke _CC.finish!(interp::_CC.AbstractInterpreter, caller::_CC.InferenceState, typemax(UInt)::UInt, time_before::UInt64)
+
+# The `CodeInstance` that stands as the edge to a constant-propagated result. The compiler's own
+# method (the same in 1.12 and 1.13) also widens a current result's `max_world` to `typemax(UInt)`
+# and calls `store_backedges` for it; this one does neither.
+function _CC.codeinst_as_edge(interp::_ScanInterpreter, sv::_CC.InferenceState, @nospecialize existing_edge)
+    min_world, max_world = first(sv.world.valid_worlds), last(sv.world.valid_worlds)
+    edges = Core.svec(sv.edges...)
+    if existing_edge isa Core.CodeInstance && existing_edge.min_world >= min_world &&
+            existing_edge.max_world <= max_world && existing_edge.edges == edges
+        return existing_edge
+    end
+    return Core.CodeInstance(
+        sv.linfo, _ScanCacheOwner(), Any, Any, nothing, nothing, zero(Int32),
+        min_world, max_world, zero(UInt32), nothing, nothing, edges
+    )
+end
 
 # A package image holds the specializations recorded while it was generated (`Base.newly_inferred`).
 # What running the scan makes the compiler specialize is the scan's own, not the consumer's, so the

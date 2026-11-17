@@ -298,8 +298,10 @@ end
         julia = Base.julia_cmd()
         out = IOBuffer()
         code = "using StrictMode; Base.compilecache(Base.identify_package(\"FixPkg\"))"
-        env = Dict("JULIA_LOAD_PATH" => join(["@", dir, "@stdlib"], Sys.iswindows() ? ";" : ":"),
-            "JULIA_DEPOT_PATH" => join(Base.DEPOT_PATH, Sys.iswindows() ? ";" : ":"))
+        env = Dict(
+            "JULIA_LOAD_PATH" => join(["@", dir, "@stdlib"], Sys.iswindows() ? ";" : ":"),
+            "JULIA_DEPOT_PATH" => join(Base.DEPOT_PATH, Sys.iswindows() ? ";" : ":")
+        )
         cmd = setenv(`$julia --startup-file=no --project=$(Base.active_project()) -e $code`, merge(Dict(ENV), env))
         run(pipeline(cmd; stdout = out, stderr = out))
         return String(take!(out))
@@ -340,6 +342,46 @@ end
     @test StrictMode._window_open() == -1
     @test isnothing(StrictMode._window_close(-1))
     @test isnothing(StrictMode._window_close(typemax(Int)))
+end
+
+@testitem "the scan's inference leaves nothing in method roots or backedges" begin
+    using StrictMode
+    # `h` is inlineable and inlines `m`, so its body names `g`'s CodeInstance without an edge to it:
+    # the shape that a compressed body roots. The tuple destructure is constant-propagated.
+    @noinline function g(v::Vector{Float64})
+        s = 0.0
+        for x in v
+            s += x
+        end
+        return s
+    end
+    @inline m(v::Vector{Float64}) = g(v) + 1.0
+    h(v::Vector{Float64}) = m(v) * 2.0
+    top(v::Vector{Float64}) = ((a, b) = (h(v), 2.0); a + b + h(v))
+    isscan(x) = x isa Core.CodeInstance && x.owner isa StrictMode._ScanCacheOwner
+    bes(mi) = isdefined(mi, :backedges) && !isnothing(mi.backedges) ? mi.backedges : Any[]
+    function scan_refs()
+        n = 0
+        Base.visit(Core.methodtable) do meth
+            isdefined(meth, :roots) && !isnothing(meth.roots) && (n += count(isscan, meth.roots))
+            for mi in Base.specializations(meth)
+                n += count(isscan, bes(mi))
+            end
+        end
+        return n
+    end
+    StrictMode.clear_cache!()
+    for gs in (:typestable, :noalloc, :noboxing, :owned, :inlined)
+        StrictMode.findings(top, (Vector{Float64},); guarantees = (gs,))
+    end
+    StrictMode._code_typed(top, (Vector{Float64},))
+    @test !isempty(StrictMode._SCAN_CODE_CACHE.entries)
+    @test iszero(scan_refs())
+    # A cached result answers only in the world it was inferred in.
+    w = StrictMode._SCAN_CODE_CACHE.world[]
+    mi = first(keys(StrictMode._SCAN_CODE_CACHE.entries))
+    @test !isnothing(StrictMode._scan_cache_lookup(StrictMode._SCAN_CODE_CACHE, mi, (w, w)))
+    @test isnothing(StrictMode._scan_cache_lookup(StrictMode._SCAN_CODE_CACHE, mi, (w + 1, w + 1)))
 end
 
 @testitem "a call that waits in the task scheduler is its own kind of :noalloc finding" begin
@@ -384,10 +426,10 @@ end
     if StrictMode._alloc_signals(top, (Int,)).alloc
         so = StrictMode._scheduler_origin(top, (Int,))
         @test !isnothing(so)
-        @test_logs (:warn, r"SM0017.*blocks in the task scheduler.*register_alloc_barrier!") StrictMode._strict_scan("t", top, (Int,))
+        @test_logs (:warn, r"SM0017.*blocks in the task scheduler.*\. If the wait.*register_alloc_barrier!") StrictMode._strict_scan("t", top, (Int,))
         @test_logs (:warn, r"SM0017.*blocks in the task scheduler") StrictMode._assert_noalloc_scan("t", top, (Int,))
     end
-    # an allocation elsewhere keeps the ordinary wording
+    # an allocation elsewhere keeps the ordinary wording, with its own code
     grow(n::Int) = (a = Float64[]; push!(a, n); a)
-    @test_logs (:warn, r"allocates / boxes") StrictMode._assert_noalloc_scan("t", grow, (Int,))
+    @test_logs (:warn, r"SM0002 allocates / boxes") StrictMode._assert_noalloc_scan("t", grow, (Int,))
 end

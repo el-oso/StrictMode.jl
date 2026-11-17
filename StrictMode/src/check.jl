@@ -66,15 +66,15 @@ function _scheduler_finding(md, fn, sg, g, sig, so; tier::Symbol = :report)
 end
 
 # What a load-time or call-site `:noalloc` warning says. The same classification `findings` applies: a
-# call whose every origin is in the task scheduler is named as that, with its code; anything else is an
-# allocation, with the nearest place the scan found one.
+# call whose every origin is in the task scheduler is named as that; anything else is an allocation. Both
+# carry their code, and an allocation names the nearest place the scan found one.
 function _alloc_message(@nospecialize(f), @nospecialize(types::Tuple), sig, base::AbstractString)
     if isnothing(sig.abscontainer)
         so = _scheduler_origin(f, types)
         isnothing(so) ||
-            return string(_code(:noalloc, :scheduler), " ", _scheduler_reason(so), " ", _SCHEDULER_SUGGESTION)
+            return string(_code(:noalloc, :scheduler), " ", _scheduler_reason(so), " ", uppercasefirst(_SCHEDULER_SUGGESTION))
     end
-    return _box_msg(base, sig) * _origin_note(f, types)
+    return string(_code(:noalloc), " ", _box_msg(base, sig), _origin_note(f, types))
 end
 
 const _GUARANTEES = (

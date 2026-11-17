@@ -60,7 +60,12 @@ StrictMode/src/
                         (_SCAN_CODE_CACHE): the compiler's native cache is serialized into a consumer's
                         package image, so reading bodies through it put native code for every body the
                         scan read into every consumer's image (8.5 MB -> 69 MB, +3.2 GB peak at 300
-                        methods). Every inference here goes through _code_typed/_return_types/
+                        methods). Nothing it infers may be reachable from global state either: the
+                        interpreter turns off IR compression (which roots an inlined callee's
+                        CodeInstance in the caller method's `roots`) and both backedge writers
+                        (finish!'s validation world, codeinst_as_edge), so the cache answers in ONE
+                        world only — without backedges nothing would invalidate it.
+                        Every inference here goes through _code_typed/_return_types/
                         _infer_effects; do not call Base.return_types or Base.code_typed directly.
                         Do not destructure tuples whose type names a consumer's function (`for (f, t) in
                         items`): the indexed_iterate specialization lands in the consumer's image; use
