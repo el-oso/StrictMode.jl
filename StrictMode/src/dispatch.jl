@@ -152,7 +152,7 @@ recognized causes fits. `cause` is one of `:nonconst_global`, `:abstract_field`,
 function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     # Only a body that is actually unstable has a cause. Without this gate an `Any`-typed statement on
     # a dead throw path is enough to blame a perfectly stable function's argument declaration.
-    rts = _return_types(f, Tuple{types...})
+    rts = _return_types(f, Tuple(types))
     if length(rts) == 1 && _is_typestable_return(only(rts))
         sig0 = try
             _alloc_signals(f, types; depth = 0)
@@ -170,7 +170,7 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     isempty(cis) && return nothing
     ci = first(cis)[1]
     ci isa Core.CodeInfo || return nothing
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     # Declarations first, method counts second. A widened global or field makes every downstream call
     # match a huge method set, so reporting the count would name a symptom of the declaration.
     # A captured variable beats everything else: `Core.Box` makes every read of that local `Any`, so
@@ -404,7 +404,7 @@ function _dispatch_sites(@nospecialize(f), @nospecialize(types::Tuple), limit::I
     end
     isempty(cis) && return (dynamic, cliff)
     ci = first(cis)[1]
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     for st in ci.code
         st isa Expr || continue
         split = _split_site(ci, sig, st)

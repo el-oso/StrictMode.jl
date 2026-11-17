@@ -255,6 +255,23 @@ function _format_allocs(results; header = "call provably allocates")
     return String(take!(io))
 end
 
+# An allocation site that lies in Base's task, lock or condition code: on the way from the allocation out
+# to the nearest frame of the package's own code, the calls pass through that code. This is what a wait,
+# a yield or a lock does, and what the value-free scan reports as its own kind.
+function _scheduler_site(@nospecialize(a))
+    hasproperty(a, :backtrace) || return false
+    sched = false
+    for fr in a.backtrace
+        mi = _frame_mi(fr)
+        if mi isa Core.MethodInstance && mi.def isa Method &&
+                !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
+            break
+        end
+        fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES && (sched = true)
+    end
+    return sched
+end
+
 # First source location among allocation sites (any / boxing-only), pulled from the backtraces.
 function _first_loc(allocs, boxing_only::Bool)
     for a in allocs
@@ -929,12 +946,27 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
                 push!(out, _unproven(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
             else
                 file, line = _first_loc(allocs, false)
-                push!(
-                    out, _mkproof(
-                        md, fn, sg, g, !isempty(allocs),
-                        "allocates ($(length(allocs)) site(s))", file, line
+                if !isempty(allocs) && all(_scheduler_site, allocs)
+                    push!(
+                        out, _mkproof(
+                            md, fn, sg, g, true,
+                            "blocks in the task scheduler: AllocCheck reports $(length(allocs)) site(s), all in " *
+                                "Base's task, lock and condition code (first: $(basename(file)):$line). It " *
+                                "waits for another task, so it can allocate.",
+                            file, line,
+                            "if the wait is a pool join that is expected, register the function that joins " *
+                                "with `register_alloc_barrier!` or exempt it with `@strict_exempt` by name";
+                            cause = :scheduler
+                        )
                     )
-                )
+                else
+                    push!(
+                        out, _mkproof(
+                            md, fn, sg, g, !isempty(allocs),
+                            "allocates ($(length(allocs)) site(s))", file, line
+                        )
+                    )
+                end
             end
         elseif g === :noboxing
             if isnothing(allocs)

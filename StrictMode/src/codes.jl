@@ -52,6 +52,7 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:conversion, nothing) => :SM0310,
     (:state_branch, nothing) => :SM0311,
     (:history, nothing) => :SM0016,
+    (:noalloc, :scheduler) => :SM0017,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -74,6 +75,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0014 => "the method writes, or cannot be shown not to write, the argument a concurrent caller would share",
     :SM0015 => "a function the call is declared to reach is not in its call graph after optimization",
     :SM0016 => "the call's result bits change after other calls have run in the same process",
+    :SM0017 => "the call can block in the task scheduler (a wait, a yield, a lock), which can allocate",
     :SM0101 => "a closure captured a local that is reassigned, so it is held in a `Core.Box`",
     :SM0102 => "a non-`const` global is read, and its type can change between reads",
     :SM0103 => "a struct field is declared with an abstract type",

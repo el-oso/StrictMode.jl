@@ -289,6 +289,15 @@ end
 # when a `@verify_strict` block runs. A listed call no method matches cannot run at all, and its
 # empty result would otherwise reduce to `Union{}`, which reads as stable.
 @noinline function _check_stable_once(target, @nospecialize(f), @nospecialize(types::Tuple))
+    n = _window_open()
+    try
+        return _check_stable_once_body(target, f, types)
+    finally
+        _window_close(n)
+    end
+end
+
+function _check_stable_once_body(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = _return_types(f, types)
     isempty(rts) && _fail(
         :typestable, target,
@@ -311,6 +320,15 @@ end
 # verdict reports for the reason `_guarantee_gates` gives: the scan reads typed IR and cannot see
 # what LLVM later elides.
 @noinline function _strict_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
+    n = _window_open()
+    try
+        return _strict_scan_body(target, f, types)
+    finally
+        _window_close(n)
+    end
+end
+
+function _strict_scan_body(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
     _unread_fail(:noalloc, target, sig; gates = false) && return nothing
     _assert_owned(target, f, types; gates = false)

@@ -65,6 +65,17 @@ StrictMode/src/
                         Do not destructure tuples whose type names a consumer's function (`for (f, t) in
                         items`): the indexed_iterate specialization lands in the consumer's image; use
                         getfield. _signal_origin shows which statement and callee a signal comes from.
+                        NOTHING the scan calls may specialize on the checked target (a `Type` or function
+                        value handed to a method without @nospecialize compiles one method per target,
+                        and a consumer's image keeps it): use _sigtype/_code_typed/_return_types, never
+                        Base.signature_type/Base.return_types with `Tuple{types...}`; and every scan entry
+                        runs inside _window_open/_window_close, which takes back the specializations
+                        recorded meanwhile (Base.newly_inferred) while a package is generated. TypeContracts'
+                        trim_report is the one callee that cannot be kept off the target: 5752 -> 680
+                        specializations on 100 checked targets with the window (8.6 MB -> 1.2 MB of image).
+                        A :noalloc failure whose every origin is Base's task/lock/condition code is its own
+                        kind, code SM0017 "blocks in the task scheduler" (_scheduler_origin; the proof tier
+                        recognizes the same sites in StrictModeTest/src/proofs.jl `_scheduler_site`).
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an

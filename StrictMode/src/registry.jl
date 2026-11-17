@@ -412,6 +412,15 @@ end
 # reporting drivers and `StrictModeTest`'s gating ones, so both keep the same shape: no item is
 # dropped, and one method that cannot be analyzed leaves the other 299 evaluated.
 function _map_findings(analyze, items)
+    n = _window_open()
+    try
+        return _map_findings_body(analyze, items)
+    finally
+        _window_close(n)
+    end
+end
+
+function _map_findings_body(analyze, items)
     out = StrictFinding[]
     # Read once rather than per item: the union walks every loaded package's store, and a module
     # sweep runs this for hundreds of signatures.

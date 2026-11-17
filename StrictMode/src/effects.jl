@@ -398,7 +398,7 @@ const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, _AllocSign
 function _alloc_signals(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
     )
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     key = (depth, Base.get_world_counter(), mode)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
@@ -495,7 +495,7 @@ end
 
 function _compute_all_news_nonescaping(@nospecialize(sig))
     EA = Core.Compiler.EscapeAnalysis
-    irs = _scan_window(() -> Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter()))
+    irs = _code_ircode_by_type(sig)
     isempty(irs) && return false
     ir = first(irs)[1]
     # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape
@@ -712,7 +712,7 @@ function _signal_origin(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
         stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
-    top = Base.signature_type(f, Tuple{types...})
+    top = _sigtype(f, types)
     parent = IdDict{Any, Any}()
     queue = Any[(top, _FAST_ALLOC_DEPTH[])]
     seen = Base.IdSet{Any}()
@@ -771,6 +771,30 @@ function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbo
     via = join((first(string(p), 70) for p in last(x.path, 3)), " -> ")
     return "; first at " * first(string(x.signature), 110) * " [" * first(string(st[2]), 90) * "]" *
         (isempty(via) ? "" : ", reached through " * via)
+end
+
+# Whether a signature is Base's task, lock or condition code.
+function _sig_in_scheduler(@nospecialize(sig))
+    m = try
+        Base._which(sig; raise = false)
+    catch
+        nothing
+    end
+    isnothing(m) && return false
+    meth = m.method
+    return meth.module === Base && basename(string(meth.file)) in _SCHEDULER_FILES
+end
+
+# `nothing` unless every place the scan finds an allocation or boxing is in the task scheduler, in
+# which case the nearest one: the finding is then that the call can block, not that it allocates.
+# What the user can do about it differs, so it is reported as its own kind.
+function _scheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
+    origins = _signal_origin(f, types; mode = :alloc)
+    isempty(origins) && return nothing
+    all(o -> _sig_in_scheduler(o.signature), origins) || return nothing
+    o = first(origins)
+    via = join((first(string(p), 70) for p in last(o.path, 3)), " -> ")
+    return (; call = first(string(o.signature), 100), statement = first(string(o.statements[1][2]), 80), via)
 end
 
 # The registered barriers the walk from `f` stops at, so a reader can see that one was reached and not
@@ -1337,7 +1361,7 @@ function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
     isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
-    irs = _scan_window(() -> Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter()))
+    irs = _code_ircode_by_type(sig)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
     ir = first(irs)[1]
     st = EA.analyze_escapes(
@@ -1474,30 +1498,77 @@ _CC.code_cache(interp::_ScanInterpreter) = _CC.WorldView(_SCAN_CODE_CACHE, _CC.W
 # A package image holds the specializations recorded while it was generated (`Base.newly_inferred`).
 # What running the scan makes the compiler specialize is the scan's own, not the consumer's, so the
 # records made inside an inference call are taken back when a package is being generated.
-function _scan_window(f::F) where {F}
-    (ccall(:jl_generating_output, Cint, ()) == 1 && isdefined(Base, :newly_inferred)) || return f()
-    n = length(Base.newly_inferred)
-    try
-        return f()
-    finally
-        length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
-    end
+# What the scan makes the compiler specialize while a package is being generated is the scan's own
+# machinery, specialized on the types it was asked about (`to_tuple_type`, `signature_type`, `code_typed`
+# and everything `TypeContracts.trim_report` calls, one set per checked signature). The records of those
+# specializations are taken back when the scan returns, so the package's image does not hold them:
+# measured on 100 checked signatures with `:trim_compatible`, 5752 specializations and 8.6 MB of image
+# against 748 and 1.0 MB.
+# No closure here: a closure over a `Type` is a method specialized on that type.
+_window_open() =
+    (ccall(:jl_generating_output, Cint, ()) == 1 && isdefined(Base, :newly_inferred)) ? length(Base.newly_inferred) : -1
+
+function _window_close(n::Int)
+    n >= 0 && length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
+    return nothing
 end
 
 # The other readings of the compiler's inference answer under the same interpreter.
-_return_types(@nospecialize(f), @nospecialize(types)) =
-    _scan_window(() -> Base.return_types(f, types; interp = _ScanInterpreter()))
-_infer_effects(@nospecialize(f), @nospecialize(types)) =
-    _scan_window(() -> Base.infer_effects(f, types; interp = _ScanInterpreter()))
+function _return_types(@nospecialize(f), @nospecialize(types))
+    n = _window_open()
+    try
+        return Base.return_types(f, types; interp = _ScanInterpreter())
+    finally
+        _window_close(n)
+    end
+end
+
+function _infer_effects(@nospecialize(f), @nospecialize(types))
+    n = _window_open()
+    try
+        return Base.infer_effects(f, types; interp = _ScanInterpreter())
+    finally
+        _window_close(n)
+    end
+end
+
+function _code_ircode_by_type(@nospecialize(sig))
+    n = _window_open()
+    try
+        return Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
+    finally
+        _window_close(n)
+    end
+end
 
 # `code_typed` with only the results that carry code. When a `@generated` method's generator raises
 # for a signature, Julia returns that `Method` in place of the `CodeInfo`. Every reader here treats
 # an empty result as a body it could not read; a `Method` read as code crashed the analysis instead.
-_code_typed(args...; kw...) = _scan_window() do
-    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; interp = _ScanInterpreter(), kw...))
+#
+# Nothing in the reading below is specialized on the function or the types being read. A call that is
+# handed a `Type` or a function value compiles a method for exactly that value, and a package that is
+# checked at its own precompile keeps those methods in its image: one per checked signature for each
+# of `signature_type`, `to_tuple_type` and `code_typed`, a few thousand on a package with a few
+# hundred checked kernels.
+_sigtype(@nospecialize(f), @nospecialize(types)) = Core.apply_type(Tuple, Core.Typeof(f), types...)
+
+function _code_typed(
+        @nospecialize(f), @nospecialize(types); optimize::Bool = true, debuginfo::Symbol = :default
+    )
+    ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
+    return _code_typed_by_type(Core.apply_type(Tuple, Core.Typeof(f), ps...); optimize, debuginfo)
 end
-_code_typed_by_type(args...; kw...) = _scan_window() do
-    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; interp = _ScanInterpreter(), kw...))
+
+function _code_typed_by_type(@nospecialize(sig); optimize::Bool = true, debuginfo::Symbol = :default)
+    n = _window_open()
+    try
+        return filter(
+            p -> first(p) isa Core.CodeInfo,
+            Base.code_typed_by_type(sig; optimize, debuginfo, interp = _ScanInterpreter())
+        )
+    finally
+        _window_close(n)
+    end
 end
 
 # `:owned`'s walk to the end of the package's own code, for a call whose ordinary walk stopped at the

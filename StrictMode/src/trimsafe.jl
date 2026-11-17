@@ -9,7 +9,9 @@
 # REACTIVE: `explain_trim` translates raw `juliac --trim` verifier output into a source-mapped
 # explanation (via `TypeContracts.explain_trim_failure`).
 
-_base_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) = TypeContracts.trim_report(f, Tuple{types...})
+# `invoke` with the method's own argument types compiles one method for all targets; a plain call compiles one per function.
+_base_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) =
+    Base.invoke(TypeContracts.trim_report, Tuple{Any, Type{<:Tuple}}, f, Tuple{types...})
 
 # The union-split rule (issue #13). `TypeContracts.trim_report` finds dynamic dispatch by asking
 # whether a call's RESULT infers to `Any`; this class infers a perfectly concrete result and is
@@ -34,7 +36,7 @@ _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) = TypeContracts
 function _union_split_findings(@nospecialize(f), @nospecialize(types::Tuple))
     out = String[]
     limit = Core.Compiler.InferenceParams().max_union_splitting
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     ci = try
         first(_code_typed(f, Tuple{types...}; optimize = true))[1]
     catch

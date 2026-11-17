@@ -35,7 +35,7 @@ would_fail_noboxing(r::StrictReport) =
 
 function _strict_report(target, @nospecialize(f), @nospecialize(types::Tuple))
     rts = try
-        _return_types(f, Tuple{types...})
+        _return_types(f, Tuple(types))
     catch
         Any[Any]
     end

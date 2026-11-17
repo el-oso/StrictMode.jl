@@ -237,3 +237,19 @@ end
     @test any(fin, raw)
     @test !any(fin, StrictModeTest._not_own_excused(lk, raw))
 end
+
+@testitem "a proof site in the task scheduler is reported as blocking, with the scan's code" begin
+    using StrictMode, StrictModeTest
+    @noinline join_pool() = yield()
+    top(x::Int) = (join_pool(); x + 1)
+    f = only(StrictModeTest._proof_findings(top, (Int,), (:noalloc,)))
+    if StrictMode._failed(f)
+        # The proof may find the scheduler's sites (the usual case) or none at all on an optimizer that
+        # folds them away; when it does find them they carry the scan's kind.
+        @test f.code === :SM0017
+        @test occursin("blocks in the task scheduler", f.reason)
+        @test f.tier === :proof
+    else
+        @test !StrictMode._failed(f)
+    end
+end

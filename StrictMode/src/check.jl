@@ -51,6 +51,18 @@ _truncated_finding(md, fn, sg, g, sig; tier::Symbol = :report) = StrictFinding(
     _code(:truncated, nothing)
 )
 
+# The call waits for another task: Base's `wait`/`yield`/lock code is reached, which can allocate and
+# which AllocCheck counts. Named for what it is, with the two ways to take it out of the verdict.
+function _scheduler_finding(md, fn, sg, g, sig, so; tier::Symbol = :report)
+    reason = "blocks in the task scheduler: reaches `" * so.call * "` [" * so.statement * "]" *
+        (isempty(so.via) ? "" : ", through " * so.via) * ". It waits for another task, so it can allocate."
+    return StrictFinding(
+        md, fn, sg, g, :fail, sig.file, sig.line, reason,
+        "if the wait is a pool join that is expected, register the function that joins with " *
+            "`register_alloc_barrier!` or exempt it with `@strict_exempt` by name", tier, _code(g, :scheduler)
+    )
+end
+
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
     :no_scalar_loops, :no_spill, :trim_compatible, :trusted, :noescape,
@@ -81,7 +93,7 @@ function _compiled_output_finding(
             return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
         # The ordinary walk stopped short: follow the package's own code to the end. A gate does not
         # pass on what it did not read, so only a walk that ran out of bodies is "not established".
-        deep = (!s.dictlookup && s.truncated) ? _owned_deep(Base.signature_type(f, Tuple{types...})) : :clean
+        deep = (!s.dictlookup && s.truncated) ? _owned_deep(_sigtype(f, types)) : :clean
         deep === :budget && return StrictFinding(
             md, fn, sg, g, tier === :proof ? :fail : :info, s.file, s.line,
             "not established: the package's own call graph below this call is larger than the walk " *
@@ -159,7 +171,12 @@ function findings(
 end
 
 function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
-    return _findings_fast(f, types, guarantees, _mod_sym(f), _func_name(f), _sig_string(types))
+    n = _window_open()
+    try
+        return _findings_fast(f, types, guarantees, _mod_sym(f), _func_name(f), _sig_string(types))
+    finally
+        _window_close(n)
+    end
 end
 
 # Enrich a boxing/alloc finding with the abstract-`eltype`-container root cause + fix, when the IR scan
@@ -205,7 +222,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         if !isnothing(shared)
             push!(out, shared)
         elseif g === :typestable
-            rts = _return_types(f, Tuple{types...})
+            rts = _return_types(f, Tuple(types))
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch; the IR boxing signal catches
             # that shape, so this checks both.
@@ -227,6 +244,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             )
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
+            so = fail && isnothing(sig.abscontainer) ? _scheduler_origin(f, types) : nothing
             if !fail && sig.truncated
                 push!(out, _truncated_finding(md, fn, sg, g, sig))
             elseif !fail && isnothing(sig.exempt) && !isnothing(sig.barrier_box)
@@ -241,6 +259,8 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
                         "", :report, _code(g, nothing)
                     )
                 )
+            elseif !isnothing(so)
+                push!(out, _scheduler_finding(md, fn, sg, g, sig, so))
             else
                 push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))
             end

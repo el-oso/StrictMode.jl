@@ -310,3 +310,67 @@ end
     with = precompile_output(true)
     @test !occursin("allocates / boxes", with)
 end
+
+@testitem "the scan's entry points do not compile a method per checked target" begin
+    using StrictMode
+    for k in 1:8
+        @eval begin
+            struct $(Symbol(:Tg, k))
+                a::Float64
+            end
+            @noinline $(Symbol(:hh, k))(s::$(Symbol(:Tg, k)), i::Int) = s.a * i
+            $(Symbol(:gg, k))(s::$(Symbol(:Tg, k)), n::Int) = $(Symbol(:hh, k))(s, n) + 1.0
+        end
+    end
+    specs(f) = sum((length(collect(Base.specializations(m))) for m in methods(f)); init = 0)
+    watched = (
+        StrictMode._code_typed, StrictMode._code_typed_by_type, StrictMode._return_types,
+        StrictMode._infer_effects, StrictMode._sigtype, StrictMode._typed_body,
+    )
+    check(g, T) = for gs in (:typestable, :noalloc, :noboxing, :owned, :inlined)
+        StrictMode.findings(g, (T, Int); guarantees = (gs,))
+    end
+    check(gg1, Tg1); check(gg2, Tg2)
+    before = sum(specs, watched)
+    for (g, T) in ((gg3, Tg3), (gg4, Tg4), (gg5, Tg5), (gg6, Tg6), (gg7, Tg7), (gg8, Tg8))
+        check(g, T)
+    end
+    @test sum(specs, watched) - before <= length(watched)
+    # Outside a package precompile nothing is taken back.
+    @test StrictMode._window_open() == -1
+    @test isnothing(StrictMode._window_close(-1))
+    @test isnothing(StrictMode._window_close(typemax(Int)))
+end
+
+@testitem "a call that waits in the task scheduler is its own kind of :noalloc finding" begin
+    using StrictMode
+    @noinline join_pool() = yield()
+    @noinline mid(x::Int) = (join_pool(); x + 1)
+    top(x::Int) = mid(x) + 1
+    plain_alloc(n::Int) = (a = Float64[]; push!(a, n); a)
+    f = only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,)))
+    # Whether `yield` reaches an allocation depends on Base's implementation of it: where the scan finds
+    # none, there is no scheduler finding to name, and the call passes.
+    if StrictMode._failed(f)
+        @test f.code === :SM0017
+        @test occursin("blocks in the task scheduler", f.reason)
+        @test occursin("join_pool", f.reason) || occursin("yield", f.reason)
+        @test occursin("register_alloc_barrier!", f.suggestion) && occursin("@strict_exempt", f.suggestion)
+    end
+    @test occursin("scheduler", StrictMode.explain(:SM0017))
+    # an allocation that is not in the scheduler stays an ordinary :noalloc finding
+    g = only(StrictMode.findings(plain_alloc, (Int,); guarantees = (:noalloc,)))
+    @test StrictMode._failed(g) && g.code === :SM0002
+    # excusing the join by name takes it out of the verdict
+    try
+        register_alloc_barrier!(join_pool)
+        @test !StrictMode._failed(only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,))))
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        let st = StrictMode._store_for(Main, :__strict_barriers__)
+            isnothing(st) || empty!(st)
+        end
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end

@@ -39,14 +39,14 @@ _is_typestable_return(@nospecialize(T)) =
 const _RETTYPE_MEMO = IdDict{Any, Dict{UInt64, Vector{Any}}}()
 
 function _return_types_memo(@nospecialize(f), @nospecialize(types::Tuple))
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     world = Base.get_world_counter()
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_RETTYPE_MEMO, sig, nothing)
         isnothing(bysig) ? nothing : get(bysig, world, nothing)
     end
     isnothing(memo) || return memo
-    rts = _return_types(f, Tuple{types...})
+    rts = _return_types(f, Tuple(types))
     @lock _SIGNAL_MEMO_LOCK get!(Dict{UInt64, Vector{Any}}, _RETTYPE_MEMO, sig)[world] = rts
     return rts
 end

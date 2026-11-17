@@ -118,7 +118,7 @@ end
 
 function _interprocedural_typekey_lookup(@nospecialize(f), @nospecialize(types::Tuple),
         code::IdDict{Any, Any} = IdDict{Any, Any}())
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     return _typekey_lookup_by_sig(sig, _FAST_ALLOC_DEPTH[], Base.IdSet{Any}(), code)
 end
 

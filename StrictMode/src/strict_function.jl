@@ -60,7 +60,7 @@ function _verify_strict_def(
     # StrictModeTest.test_registered) re-check it.
     register_strict!(f, types; mod, source)
     # Type stability: the return type for this signature must be concrete.
-    rts = _return_types(f, Tuple{types...})
+    rts = _return_types(f, Tuple(types))
     # No method at all is its own mistake — usually a typo in `signatures = [...]`. Reporting it as
     # "return type is not concrete … inferred Any[]" sends the reader looking for an instability
     # that is not there.

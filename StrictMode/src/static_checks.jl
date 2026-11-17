@@ -218,7 +218,7 @@ function _assert_owned(
     sig = _alloc_signals(f, types; depth = depth)
     _unread_fail(:owned, target, sig; gates) && return nothing
     # The ordinary walk stopped short: follow the package's own code to the end.
-    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(Base.signature_type(f, Tuple{types...})) : :clean
+    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(_sigtype(f, types)) : :clean
     if sig.dictlookup || deep === :lookup
         _fail(
             :owned, target,

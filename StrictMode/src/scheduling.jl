@@ -81,7 +81,7 @@ end
 
 # The function and argument types a check should read for the call `f(types...)`.
 function _forwarded_call(@nospecialize(f), @nospecialize(types::Tuple))
-    sig = Base.signature_type(f, Tuple{types...})
+    sig = _sigtype(f, types)
     fsig = _forwarded_sig(sig)
     fsig === sig && return (f, types)
     ft = fsig.parameters[1]
