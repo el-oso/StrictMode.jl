@@ -362,7 +362,7 @@ function _alloc_signals(
     return r
 end
 
-function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int, full::Bool)
+function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int, full::Bool = true)
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
