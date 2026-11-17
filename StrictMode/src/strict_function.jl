@@ -88,11 +88,12 @@ function _verify_strict_def(
     sig = _alloc_signals(f, types; mode = :alloc)
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         @warn "@strict_function $target: " *
-            _box_msg(
+            _alloc_message(
+            f, types, sig,
             "allocates / boxes (value-free IR scan — a structural guess, not a proof; " *
                 "add StrictModeTest to your test environment and call test_registered() to " *
-                "resolve it)", sig
-        ) * _origin_note(f, types)
+                "resolve it)"
+        )
     elseif sig.truncated
         @warn "@strict_function $target: not established — the value-free scan found nothing, but " *
             "did not read the whole call tree below this call. Add StrictModeTest to your test " *

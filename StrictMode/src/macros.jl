@@ -335,7 +335,7 @@ function _strict_scan_body(target, @nospecialize(f), @nospecialize(types::Tuple)
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(
             :noalloc, target,
-            _box_msg("allocates / boxes (value-free IR scan)", sig) * _origin_note(f, types); gates = false
+            _alloc_message(f, types, sig, "allocates / boxes (value-free IR scan)"); gates = false
         )
     end
     # F39, and it belongs to `:typestable` rather than `:noalloc`: a union-typed local whose members

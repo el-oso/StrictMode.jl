@@ -53,14 +53,28 @@ _truncated_finding(md, fn, sg, g, sig; tier::Symbol = :report) = StrictFinding(
 
 # The call waits for another task: Base's `wait`/`yield`/lock code is reached, which can allocate and
 # which AllocCheck counts. Named for what it is, with the two ways to take it out of the verdict.
+_scheduler_reason(so) = "blocks in the task scheduler: reaches `" * so.call * "` [" * so.statement * "]" *
+    (isempty(so.via) ? "" : ", through " * so.via) * ". It waits for another task, so it can allocate."
+const _SCHEDULER_SUGGESTION = "if the wait is a pool join that is expected, register the function that joins with " *
+    "`register_alloc_barrier!` or exempt it with `@strict_exempt` by name"
+
 function _scheduler_finding(md, fn, sg, g, sig, so; tier::Symbol = :report)
-    reason = "blocks in the task scheduler: reaches `" * so.call * "` [" * so.statement * "]" *
-        (isempty(so.via) ? "" : ", through " * so.via) * ". It waits for another task, so it can allocate."
     return StrictFinding(
-        md, fn, sg, g, :fail, sig.file, sig.line, reason,
-        "if the wait is a pool join that is expected, register the function that joins with " *
-            "`register_alloc_barrier!` or exempt it with `@strict_exempt` by name", tier, _code(g, :scheduler)
+        md, fn, sg, g, :fail, sig.file, sig.line, _scheduler_reason(so),
+        _SCHEDULER_SUGGESTION, tier, _code(g, :scheduler)
     )
+end
+
+# What a load-time or call-site `:noalloc` warning says. The same classification `findings` applies: a
+# call whose every origin is in the task scheduler is named as that, with its code; anything else is an
+# allocation, with the nearest place the scan found one.
+function _alloc_message(@nospecialize(f), @nospecialize(types::Tuple), sig, base::AbstractString)
+    if isnothing(sig.abscontainer)
+        so = _scheduler_origin(f, types)
+        isnothing(so) ||
+            return string(_code(:noalloc, :scheduler), " ", _scheduler_reason(so), " ", _SCHEDULER_SUGGESTION)
+    end
+    return _box_msg(base, sig) * _origin_note(f, types)
 end
 
 const _GUARANTEES = (

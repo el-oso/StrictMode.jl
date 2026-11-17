@@ -374,3 +374,20 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "the call-site and load-time :noalloc warnings name a scheduler wait" begin
+    using StrictMode
+    @noinline join_pool() = yield()
+    @noinline mid(x::Int) = (join_pool(); x + 1)
+    top(x::Int) = mid(x) + 1
+    # Where this Julia's `yield` reaches an allocation the scan reports it; where it does not, nothing to name.
+    if StrictMode._alloc_signals(top, (Int,)).alloc
+        so = StrictMode._scheduler_origin(top, (Int,))
+        @test !isnothing(so)
+        @test_logs (:warn, r"SM0017.*blocks in the task scheduler.*register_alloc_barrier!") StrictMode._strict_scan("t", top, (Int,))
+        @test_logs (:warn, r"SM0017.*blocks in the task scheduler") StrictMode._assert_noalloc_scan("t", top, (Int,))
+    end
+    # an allocation elsewhere keeps the ordinary wording
+    grow(n::Int) = (a = Float64[]; push!(a, n); a)
+    @test_logs (:warn, r"allocates / boxes") StrictMode._assert_noalloc_scan("t", grow, (Int,))
+end
