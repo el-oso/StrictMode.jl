@@ -181,6 +181,11 @@ StrictMode/src/
                         THROW from StrictMode and which only WARN — observation vs. inference)
   backend.jl          — the llvm-mca seam ONLY (`_be_mca_*`, mca_available). The analysis tier is
                         NOT a seam: nothing here reaches for a backend that may or may not be loaded
+  precompile.jl       — a PrecompileTools workload that runs the scan, the module census and the module
+                        check on a toy submodule, so a consumer's own precompile (where @strict_policy
+                        runs them) does not compile the scan: 4.4 s -> 2.35 s on an 80-method module,
+                        0.8 s with checks off. Reads of a body at that precompile come from the compiler's
+                        cache, which keeps the optimized source only while a package image is generated
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
   trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate;
