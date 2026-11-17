@@ -180,12 +180,13 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
     # A verdict read from no body is not a verdict, for any guarantee: "could not check" must not
     # render as a pass. The scan is memoized, so asking it here costs nothing the guarantees below
     # would not pay anyway.
-    if _alloc_signals(f, types).unread
+    if _alloc_signals(f, types; depth = 0).unread
         why = "no typed body could be read for this signature (no method matches, or its generator raised)"
         return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
     end
+    # `:noalloc` alone is decided by the first allocation or boxing, so its scan stops there.
     sig = (:typestable in guarantees || :noalloc in guarantees || :noboxing in guarantees) ?
-        _alloc_signals(f, types) : nothing
+        _alloc_signals(f, types; full = :noboxing in guarantees) : nothing
     # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-
     # free? A resolved `:invoke` to a callee that boxes internally (e.g. the complex `_l3ws` IdDict
     # `get!`, whose abstract result is narrowed by a `::L3Workspace{T}` assert) is not the caller's

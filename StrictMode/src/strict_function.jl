@@ -83,7 +83,7 @@ function _verify_strict_def(
     # rate on a real consumer is ~28% (issue #17: 19 of 68, every one measuring 0 bytes). The
     # declaration is registered either way, so `StrictModeTest.test_registered()` re-checks this
     # same signature against AllocCheck from the test environment and DOES fail.
-    sig = _alloc_signals(f, types)
+    sig = _alloc_signals(f, types; full = false)
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         @warn "@strict_function $target: " *
             _box_msg(

@@ -68,3 +68,21 @@ end
     # A pointer kept past the call is a different shape, and the scan still reports the Ref.
     @test StrictMode._alloc_signals(pointer_escapes, (Float64,)).alloc
 end
+
+@testitem "an allocation-only scan agrees with the full scan on allocation and boxing" begin
+    using StrictMode
+    @noinline g3(x) = (v = Float64[]; push!(v, x); v)
+    @noinline g2(x) = g3(x)
+    alloc_top(x) = g2(x)
+    @noinline k3(x) = x * 2.0
+    @noinline k2(x) = k3(x) + 1.0
+    clean_top(x) = k2(x)
+    boxy(t, i) = t[i]
+    for f in (alloc_top, clean_top)
+        a = StrictMode._alloc_signals(f, (Float64,); full = false)
+        b = StrictMode._alloc_signals(f, (Float64,))
+        @test a.alloc == b.alloc
+        @test a.boxing == b.boxing
+    end
+    @test StrictMode._alloc_signals(boxy, (Tuple{Int, Float64}, Int); full = false).boxing
+end

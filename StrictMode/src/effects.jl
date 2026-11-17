@@ -343,24 +343,26 @@ const _AllocSignals = @NamedTuple{
 # uncached top body is paid per iteration of any loop containing one: measured 450 µs uncached
 # against 240 ns cached on a 256-element dot product whose bare call is 19 ns. `@assert_noalloc`
 # (heuristic mode) and `@assert_owned` ask at the same default depth, so they share one entry.
-const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, _AllocSignals}}()
+const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Bool}, _AllocSignals}}()
 
-function _alloc_signals(@nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[])
+function _alloc_signals(
+        @nospecialize(f), @nospecialize(types::Tuple); depth::Int = _FAST_ALLOC_DEPTH[], full::Bool = true
+    )
     sig = Base.signature_type(f, Tuple{types...})
-    key = (depth, Base.get_world_counter())
+    key = (depth, Base.get_world_counter(), full)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
         isnothing(bysig) ? nothing : get(bysig, key, nothing)
     end
     isnothing(memo) || return memo
-    r = _alloc_signals_uncached(f, types, sig, depth)
+    r = _alloc_signals_uncached(f, types, sig, depth, full)
     @lock _SIGNAL_MEMO_LOCK get!(
-        Dict{Tuple{Int, UInt64}, _AllocSignals}, _TOP_SIGNAL_MEMO, sig
+        Dict{Tuple{Int, UInt64, Bool}, _AllocSignals}, _TOP_SIGNAL_MEMO, sig
     )[key] = r
     return r
 end
 
-function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int)
+function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int, full::Bool)
     # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
     # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
     # so that form is reserved for the callee recursion, where the memo amortizes it.
@@ -373,7 +375,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     push!(seen, sig)
     alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated =
         isempty(cts) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
-        _scan_ci(first(cts)[1], sig, depth, seen)
+        _scan_ci(first(cts)[1], sig, depth, seen, full)
     m = try
         which(f, types)
     catch
@@ -553,7 +555,7 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 # A body already on this walk contributes nothing a second time, so a result computed below such a
@@ -562,13 +564,13 @@ const _SIGNAL_MEMO_LOCK = ReentrantLock()
 # therefore counts its cuts, and only a body whose subtree met none is memoized.
 _cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)::Base.RefValue{Int}
 
-function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, full::Bool = true)
     if sig in seen
         _cut_counter()[] += 1
         return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     end
     push!(seen, sig)
-    key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
+    key = (depth, Base.get_world_counter(), full)   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_SIGNAL_MEMO, sig, nothing)
         bysig === nothing ? nothing : get(bysig, key, nothing)
@@ -576,9 +578,9 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     memo === nothing || return memo
     cuts = _cut_counter()
     before = cuts[]
-    r = _signals_by_type_uncached(sig, depth, seen)
+    r = _signals_by_type_uncached(sig, depth, seen, full)
     cuts[] == before || return r
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -591,20 +593,49 @@ function _typed_body(@nospecialize(sig))
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
     (!isnothing(hit) && hit[1] == world) && return hit[2]
-    cts = try
-        _code_typed_by_type(sig; optimize = true)
-    catch
-        Any[]
+    ci = _compiled_body(sig, world)
+    if isnothing(ci)
+        cts = try
+            _code_typed_by_type(sig; optimize = true)
+        catch
+            Any[]
+        end
+        ci = isempty(cts) ? nothing : first(cts[1])
     end
-    ci = isempty(cts) ? nothing : first(cts[1])
     @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci))
     return ci
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+# The optimized body the compiler already holds for a signature that has been run, when it keeps one
+# (a method compiled into a package image keeps none, and one cached compressed is not read here).
+# Reading it costs nothing; inferring the body again costs milliseconds.
+function _compiled_body(@nospecialize(sig), world::UInt)
+    m = try
+        Base._which(sig; raise = false, world)
+    catch
+        nothing
+    end
+    isnothing(m) && return nothing
+    mi = try
+        Base.specialize_method(m)
+    catch
+        nothing
+    end
+    mi isa Core.MethodInstance || return nothing
+    ci = isdefined(mi, :cache) ? mi.cache : nothing
+    while ci isa Core.CodeInstance
+        if isnothing(ci.owner) && ci.min_world <= world <= ci.max_world && ci.inferred isa Core.CodeInfo
+            return ci.inferred
+        end
+        ci = isdefined(ci, :next) ? ci.next : nothing
+    end
+    return nothing
+end
+
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, full::Bool)
     ci = _typed_body(sig)
     isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
-    return _scan_ci(ci, sig, depth, seen)
+    return _scan_ci(ci, sig, depth, seen, full)
 end
 
 # Would a value of this type have to be boxed to flow through a union-typed slot? An isbits type
@@ -805,7 +836,7 @@ function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     return !newsdead()
 end
 
-function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, full::Bool = true)
     alloc = false
     boxing = false
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
@@ -892,7 +923,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
                         barrier = true
                         if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen)
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen, full)
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
@@ -918,11 +949,15 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # first. Below the last Base level `depth` is -1, which follows user code alone.
                         user = _enters_user_code(mi)
                         follows = depth > 0 || (depth < 0 && user)
-                        if follows && (!alloc || !boxing || !dictlookup) && length(seen) > _SCAN_BODY_BUDGET[]
+                        # A callee can still change the answer while `undecided`. A caller asking only about allocation
+                        # (`full = false`) is decided by the first allocation or boxing; any other also needs the
+                        # dictionary lookup, which the walk goes on looking for.
+                        undecided = full ? (!alloc || !boxing || !dictlookup) : (!alloc && !boxing)
+                        if follows && undecided && length(seen) > _SCAN_BODY_BUDGET[]
                             truncated = true
-                        elseif follows && (!alloc || !boxing || !dictlookup)
+                        elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen)
+                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, full)
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)

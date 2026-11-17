@@ -55,7 +55,7 @@ end
 
 # The scan half on its own, with no thunk: the caller already has the value.
 function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
-    sig = _alloc_signals(f, types)
+    sig = _alloc_signals(f, types; full = false)
     _unread_fail(:noalloc, target, sig) && return nothing
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
@@ -77,7 +77,7 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
     )
     val = thunk()                 # warm up / force compilation, and capture the call's value
     if mode === :heuristic
-        sig = _alloc_signals(f, types)
+        sig = _alloc_signals(f, types; full = false)
         _unread_fail(:noalloc, target, sig) && return val
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
