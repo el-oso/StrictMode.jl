@@ -86,6 +86,10 @@ function clear_cache!()
         empty!(_MATCH_MEMO)
     end
     @lock _ESCAPE_MEMO_LOCK empty!(_ESCAPE_MEMO)   # …as does the escape-analysis memo
+    @lock _OWNED_DEEP_LOCK begin                   # …and the walk behind `:owned`
+        empty!(_OWNED_NODE_MEMO)
+        empty!(_OWNED_DEEP_MEMO)
+    end
     return nothing
 end
 

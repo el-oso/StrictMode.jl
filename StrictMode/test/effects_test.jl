@@ -656,3 +656,23 @@ end
     @test StrictMode._failed(own(OwnedClosure.m1))     # the lookup is in a closure sort runs
     @test own(OwnedClosure.c1).status === :pass
 end
+
+@testitem ":owned reads a shared callee once across entry points" begin
+    using StrictMode, Test
+    module OwnedShared
+    @noinline h4() = Dict(:a => 1)[:a]; @noinline h3() = h4(); @noinline h2() = h3(); @noinline h1() = h2()
+    @noinline c4() = 1.0; @noinline c3() = c4(); @noinline c2() = c3(); @noinline c1() = c2()
+    @noinline a() = h1() + 1; @noinline b() = h1() + 2
+    @noinline x() = c1() + 1; @noinline y() = c1() + 2
+    end
+    foreach(f -> f(), (OwnedShared.a, OwnedShared.b, OwnedShared.x, OwnedShared.y))
+    StrictMode.clear_cache!()
+    own(f) = only(StrictMode.findings(f, (); guarantees = (:owned,)))
+    @test StrictMode._failed(own(OwnedShared.a))
+    @test own(OwnedShared.x).status === :pass
+    n = length(StrictMode._OWNED_NODE_MEMO)
+    # Entry points whose callees are already read add only their own body.
+    @test StrictMode._failed(own(OwnedShared.b))
+    @test own(OwnedShared.y).status === :pass
+    @test length(StrictMode._OWNED_NODE_MEMO) <= n + 2
+end

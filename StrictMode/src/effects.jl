@@ -1141,6 +1141,46 @@ const _OWNED_DEEP_BUDGET = 2000
 const _OWNED_DEEP_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
 const _OWNED_DEEP_LOCK = ReentrantLock()
 
+# One body of the walk: whether it holds a dictionary lookup of its own, and the signatures it calls
+# that the walk enters (`nothing` when its body cannot be read). This depends on the body alone, so
+# it is computed once per body and world and shared by every walk that reaches it; a package's
+# entry points share most of their callees, and reading each body again for every one of them is
+# what made a sweep of a few hundred signatures cost minutes.
+const _OWNED_NODE_MEMO = IdDict{Any, Tuple{UInt, Bool, Union{Nothing, Vector{Any}}}}()
+
+function _owned_node(@nospecialize(s))
+    world = Base.get_world_counter()
+    hit = @lock _OWNED_DEEP_LOCK get(_OWNED_NODE_MEMO, s, nothing)
+    (!isnothing(hit) && hit[1] == world) && return (hit[2], hit[3])
+    cts = try
+        _code_typed_by_type(s; optimize = true)
+    catch
+        Any[]
+    end
+    lookup = false
+    succ = nothing
+    if !isempty(cts)
+        ci = first(cts[1])
+        seen = Base.IdSet{Any}()
+        push!(seen, s)
+        lookup = _scan_ci(ci, s, 0, seen)[3]
+        succ = Any[]
+        for st in ci.code
+            Meta.isexpr(st, :invoke) || continue
+            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
+            (mi isa Core.MethodInstance && mi.def isa Method) || continue
+            # A Base function is entered only when it was handed the package's code or types to run —
+            # a closure given to `sort` or `map`, a package type whose methods it calls.
+            root = Base.moduleroot(mi.def.module)
+            (root === Base || root === Core) && !_carries_user_type(mi.specTypes) && continue
+            (_mi_is_strictmode(mi) || _mi_is_barrier(mi)) && continue
+            push!(succ, mi.specTypes)
+        end
+    end
+    @lock _OWNED_DEEP_LOCK (_OWNED_NODE_MEMO[s] = (world, lookup, succ))
+    return (lookup, succ)
+end
+
 function _owned_deep(@nospecialize(sig))
     key = (sig, Base.get_world_counter())
     hit = @lock _OWNED_DEEP_LOCK get(_OWNED_DEEP_MEMO, key, nothing)
@@ -1156,31 +1196,16 @@ function _owned_deep(@nospecialize(sig))
             v = :budget
             break
         end
-        r = _signals_by_type(s, 0, Base.IdSet{Any}())
-        if r[3]
+        lookup, succ = _owned_node(s)
+        if lookup
             v = :lookup
             break
         end
-        cts = try
-            _code_typed_by_type(s; optimize = true)
-        catch
-            Any[]
-        end
-        if isempty(cts)
+        if isnothing(succ)
             v = :budget
             break
         end
-        for st in first(cts[1]).code
-            Meta.isexpr(st, :invoke) || continue
-            mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
-            (mi isa Core.MethodInstance && mi.def isa Method) || continue
-            # A Base function is entered only when it was handed the package's code or types to run —
-            # a closure given to `sort` or `map`, a package type whose methods it calls.
-            root = Base.moduleroot(mi.def.module)
-            (root === Base || root === Core) && !_carries_user_type(mi.specTypes) && continue
-            (_mi_is_strictmode(mi) || _mi_is_barrier(mi)) && continue
-            push!(queue, mi.specTypes)
-        end
+        append!(queue, succ)
     end
     @lock _OWNED_DEEP_LOCK (_OWNED_DEEP_MEMO[key] = v)
     return v
