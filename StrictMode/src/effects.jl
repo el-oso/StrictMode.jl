@@ -277,10 +277,6 @@ const _FAST_ALLOC_DEPTH = Ref(2)
 # The most bodies one scan reads. A call graph larger than this leaves the verdict `truncated`.
 const _SCAN_BODY_BUDGET = Ref(1000)
 
-# `:noboxing` reads a bounded part of the call graph: this many levels, and this many bodies.
-const _BOXING_DEPTH = Ref(4)
-const _BOXING_BODY_BUDGET = Ref(40)
-
 # Base's task, lock and condition code. Its run-time dispatch is the scheduler's own, off the call's
 # hot path, and AllocCheck reports none there, so a callee reached only through it is not boxing.
 const _SCHEDULER_FILES = ("task.jl", "condition.jl", "lock.jl", "locks-mt.jl", "partr.jl")
@@ -350,8 +346,7 @@ const _AllocSignals = @NamedTuple{
 const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, _AllocSignals}}()
 
 function _alloc_signals(
-        @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full,
-        depth::Int = mode === :boxing ? _BOXING_DEPTH[] : _FAST_ALLOC_DEPTH[]
+        @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
     )
     sig = Base.signature_type(f, Tuple{types...})
     key = (depth, Base.get_world_counter(), mode)
@@ -368,19 +363,14 @@ function _alloc_signals(
 end
 
 function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), @nospecialize(sig), depth::Int, mode::Symbol = :full)
-    # Top body via `code_typed(f, types)` — it reuses the compiled specialization's inference
-    # (~3 ms); `code_typed_by_type` on the same signature measured ~20 ms (fresh-inference path),
-    # so that form is reserved for the callee recursion, where the memo amortizes it.
-    cts = try
-        _code_typed(f, types; optimize = true)
-    catch
-        Any[]
-    end
+    # The top body comes from the body memo the callee recursion shares: an entry point is often a
+    # callee of another, and a body is read once.
+    topci = _typed_body(sig)
     seen = Base.IdSet{Any}()
     push!(seen, sig)
     alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated =
-        isempty(cts) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
-        _scan_ci(first(cts)[1], sig, depth, seen, mode)
+        isnothing(topci) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
+        _scan_ci(topci, sig, depth, seen, mode, true)
     m = try
         which(f, types)
     catch
@@ -390,7 +380,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     line = isnothing(m) ? 0 : Int(m.line)
     return (;
         alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, file, line,
-        unread = isempty(cts), barrier_dict, barrier_box, truncated,
+        unread = isnothing(topci), barrier_dict, barrier_box, truncated,
     )
 end
 
@@ -515,37 +505,36 @@ end
 # there, and marking only the terminator block left an interpolated message live — so the scan
 # reported `print_to_string`'s allocation for text no successful call ever builds (issue #33).
 #
-# `alive` is seeded at every `ReturnNode` carrying a value and propagated BACKWARD to predecessors
-# until it stops growing. A loop cannot fool it: a statement is alive when *some* path from it returns,
-# which is exactly what backward propagation from the returns computes, and everything left over
-# leads only to a throw or to an unreachable terminator.
+# A statement is alive when one of its successors is, and a `ReturnNode` carrying a value is alive: the
+# fixed point of that, taken over the statements from the last to the first until nothing changes. A
+# loop cannot fool it: a statement is alive when *some* path from it returns, and everything left over
+# leads only to a throw or to an unreachable terminator. No per-statement storage: a body is a few
+# thousand statements and this runs for every body a walk reads.
 function _deadend_mask(code::Vector{Any})
     n = length(code)
     iszero(n) && return falses(0)
-    preds = [Int[] for _ in 1:n]
     alive = falses(n)
-    for (i, st) in enumerate(code)
-        if st isa Core.ReturnNode
-            isdefined(st, :val) && (alive[i] = true)     # a normal return: the one live exit
-        elseif st isa Core.GotoNode
-            1 <= st.label <= n && push!(preds[st.label], i)
-        elseif st isa Core.GotoIfNot
-            1 <= st.dest <= n && push!(preds[st.dest], i)
-            i < n && push!(preds[i + 1], i)
-        elseif Meta.isexpr(st, :gotoifnot)
-            t = st.args[2]
-            t isa Integer && 1 <= t <= n && push!(preds[t], i)
-            i < n && push!(preds[i + 1], i)
-        elseif i < n
-            push!(preds[i + 1], i)                       # falls through
-        end
-    end
-    work = [i for i in 1:n if alive[i]]
-    while !isempty(work)
-        for p in preds[pop!(work)]
-            if !alive[p]
-                alive[p] = true
-                push!(work, p)
+    changed = true
+    while changed
+        changed = false
+        for i in n:-1:1
+            alive[i] && continue
+            st = code[i]
+            up = if st isa Core.ReturnNode
+                isdefined(st, :val)
+            elseif st isa Core.GotoNode
+                1 <= st.label <= n && alive[st.label]
+            elseif st isa Core.GotoIfNot
+                (1 <= st.dest <= n && alive[st.dest]) || (i < n && alive[i + 1])
+            elseif Meta.isexpr(st, :gotoifnot)
+                t = st.args[2]
+                (t isa Integer && 1 <= t <= n && alive[t]) || (i < n && alive[i + 1])
+            else
+                i < n && alive[i + 1]                    # falls through
+            end
+            if up
+                alive[i] = true
+                changed = true
             end
         end
     end
@@ -591,13 +580,18 @@ end
 
 # The optimized body of a signature, or `nothing` when none can be read. Inferring a body is most of
 # what a scan costs, and the same body is reached again by every walk that passes through it, at
-# each depth and from every entry point, so it is read once per world.
-const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any}}()
+# each depth and from every entry point, so it is read once. An entry stays valid while the compiler's
+# own record of the signature does (a method defined elsewhere does not end it), or, for a signature
+# the compiler holds no record of, while the world is the one it was read in.
+const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any, Any}}()
 
 function _typed_body(@nospecialize(sig))
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
-    (!isnothing(hit) && hit[1] == world) && return hit[2]
+    if !isnothing(hit)
+        rec = hit[3]
+        (hit[1] == world || (rec isa Core.CodeInstance && rec.min_world <= world <= rec.max_world)) && return hit[2]
+    end
     ci = _compiled_body(sig, world)
     if isnothing(ci)
         cts = try
@@ -607,8 +601,32 @@ function _typed_body(@nospecialize(sig))
         end
         ci = isempty(cts) ? nothing : first(cts[1])
     end
-    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci))
+    rec = isnothing(ci) ? nothing : _record_of(sig, world)
+    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci, rec))
     return ci
+end
+
+# The compiler's record of a signature in `world`: the cached `CodeInstance` that says in which worlds
+# its inference holds.
+function _record_of(@nospecialize(sig), world::UInt)
+    m = try
+        Base._which(sig; raise = false, world)
+    catch
+        nothing
+    end
+    isnothing(m) && return nothing
+    mi = try
+        Base.specialize_method(m)
+    catch
+        nothing
+    end
+    mi isa Core.MethodInstance || return nothing
+    ci = isdefined(mi, :cache) ? mi.cache : nothing
+    while ci isa Core.CodeInstance
+        (isnothing(ci.owner) && ci.min_world <= world <= ci.max_world) && return ci
+        ci = isdefined(ci, :next) ? ci.next : nothing
+    end
+    return nothing
 end
 
 # The optimized body the compiler already holds for a signature that has been run, when it keeps one
@@ -841,7 +859,7 @@ function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     return !newsdead()
 end
 
-function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full)
+function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false)
     alloc = false
     boxing = false
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
@@ -872,8 +890,12 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
     ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci))::_SSAUses : usememo[]::_SSAUses
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
-        if abscontainer === nothing && _abstract_container(T)
+        if top && abscontainer === nothing && _abstract_container(T)
             abscontainer = eltype(T)
+        end
+        # `:boxing` reads dispatch only: an allocation, a dictionary lookup and a union phi are other questions.
+        if mode === :boxing && (st isa Core.PhiNode || Meta.isexpr(st, :foreigncall) || Meta.isexpr(st, :new))
+            continue
         end
         if Meta.isexpr(st, :foreigncall)
             dead[i] && continue
@@ -953,18 +975,16 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
                         # reached through a chain of the package's own helpers is as real as one in the
                         # first. Below the last Base level `depth` is -1, which follows user code alone.
                         user = _enters_user_code(mi)
-                        follows = mode === :boxing ? depth > 0 : (depth > 0 || (depth < 0 && user))
+                        follows = depth > 0 || (depth < 0 && user)
                         # A callee can still change the answer while `undecided`: `:alloc` is decided by the
                         # first allocation or boxing, `:boxing` by the first boxing, and `:full` also needs the
-                        # dictionary lookup. `:boxing` is bounded, not complete: it follows `depth` levels of
-                        # any callee and at most `_BOXING_BODY_BUDGET` bodies, and says so when it stops.
+                        # dictionary lookup.
                         undecided = mode === :full ? (!alloc || !boxing || !dictlookup) :
                             mode === :alloc ? (!alloc && !boxing) : !boxing
-                        budget = mode === :boxing ? _BOXING_BODY_BUDGET[] : _SCAN_BODY_BUDGET[]
-                        if follows && undecided && length(seen) > budget
+                        if follows && undecided && length(seen) > _SCAN_BODY_BUDGET[]
                             truncated = true
                         elseif follows && undecided
-                            sub = mode === :boxing ? depth - 1 : user ? depth : (depth > 1 ? depth - 1 : -1)
+                            sub = user ? depth : (depth > 1 ? depth - 1 : -1)
                             a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode)
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
@@ -985,7 +1005,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
                             up2 && (unionphi = true)
-                        elseif iszero(depth) && (mode === :boxing || !dictlookup) && mi.def isa Method &&
+                        elseif iszero(depth) && !dictlookup && mi.def isa Method &&
                                 !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
                             # The walk ends here with a callee of the user's own unread: whatever it
                             # does is not in this verdict, so `:owned` reports it as not checked.
@@ -1003,7 +1023,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
-                (alloc || dead[i] || newsdead()) || (alloc = true)
+                (mode === :boxing || alloc || dead[i] || newsdead()) || (alloc = true)
             elseif _nonconcrete(T) && !_static_getfield(callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee

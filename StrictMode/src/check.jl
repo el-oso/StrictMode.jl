@@ -184,8 +184,8 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         why = "no typed body could be read for this signature (no method matches, or its generator raised)"
         return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
     end
-    # `:noalloc` is decided by the first allocation or boxing, so its scan stops there; `:noboxing` reads
-    # a bounded part of the call graph and reports when that was not all of it.
+    # `:noalloc` is decided by the first allocation or boxing, so its scan stops there; `:noboxing`
+    # reads dispatch alone, to the end of the call graph.
     sig = :noalloc in guarantees ? _alloc_signals(f, types; mode = :alloc) : nothing
     boxsig = :noboxing in guarantees ? _alloc_signals(f, types; mode = :boxing) : nothing
     # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-

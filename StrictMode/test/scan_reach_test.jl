@@ -26,10 +26,9 @@ end
         @test !StrictMode._failed(only(StrictMode.findings(top, (Float64,); guarantees = (g,))))
     end
 
-    old, oldbox, olddepth = StrictMode._SCAN_BODY_BUDGET[], StrictMode._BOXING_BODY_BUDGET[], StrictMode._BOXING_DEPTH[]
+    old = StrictMode._SCAN_BODY_BUDGET[]
     try
         StrictMode._SCAN_BODY_BUDGET[] = 2
-        StrictMode._BOXING_BODY_BUDGET[] = 2
         StrictMode.clear_cache!()
         for g in (:noalloc, :noboxing)
             f = only(StrictMode.findings(top, (Float64,); guarantees = (g,)))
@@ -38,18 +37,8 @@ end
             @test occursin("not established", f.reason)
         end
         @test occursin("scan could not read", StrictMode.explain(:SM0207))
-
-        # `:noboxing` is also bounded in depth; `:noalloc` is not.
-        StrictMode._SCAN_BODY_BUDGET[], StrictMode._BOXING_BODY_BUDGET[] = old, oldbox
-        StrictMode._BOXING_DEPTH[] = 1
-        StrictMode.clear_cache!()
-        fb = only(StrictMode.findings(top, (Float64,); guarantees = (:noboxing,)))
-        @test StrictMode._failed(fb) && fb.code === :SM0207
-        @test !StrictMode._failed(only(StrictMode.findings(top, (Float64,); guarantees = (:noalloc,))))
     finally
         StrictMode._SCAN_BODY_BUDGET[] = old
-        StrictMode._BOXING_BODY_BUDGET[] = oldbox
-        StrictMode._BOXING_DEPTH[] = olddepth
         StrictMode.clear_cache!()
     end
 end
