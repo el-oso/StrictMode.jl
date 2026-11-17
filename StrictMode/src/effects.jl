@@ -250,12 +250,26 @@ _is_base_barrier_type(@nospecialize(p)) = p isa Type && any(bt -> p <: bt, _BASE
 _mi_is_strictmode(mi::Core.MethodInstance) =
     mi.def isa Method && Base.moduleroot(mi.def.module) === @__MODULE__
 
+# A registered function called with keywords is reached through two more methods: `Core.kwcall`, which
+# carries the function at parameter 3, and the keyword-sorted body `#f#N`, which carries it after the
+# keyword values. Both are the barrier: the allocation is the registered function's own.
+function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
+    (isempty(_ALLOC_BARRIERS) || !(mi.def isa Method)) && return false
+    ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
+    name = _demangle(mi.def.name)
+    for f in _ALLOC_BARRIERS
+        nameof(f) === name && any(p -> p === typeof(f), ps) && return true
+    end
+    return false
+end
+
 function _mi_is_barrier(mi::Core.MethodInstance)
     st = mi.specTypes
     st isa DataType || return false
     ps = st.parameters
     isempty(ps) && return false
     _is_registered_callee(ps[1]) && return true
+    _is_registered_kw_callee(mi, ps) && return true
     # The parameter-2 (Base once-guard) shape must ALSO be Base's own init closure, not merely
     # any function whose second argument happens to be a OncePerProcess/OncePerThread — a user
     # method with that exact parameter shape (e.g. `helper(o::OncePerProcess, n::Int) = o() +
@@ -445,7 +459,7 @@ end
 
 function _compute_all_news_nonescaping(@nospecialize(sig))
     EA = Core.Compiler.EscapeAnalysis
-    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
+    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
     isempty(irs) && return false
     ir = first(irs)[1]
     # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape
@@ -655,6 +669,47 @@ function _compiled_body(@nospecialize(sig), world::UInt)
     return nothing
 end
 
+# Where the scan finds what it reports: for every body of the call graph whose own statements set the
+# signal `mode` asks about, the callees that lead to it and the statements. `_alloc_signals` says that
+# something allocates; this says which statement, in which callee, reached from where.
+function _signal_origin(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc)
+    top = Base.signature_type(f, Tuple{types...})
+    parent = IdDict{Any, Any}()
+    queue = Any[top]
+    seen = Base.IdSet{Any}()
+    out = Any[]
+    while !isempty(queue) && length(seen) < _SCAN_BODY_BUDGET[]
+        s = popfirst!(queue)
+        s in seen && continue
+        push!(seen, s)
+        ci = _typed_body(s)
+        isnothing(ci) && continue
+        trace = Any[]
+        _scan_ci(ci, s, 0, Base.IdSet{Any}([s]), mode, false, trace)
+        if !isempty(trace)
+            path = Any[]
+            c = s
+            while haskey(parent, c)
+                c = parent[c]
+                pushfirst!(path, c)
+            end
+            push!(out, (; signature = s, path, statements = trace))
+        end
+        dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+        for (j, st) in enumerate(ci.code)
+            (Meta.isexpr(st, :invoke) && !dead[j]) || continue
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            (mi isa Core.MethodInstance && mi.def isa Method) || continue
+            (_mi_is_strictmode(mi) || _mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi))) && continue
+            _enters_user_code(mi) || continue
+            haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
+            push!(queue, mi.specTypes)
+        end
+    end
+    return out
+end
+
 function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol)
     ci = _typed_body(sig)
     isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
@@ -859,7 +914,9 @@ function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
     return !newsdead()
 end
 
-function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false)
+function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
+        trace::Union{Nothing, Vector{Any}} = nothing
+    )
     alloc = false
     boxing = false
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
@@ -900,7 +957,10 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
         if Meta.isexpr(st, :foreigncall)
             dead[i] && continue
             tgt = lowercase(string(st.args[1]))
-            any(p -> occursin(p, tgt), _ALLOC_FFI) && (alloc = true)
+            if any(p -> occursin(p, tgt), _ALLOC_FFI)
+                alloc = true
+                isnothing(trace) || push!(trace, (i, st, :alloc))
+            end
             # An `IdDict` runtime lookup inlines to a `jl_eqtable_get`/`_put`/`_pop` ccall (no `:get`
             # method survives in optimized IR), so the method-name rules below never see it. This is
             # the exact PureBLAS `_symm_scr` shape — detect the primitive directly.
@@ -926,7 +986,10 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
             # Which non-isbits `:new`s allocate is decided by `_new_allocates`; see the note above it.
-            (!alloc && _new_allocates(ci, sig, ssauses(), dead, i, newsdead)) && (alloc = true)
+            if !alloc && _new_allocates(ci, sig, ssauses(), dead, i, newsdead)
+                alloc = true
+                isnothing(trace) || push!(trace, (i, st, :alloc))
+            end
         elseif Meta.isexpr(st, :invoke)
             # A resolved `:invoke` is never dispatch *from its own recorded result* (F9) — even
             # with an abstract recorded result (mutating helpers with an unused return are typed
@@ -1023,7 +1086,10 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
-                (mode === :boxing || alloc || dead[i] || newsdead()) || (alloc = true)
+                if !(mode === :boxing || alloc || dead[i] || newsdead())
+                    alloc = true
+                    isnothing(trace) || push!(trace, (i, st, :alloc))
+                end
             elseif _nonconcrete(T) && !_static_getfield(callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee
@@ -1038,11 +1104,15 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mod
                 # varies by which runtime index is read) — that IS the founding runtime-tuple-
                 # index trap `@unroll` exists for, and must keep flagging as boxing.
                 boxing = true
+                isnothing(trace) || push!(trace, (i, st, :boxing))
             elseif !boxing
                 # Concrete result but a boxy argument on a non-builtin call = runtime dispatch
                 # that inference resolved only by return type (e.g. `Vec{32,UInt8}(::Tuple{Vararg})`).
                 if !(callee isa Core.Builtin || callee isa Core.IntrinsicFunction)
-                    any(a -> _boxy(_stmt_arg_type(ci, sig, a)), st.args[2:end]) && (boxing = true)
+                    if any(a -> _boxy(_stmt_arg_type(ci, sig, a)), st.args[2:end])
+                        boxing = true
+                        isnothing(trace) || push!(trace, (i, st, :boxing))
+                    end
                 end
             end
         end
@@ -1081,7 +1151,7 @@ The compiler's inferred effects for `f`'s signature — a cheap (inference-only)
 method is `:nothrow`, `:effect_free`, `:terminates`, `:consistent`, etc. Used by the `:fast`
 triage and by `@assert_effects`.
 """
-effects(@nospecialize(f), @nospecialize(types::Tuple)) = Base.infer_effects(f, types)
+effects(@nospecialize(f), @nospecialize(types::Tuple)) = _infer_effects(f, types)
 
 # Predicate by symbol, so callers can ask `effect_holds(eff, :nothrow)`.
 #
@@ -1196,7 +1266,7 @@ function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
     isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
-    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS)
+    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
     ir = first(irs)[1]
     st = EA.analyze_escapes(
@@ -1263,12 +1333,86 @@ function _noescape_finding(
     )
 end
 
+# Inference runs under an interpreter whose results never enter the compiler's own code cache. Under
+# the native interpreter every body the scan reads is cached for the compiler, and a package image
+# generated while a consumer precompiles holds what is cached in that process: measured on a package
+# of 300 methods with a module check, the scan took the image from 8.5 MB to 58 MB and the precompile
+# from 0.5 GB to 4 GB at its peak. The results live in a cache of this module's own instead, reused
+# by the scans that follow and emptied with the other memos.
+const _CC = Base.Compiler
+
+struct _ScanCacheOwner end
+
+struct _ScanCodeCache
+    entries::IdDict{Core.MethodInstance, Vector{Core.CodeInstance}}
+    lock::ReentrantLock
+end
+_ScanCodeCache() = _ScanCodeCache(IdDict{Core.MethodInstance, Vector{Core.CodeInstance}}(), ReentrantLock())
+
+const _SCAN_CODE_CACHE = _ScanCodeCache()
+
+function _scan_cache_lookup(c::_ScanCodeCache, mi::Core.MethodInstance, worlds)
+    lo, hi = first(worlds), last(worlds)
+    @lock c.lock begin
+        cis = get(c.entries, mi, nothing)
+        isnothing(cis) && return nothing
+        for ci in Iterators.reverse(cis)
+            ci.min_world <= lo && hi <= ci.max_world && return ci
+        end
+    end
+    return nothing
+end
+
+Base.haskey(wvc::_CC.WorldView{_ScanCodeCache}, mi::Core.MethodInstance) =
+    !isnothing(_scan_cache_lookup(wvc.cache, mi, wvc.worlds))
+
+function Base.get(wvc::_CC.WorldView{_ScanCodeCache}, mi::Core.MethodInstance, default)
+    ci = _scan_cache_lookup(wvc.cache, mi, wvc.worlds)
+    return isnothing(ci) ? default : ci
+end
+
+function Base.getindex(wvc::_CC.WorldView{_ScanCodeCache}, mi::Core.MethodInstance)
+    ci = _scan_cache_lookup(wvc.cache, mi, wvc.worlds)
+    isnothing(ci) && throw(KeyError(mi))
+    return ci
+end
+
+function Base.setindex!(wvc::_CC.WorldView{_ScanCodeCache}, ci::Core.CodeInstance, mi::Core.MethodInstance)
+    c = wvc.cache
+    @lock c.lock push!(get!(() -> Core.CodeInstance[], c.entries, mi), ci)
+    return wvc
+end
+
+struct _ScanInterpreter <: _CC.AbstractInterpreter
+    world::UInt
+    inf_params::_CC.InferenceParams
+    opt_params::_CC.OptimizationParams
+    inf_cache::Vector{_CC.InferenceResult}
+end
+
+_ScanInterpreter(world::UInt = Base.get_world_counter()) =
+    _ScanInterpreter(world, _CC.InferenceParams(), _CC.OptimizationParams(), _CC.InferenceResult[])
+
+_CC.InferenceParams(interp::_ScanInterpreter) = interp.inf_params
+_CC.OptimizationParams(interp::_ScanInterpreter) = interp.opt_params
+_CC.get_inference_world(interp::_ScanInterpreter) = interp.world
+_CC.get_inference_cache(interp::_ScanInterpreter) = interp.inf_cache
+_CC.cache_owner(::_ScanInterpreter) = _ScanCacheOwner()
+_CC.code_cache(interp::_ScanInterpreter) = _CC.WorldView(_SCAN_CODE_CACHE, _CC.WorldRange(interp.world))
+
+# The other readings of the compiler's inference answer under the same interpreter.
+_return_types(@nospecialize(f), @nospecialize(types)) = Base.return_types(f, types; interp = _ScanInterpreter())
+_infer_effects(@nospecialize(f), @nospecialize(types)) = Base.infer_effects(f, types; interp = _ScanInterpreter())
+
 # `code_typed` with only the results that carry code. When a `@generated` method's generator raises
 # for a signature, Julia returns that `Method` in place of the `CodeInfo`. Every reader here treats
 # an empty result as a body it could not read; a `Method` read as code crashed the analysis instead.
-_code_typed(args...; kw...) = filter(p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; kw...))
-_code_typed_by_type(args...; kw...) =
-    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; kw...))
+_code_typed(args...; kw...) = filter(
+    p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; interp = _ScanInterpreter(), kw...)
+)
+_code_typed_by_type(args...; kw...) = filter(
+    p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; interp = _ScanInterpreter(), kw...)
+)
 
 # `:owned`'s walk to the end of the package's own code, for a call whose ordinary walk stopped at the
 # depth limit. A lookup can only sit in the package's code or in a Base dictionary accessor that code

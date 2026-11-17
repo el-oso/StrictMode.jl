@@ -205,7 +205,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         if !isnothing(shared)
             push!(out, shared)
         elseif g === :typestable
-            rts = Base.return_types(f, Tuple{types...})
+            rts = _return_types(f, Tuple{types...})
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch; the IR boxing signal catches
             # that shape, so this checks both.

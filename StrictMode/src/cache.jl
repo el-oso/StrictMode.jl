@@ -72,6 +72,11 @@ A cached verdict is dropped on its own when the compiled code it was read from i
 covers editing a *callee* of a checked method. A method that has not been compiled at all has no
 compiled code to watch, so reach for this after editing a callee of one of those.
 """
+# What the scan keeps is worth keeping in a session, where the next check reuses it, and not at a
+# precompile, where nothing asks again and a process that is about to write a package image holds
+# it as live heap: 282 MB after a module check of 300 methods.
+_release_after_load_check() = ccall(:jl_generating_output, Cint, ()) == 1 ? clear_cache!() : nothing
+
 function clear_cache!()
     @lock _CACHE_LOCK begin
         empty!(_CACHE)
@@ -83,6 +88,7 @@ function clear_cache!()
         empty!(_SIGNAL_MEMO)
         empty!(_TOP_SIGNAL_MEMO)
         empty!(_BODY_MEMO)
+        @lock _SCAN_CODE_CACHE.lock empty!(_SCAN_CODE_CACHE.entries)
         empty!(_RETTYPE_MEMO)
         empty!(_MATCH_MEMO)
     end

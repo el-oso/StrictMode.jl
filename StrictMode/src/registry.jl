@@ -77,6 +77,20 @@ A package's declarations live in a `const` of the package itself, because a decl
 its precompile cannot be stored in StrictMode — StrictMode is loaded from its own cache by then, and
 the mutation does not survive the declaring package's next cached load.
 """
+# A declaration is looked up by the identity of its function and of its argument types. Hashing the
+# `(f, types)` tuple itself compiles a method of `hash` for every distinct tuple type, which is one
+# compilation per signature a module check looks up: 7.8 ms each, 0.6 s for a module of 80 methods.
+_decl_key(@nospecialize(f), @nospecialize(types)) = (objectid(f), objectid(Tuple(types)))
+
+function _declaration_index(decls)
+    index = Dict{Tuple{UInt, UInt}, Any}()
+    for p in decls
+        key = getfield(p, :first)
+        index[_decl_key(getfield(key, 1), getfield(key, 2))] = getfield(p, :second)
+    end
+    return index
+end
+
 function declarations()
     out = Dict{Any, @NamedTuple{guarantees::Any, source::String}}()
     for m in _store_modules()
@@ -401,8 +415,14 @@ function _map_findings(analyze, items)
     out = StrictFinding[]
     # Read once rather than per item: the union walks every loaded package's store, and a module
     # sweep runs this for hundreds of signatures.
-    decls = declarations()
-    for (f, types, gs) in items
+    decls = _declaration_index(declarations())
+    # The elements are read with `getfield`, not destructured: destructuring a tuple compiles a method of
+    # `indexed_iterate` for its exact type, and that type names the consumer's function, so every
+    # signature checked at a consumer's precompile left native code in the consumer's image.
+    for it in items
+        f = getfield(it, 1)
+        types = getfield(it, 2)
+        gs = getfield(it, 3)
         # A narrowed exemption is honored HERE, at the one funnel both tiers run through, so the
         # scan and the proofs answer alike — the same arrangement `ignore_throw` has. An exempted
         # guarantee is reported as `:info` rather than dropped: an opt-out nobody can see in the
@@ -431,8 +451,8 @@ _restamp(x::StrictFinding, source::AbstractString) = StrictFinding(
 )
 
 function _with_policy(fs, decls, @nospecialize(f), @nospecialize(types))
-    isempty(fs) && return fs
-    meta = get(decls, (f, Tuple(types)), nothing)
+    (isempty(fs) || isempty(decls)) && return fs
+    meta = get(decls, _decl_key(f, types), nothing)
     (isnothing(meta) || meta.source == "") && return fs
     return [
         StrictFinding(
@@ -633,9 +653,11 @@ end
 # called yet at load, so there are no specializations to read, and a generic declaration infers to
 # `Any`. Those are reported by the coverage gate from the test environment instead.
 function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
-    declared = Dict{Any, Any}()
-    for ((f, tt), meta) in declarations()
-        _mod_sym(f) === nameof(mod) && (declared[(f, tt)] = meta.guarantees)
+    declared = Dict{Tuple{UInt, UInt}, Any}()
+    for p in declarations()
+        key = getfield(p, :first)
+        f = getfield(key, 1)
+        _mod_sym(f) === nameof(mod) && (declared[_decl_key(f, getfield(key, 2))] = getfield(p, :second).guarantees)
     end
     items = Any[]
     ms, _ = module_methods(mod; only, exempt)
@@ -649,7 +671,7 @@ function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
             continue
         end
         tt = Tuple(base.parameters[2:end])
-        push!(items, (f, tt, get(declared, (f, tt), policy)))
+        push!(items, (f, tt, isempty(declared) ? policy : get(declared, _decl_key(f, tt), policy)))
     end
     return items
 end
@@ -667,6 +689,7 @@ function _auto_check_module(
     # own declaration keeps that one, which `_map_findings` has already stamped.
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
     _report_at_load(fs, :strict_module, string(nameof(mod)))
+    _release_after_load_check()
     return nothing
 end
 

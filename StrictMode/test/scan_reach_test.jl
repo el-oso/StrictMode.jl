@@ -86,3 +86,118 @@ end
     end
     @test StrictMode._alloc_signals(boxy, (Tuple{Int, Float64}, Int); mode = :alloc).boxing
 end
+
+@testitem "an allocation behind a registered barrier is excused at any depth" begin
+    using StrictMode
+    @noinline ws(::Type{T}) where {T} = Vector{T}(undef, 64)
+    @noinline l3(x::Int) = length(ws(Float64)) + x
+    @noinline l2(x::Int) = l3(x) + 1
+    @noinline l1(x::Int) = l2(x) + 1
+    top(x::Int) = l1(x) + 1
+    try
+        register_alloc_barrier!(ws)
+        for g in (:noalloc, :noboxing)
+            f = only(StrictMode.findings(top, (Int,); guarantees = (g,)))
+            @test !StrictMode._failed(f)
+        end
+        @test StrictMode._alloc_signals(top, (Int,)).barrier
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        StrictMode.clear_cache!()
+    end
+    # without the registration the same chain allocates
+    @test StrictMode._failed(only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,))))
+end
+
+@testitem "an allocation behind a registered barrier called with keywords is excused" begin
+    using StrictMode
+    @noinline ws_kw(::Type{T}; extra::Int = 0) where {T} = Vector{T}(undef, 64 + extra)
+    @noinline l3(x::Int) = length(ws_kw(Float64; extra = x)) + x
+    @noinline l2(x::Int) = l3(x) + 1
+    @noinline l1(x::Int) = l2(x) + 1
+    top(x::Int) = l1(x) + 1
+    try
+        register_alloc_barrier!(ws_kw)
+        f = only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,)))
+        @test !StrictMode._failed(f)
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        StrictMode.clear_cache!()
+    end
+end
+
+@testitem "the precompile workload reports nothing and leaves nothing behind" begin
+    using StrictMode
+    W = StrictMode.PrecompileWorkload
+    only = StrictMode._WORKLOAD_FUNCTIONS
+    items = StrictMode._module_load_items(W, (:typestable, :noalloc); only)
+    @test !isempty(items)
+    # What the workload checks must pass, so that checking it prints nothing at any install.
+    @test !any(StrictMode._failed, StrictMode._map_findings(StrictMode._scan_findings, items))
+    @test_logs StrictMode._auto_check_module(W, (:typestable, :noalloc); only)
+    StrictMode._precompile_workload()
+    @test isempty(StrictMode._BODY_MEMO)
+    @test isempty(StrictMode._TOP_SIGNAL_MEMO)
+end
+
+@testitem "a Ref read back after a ccall through a stored function pointer, behind an atomic counter" begin
+    using StrictMode
+    mutable struct Counter
+        @atomic value::Int
+    end
+    const CALLS = Counter(0)
+    function kern(out::Ptr{Float64}, x::Ptr{Float64}, y::Ptr{Float64}, n::Int)
+        s = 0.0
+        for i in 1:n
+            s += unsafe_load(x, i) * unsafe_load(y, i)
+        end
+        unsafe_store!(out, s)
+        return nothing
+    end
+    const ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
+    ENTRY[] = @cfunction(kern, Cvoid, (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
+    function entry_dot(n::Int, x::Vector{Float64}, y::Vector{Float64})
+        @atomic CALLS.value += 1
+        nb = n ÷ 8
+        o = Ref(0.0)
+        GC.@preserve x y o begin
+            ccall(
+                ENTRY[], Cvoid, (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int),
+                Base.unsafe_convert(Ptr{Float64}, o), pointer(x), pointer(y), nb
+            )
+        end
+        s = o[]
+        GC.@preserve x y begin
+            for i in (8 * nb + 1):n
+                s = muladd(unsafe_load(pointer(x), i), unsafe_load(pointer(y), i), s)
+            end
+        end
+        return s
+    end
+    function plain_dot(x::Vector{Float64}, y::Vector{Float64})
+        length(x) >= 65536 && return entry_dot(length(x), x, y)
+        s = 0.0
+        for i in eachindex(x, y)
+            s += x[i] * y[i]
+        end
+        return s
+    end
+    x = ones(1000); y = ones(1000)
+    entry_dot(1000, x, y)
+    @test iszero(@allocated entry_dot(1000, x, y))
+    @test !StrictMode._alloc_signals(entry_dot, (Int, Vector{Float64}, Vector{Float64})).alloc
+    @test !StrictMode._alloc_signals(plain_dot, (Vector{Float64}, Vector{Float64})).alloc
+end
+
+@testitem "_signal_origin names the statement and the callee an allocation comes from" begin
+    using StrictMode
+    @noinline leaf(n::Int) = (a = Float64[]; push!(a, n); a)
+    @noinline mid(n::Int) = length(leaf(n))
+    top(n::Int) = mid(n) + 1
+    o = StrictMode._signal_origin(top, (Int,))
+    @test !isempty(o)
+    @test any(x -> occursin("leaf", string(x.signature)), o)
+    @test length(first(o).path) >= 0
+    @test all(x -> !isempty(x.statements), o)
+    @test isempty(StrictMode._signal_origin(mid, (Int,); mode = :boxing))
+end

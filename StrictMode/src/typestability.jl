@@ -46,7 +46,7 @@ function _return_types_memo(@nospecialize(f), @nospecialize(types::Tuple))
         isnothing(bysig) ? nothing : get(bysig, world, nothing)
     end
     isnothing(memo) || return memo
-    rts = Base.return_types(f, Tuple{types...})
+    rts = _return_types(f, Tuple{types...})
     @lock _SIGNAL_MEMO_LOCK get!(Dict{UInt64, Vector{Any}}, _RETTYPE_MEMO, sig)[world] = rts
     return rts
 end

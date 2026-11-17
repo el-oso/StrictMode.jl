@@ -152,7 +152,7 @@ recognized causes fits. `cause` is one of `:nonconst_global`, `:abstract_field`,
 function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     # Only a body that is actually unstable has a cause. Without this gate an `Any`-typed statement on
     # a dead throw path is enough to blame a perfectly stable function's argument declaration.
-    rts = Base.return_types(f, Tuple{types...})
+    rts = _return_types(f, Tuple{types...})
     if length(rts) == 1 && _is_typestable_return(only(rts))
         sig0 = try
             _alloc_signals(f, types; depth = 0)

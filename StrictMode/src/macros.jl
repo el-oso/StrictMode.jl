@@ -289,7 +289,7 @@ end
 # when a `@verify_strict` block runs. A listed call no method matches cannot run at all, and its
 # empty result would otherwise reduce to `Union{}`, which reads as stable.
 @noinline function _check_stable_once(target, @nospecialize(f), @nospecialize(types::Tuple))
-    rts = Base.return_types(f, types)
+    rts = _return_types(f, types)
     isempty(rts) && _fail(
         :typestable, target,
         "no method matches this call, so it cannot run: $(f)(" * join(types, ", ") * ")";
