@@ -92,7 +92,7 @@ function _verify_strict_def(
             "allocates / boxes (value-free IR scan — a structural guess, not a proof; " *
                 "add StrictModeTest to your test environment and call test_registered() to " *
                 "resolve it)", sig
-        )
+        ) * _origin_note(f, types)
     elseif sig.truncated
         @warn "@strict_function $target: not established — the value-free scan found nothing, but " *
             "did not read the whole call tree below this call. Add StrictModeTest to your test " *

@@ -317,7 +317,7 @@ end
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(
             :noalloc, target,
-            _box_msg("allocates / boxes (value-free IR scan)", sig); gates = false
+            _box_msg("allocates / boxes (value-free IR scan)", sig) * _origin_note(f, types); gates = false
         )
     end
     # F39, and it belongs to `:typestable` rather than `:noalloc`: a union-typed local whose members

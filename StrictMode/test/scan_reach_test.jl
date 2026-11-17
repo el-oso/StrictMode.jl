@@ -269,3 +269,44 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "a barrier registered by a package excuses the allocation behind it at that package's own precompile" begin
+    using StrictMode
+    dir = mktempdir()
+    mkpath(joinpath(dir, "FixPkg", "src"))
+    function source(register)
+        return """
+        module FixPkg
+        using StrictMode
+        const GP = IdDict{Any, Any}()
+        @noinline gpack(::Type{T}) where {T} = get!(() -> (T[], T[]), GP, T)::NTuple{2, Vector{T}}
+        $(register ? "register_alloc_barrier!(gpack)" : "")
+        @noinline function drv(A::Vector{Float64}, a::Bool, b::Bool)
+            return length(gpack(Float64)[1]) + length(A) + (a & b)
+        end
+        drv(A::Vector{Float64}, a::Bool) = drv(A, a, false)
+        drv(A::Vector{Float64}) = drv(A, true)
+        @noinline mid(A::Vector{Float64}) = drv(A) + 1
+        top(A::Vector{Float64}) = mid(A) + 1
+        @strict_function topf(A::Vector{Float64}) = mid(A) + 1
+        end
+        """
+    end
+    # The child process sees this test's own environment (which holds StrictMode) and the package's directory.
+    function precompile_output(register)
+        write(joinpath(dir, "FixPkg", "src", "FixPkg.jl"), source(register))
+        julia = Base.julia_cmd()
+        out = IOBuffer()
+        code = "using StrictMode; Base.compilecache(Base.identify_package(\"FixPkg\"))"
+        env = Dict("JULIA_LOAD_PATH" => join(["@", dir, "@stdlib"], Sys.iswindows() ? ";" : ":"),
+            "JULIA_DEPOT_PATH" => join(Base.DEPOT_PATH, Sys.iswindows() ? ";" : ":"))
+        cmd = setenv(`$julia --startup-file=no --project=$(Base.active_project()) -e $code`, merge(Dict(ENV), env))
+        run(pipeline(cmd; stdout = out, stderr = out))
+        return String(take!(out))
+    end
+    without = precompile_output(false)
+    @test occursin("allocates / boxes", without)
+    @test occursin("first at", without)
+    with = precompile_output(true)
+    @test !occursin("allocates / boxes", with)
+end

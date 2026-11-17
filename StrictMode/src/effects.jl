@@ -495,7 +495,7 @@ end
 
 function _compute_all_news_nonescaping(@nospecialize(sig))
     EA = Core.Compiler.EscapeAnalysis
-    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
+    irs = _scan_window(() -> Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter()))
     isempty(irs) && return false
     ir = first(irs)[1]
     # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape
@@ -710,15 +710,15 @@ end
 # something allocates; this says which statement, in which callee, reached from where.
 function _signal_origin(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
-        stops::Union{Nothing, Vector{Any}} = nothing
+        stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
     top = Base.signature_type(f, Tuple{types...})
     parent = IdDict{Any, Any}()
-    queue = Any[top]
+    queue = Any[(top, _FAST_ALLOC_DEPTH[])]
     seen = Base.IdSet{Any}()
     out = Any[]
     while !isempty(queue) && length(seen) < _SCAN_BODY_BUDGET[]
-        s = popfirst!(queue)
+        s, depth = popfirst!(queue)
         s in seen && continue
         push!(seen, s)
         ci = _typed_body(s)
@@ -733,6 +733,7 @@ function _signal_origin(
                 pushfirst!(path, c)
             end
             push!(out, (; signature = s, path, statements = trace))
+            first_only && break
         end
         dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
         for (j, st) in enumerate(ci.code)
@@ -746,12 +747,30 @@ function _signal_origin(
                 continue
             end
             isnothing(_mi_exempt_name(mi)) || continue
-            _enters_user_code(mi) || continue
+            # The scan's own rule: the package's code to the end, Base to `depth` levels.
+            user = _enters_user_code(mi)
+            (depth > 0 || (depth < 0 && user)) || continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, mi.specTypes)
+            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1)))
         end
     end
     return out
+end
+
+# The nearest place an allocation or boxing comes from, as a sentence for a warning: the callee, the
+# statement, and the calls that lead to it. Empty when the walk finds none.
+function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc)
+    o = try
+        _signal_origin(f, types; mode, first_only = true)
+    catch
+        return ""
+    end
+    isempty(o) && return ""
+    x = first(o)
+    st = first(x.statements)
+    via = join((first(string(p), 70) for p in last(x.path, 3)), " -> ")
+    return "; first at " * first(string(x.signature), 110) * " [" * first(string(st[2]), 90) * "]" *
+        (isempty(via) ? "" : ", reached through " * via)
 end
 
 # The registered barriers the walk from `f` stops at, so a reader can see that one was reached and not
@@ -1318,7 +1337,7 @@ function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
     isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
-    irs = Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
+    irs = _scan_window(() -> Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter()))
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
     ir = first(irs)[1]
     st = EA.analyze_escapes(
@@ -1452,19 +1471,34 @@ _CC.get_inference_cache(interp::_ScanInterpreter) = interp.inf_cache
 _CC.cache_owner(::_ScanInterpreter) = _ScanCacheOwner()
 _CC.code_cache(interp::_ScanInterpreter) = _CC.WorldView(_SCAN_CODE_CACHE, _CC.WorldRange(interp.world))
 
+# A package image holds the specializations recorded while it was generated (`Base.newly_inferred`).
+# What running the scan makes the compiler specialize is the scan's own, not the consumer's, so the
+# records made inside an inference call are taken back when a package is being generated.
+function _scan_window(f::F) where {F}
+    (ccall(:jl_generating_output, Cint, ()) == 1 && isdefined(Base, :newly_inferred)) || return f()
+    n = length(Base.newly_inferred)
+    try
+        return f()
+    finally
+        length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
+    end
+end
+
 # The other readings of the compiler's inference answer under the same interpreter.
-_return_types(@nospecialize(f), @nospecialize(types)) = Base.return_types(f, types; interp = _ScanInterpreter())
-_infer_effects(@nospecialize(f), @nospecialize(types)) = Base.infer_effects(f, types; interp = _ScanInterpreter())
+_return_types(@nospecialize(f), @nospecialize(types)) =
+    _scan_window(() -> Base.return_types(f, types; interp = _ScanInterpreter()))
+_infer_effects(@nospecialize(f), @nospecialize(types)) =
+    _scan_window(() -> Base.infer_effects(f, types; interp = _ScanInterpreter()))
 
 # `code_typed` with only the results that carry code. When a `@generated` method's generator raises
 # for a signature, Julia returns that `Method` in place of the `CodeInfo`. Every reader here treats
 # an empty result as a body it could not read; a `Method` read as code crashed the analysis instead.
-_code_typed(args...; kw...) = filter(
-    p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; interp = _ScanInterpreter(), kw...)
-)
-_code_typed_by_type(args...; kw...) = filter(
-    p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; interp = _ScanInterpreter(), kw...)
-)
+_code_typed(args...; kw...) = _scan_window() do
+    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed(args...; interp = _ScanInterpreter(), kw...))
+end
+_code_typed_by_type(args...; kw...) = _scan_window() do
+    filter(p -> first(p) isa Core.CodeInfo, Base.code_typed_by_type(args...; interp = _ScanInterpreter(), kw...))
+end
 
 # `:owned`'s walk to the end of the package's own code, for a call whose ordinary walk stopped at the
 # depth limit. A lookup can only sit in the package's code or in a Base dictionary accessor that code
@@ -1544,4 +1578,26 @@ function _owned_deep(@nospecialize(sig))
     end
     @lock _OWNED_DEEP_LOCK (_OWNED_DEEP_MEMO[key] = v)
     return v
+end
+
+# What a package image generated now would hold from this process's inference: the specializations
+# recorded since the process started, by the module of their method. Meant to be called from the end
+# of a module body while it precompiles, to see what the checks left in the image.
+function _image_report(io::IO = stderr; top::Int = 10)
+    bymod = Dict{String, Int}()
+    byname = Dict{String, Int}()
+    for ci in Base.newly_inferred
+        d = ci.def
+        mi = d isa Core.MethodInstance ? d : (isdefined(d, :def) ? d.def : nothing)
+        mi isa Core.MethodInstance || continue
+        mi.def isa Method || continue
+        bymod[string(mi.def.module)] = get(bymod, string(mi.def.module), 0) + 1
+        k = string(mi.def.module, ".", mi.def.name)
+        byname[k] = get(byname, k, 0) + 1
+    end
+    pick(d) = first(sort(collect(d); by = x -> -x[2]), top)
+    println(io, "specializations for the image: ", length(Base.newly_inferred))
+    println(io, "  by module: ", pick(bymod))
+    println(io, "  by method: ", pick(byname))
+    return nothing
 end
