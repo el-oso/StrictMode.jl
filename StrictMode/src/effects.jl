@@ -266,19 +266,38 @@ function _mi_is_barrier(mi::Core.MethodInstance)
     return length(ps) >= 2 && _is_base_barrier_type(ps[2]) && mi.def.module === Base
 end
 
-# How many non-inlined `:invoke` levels the alloc/boxing/dictlookup scan follows by default. F35
+# How many non-inlined `:invoke` levels of Base the alloc/boxing/dictlookup scan follows by default; the
+# package's own helpers are followed to the end of their call graph whatever this is. F35
 # measured depth 1 as sufficient on the PureFFT/BlazingPorts corpus; BLAS/LAPACK-style drivers
 # (issue #8) route workspace allocation through a `driver! -> prep-helper -> similar/Array` chain
 # that's 2+ levels deep, which depth 1 can't see. Override for a codebase with deeper chains:
 # `StrictMode._FAST_ALLOC_DEPTH[] = 3`.
 const _FAST_ALLOC_DEPTH = Ref(2)
 
+# The most bodies one scan reads. A call graph larger than this leaves the verdict `truncated`.
+const _SCAN_BODY_BUDGET = Ref(1000)
+
+# Base's task, lock and condition code. Its run-time dispatch is the scheduler's own, off the call's
+# hot path, and AllocCheck reports none there, so a callee reached only through it is not boxing.
+const _SCHEDULER_FILES = ("task.jl", "condition.jl", "lock.jl", "locks-mt.jl", "partr.jl")
+_in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && mi.def.module === Base &&
+    basename(string(mi.def.file)) in _SCHEDULER_FILES
+
+# A callee the scan follows below the Base levels: one defined outside Base and Core, or a Base
+# method handed the package's code or types to run (a closure given to `map`).
+function _enters_user_code(mi::Core.MethodInstance)
+    mi.def isa Method || return false
+    root = Base.moduleroot(mi.def.module)
+    return !(root === Base || root === Core) || _carries_user_type(mi.specTypes)
+end
+
 """
     _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[]) -> (; alloc, boxing, dictlookup, abscontainer, barrier, file, line)
 
 Value-free allocation heuristic from optimized typed IR (no execution, no backend). `alloc` flags
 explicit heap allocation (`:new` of a mutable/Array/`Core.Box` type, or a GC/box `:foreigncall`),
-**following non-inlined `:invoke` callees to `depth` levels** (allocations in a non-inlined helper
+**following non-inlined `:invoke` callees: Base's to `depth` levels, the package's own to the end of
+its call graph** (allocations in a non-inlined helper
 — a grow path, a string build — are real allocations of the caller). `boxing` flags the boxing /
 dynamic-dispatch subclass:
 
@@ -310,8 +329,9 @@ const _AllocSignals = @NamedTuple{
     # A registered barrier the call reaches whose own dictionary lookup, or boxing, is reported at the
     # barrier rather than here (`nothing` when there is none).
     barrier_dict::Union{Nothing, Symbol}, barrier_box::Union{Nothing, Symbol},
-    # The walk reached its depth limit with a callee outside Base still unread, so a verdict that
-    # depends on what lies below it (`:owned`) is not established.
+    # The walk did not read the whole call graph: a body it could not read, the body budget, or the
+    # depth limit with a callee outside Base below it. A verdict that depends on what lies below
+    # (`:noalloc`, `:noboxing`, `:owned`) is not established.
     truncated::Bool,
 }
 
@@ -536,8 +556,17 @@ end
 const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
+# A body already on this walk contributes nothing a second time, so a result computed below such a
+# cut is the walk's, not the body's own: it omits what the cut body reaches. Memoizing it would hand
+# a later walk, which reaches the body by another route, a verdict with that part missing. The scan
+# therefore counts its cuts, and only a body whose subtree met none is memoized.
+_cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)::Base.RefValue{Int}
+
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
-    sig in seen && return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
+    if sig in seen
+        _cut_counter()[] += 1
+        return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
+    end
     push!(seen, sig)
     key = (depth, Base.get_world_counter())   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
@@ -545,19 +574,37 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
         bysig === nothing ? nothing : get(bysig, key, nothing)
     end
     memo === nothing || return memo
+    cuts = _cut_counter()
+    before = cuts[]
     r = _signals_by_type_uncached(sig, depth, seen)
+    cuts[] == before || return r
     @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+# The optimized body of a signature, or `nothing` when none can be read. Inferring a body is most of
+# what a scan costs, and the same body is reached again by every walk that passes through it, at
+# each depth and from every entry point, so it is read once per world.
+const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any}}()
+
+function _typed_body(@nospecialize(sig))
+    world = Base.get_world_counter()
+    hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
+    (!isnothing(hit) && hit[1] == world) && return hit[2]
     cts = try
         _code_typed_by_type(sig; optimize = true)
     catch
-        return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
+        Any[]
     end
-    isempty(cts) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
-    return _scan_ci(first(cts)[1], sig, depth, seen)
+    ci = isempty(cts) ? nothing : first(cts[1])
+    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci))
+    return ci
+end
+
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
+    ci = _typed_body(sig)
+    isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
+    return _scan_ci(ci, sig, depth, seen)
 end
 
 # Would a value of this type have to be boxed to flow through a union-typed slot? An isbits type
@@ -711,12 +758,32 @@ function _immutable_escapes(ci, @nospecialize(sig), uses, dead, i::Int, seen::Bi
     return false
 end
 
+# `Base.unsafe_convert(Ptr, ref)` lowers to a `jl_value_ptr` call on the `Ref` and a `bitcast` of the
+# result. The pointer is confined when everything it reaches is a `bitcast` that is itself confined,
+# or a `ccall`; a pointer stored, returned or passed to a Julia call may outlive the frame.
+function _ptr_confined(ci, uses, i::Int)
+    for (j, _) in uses[i]
+        st = ci.code[j]
+        if Meta.isexpr(st, :foreigncall)
+            continue
+        elseif Meta.isexpr(st, :call) && _static_callee(ci, st.args[1]) === Core.bitcast
+            _ptr_confined(ci, uses, j) || return false
+        else
+            return false
+        end
+    end
+    return true
+end
+
 function _ccall_ref_only(ci, uses, i::Int)
     sawccall = false
     for (j, k) in uses[i]
         st = ci.code[j]
         if Meta.isexpr(st, :foreigncall)
+            occursin("jl_value_ptr", string(st.args[1])) && !_ptr_confined(ci, uses, j) && return false
             sawccall = true
+        elseif Meta.isexpr(st, :gc_preserve_begin)
+            continue
         elseif Meta.isexpr(st, :call) && k == 2
             callee = _static_callee(ci, st.args[1])
             (callee === Core.getfield || callee === Core.setfield!) || return false
@@ -751,7 +818,7 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
     # are pointed there rather than failed again for the same cause.
     barrier_dict = nothing
     barrier_box = nothing
-    truncated = false                 # a callee outside Base was left unread at the depth limit
+    truncated = false                 # part of the call graph was left unread
     # Per frame, so a callee's own `:new`s are judged against the callee's own escape analysis.
     # Computed on demand: the analysis costs about as much as the whole rest of the scan, and it can
     # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
@@ -845,8 +912,17 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                         # exemption, never grant one. `abscontainer` is one-sided here too, and
                         # more so: it is a top-level-only signal, never propagated from a callee
                         # (widening it to callees and to dict value types over-flags `IdDict`, #17).
-                        if depth > 0 && (!alloc || !boxing || !dictlookup)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, depth - 1, seen)
+                        # The package's own code is followed to the end of its call graph (bounded by
+                        # `_SCAN_BODY_BUDGET`): `depth` counts levels of Base only, since an allocation
+                        # reached through a chain of the package's own helpers is as real as one in the
+                        # first. Below the last Base level `depth` is -1, which follows user code alone.
+                        user = _enters_user_code(mi)
+                        follows = depth > 0 || (depth < 0 && user)
+                        if follows && (!alloc || !boxing || !dictlookup) && length(seen) > _SCAN_BODY_BUDGET[]
+                            truncated = true
+                        elseif follows && (!alloc || !boxing || !dictlookup)
+                            sub = user ? depth : (depth > 1 ? depth - 1 : -1)
+                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen)
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)
@@ -862,11 +938,11 @@ function _scan_ci(ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any})
                                 exempt = exname
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
-                            b2 && (boxing = true)
+                            (b2 && !_in_scheduler(mi)) && (boxing = true)
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
                             up2 && (unionphi = true)
-                        elseif depth <= 0 && !dictlookup && mi.def isa Method &&
+                        elseif iszero(depth) && !dictlookup && mi.def isa Method &&
                                 !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
                             # The walk ends here with a callee of the user's own unread: whatever it
                             # does is not in this verdict, so `:owned` reports it as not checked.

@@ -30,7 +30,8 @@ end
     @noinline _l1(::Type{T}) where {T} = _l2(T)
     usescr(::Type{T}) where {T} = length(_l1(T))
 
-    @test !StrictMode._alloc_signals(usescr, (Type{Float64},); depth = StrictMode._FAST_ALLOC_DEPTH[]).dictlookup
+    # The package's own helpers are followed to the end whatever the depth, so the lookup is seen here too.
+    @test StrictMode._alloc_signals(usescr, (Type{Float64},); depth = StrictMode._FAST_ALLOC_DEPTH[]).dictlookup
 
     old = StrictMode._FAST_ALLOC_DEPTH[]
     StrictMode._FAST_ALLOC_DEPTH[] = 3

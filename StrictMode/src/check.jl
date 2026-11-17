@@ -41,6 +41,16 @@ _mkfinding(
     fail ? (isempty(suggestion) ? _suggestion(g) : suggestion) : "", tier, _code(g, cause)
 )
 
+# A clean verdict from a scan that left part of the call tree unread. `:fail`, like any analysis
+# that could not be evaluated, so "could not read it all" and "is fine" never render alike.
+_truncated_finding(md, fn, sg, g, sig; tier::Symbol = :report) = StrictFinding(
+    md, fn, sg, g, :fail, sig.file, sig.line,
+    "not established: the value-free scan found nothing, but did not read the whole call tree " *
+        "below this call (a body it could not read, or more than $(_SCAN_BODY_BUDGET[]) bodies)",
+    "check a smaller part of the call, or prove it with StrictModeTest (`@test_noalloc`)", tier,
+    _code(:truncated, nothing)
+)
+
 const _GUARANTEES = (
     :typestable, :noalloc, :noboxing, :owned, :inlined, :vectorized,
     :no_scalar_loops, :no_spill, :trim_compatible, :trusted, :noescape,
@@ -52,11 +62,11 @@ const _GUARANTEES = (
 # than failed again, or passed as if it had been checked.
 _barrier_note(md, fn, sg, g::Symbol, barrier::Symbol, file, line; tier::Symbol = :report) =
     StrictFinding(
-        md, fn, sg, g, :info, file, line,
-        "reaches `$barrier`, a registered allocation barrier; its " *
-            (g === :owned ? "dictionary lookup" : "boxing") * " is reported there, under :$g",
-        "", tier, _code(g, nothing)
-    )
+    md, fn, sg, g, :info, file, line,
+    "reaches `$barrier`, a registered allocation barrier; its " *
+        (g === :owned ? "dictionary lookup" : "boxing") * " is reported there, under :$g",
+    "", tier, _code(g, nothing)
+)
 
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
 # same answer whichever tier asks, so `StrictModeTest` delegates here for these instead of keeping
@@ -215,7 +225,9 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             )
         elseif g === :noalloc
             fail = sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
-            if !fail && isnothing(sig.exempt) && !isnothing(sig.barrier_box)
+            if !fail && sig.truncated
+                push!(out, _truncated_finding(md, fn, sg, g, sig))
+            elseif !fail && isnothing(sig.exempt) && !isnothing(sig.barrier_box)
                 push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
             elseif !fail && !isnothing(sig.exempt)
                 # Its only allocation is in a callee exempted from `:noalloc`: a note, so the
@@ -232,6 +244,10 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             end
         elseif g === :noboxing
             fail = sig.boxing || !isnothing(sig.abscontainer)
+            if !fail && sig.truncated
+                push!(out, _truncated_finding(md, fn, sg, g, sig))
+                continue
+            end
             if !fail && !isnothing(sig.barrier_box)
                 push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
                 continue

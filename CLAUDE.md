@@ -50,7 +50,16 @@ StrictMode/src/
                         no sweep has values to give it)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
-  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned),
+  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned; `depth`
+                        counts levels of BASE only — the package's own helpers are followed to the end,
+                        bounded by _SCAN_BODY_BUDGET, and a scan that read less than the whole tree is
+                        `truncated`, which findings report as :fail SM0207, never :pass. A callee result
+                        is memoized only when its subtree met no cut (_cut_counter): a result computed
+                        below a cut is the walk's, not the body's, and made verdicts order-dependent.
+                        _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
+                        a dynamic dispatch in `trypoptask` for some callers and not others, so it is
+                        not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an
+                        explicit unsafe_convert while it stays confined to ccalls),
                         ignore_throw/set_ignore_throw! (both tiers honor it), _DICT_ACCESSORS,
                         register_alloc_barrier!/_is_base_barrier_type/_mi_is_barrier (issue #14
                         one-time-init allocation barriers: OncePerProcess/OncePerThread auto-

@@ -82,6 +82,7 @@ function clear_cache!()
     @lock _SIGNAL_MEMO_LOCK begin                  # the scan memos share the staleness contract
         empty!(_SIGNAL_MEMO)
         empty!(_TOP_SIGNAL_MEMO)
+        empty!(_BODY_MEMO)
         empty!(_RETTYPE_MEMO)
         empty!(_MATCH_MEMO)
     end

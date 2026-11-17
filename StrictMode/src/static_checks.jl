@@ -41,12 +41,25 @@ function _unread_fail(g::Symbol, target, sig; gates::Bool = _guarantee_gates(g))
     return true
 end
 
+# The scan found nothing but did not read the whole call tree, so its silence is not a verdict.
+function _truncated_fail(g::Symbol, target, sig; gates::Bool = _guarantee_gates(g))
+    sig.truncated || return false
+    _fail(
+        g, target,
+        "not established: the value-free scan found nothing, but did not read the whole call tree " *
+            "below this call (a body it could not read, or more than $(_SCAN_BODY_BUDGET[]) bodies)";
+        gates
+    )
+    return true
+end
+
 # The scan half on its own, with no thunk: the caller already has the value.
 function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types)
     _unread_fail(:noalloc, target, sig) && return nothing
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
+    elseif _truncated_fail(:noalloc, target, sig)
     else
         _barrier_info(:noalloc, target, sig.barrier_box)
     end
@@ -68,6 +81,7 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
         _unread_fail(:noalloc, target, sig) && return val
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _box_msg("allocates / boxes (value-free IR scan)", sig))
+        elseif _truncated_fail(:noalloc, target, sig)
         else
             _barrier_info(:noalloc, target, sig.barrier_box)
         end
@@ -159,6 +173,7 @@ function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
     _unread_fail(:noboxing, target, sig) && return nothing
     if sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig))
+    elseif _truncated_fail(:noboxing, target, sig)
     else
         _barrier_info(:noboxing, target, sig.barrier_box)
     end

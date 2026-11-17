@@ -91,6 +91,10 @@ function _verify_strict_def(
                 "add StrictModeTest to your test environment and call test_registered() to " *
                 "resolve it)", sig
         )
+    elseif sig.truncated
+        @warn "@strict_function $target: not established — the value-free scan found nothing, but " *
+            "did not read the whole call tree below this call. Add StrictModeTest to your test " *
+            "environment and call test_registered() to prove it."
     end
     return nothing
 end
