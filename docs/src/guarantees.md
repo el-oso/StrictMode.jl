@@ -571,6 +571,16 @@ xs = [1.5, 2.5, 3.5]
 end
 ```
 
+A line may name the argument types instead of passing values, which needs no instance. Write
+every positional argument as `::T` and every keyword as `name::T`; keywords may come in any order,
+and one left out takes its default:
+
+```@example guide
+@verify_strict PeakMetric begin
+    score(::PeakMetric, ::Vector{Float64})
+end
+```
+
 An implementation that has the right methods but allocates is reported:
 
 ```julia

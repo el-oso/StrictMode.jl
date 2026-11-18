@@ -82,6 +82,21 @@ package's top level pays for at every consumer's precompile.
 
 Each argument expression is still evaluated once, so bind them to values that are cheap to produce.
 
+A line may give the argument types instead of an example call: every positional argument written
+`::T` and every keyword `name::T`. Nothing but the function and the type expressions is evaluated,
+so no instance has to exist. Keywords may be listed in any order — the line is checked as the
+`Core.kwcall` signature with the keywords in the order the method declares them — and a keyword
+left out takes its default, as in a call. A keyword the method does not declare by name, or a
+positional signature no single method matches, is an error. The two kinds of line may be mixed in
+one block:
+
+```julia
+@verify_strict MyKPI begin
+    compute(::MyKPI, ::Vector{Float64}; window::Int)
+    name(k)
+end
+```
+
 `@verify_strict T guarantees = (...) begin … end` checks exactly the named guarantees on each
 listed call instead, the way [`@strict_function`](@ref)`guarantees = …` does, and registers each
 signature so `StrictModeTest.test_registered` re-proves it. Keeping only the guarantees that gate
@@ -129,7 +144,8 @@ function _verify_strict(__source__, __module__, T, block, guarantees)
         # Already fully escaped and self-gated. The call itself is NOT performed: every check here
         # reads the argument types, this block's values are discarded, and performing one call
         # compiles its whole tree.
-        push!(out, isnothing(guarantees) ? _strict_expr(s; execute = false) : _verify_listed(s, guarantees, __source__))
+        p = _line_parts(s)
+        push!(out, isnothing(guarantees) ? _strict_expr(s; execute = false, parts = p) : _verify_listed(s, guarantees, __source__, p))
     end
     # The interface check runs AFTER the per-call checks. Those infer each listed call at its
     # concrete types, and TypeContracts reads conformance for an unannotated member from that cached
@@ -141,8 +157,7 @@ end
 # One listed call checked for exactly `guarantees`, through the funnel `@strict_function
 # guarantees = …` uses: each guarantee gates or warns as `_guarantee_gates` says, and the signature
 # is registered so the test-environment drivers re-prove it.
-function _verify_listed(call, guarantees, src)
-    p = _call_parts(call)
+function _verify_listed(call, guarantees, src, p)
     srcstr = "@verify_strict at " * string(src.file) * ":" * string(src.line)
     checked = quote
         $(p.binds...)
@@ -152,6 +167,88 @@ function _verify_listed(call, guarantees, src)
         )
     end
     return _gate(checked, nothing)
+end
+
+# --- signature lines ----------------------------------------------------------------------------
+
+_is_sig_arg(a) = Meta.isexpr(a, :(::), 1)
+_is_sig_kw(a) = Meta.isexpr(a, :(::), 2) && a.args[1] isa Symbol
+
+# The parts of one listed line: `_signature_parts` for a signature line, `_call_parts` otherwise.
+function _line_parts(line)
+    p = _signature_parts(line)
+    return isnothing(p) ? _call_parts(line) : p
+end
+
+# A signature line `f(::T1, ::T2; k1::K1, …)` names the argument types directly. Returns the
+# `binds`/`checkfn`/`types` an example call with arguments of those types gets from `_call_parts`,
+# or `nothing` when `line` is not a signature line. Only `f` and the type expressions are evaluated.
+function _signature_parts(line)
+    Meta.isexpr(line, :call) || return nothing
+    pos = Any[]
+    kws = Any[]
+    for a in line.args[2:end]
+        Meta.isexpr(a, :parameters) ? append!(kws, a.args) : push!(pos, a)
+    end
+    nsig = count(_is_sig_arg, pos) + count(_is_sig_kw, kws)
+    iszero(nsig) && return nothing
+    nsig == length(pos) + length(kws) || throw(
+        ArgumentError(
+            "@verify_strict: `$line` mixes a signature with an example call. A signature line " *
+                "writes every positional argument as `::T` and every keyword as `name::T`; an " *
+                "example call passes values (`f(x, y; name = value)`)."
+        )
+    )
+
+    fnsym = gensym(:f)
+    binds = Any[:($fnsym = $(esc(line.args[1])))]
+    tsyms = [gensym(:T) for _ in pos]
+    append!(binds, Any[:($s = $(esc(a.args[1]))) for (s, a) in zip(tsyms, pos)])
+    postypes = Expr(:tuple, tsyms...)
+    isempty(kws) && return (; binds, checkfn = fnsym, types = postypes)
+
+    ksyms = [gensym(:K) for _ in kws]
+    append!(binds, Any[:($s = $(esc(k.args[2]))) for (s, k) in zip(ksyms, kws)])
+    names = Tuple(Symbol[k.args[1] for k in kws])
+    sigsym = gensym(:sig)
+    push!(
+        binds, :(
+            $sigsym = $(_signature_kwcall_types)(
+                $fnsym, $postypes, $(QuoteNode(names)), $(Expr(:tuple, ksyms...)), $(string(line))
+            )
+        )
+    )
+    return (; binds, checkfn = Core.kwcall, types = sigsym)
+end
+
+# The `Core.kwcall` argument types of `f(postypes...; names::kwtypes...)`, with the keywords in the
+# order the method DECLARES them. A `NamedTuple` type is order-sensitive and a caller may write
+# keywords in any order, so the declared order is the one spelling every listing of the same
+# keywords agrees on. A keyword left out is absent from the `NamedTuple`: the keyword sorter tests
+# `isdefined(kw, :name)` and substitutes the default, as it does for a call that omits it.
+function _signature_kwcall_types(@nospecialize(f), postypes::Tuple, names::Tuple, kwtypes::Tuple, line)
+    tt = Tuple{postypes...}
+    if !hasmethod(f, tt)
+        cause = isempty(Base.methods_including_ambiguous(f, tt)) ? "no method matches" : "more than one method matches, ambiguously,"
+        throw(ArgumentError("@verify_strict: $cause the positional signature ($(join(postypes, ", "))) in `$line`"))
+    end
+    m = which(f, tt)
+    # A method taking `kw...` is held to its named keywords too: a keyword that only the splat
+    # accepts has no declared position, so no order for it is canonical.
+    decl = Base.kwarg_decl(m)
+    for n in names
+        n in decl || throw(
+            ArgumentError(
+                "@verify_strict: keyword `$n` in `$line` is not declared by the method it dispatches " *
+                    "to, $m (declared keywords: $(join(filter(d -> !endswith(string(d), "..."), decl), ", ")))"
+            )
+        )
+        count(==(n), names) == 1 ||
+            throw(ArgumentError("@verify_strict: keyword `$n` is listed more than once in `$line`"))
+    end
+    order = [i for d in decl for i in eachindex(names) if names[i] === d]
+    NT = NamedTuple{Tuple(names[i] for i in order), Tuple{(kwtypes[i] for i in order)...}}
+    return (NT, Core.Typeof(f), postypes...)
 end
 
 # --- the TypeContracts verify hook --------------------------------------------------------------

@@ -174,7 +174,14 @@ StrictMode/src/
                         @strict_exempt (a definition, a name, a `begin … end` block, or an
                         `include` whose definitions are found by diffing the census), @strict_policy
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
-                        StrictMode performance guarantees)
+                        StrictMode performance guarantees. A @verify_strict line is an
+                        example call or a SIGNATURE line, `f(::T1, ::T2; k::K)`: _signature_parts
+                        yields the same binds/checkfn/types _call_parts does, so both go down one
+                        funnel. A keyword signature is the Core.kwcall one with the NamedTuple in
+                        the order Base.kwarg_decl gives for the method `which` picks — a
+                        NamedTuple type is order-sensitive, and declaration order is the one
+                        spelling every listing agrees on. An omitted keyword is simply absent:
+                        the sorter tests isdefined and substitutes the default)
   registry.jl         — @strict_function registry, register_strict!, watch/unwatch, _demangle
                         (kwsorter name stripping), and the ITEM BUILDERS both tiers share:
                         _registry_items/_compiled_items/_map_findings/_run_and_report. The

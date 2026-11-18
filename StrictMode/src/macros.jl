@@ -244,9 +244,9 @@ const _GENERATION = Ref{UInt}(0)
 # forces its whole tree to be compiled, and a `@verify_strict` block at a package's top level pays
 # that at every consumer's precompile (issue #40, measured at 672 s and 5.7 GB on a 119-call BLAS
 # consumer against the same build with the block skipped, of which the IR scans are 13 s).
-function _strict_expr(call; types = nothing, execute::Bool = true)
+function _strict_expr(call; types = nothing, execute::Bool = true, parts = _call_parts(call; types))
     target = string(call)
-    p = _call_parts(call; types)
+    p = parts
     site = QuoteNode(gensym(:strictsite))
 
     # (1) Type stability, from inference. Two spellings of one question, because a site wrapping a

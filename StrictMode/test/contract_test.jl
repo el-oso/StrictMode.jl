@@ -107,3 +107,147 @@ end
         _sc_speak(::Self)::String
     end
 end
+
+@testitem "@verify_strict signature lines name types instead of values" begin
+    using StrictMode
+    using TypeContracts
+
+    StrictMode.clear_declarations!()
+    @strict_contract AbstractKernel4 begin
+        apply4(::Self, xs::AbstractVector{<:Real})::Real
+    end
+    function apply4 end
+    struct Kernel4 end
+    apply4(::Kernel4, xs::AbstractVector{<:Real}; alpha::Float64 = 1.0, beta::Float64 = 0.0, shift = 0) =
+        alpha * xs[begin] + beta + shift
+
+    gs = (:typestable,)
+    decls() = Set(keys(StrictMode.declarations()))
+
+    # No keywords: the declaration an example call with those types registers.
+    @verify_strict Kernel4 guarantees = gs begin
+        apply4(::Kernel4, ::Vector{Float64})
+    end
+    @test decls() == Set([(apply4, (Kernel4, Vector{Float64}))])
+
+    # Keywords in declaration order, in another order, and as an example call: one declaration.
+    k = Kernel4()
+    xs = [1.0, 2.0]
+    NT = @NamedTuple{alpha::Float64, beta::Float64}
+    kwsig = (Core.kwcall, (NT, typeof(apply4), Kernel4, Vector{Float64}))
+    for block in (
+            :(apply4(::Kernel4, ::Vector{Float64}; alpha::Float64, beta::Float64)),
+            :(apply4(::Kernel4, ::Vector{Float64}; beta::Float64, alpha::Float64)),
+            :(apply4(k, xs; alpha = 2.0, beta = 1.0)),
+        )
+        StrictMode.clear_declarations!()
+        @eval @verify_strict Kernel4 guarantees = $gs begin
+            $block
+        end
+        @test decls() == Set([kwsig])
+        @test StrictMode.declarations()[kwsig].guarantees == gs
+    end
+
+    # An omitted keyword is absent from the NamedTuple, so the sorter supplies its default; the
+    # listed one keeps the type the line gives it, not the default's.
+    StrictMode.clear_declarations!()
+    @verify_strict Kernel4 guarantees = gs begin
+        apply4(::Kernel4, ::Vector{Float64}; shift::Float64)
+    end
+    onekw = (Core.kwcall, (@NamedTuple{shift::Float64}, typeof(apply4), Kernel4, Vector{Float64}))
+    @test decls() == Set([onekw])
+    @test Base.return_types(onekw...) == [Float64]
+
+    # Signature lines and call lines in one block, in the form without `guarantees` too.
+    StrictMode.clear_declarations!()
+    @verify_strict Kernel4 guarantees = gs begin
+        apply4(::Kernel4, ::Vector{Float64}; beta::Float64, alpha::Float64)
+        apply4(k, xs)
+        apply4(::Kernel4, ::Vector{Float32})
+    end
+    @test decls() == Set([kwsig, (apply4, (Kernel4, Vector{Float64})), (apply4, (Kernel4, Vector{Float32}))])
+    @test_logs @verify_strict Kernel4 begin
+        apply4(::Kernel4, ::Vector{Float64}; beta::Float64, alpha::Float64)
+        apply4(k, xs; shift = 1)
+    end
+    StrictMode.clear_declarations!()
+end
+
+@testitem "@verify_strict signature lines reject what no call could be" begin
+    using StrictMode
+    using TypeContracts
+
+    @strict_contract AbstractKernel5 begin
+        apply5(::Self, xs::AbstractVector{<:Real})::Real
+    end
+    function apply5 end
+    struct Kernel5 end
+    apply5(::Kernel5, xs::AbstractVector{<:Real}; alpha::Float64 = 1.0) = alpha * xs[begin]
+    struct Splat5 end
+    apply5(::Splat5, xs::AbstractVector{<:Real}; alpha::Float64 = 1.0, rest...) = alpha * xs[begin]
+    k = Kernel5()
+
+    for gs in (nothing, (:typestable,))
+        opt = isnothing(gs) ? () : (:(guarantees = $gs),)
+        verify(T, line) = @eval @verify_strict $T $(opt...) begin
+            $line
+        end
+        # An undeclared keyword, also where the method takes `rest...`.
+        @test_throws "keyword `uplo` in `apply5(::Kernel5, ::Vector{Float64}; uplo::Char)` is not declared" verify(
+            :Kernel5, :(apply5(::Kernel5, ::Vector{Float64}; uplo::Char))
+        )
+        @test_throws "declared keywords: alpha" verify(:Splat5, :(apply5(::Splat5, ::Vector{Float64}; uplo::Char)))
+        @test_throws "listed more than once" verify(
+            :Kernel5, :(apply5(::Kernel5, ::Vector{Float64}; alpha::Float64, alpha::Float64))
+        )
+        # A positional signature no method matches, with and without keywords.
+        @test_throws "no method matches" verify(:Kernel5, :(apply5(::Kernel5, ::String; alpha::Float64)))
+        @test_throws "no method matches" verify(:Kernel5, :(apply5(::Kernel5, ::String)))
+        # A line that is half signature, half call.
+        @test_throws "mixes a signature with an example call" verify(:Kernel5, :(apply5(k, ::Vector{Float64})))
+        @test_throws "mixes a signature with an example call" verify(
+            :Kernel5, :(apply5(::Kernel5, ::Vector{Float64}; alpha = 1.0))
+        )
+        @test_throws "mixes a signature with an example call" verify(:Kernel5, :(apply5(k, [1.0]; alpha::Float64)))
+    end
+
+    amb5(x::Integer, y; a = 1) = 1
+    amb5(x, y::Integer; a = 1) = 2
+    @test_throws "more than one method matches" StrictMode._signature_kwcall_types(
+        amb5, (Int, Int), (:a,), (Int,), "amb5(::Int, ::Int; a::Int)"
+    )
+    StrictMode.clear_declarations!()
+end
+
+@testitem "@verify_strict signature lines check the keyword body" begin
+    using StrictMode
+    using TypeContracts
+
+    StrictMode.clear_declarations!()
+    @strict_contract AbstractKernel6 begin
+        apply6(::Self, xs::AbstractVector{<:Real})::Real
+    end
+    function apply6 end
+
+    # The allocation and the instability are in the keyword body: the positional method only
+    # forwards the defaults to it.
+    struct Alloc6 end
+    apply6(::Alloc6, xs::AbstractVector{<:Real}; scale::Float64 = 1.0) = scale * sum(collect(xs))
+    @test_logs (:warn, r"noalloc.*kwcall.*scale::Float64") match_mode = :any @verify_strict Alloc6 guarantees = (:noalloc,) begin
+        apply6(::Alloc6, ::Vector{Float64}; scale::Float64)
+    end
+    @test_logs (:warn,) match_mode = :any @verify_strict Alloc6 begin
+        apply6(::Alloc6, ::Vector{Float64}; scale::Float64)
+    end
+
+    struct Unstable6 end
+    const G6 = Ref{Any}(1.0)
+    apply6(::Unstable6, xs::AbstractVector{<:Real}; scale::Float64 = 1.0) = G6[]
+    @test_throws StrictViolation @verify_strict Unstable6 guarantees = (:typestable,) begin
+        apply6(::Unstable6, ::Vector{Float64}; scale::Float64)
+    end
+    @test_throws StrictViolation @verify_strict Unstable6 begin
+        apply6(::Unstable6, ::Vector{Float64}; scale::Float64)
+    end
+    StrictMode.clear_declarations!()
+end
