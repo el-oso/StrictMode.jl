@@ -503,6 +503,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         DynamicDispatch. _is_boxing reads a heap allocation of an isbits type as a
                         box; do NOT narrow it to `Any` slots: an abstract-eltype slot boxes the same
                         way and the site carries no destination.
+                        _kept/_Stamp keep two reads for the session: the sites of a signature
+                        (_SITES_MEMO) and what the walk
+                        reads from one body (_WALK_MEMO, by MethodInstance, shared by every
+                        signature that reaches it). A kept read holds in its own world, and in a
+                        later one while the compiler's CodeInstance for the specialization is valid;
+                        clear_cache! ends both through _GENERATION. Do NOT read a body from
+                        the compiler's cache instead of typeinf_code: it holds source for 115 of
+                        1945 walked LinearAlgebra bodies and 17 of those differ from a fresh read.
                         _opt_reports (JET,
                         wrapped in AnalysisError), _trim_validate (TrimCheck), _proof_findings/
                         proof_findings, ignore_barrier/set_ignore_barrier!

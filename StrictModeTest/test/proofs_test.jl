@@ -385,3 +385,29 @@ end
     @test isempty(StrictModeTest._native_dispatches(recover, (Float64,)))
     @test StrictModeTest._catch_only_mask(Any[Core.EnterNode(3), Core.ReturnNode(1), Core.ReturnNode(2)]) == [false, false, true]
 end
+
+@testitem "a proof's reads are kept while the code they were read from is unchanged" begin
+    using StrictMode, StrictModeTest
+    @noinline leaf(x::Float64) = x + 1.0
+    entry(x::Float64) = leaf(x) * 2.0
+    entry(1.0)   # compiled, so the compiler holds a record of the specialization
+    T = (Float64,)
+    sites = StrictModeTest._raw_allocs_unfiltered(entry, T)
+    @test isempty(sites)
+    @test StrictModeTest._raw_allocs_unfiltered(entry, T) === sites
+
+    # A definition the signature does not depend on moves the world and ends nothing.
+    @eval unrelated() = 1
+    @test StrictModeTest._raw_allocs_unfiltered(entry, T) === sites
+
+    # Redefining a callee ends the record, so the proof reads the new code.
+    @eval @noinline leaf(x::Float64) = (push!(Any[], x); x + 1.0)
+    @test !isempty(StrictModeTest._raw_allocs_unfiltered(entry, T))
+    @eval @noinline leaf(x::Float64) = Base.inferencebarrier(x) + 1.0
+    @test any(a -> a isa StrictModeTest.AllocCheck.DynamicDispatch, StrictModeTest._native_dispatches(entry, T))
+
+    # A changed setting ends every kept read.
+    kept = StrictModeTest._raw_allocs_unfiltered(entry, T)
+    StrictMode.set_ignore_throw!(StrictMode.ignore_throw())
+    @test StrictModeTest._raw_allocs_unfiltered(entry, T) !== kept
+end

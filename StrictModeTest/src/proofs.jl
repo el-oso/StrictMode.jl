@@ -119,10 +119,63 @@ end
 # `StrictMode.ignore_throw()` (default true): don't count allocations on never-taken error/throw branches
 # (BoundsError etc.) — they are not on the hot path and produce false positives on
 # runtime-zero-alloc code.
-_raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) = vcat(
-    AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
-    _native_dispatches(f, types)
-)
+function _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types))
+    world = Base.get_world_counter()
+    # AllocCheck and the walk infer outside the compiler's cache. Inferring the entry into it makes
+    # the record that lets these sites hold in a later world.
+    entry() = (Base.return_types(f, Tuple{types...}; world); Base.method_instance(f, types; world))
+    return _kept(_SITES_MEMO, StrictMode._sigtype(f, types), world, entry) do
+        vcat(
+            AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
+            _native_dispatches(f, types)
+        )
+    end
+end
+
+# Most of what the allocation proofs cost is reading code: AllocCheck's compile of the call graph,
+# and the inference of each body the native walk visits. A signature is proved again by another
+# driver or for another guarantee, and the same bodies are reached from most signatures, so each
+# read is kept for the session.
+#
+# A kept read holds in the world it was made in. In a later world it holds while the compiler's
+# record of the specialization it was read from is valid: Julia ends that record when a method or a
+# binding that the inference of the specialization, or of anything it calls statically, depended on
+# changes. A specialization the compiler holds no record of is read again in every new world.
+# Every setting a proof reads (`ignore_throw`, the barriers, the exemptions) clears StrictMode's
+# cache when it is changed, which advances `_GENERATION` and ends every kept read.
+struct _Stamp
+    world::UInt
+    generation::UInt
+    record::Union{Nothing, Core.CodeInstance}
+end
+
+function _holds(s::_Stamp)
+    s.generation == StrictMode._GENERATION[] || return false
+    world = Base.get_world_counter()
+    s.world == world && return true
+    r = s.record
+    return !isnothing(r) && r.min_world <= world <= r.max_world
+end
+
+const _MEMO_LOCK = ReentrantLock()
+# By signature type: the sites of `_raw_allocs_unfiltered`.
+const _SITES_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
+# By specialization: what the native walk reads from its body (`_walk_body`).
+const _WALK_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
+
+# `read()`, or what an earlier call kept under `key`. `world` is the world `read` reads in, and
+# `entry()` the specialization it reads from, asked after the read because the read is often what
+# makes the compiler record it. A read that raises keeps nothing.
+function _kept(read, memo::IdDict, @nospecialize(key), world::UInt, entry)
+    hit = @lock _MEMO_LOCK get(memo, key, nothing)
+    !isnothing(hit) && _holds(hit[1]) && return hit[2]
+    generation = StrictMode._GENERATION[]
+    value = read()
+    mi = entry()
+    record = mi isa Core.MethodInstance && Base.get_world_counter() == world ? StrictMode._record_of(mi, world) : nothing
+    @lock _MEMO_LOCK (memo[key] = (_Stamp(world, generation, record), value))
+    return value
+end
 
 # The dynamic calls in the code Julia's own compiler produces for `f(types...)` and for everything
 # that code invokes, each as an `AllocCheck.DynamicDispatch`.
@@ -154,20 +207,12 @@ function _native_dispatches(@nospecialize(f), @nospecialize(types))
     work = Any[entry]
     while !isempty(work)
         mi = pop!(work)
-        src = CC.typeinf_code(interp, mi, true)
-        src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
-        skip = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) .| _catch_only_mask(src.code) :
-            falses(length(src.code))
-        for (i, st) in pairs(src.code)
-            skip[i] && continue
-            if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
-                callee = StrictMode._invoke_mi(st.args[1])
-                (isnothing(callee) || haskey(parent, callee)) && continue
-                parent[callee] = mi
-                push!(work, callee)
-            elseif Meta.isexpr(st, :call)
-                ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
-                ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
+        for step in _walk_body(interp, world, mi)
+            if step isa Core.MethodInstance
+                haskey(parent, step) && continue
+                parent[step] = mi
+                push!(work, step)
+            else
                 bt = Base.StackTraces.StackFrame[]
                 m = mi
                 while !isnothing(m)
@@ -179,12 +224,36 @@ function _native_dispatches(@nospecialize(f), @nospecialize(types))
                     )
                     m = parent[m]
                 end
-                c = StrictMode._static_callee(src, st.args[1])
-                push!(out, AllocCheck.DynamicDispatch(bt, c isa Function ? nameof(c) : Symbol(ft)))
+                push!(out, AllocCheck.DynamicDispatch(bt, step))
             end
         end
     end
     return out
+end
+
+# What the walk reads from one optimized body, in statement order: the specialization of each
+# `:invoke` (a `MethodInstance`) and the callee name of each dynamic call (a `Symbol`).
+function _walk_body(interp, world::UInt, mi::Core.MethodInstance)
+    return _kept(_WALK_MEMO, mi, world, () -> mi) do
+        src = Base.Compiler.typeinf_code(interp, mi, true)
+        src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
+        skip = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) .| _catch_only_mask(src.code) :
+            falses(length(src.code))
+        steps = Any[]
+        for (i, st) in pairs(src.code)
+            skip[i] && continue
+            if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
+                callee = StrictMode._invoke_mi(st.args[1])
+                isnothing(callee) || push!(steps, callee)
+            elseif Meta.isexpr(st, :call)
+                ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
+                ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
+                c = StrictMode._static_callee(src, st.args[1])
+                push!(steps, c isa Function ? nameof(c) : Symbol(ft))
+            end
+        end
+        steps
+    end
 end
 
 # Statements reached only through a `catch`: not reachable from the first statement without taking an
