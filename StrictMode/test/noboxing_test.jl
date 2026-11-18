@@ -191,3 +191,65 @@ end
     @test StrictMode._noalloc_mode(true) === :static
     @test_throws ArgumentError StrictMode._assert_noalloc("boxy", boxy, (typeof(tup),), () -> boxy(tup); mode = :static)
 end
+
+@testitem "a splat the optimizer cannot unroll is run-time dispatch" begin
+    using StrictMode
+    # `max(v...)` over a `Vector` stays a `Core._apply_iterate` call whose result infers as `Float64`:
+    # the callee is still looked up at run time. Over a tuple the splat unrolls and nothing is left.
+    splat_vec(v::Vector{Float64}) = max(v...)
+    splat_tup(t::NTuple{3, Float64}) = max(t...)
+    @test StrictMode._alloc_signals(splat_vec, (Vector{Float64},); mode = :boxing).boxing
+    @test !StrictMode._alloc_signals(splat_tup, (NTuple{3, Float64},); mode = :boxing).boxing
+    f = only(findings(splat_vec, (Vector{Float64},); guarantees = (:noboxing,)))
+    @test StrictMode._failed(f)
+    @test f.code === :SM0003
+end
+
+@testitem "a builtin that hands back a reference is not boxing" begin
+    using StrictMode
+    struct ByReference
+        a::Vector{Float64}
+        b::Vector{Int}
+        c::String
+    end
+    struct StoredInline
+        a::Int
+        b::Float64
+    end
+    # A run-time field name on a struct whose fields are all held by reference is a lookup and a
+    # load. With a field stored inline the value read has to be boxed.
+    by_reference(q::ByReference, s::Symbol) = getfield(q, s) === nothing
+    stored_inline(p::StoredInline, s::Symbol) = getfield(p, s) === nothing
+    runtime_index(t::Tuple{Int, Float64, Float32}, i::Int) = t[i] === nothing
+    @test !StrictMode._alloc_signals(by_reference, (ByReference, Symbol); mode = :boxing).boxing
+    @test StrictMode._alloc_signals(stored_inline, (StoredInline, Symbol); mode = :boxing).boxing
+    @test StrictMode._alloc_signals(runtime_index, (Tuple{Int, Float64, Float32}, Int); mode = :boxing).boxing
+    # A `typeassert` to a union returns the value it was given.
+    narrowed(r::Base.RefValue{Any}) = (r[]::Union{Int, Nothing}) === nothing
+    @test !StrictMode._alloc_signals(narrowed, (Base.RefValue{Any},); mode = :boxing).boxing
+    # `Base.inferencebarrier` boxes a value stored inline and hands a reference back as it is.
+    hidden_fn(x::Float64) = Base.inferencebarrier(sin) === nothing
+    hidden_value(x::Float64) = Base.inferencebarrier(x) === nothing
+    @test !StrictMode._alloc_signals(hidden_fn, (Float64,); mode = :boxing).boxing
+    @test StrictMode._alloc_signals(hidden_value, (Float64,); mode = :boxing).boxing
+end
+
+@testitem "a check site hides the checked function from inference" begin
+    using StrictMode
+    # The function is a constant at a call site, and a constant function is propagated through the
+    # whole scan and inferred again per site. The cold branch therefore passes it through
+    # `Base.inferencebarrier`; the guard's flag and the bare call still see the function itself.
+    kernel(x::Float64) = x + 1
+    for ex in (
+            :(@assert_noboxing kernel(1.0)), :(@assert_noalloc kernel(1.0)),
+            :(@assert_typestable kernel(1.0)), :(@strict kernel(1.0)),
+        )
+        s = string(macroexpand(@__MODULE__, ex))
+        @test occursin("inferencebarrier", s)
+    end
+    body = :(runner("t", fn, (Float64,)))
+    @test StrictMode._opaque_function(body, :fn).args[3] == :($(Base.inferencebarrier)(fn))
+    @test StrictMode._opaque_function(:(a + b), :fn) == :(a + b)
+    site() = @assert_noboxing kernel(1.0)
+    @test site() == 2.0
+end

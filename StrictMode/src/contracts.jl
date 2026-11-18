@@ -162,7 +162,7 @@ function _verify_listed(call, guarantees, src, p)
     checked = quote
         $(p.binds...)
         $(_verify_strict_guarantees)(
-            $(p.checkfn), $(p.types), $(string(call)), $(esc(guarantees));
+            $(Base.inferencebarrier)($(p.checkfn)), $(p.types), $(string(call)), $(esc(guarantees));
             mod = @__MODULE__, source = $srcstr
         )
     end

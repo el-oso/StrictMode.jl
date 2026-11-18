@@ -147,8 +147,10 @@ end
             StrictModeTest.proof_findings(kern, (Float64,); guarantees = (g,))
         catch err
             err isa ArgumentError &&
-                error("proof_findings cannot answer :$g, which is in _GUARANTEES: " *
-                      sprint(showerror, err))
+                error(
+                "proof_findings cannot answer :$g, which is in _GUARANTEES: " *
+                    sprint(showerror, err)
+            )
             rethrow()
         end
         @test length(fs) == 1
@@ -220,7 +222,11 @@ end
 
 @testitem "the clock read behind time_ns is not an allocation" begin
     using StrictMode, StrictModeTest
-    spin(n::Int) = (t0 = time_ns(); s = 0; for i in 1:n; s += i; end; time_ns() - t0 + s)
+    spin(n::Int) = (
+        t0 = time_ns(); s = 0; for i in 1:n
+            s += i
+        end; time_ns() - t0 + s
+    )
     spin_alloc(n::Int) = (t0 = time_ns(); v = zeros(n); time_ns() - t0 + length(v))
     spin(10); spin_alloc(10)
     @test only(proof_findings(spin, (Int,); guarantees = (:noalloc,))).status === :pass
@@ -258,4 +264,49 @@ end
     @test StrictMode._failed(g) && g.code !== :SM0017
     @test !occursin("blocks in the task scheduler", g.reason)
     @test only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,))).code === :SM0002
+end
+
+@testitem "a C varargs call is not reported as dispatch" begin
+    using StrictMode, StrictModeTest
+    const AC = StrictModeTest.AllocCheck
+    # AllocCheck lists a `ccall` with a required-argument count as a dispatch to an unknown target.
+    c_varargs(x::Int32) = ccall(:jl_safe_printf, Cvoid, (Ptr{UInt8}, Int32...), "%d\n", x)
+    raw = StrictModeTest._raw_allocs(c_varargs, (Int32,))
+    @test any(a -> a isa AC.DynamicDispatch && isnothing(a.fname), raw)
+    @test !any(StrictModeTest._is_boxing, raw)
+    @test !StrictMode._failed(only(StrictModeTest._proof_findings(c_varargs, (Int32,), (:noboxing,))))
+
+    # The same call next to a dispatch of the function's own stays a dispatch.
+    const HOOK = Ref{Any}(identity)
+    both(x::Int32) = (ccall(:jl_safe_printf, Cvoid, (Ptr{UInt8}, Int32...), "%d\n", x); HOOK[](x)::Int32)
+    @test StrictMode._failed(only(StrictModeTest._proof_findings(both, (Int32,), (:noboxing,))))
+
+    # A wait reaches `Base.trypoptask`, whose only such site is a `jl_safe_printf` of a warning: the
+    # call allocates (it can switch tasks) and does not box. Both tiers agree on each.
+    waits() = (yield(); nothing)
+    for g in (:noalloc, :noboxing)
+        proof = StrictMode._failed(only(StrictModeTest._proof_findings(waits, (), (g,))))
+        scan = StrictMode._failed(only(findings(waits, (); guarantees = (g,))))
+        @test proof == scan == (g === :noalloc)
+    end
+    # `string(::Int)` allocates through `jl_alloc_string`, called the same way.
+    @test !StrictMode._failed(only(StrictModeTest._proof_findings(string, (Int,), (:noboxing,))))
+end
+
+@testitem "the scan and the proof agree on dispatch shapes" begin
+    using StrictMode, StrictModeTest
+    struct ByReference
+        a::Vector{Float64}
+        b::Vector{Int}
+    end
+    splat_vec(v::Vector{Float64}) = max(v...)
+    by_reference(q::ByReference, s::Symbol) = getfield(q, s) === nothing
+    runtime_index(t::Tuple{Int, Float64, Float32}, i::Int) = t[i] === nothing
+    for (f, T, boxes) in (
+            (splat_vec, (Vector{Float64},), true), (by_reference, (ByReference, Symbol), false),
+            (runtime_index, (Tuple{Int, Float64, Float32}, Int), true),
+        )
+        @test StrictMode._failed(only(StrictModeTest._proof_findings(f, T, (:noboxing,)))) == boxes
+        @test StrictMode._failed(only(findings(f, T; guarantees = (:noboxing,)))) == boxes
+    end
 end

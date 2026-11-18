@@ -121,6 +121,29 @@ function _static_getfield(@nospecialize(callee), st)
     return !(a isa Core.SSAValue || a isa Core.Argument)
 end
 
+# A builtin whose result has no concrete type and which neither dispatches nor boxes: it hands back a
+# value that is already a reference. `typeassert` and `Core.current_scope` (behind every `ScopedValue`
+# read) return what they were given or what the task holds. A `getfield` with a run-time field name
+# boxes only a field that is stored inline; when every field of the receiver is held by reference
+# (`getproperty(F::QRPivoted, d::Symbol)` falling through to `getfield(F, d)`) it is a field lookup
+# and a load: measured 0 bytes, against 16 for a struct of an `Int` and a `Float64`.
+# `Core.compilerbarrier` (`Base.inferencebarrier`) returns its argument typed `Any`, which boxes a
+# value stored inline and nothing else. Every guarantee macro leaves one in the caller's body, around
+# the checked function, so reading it as boxing reports the guard against the function it guards.
+function _plain_load(ci, @nospecialize(sig), @nospecialize(callee), st::Expr)
+    (callee === Core.typeassert || (isdefined(Core, :current_scope) && callee === Core.current_scope)) && return true
+    if callee === Core.compilerbarrier && length(st.args) >= 3
+        A = _stmt_arg_type(ci, sig, st.args[3])
+        A isa Core.Const && (A = Core.Typeof(A.val))
+        return A isa Type && (Base.issingletontype(A) || !(isconcretetype(A) && Base.allocatedinline(A)))
+    end
+    (callee === Core.getfield && length(st.args) >= 3) || return false
+    R = _stmt_arg_type(ci, sig, st.args[2])
+    R isa Core.Const && (R = Core.Typeof(R.val))
+    (R isa DataType && isconcretetype(R) && !(R <: Tuple)) || return false
+    return all(i -> !Base.allocatedinline(fieldtype(R, i)), 1:fieldcount(R))
+end
+
 # `AbstractDict` accessors whose appearance on the hot path means a runtime keyed lookup — the
 # "static ownership" violation: an owned workspace must resolve to a const-dispatched
 # per-type accessor, never a runtime dictionary probe (measured ~130 ns/call, type-stable and
@@ -354,7 +377,9 @@ dynamic-dispatch subclass:
 - a `:call`/`:invoke` with an abstract, non-union-splittable result (e.g. a runtime tuple index,
   an un-`Val`ed `ntuple`), or
 - a dynamic `:call` (non-builtin) taking an abstract, non-union-splittable **argument** even when
-  its own result is concrete — the "internal dispatch with a concrete return" blind spot.
+  its own result is concrete — the "internal dispatch with a concrete return" blind spot, or
+- a `Core._apply_iterate` left in the body: a splat over a collection of unknown length
+  (`max(v...)`), whose callee is looked up at run time whatever its result infers as.
 
 A small all-concrete `Union` result stays unflagged (union-split, not boxing — flagging those
 over-reported on type-stable SIMD/pointer kernels). `dictlookup` flags a runtime `AbstractDict`
@@ -1290,7 +1315,15 @@ function _scan_ci(
                     alloc = true
                     isnothing(trace) || push!(trace, (i, st, :alloc))
                 end
-            elseif _nonconcrete(T) && !_static_getfield(callee, st)
+            elseif callee === Core._apply_iterate
+                # A splat the optimizer could not unroll (`max(v...)` over a `Vector`): the callee is
+                # looked up at run time for an argument list built at run time, whatever type
+                # inference gives the result.
+                if !dead[i]
+                    boxing = true
+                    isnothing(trace) || push!(trace, (i, st, :boxing))
+                end
+            elseif _nonconcrete(T) && !_static_getfield(callee, st) && !_plain_load(ci, sig, callee, st)
                 # A *dynamic* call with any non-concrete result boxes — including a small union
                 # (the founding runtime-tuple-index trap): union-split is a resolved-callee
                 # (`:invoke`) optimization, it does not save a dynamic `:call`. EXCEPT a

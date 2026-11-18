@@ -177,6 +177,10 @@ function findings(
         @nospecialize(f), @nospecialize(types::Tuple);
         guarantees = (:typestable, :noalloc),
     )
+    # A caller that names the function hands over a constant, and the compiler propagates a constant
+    # function through everything below, `@nospecialize` or not: the whole scan inferred again for
+    # every such caller (99 ms per call site, against 5 ms).
+    f = Base.inferencebarrier(f)
     key = _cache_key(f, types, guarantees)
     if !isnothing(key)
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
@@ -226,9 +230,8 @@ end
 # `_inlined_survives`).
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
     # A verdict read from no body is not a verdict, for any guarantee: "could not check" must not
-    # render as a pass. The scan is memoized, so asking it here costs nothing the guarantees below
-    # would not pay anyway.
-    if _alloc_signals(f, types; depth = 0).unread
+    # render as a pass. The body is memoized, and every guarantee below reads it.
+    if isnothing(_typed_body(_sigtype(f, types)))
         why = "no typed body could be read for this signature (no method matches, or its generator raised)"
         return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
     end

@@ -29,7 +29,7 @@ function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, ar
     return quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types))
+        $(StrictMode._opaque_function(:($(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types))), p.checkfn))
         _val
     end
 end

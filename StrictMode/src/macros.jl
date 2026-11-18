@@ -159,6 +159,16 @@ function _guarantee_expr(call, runner, extra_args...; types = nothing)
     end
 end
 
+# The check call with the checked function hidden from inference. At a call site the function is a
+# constant, and the compiler propagates a constant function into the callee and on through
+# everything the callee passes it to, `@nospecialize` or not: here that is the whole scan, inferred
+# again for every call site (measured 37 ms per `@assert_noboxing` site against 6 ms). The check
+# reads the function as a value, so nothing is lost by its type being unknown.
+function _opaque_function(body, fn)
+    Meta.isexpr(body, :call) || return body
+    return Expr(:call, (a === fn ? :($(Base.inferencebarrier)($fn)) : a for a in body.args)...)
+end
+
 # Wrap a check so it runs once per (call site, argument signature) instead of once per execution.
 #
 # Every check reached this way reads only the SIGNATURE — a scan of typed IR or of compiled output —
@@ -176,7 +186,7 @@ function _guarded_check(p, body)
         local var"#flag" = $(_site_flag)(Val($site), Tuple{Core.Typeof($(p.checkfn)), $(p.types)...})
         local var"#stamp" = $(_guard_stamp)()
         if var"#flag"[] != var"#stamp"
-            $body
+            $(_opaque_function(body, p.checkfn))
             var"#flag"[] = var"#stamp"
         end
     end
@@ -262,7 +272,7 @@ function _strict_expr(call; types = nothing, execute::Bool = true, parts = _call
             local var"#T" = $(Base.promote_op)($(p.checkfn), $(p.types)...)
             $(_is_typestable_return)(var"#T") || $(_stable_violation)($target, var"#T")
         end :
-        :($(_check_stable_once)($target, $(p.checkfn), $(p.types)))
+        _opaque_function(:($(_check_stable_once)($target, $(p.checkfn), $(p.types))), p.checkfn)
 
     checked = quote
         $(p.binds...)
@@ -272,7 +282,7 @@ function _strict_expr(call; types = nothing, execute::Bool = true, parts = _call
         local var"#flag" = $(_site_flag)(Val($site), Tuple{Core.Typeof($(p.checkfn)), $(p.types)...})
         local var"#stamp" = $(_guard_stamp)()
         if var"#flag"[] != var"#stamp"
-            $(_strict_scan)($target, $(p.checkfn), $(p.types))
+            $(_opaque_function(:($(_strict_scan)($target, $(p.checkfn), $(p.types))), p.checkfn))
             var"#flag"[] = var"#stamp"
         end
         $(execute ? p.litcall : nothing)

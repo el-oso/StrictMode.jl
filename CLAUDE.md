@@ -36,7 +36,13 @@ hand-off to C), take precedent from a mature system rather than inventing one:
 ```
 StrictMode/src/
   StrictMode.jl       — module root, exports, top-level docstring
-  macros.jl           — @strict (composite guarantee), @kernel (SIMD shorthand)
+  macros.jl           — @strict (composite guarantee), @kernel (SIMD shorthand). _guarded_check runs a
+                        check once per (site, signature); its cold branch passes the checked function
+                        through Base.inferencebarrier (_opaque_function), because a function that is a
+                        constant at the call site is constant-propagated through the whole scan and
+                        inferred again per site, @nospecialize or not (37 ms per @assert_noboxing site
+                        against 6 ms). findings() does the same on entry. Do NOT hand a runner the bare
+                        p.checkfn; the flag and promote_op still need the function itself
   preferences.jl      — checks_enabled/enable_checks!/disable_checks!/proofs_loaded, _gate (the
                         zero-cost compile-time expansion switch), assert_enabled, _announce_tier
                         (the load-time banner naming which TIER a session is in), direct_dependency
@@ -50,7 +56,13 @@ StrictMode/src/
                         no sweep has values to give it)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
-  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned; `depth`
+  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned). Dispatch
+                        is a dynamic :call with a non-concrete result or a boxy argument, plus a
+                        surviving Core._apply_iterate (a splat over a Vector: concrete result, callee
+                        still looked up at run time). _plain_load names the builtins whose non-concrete
+                        result is a reference handed back, not a box: typeassert, Core.current_scope,
+                        and a run-time-field getfield on a struct whose fields are ALL held by
+                        reference (an inline field does box: 16 B measured). `depth`
                         counts levels of BASE only — the package's own helpers are followed to the end,
                         bounded by _SCAN_BODY_BUDGET, and a scan that read less than the whole tree is
                         `truncated`, which findings report as :fail SM0207, never :pass. A callee result
@@ -454,6 +466,13 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         bare call, nothing registers, and test_registered() sweeps an empty
                         registry and passes), then announces the proof tier.
   src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _opt_reports (JET,
+                        wrapped in AnalysisError). _is_boxing drops a DynamicDispatch that is a C
+                        VARARGS call (_c_varargs_call): AllocCheck lists a `ccall` with a required-
+                        argument count as a dispatch to an unknown target, and Base.trypoptask holds
+                        one (a jl_safe_printf) that every wait reaches, as _string_n does for
+                        jl_alloc_string. Judged by the nearest frame with a specialization: its typed
+                        body must hold a varargs :foreigncall and no dispatch of its own.
+                        _opt_reports (JET,
                         wrapped in AnalysisError), _trim_validate (TrimCheck), _proof_findings/
                         proof_findings, ignore_barrier/set_ignore_barrier!
                         _trim_validate returns (passed, findings, sites, ORACLE): :patched is the

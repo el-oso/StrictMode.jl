@@ -158,7 +158,7 @@ _is_unattributed(@nospecialize(inst)) =
 # Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
 # uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
 function _is_boxing(@nospecialize(inst))
-    inst isa AllocCheck.DynamicDispatch && return true
+    inst isa AllocCheck.DynamicDispatch && return !_c_varargs_call(inst)
     if inst isa AllocCheck.AllocatingRuntimeCall
         n = inst.name
         # jl_box_int64 (boxing a primitive), jl_get_nth_field_checked (runtime tuple/field index
@@ -173,6 +173,32 @@ function _is_boxing(@nospecialize(inst))
     @warn "StrictModeTest: AllocCheck reported a $(typeof(inst)), which the boxing classifier " *
         "does not recognize — `:noboxing` cannot speak for it, and `:noalloc` still counts it. " *
         "If AllocCheck added or renamed an instance type, `_is_boxing` needs it." maxlog = 1
+    return false
+end
+
+# A C varargs call that AllocCheck reports as a dynamic dispatch. A `ccall` whose signature has a
+# required-argument count (`ccall(:printf, Cint, (Cstring, Cint...), …)`, or Base's `_string_n`, which
+# calls `jl_alloc_string` that way) compiles to a call through a varargs function type, and AllocCheck
+# lists a callee it cannot name as a dispatch to an unknown target. It is a call into C: nothing is
+# looked up and nothing is boxed. The one in `Base.trypoptask`, a `jl_safe_printf` of a warning, is
+# reached by every `wait`: counted as boxing, it fails `:noboxing` for every call that waits.
+#
+# The site carries no instruction to inspect, so it is judged by the function that holds it: the
+# nearest frame with a specialization, whose typed body must contain a varargs `:foreigncall` and no
+# dispatch of its own. Anything else stays a dispatch. A body holding both a varargs C call and a
+# dispatch the scan cannot see is therefore read as the C call alone.
+function _c_varargs_call(@nospecialize(inst))
+    isnothing(inst.fname) || return false
+    for fr in inst.backtrace
+        mi = _frame_mi(fr)
+        mi isa Core.MethodInstance || continue
+        ci = StrictMode._typed_body(mi.specTypes)
+        isnothing(ci) && return false
+        any(st -> Meta.isexpr(st, :foreigncall) && st.args[4] isa Int && st.args[4] > 0, ci.code) || return false
+        own = Base.IdSet{Any}()
+        push!(own, mi.specTypes)
+        return !StrictMode._scan_ci(ci, mi.specTypes, 0, own, :boxing)[2]
+    end
     return false
 end
 
