@@ -1,11 +1,54 @@
 # Guarantees
 
-Each guarantee pins a *necessary* property of a hot kernel — allocation-free, type-stable,
-vectorized — and tells you the moment an edit breaks it. Once an assert is in place it watches
-every future edit: refactor freely and get told the instant something crosses the line. They keep
-you on the fast path; they don't promise you've found the *fastest* path.
+A guarantee is a property you declare for a function and StrictMode checks: at the call site, when
+the module loads, or in the test suite. Once it is in place, any later edit that breaks the
+property is reported. The guarantees come in two kinds, and both are first-class: **speed**, the
+properties a hot path needs, and **correctness**, the properties that keep a program from reading
+the wrong memory, racing, or failing on a branch no test ran.
 
-For the gap between "passing" and "fast" — `@explain` and the rest of the tools — see
+### Speed
+
+| Guarantee | Holds when | Section |
+|:--- |:--- |:--- |
+| `:noalloc` | the call allocates nothing on the heap | `@assert_noalloc` below |
+| `:noboxing` | no value is boxed and nothing dispatches at run time; buffers may still be allocated | `@assert_noboxing` below |
+| `:typestable` | the return type and the locals are concrete | `@assert_typestable` below |
+| `:inlined` | a named callee is inlined into the caller | [`@assert_inlined`](@ref) |
+| `:vectorized`, `:no_scalar_loops` | the loops compile to vector arithmetic, not one element at a time | [`@assert_vectorized`](@ref), [Performance diagnostics](performance_diagnostics.md) |
+| `:no_spill` | the kernel's live values fit in registers | [`@assert_no_spill`](@ref) |
+| `:owned` | the hot path reaches its buffers by dispatch, not by a run-time lookup | Static ownership below |
+| `@test_no_gc_pause`, `test_latency` | no collection pauses the call; load and first-call time stay in budget | their sections below |
+
+### Correctness
+
+| Guarantee | Holds when | Section |
+|:--- |:--- |:--- |
+| `:memsafe` | the call reads and writes only inside its arrays, checked against guard pages | `@assert_memsafe` below |
+| `:noalias` | an array the call writes does not overlap one it reads | `@assert_noalias` below |
+| `:noescape` | a handle created in the frame does not outlive it | `@assert_noescape` below |
+| `:trusted` | data from outside is read only inside a declared trust boundary | [`@assert_trusted`](@ref) |
+| `:concurrency_safe` | no task writes state another task can see | [`@assert_concurrency_safe`](@ref), Promise scope below |
+| `:no_threadid_state` | no state is indexed by `threadid()` | [`@assert_no_threadid_state`](@ref) |
+| `:trim_compatible` | the code still builds as a static binary with `juliac --trim` | `@assert_trim_compatible` below |
+| `test_calls` | every call resolves, including on branches no test runs | StrictModeTest |
+| `test_no_unsafe` | every `ccall`, raw pointer and `@inbounds` sits where the module allows it | `test_no_unsafe` below |
+| `test_layers` | modules depend on each other only in the declared direction | `test_layers` below |
+| `@golden`, `threadcount_invariant_report` | results stay bit-exact across edits and across thread counts | the API reference |
+
+### How StrictMode keeps its own verdicts correct
+
+- **A check that could not finish fails.** It never passes. A scan that read only part of the code
+  reports SM0207, "not established"; an analysis that errored reports the error. "Could not check"
+  never looks like "is fine".
+- **Certainty decides what stops a build.** A check that reads compiled output throws. A check
+  that infers from typed IR, such as the allocation scan, warns, and the proof in StrictModeTest
+  (AllocCheck, JET, TrimCheck) is the gate. See Promise scope below for which is which.
+- **The policy follows established practice.** Memory and calls into C follow Go; concurrency and
+  unsafe code follow Rust; where they disagree, Julia's own semantics decide. See Compared with
+  Rust below.
+
+A speed guarantee keeps you on the fast path; it does not promise you have found the *fastest*
+path. For the gap between "passing" and "fast", `@explain` and the rest of the tools, see
 [Performance diagnostics](performance_diagnostics.md). For the techniques that fix what a
 guarantee flags, `@unroll` among them, see the [Cookbook](cookbook.md).
 
