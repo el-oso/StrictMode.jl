@@ -91,7 +91,7 @@ end
 
 _forwarded_types(@nospecialize(f), @nospecialize(types::Tuple)) = last(_forwarded_call(f, types))
 
-_vectorized(@nospecialize(f), @nospecialize(types::Tuple)) = _vector_work(_llvm_ir(f, types), _VEC_ELT_RE)
+_vectorized(@nospecialize(f), @nospecialize(types::Tuple)) = _ir_vectorized(_llvm_ir(f, types))
 
 # An in-order floating-point reduction: `@llvm.vector.reduce.fadd`/`fmul` called without `reassoc`
 # or `fast`. LLVM's loop vectorizer emits it for a strict (non-`@simd`) accumulation on targets
@@ -113,6 +113,20 @@ const _NOT_VECTOR_WORK_RE = Regex(raw"= (?:load|extractelement|phi) <|" * _ORDER
 # `<2 x double>` and feeds it to an in-order reduction adds one lane at a time.
 _vector_work(ir::AbstractString, vec_re::Regex) =
     any(l -> occursin(vec_re, l) && !occursin(_NOT_VECTOR_WORK_RE, l), eachsplit(ir, '\n'))
+
+# Whether one loop region vectorized. A loop whose accumulation is an in-order reduction did not,
+# whatever else it holds: its vector multiplies feed a chain of scalar adds, which sets its speed.
+# x86 leaves the same source loop entirely scalar, so both targets give it one verdict.
+_loop_vectorized(r::AbstractString) = _vector_work(r, _VEC_RE) && !occursin(_ORDERED_REDUCE_RE, r)
+
+# Whether a whole body vectorized: vector work somewhere outside the loops that reduce in order.
+# An enclosing loop is dropped together with the in-order loop nested in it.
+function _ir_vectorized(ir::AbstractString)
+    for r in _loop_regions(ir)
+        occursin(_ORDERED_REDUCE_RE, r) && (ir = replace(ir, r => ""))
+    end
+    return !occursin(_ORDERED_REDUCE_RE, ir) && _vector_work(ir, _VEC_ELT_RE)
+end
 
 # Names of the non-inlined callees (`:invoke` targets) in `f`'s optimized body — where SIMD may
 # live if it isn't in `f` itself (a thin dispatcher). Used to make `@assert_vectorized`'s failure
@@ -144,7 +158,7 @@ function _assert_vectorized(target, @nospecialize(f), @nospecialize(types::Tuple
         " The SIMD may be in non-inlined callee(s) — assert on those directly: $(join(callees, ", "))."
     _fail(
         :vectorized, target,
-        "no vector arithmetic in this method body: no `<N x …>` ops other than loads and in-order reductions (best-effort)." * hint *
+        "no vector arithmetic in this method body: no `<N x …>` ops outside loads and loops that reduce in order (best-effort)." * hint *
             " (Try `@inbounds @simd`/`@simd ivdep`, or `descend` to see why.)"
     )
     return nothing
@@ -155,8 +169,9 @@ end
 
 Fail unless `f(args...)` compiled to SIMD vector instructions (**best-effort**): StrictMode scans
 the method's LLVM IR for operations on vector types (`<N x …>`). A vector load does not count, and
-neither does an in-order reduction (`@llvm.vector.reduce.fadd` without `reassoc`, which AArch64 emits
-for a strict accumulation): that loop adds one lane at a time. A failure means the compiler did not vectorize
+neither does a loop whose accumulation is an in-order reduction (`@llvm.vector.reduce.fadd` without
+`reassoc`, which AArch64 emits for a strict accumulation), even one that also multiplies vectors: it
+adds one lane at a time. A failure means the compiler did not vectorize
 the loop under the current settings — informative, not a proof, so it is **not** part of
 [`@strict`](@ref). Each argument is evaluated once; disabled builds expand to the bare call.
 
@@ -269,7 +284,7 @@ Base.@kwdef struct KernelReport
     # numerical results, not just speed — surfaced explicitly rather than silently folded into `fp_ops`.
     fastmath_ops::Int
     # In-order FP reductions (`_ORDERED_REDUCE_RE`): scalar accumulation over vector-loaded data.
-    # Not part of `fp_ops`, and not enough on their own to make `vectorized` true.
+    # Not part of `fp_ops`. A loop holding one is not vectorized.
     ordered_reduce_ops::Int = 0
 end
 
@@ -377,8 +392,8 @@ memory-bound — pointing straight at register/cache blocking rather than discov
 
 Fields: `vectorized`, `width`, `fp_ops`, `mem_ops`, `intensity` (= `fp_ops/mem_ops`),
 `ordered_reduce_ops` (in-order `@llvm.vector.reduce.fadd`/`fmul` calls — scalar accumulation over
-vector-loaded data, which AArch64 emits for a strict reduction; never part of `fp_ops`, and a body
-whose only vector statements are loads feeding them is not `vectorized`),
+vector-loaded data, which AArch64 emits for a strict reduction; never part of `fp_ops`, and a loop
+holding one is not `vectorized`, whatever vector arithmetic feeds it),
 `unaligned_mem_ops` (vector loads/stores with alignment < vector width — a proxy for unaligned
 access), `masked_mem_ops` (masked/variable-length memory ops — a proxy for irregular trip counts),
 `fastmath_ops` (FP ops carrying `contract`/`reassoc`/`nnan`/`ninf`/`nsz`/`arcp`/`afn`/`fast` flags —
@@ -474,7 +489,7 @@ function _kernel_report(target, s::AbstractString, working_set_bytes)
         scalarf("fmul") + scalarf("fadd") + scalarf("fsub") + scalarf("fdiv") +
         count(_ -> true, eachmatch(Regex(raw"call" * _FMF1 * raw" (?:double|float) @llvm\.(?:fma|fmuladd)"), s))
     return KernelReport(;
-        target, vectorized = _vector_work(s, _VEC_ELT_RE), width, fp_ops = fp, mem_ops = mem, intensity,
+        target, vectorized = _ir_vectorized(s), width, fp_ops = fp, mem_ops = mem, intensity,
         unaligned_mem_ops = unaligned, masked_mem_ops = masked, working_set_bytes,
         int_ops = int_ops_val, int_mem_ops = int_mem_val, branch_count = branch_count_val,
         serial_dep_count = serial_dep_val, noalias_missing_count = noalias_missing_val,
@@ -549,7 +564,8 @@ end
 (a back-edge branch) with scalar (non-`<N x>` vector) FP or integer arithmetic on its
 loop-carried index, and that region isn't LLVM's own bounded remainder/epilogue of a loop it
 already vectorized elsewhere. An in-order reduction (`@llvm.vector.reduce.fadd` without `reassoc`)
-is scalar FP arithmetic, and a vector load feeding one does not make its loop a vector loop.
+is scalar FP arithmetic, and a loop holding one is a scalar loop even when vector loads or vector
+multiplies feed it.
 
 This is intentionally coarse — it operates on text IR, not a structured IR graph. A loop region
 is any back-edge found by `_loop_regions`; a region counts as scalar hot work if it
@@ -582,17 +598,17 @@ function _scalar_fp_loops(s::AbstractString)
     # vector op of its own is a scalar loop — even if a *different* loop in the same function vectorized.
     regions = _loop_regions(s)
     if isempty(regions)   # no detectable back-edge: fall back to the whole-function scan (unchanged)
-        _vector_work(s, _VEC_ELT_RE) && return false
+        _ir_vectorized(s) && return false
         return (occursin(_LOOP_RE, s) && occursin(_SCALAR_FP_RE, s)) ||
             (occursin(_LOOP_INT_RE, s) && occursin(_SCALAR_INT_RE, s))
     end
     # A hand-vectorized loop (vector ops, none of LLVM's own scaffolding) means the author
     # already vectorized this function's numeric work — any separate scalar loop is glue.
     hand_vectorized = any(regions) do r
-        _vector_work(r, _VEC_RE) && !occursin(_VECTORIZER_SCAFFOLD_RE, r)
+        _loop_vectorized(r) && !occursin(_VECTORIZER_SCAFFOLD_RE, r)
     end
     for r in regions
-        _vector_work(r, _VEC_RE) && continue   # this loop vectorized → fine
+        _loop_vectorized(r) && continue   # this loop vectorized → fine
         is_scalar_hot = occursin(_SCALAR_FP_RE, r) ||
             (occursin(_LOOP_INT_RE, r) && occursin(_SCALAR_INT_RE, r))
         is_scalar_hot || continue
@@ -672,7 +688,7 @@ function Base.show(io::IO, r::KernelReport)
     if !r.vectorized
         printstyled(io, "  not vectorized"; color = :red)
         if r.ordered_reduce_ops > 0
-            print(io, " — the only use of the vector loads is an in-order reduction (see `@assert_vectorized`).\n")
+            print(io, " — the accumulation is an in-order reduction (see `@assert_vectorized`).\n")
             _print_ordered_reduce_warning(io, r)
         else
             print(io, " — no `<N x …>` ops (see `@assert_vectorized`).\n")

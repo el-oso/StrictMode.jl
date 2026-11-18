@@ -138,9 +138,12 @@ StrictMode/src/
                         reduction (@llvm.vector.reduce.fadd/fmul without reassoc/fast). AArch64 turns
                         a strict accumulation into vector loads feeding that reduction, which runs
                         one scalar add per lane, so "a `<N x …>` type appears" passed a scalar loop
-                        there. A loop with BOTH real vector arithmetic and an in-order reduction
-                        still passes (any vector op in the loop passes, the rule x86 already had)
-                        and is counted in KernelReport.ordered_reduce_ops. _kernel_report and
+                        there. A loop holding an in-order reduction is NOT vectorized even when it
+                        also holds vector multiplies (_loop_vectorized): x86 leaves that source loop
+                        scalar, and the two targets must agree on it. _ir_vectorized drops those
+                        loops and asks what is left, so a body with a separate vector loop still
+                        passes :vectorized and fails :no_scalar_loops, as on x86. The reductions are
+                        counted in KernelReport.ordered_reduce_ops. _kernel_report and
                         _scalar_fp_loops take IR TEXT, so a test classifies IR captured on another
                         target; the vector-type patterns accept `<vscale x N x …>` (SVE/SME)
   static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)

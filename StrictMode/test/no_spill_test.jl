@@ -53,7 +53,7 @@
     # proxy was already wrong once. CI runs the suite a second time with coverage off and bounds at
     # auto, which is the pass where these items are expected to run.
     spills_observable() =
-        Sys.ARCH === :x86_64 && StrictMode.spill_report(spilly_accum_kernel!, KERNEL_TYPES).vec_spills > 0
+        StrictMode.spill_report(spilly_accum_kernel!, KERNEL_TYPES).vec_spills > 0
 end
 
 @testitem "@assert_no_spill passes on a register-clean kernel" setup = [NoSpillFixtures] begin

@@ -61,7 +61,7 @@
       ret double %value_phi10
     }
     """
-    @test !StrictMode._vector_work(strict_sum_ir, StrictMode._VEC_ELT_RE)
+    @test !StrictMode._ir_vectorized(strict_sum_ir)
     @test StrictMode._scalar_fp_loops(strict_sum_ir)
     r = StrictMode._kernel_report("strict_sum", strict_sum_ir, nothing)
     @test !r.vectorized
@@ -74,8 +74,8 @@
     @test occursin("in-order reductions: 4", shown)
 
     # The same loop with a product: the multiplies are `fmul <2 x double>` (`fmul.2d`), the adds
-    # are still an in-order reduction. A loop holding any vector arithmetic passes, and the
-    # report counts the scalar accumulation beside it.
+    # are still an in-order reduction. The loop is scalar all the same: the chain of adds sets its
+    # speed, and x86 compiles this source to a fully scalar loop.
     strict_dot_ir = replace(
         strict_sum_ir,
         "  %6 = call double @llvm.vector.reduce.fadd.v2f64(double %vec.phi, <2 x double> %wide.load)\n" =>
@@ -83,11 +83,35 @@
             "  %6 = call double @llvm.vector.reduce.fadd.v2f64(double %vec.phi, <2 x double> %m)\n"
     )
     @test strict_dot_ir != strict_sum_ir
-    @test StrictMode._vector_work(strict_dot_ir, StrictMode._VEC_ELT_RE)
-    @test !StrictMode._scalar_fp_loops(strict_dot_ir)
+    @test StrictMode._vector_work(strict_dot_ir, StrictMode._VEC_ELT_RE)   # the `fmul` alone
+    @test !StrictMode._ir_vectorized(strict_dot_ir)
+    @test StrictMode._scalar_fp_loops(strict_dot_ir)
     rd = StrictMode._kernel_report("strict_dot", strict_dot_ir, nothing)
-    @test rd.vectorized && rd.fp_ops == 1 && rd.ordered_reduce_ops == 4
-    @test occursin("in-order reductions: 4", sprint(show, rd))
+    @test !rd.vectorized && rd.fp_ops == 1 && rd.ordered_reduce_ops == 4
+    shown = sprint(show, rd)
+    @test occursin("not vectorized", shown) && occursin("in-order reductions: 4", shown)
+
+    # A body with a second, separately vectorized loop: the in-order loop is still a scalar loop,
+    # and the body still holds vector work. x86 gives the same pair of verdicts.
+    two_loops_ir = replace(
+        strict_dot_ir,
+        "L33:                                              ; preds = %L17, %middle.block, %top\n" =>
+            "L33:                                              ; preds = %L17, %middle.block, %top\n" *
+            "  br label %L40\n\n" *
+            "L40:                                              ; preds = %L40, %L33\n" *
+            "  %j = phi i64 [ 0, %L33 ], [ %j.next, %L40 ]\n" *
+            "  %q = getelementptr double, ptr %\"p::Ptr\", i64 %j\n" *
+            "  %v = load <2 x double>, ptr %q, align 8\n" *
+            "  %w = fmul <2 x double> %v, %v\n" *
+            "  store <2 x double> %w, ptr %q, align 8\n" *
+            "  %j.next = add nuw i64 %j, 2\n" *
+            "  %done = icmp eq i64 %j.next, %n.vec\n" *
+            "  br i1 %done, label %L50, label %L40\n\n" *
+            "L50:                                              ; preds = %L40\n"
+    )
+    @test two_loops_ir != strict_dot_ir
+    @test StrictMode._ir_vectorized(two_loops_ir)
+    @test StrictMode._scalar_fp_loops(two_loops_ir)
 
     # A reduction carrying `reassoc` (or `fast`) is a real vector reduction: the horizontal add
     # after a vector accumulator, which is what `@simd` and SIMD.jl's `sum(::Vec)` emit.
@@ -184,7 +208,8 @@ end
     using StrictMode, StrictModeTest
 
     # No `@simd`, so the adds must stay in order. x86 leaves the loop scalar; AArch64 loads
-    # `<2 x double>` and reduces in order. Neither is vector arithmetic.
+    # `<2 x double>` and reduces in order, multiplying as vectors first in the dot. Neither is a
+    # vectorized loop, and the two targets agree.
     @noinline function strict_sum(p::Ptr{Float64}, n::Int)
         s = 0.0
         for i in 1:n
@@ -199,18 +224,31 @@ end
         end
         return s
     end
+    @noinline function strict_dot(p::Ptr{Float64}, q::Ptr{Float64}, n::Int)
+        s = 0.0
+        for i in 1:n
+            s += unsafe_load(p, i) * unsafe_load(q, i)
+        end
+        return s
+    end
     x = ones(64)
     x32 = ones(Float32, 64)
     @test GC.@preserve(x, strict_sum(pointer(x), 64)) == 64.0
     @test GC.@preserve(x32, strict_sum32(pointer(x32), 64)) == 64.0f0
 
-    for (f, T) in ((strict_sum, Float64), (strict_sum32, Float32))
-        types = (Ptr{T}, Int)
+    @test GC.@preserve(x, strict_dot(pointer(x), pointer(x), 64)) == 64.0
+
+    cases = (
+        (strict_sum, (Ptr{Float64}, Int)), (strict_sum32, (Ptr{Float32}, Int)),
+        (strict_dot, (Ptr{Float64}, Ptr{Float64}, Int)),
+    )
+    for (f, types) in cases
         @test !StrictMode._vectorized(f, types)
         @test scalar_fp_loops(f, types)
         r = kernel_report(f, types)
         @test !r.vectorized
-        @test iszero(r.fp_ops)
+        # Only the dot has anything to multiply, and only AArch64 multiplies it as vectors.
+        (f === strict_dot && Sys.ARCH === :aarch64) || @test iszero(r.fp_ops)
         @test StrictMode._failed(only(findings(f, types; guarantees = (:vectorized,))))
         @test StrictMode._failed(only(findings(f, types; guarantees = (:no_scalar_loops,))))
         @test_throws StrictViolation test_signatures([(f, types)]; guarantees = (:vectorized,))
