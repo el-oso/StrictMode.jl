@@ -189,8 +189,9 @@ warming the call and checking that a second identical call allocates nothing.
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It objects only to
-allocations that come from type uncertainty: boxing (the runtime-tuple-index trap, or a captured
-variable wrapped in a `Core.Box`) and dynamic dispatch. Honest typed heap allocations are fine.
+allocations that come from type uncertainty: boxing (the runtime-tuple-index trap, a captured
+variable wrapped in a `Core.Box`, or an isbits value stored into a slot of abstract type, such as a
+`Float64` into a `Ref{Any}`) and dynamic dispatch. Honest typed heap allocations are fine.
 Use it on a hot path that may allocate a working buffer but must never box.
 
 ```@example guide

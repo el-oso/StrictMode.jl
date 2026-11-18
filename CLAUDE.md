@@ -56,7 +56,16 @@ StrictMode/src/
                         no sweep has values to give it)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
-  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned). Dispatch
+  effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned). A
+                        BOXING STORE sets `boxing` in every mode (_boxing_store, F50): an isbits value
+                        written to a slot that holds a reference, by a :new, setfield!, memoryrefset!,
+                        setglobal! or an `Any` argument of a :foreigncall. _boxed_on_store is the same
+                        isbits rule as StrictModeTest's _is_boxing, read from the store's side; it
+                        clears a literal or Const (boxed at compile time), Bool/UInt8/Int8 (boxes that
+                        are never allocated, measured), and a value a PiNode or typeassert narrowed
+                        from a reference. _stmt_in_scheduler mirrors the proof's _scheduler_site for
+                        a statement INLINED from task/lock/condition code, read from the body's
+                        debug-info edges. Change one tier's rule and the other's with it. Dispatch
                         is a dynamic :call with a non-concrete result or a boxy argument, plus a
                         surviving Core._apply_iterate (a splat over a Vector: concrete result, callee
                         still looked up at run time). _plain_load names the builtins whose non-concrete
@@ -686,7 +695,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F49 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F50 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

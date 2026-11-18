@@ -1034,6 +1034,106 @@ function _boxes_into_field(ci, @nospecialize(sig), st::Expr, @nospecialize(nt))
     return false
 end
 
+# --- a value boxed to be stored ------------------------------------------------------------------
+#
+# An isbits value lives in a register, on the stack or inline in its container. Written to a slot that
+# holds a reference (a field or an array element of abstract type, an `Any` argument of a `ccall`),
+# it is heap-allocated first: a box, with no dispatch anywhere near it. AllocCheck lists that box as
+# an allocation of the value's type, and the proof tier counts an allocation of an isbits type as
+# boxing, so these rules name the same event from the store's side.
+
+# `Bool` boxes to one of two constants and an 8-bit integer to an entry of a table: no allocation.
+const _PREBOXED = (Bool, UInt8, Int8)
+
+# Is `v` heap-allocated when it is written to a slot that holds a reference? Not when it is a literal
+# or a compile-time constant, whose box exists before the code runs; not when its type is not isbits,
+# a singleton, or one of `_PREBOXED`; and not when it is already a reference that a `PiNode` or a
+# `typeassert` narrowed to an isbits type, since the store then writes that reference.
+function _boxed_on_store(ci, @nospecialize(sig), @nospecialize(v))
+    for _ in 1:8
+        (v isa Core.SSAValue || v isa Core.Argument) || return false
+        T = _stmt_arg_type(ci, sig, v)
+        T isa Core.Const && return false
+        T = _unwrap_lattice(T)
+        (T isa DataType && isbitstype(T) && !Base.issingletontype(T) && !(T in _PREBOXED)) || return false
+        v isa Core.SSAValue || return true
+        def = ci.code[v.id]
+        if def isa Core.PiNode
+            v = def.val
+        elseif Meta.isexpr(def, :call) && _static_callee(ci, def.args[1]) === Core.typeassert
+            v = def.args[2]
+        else
+            return true
+        end
+    end
+    return true
+end
+
+# Does a slot declared `FT` hold a reference? One these rules cannot name is assumed to.
+_reference_slot(@nospecialize(FT)) = !(FT isa Type && Base.allocatedinline(FT))
+
+# Does this statement box a value in order to store it? Read for a `:new`, a `setfield!`, a
+# `memoryrefset!`, a `setglobal!` and the `Any` arguments of a `:foreigncall` (`IdDict`'s `setindex!` is
+# a `jl_eqtable_put`).
+# ponytail: the swap, modify, replace and set-once forms of the store builtins are not read; add them
+# to the positions below when a corpus shows one.
+function _boxing_store(ci, @nospecialize(sig), st::Expr, @nospecialize(callee) = nothing)
+    a = st.args
+    if st.head === :new
+        nt = _new_type(ci, st)
+        nt isa DataType || return false
+        for k in 2:min(length(a), fieldcount(nt) + 1)
+            _reference_slot(fieldtype(nt, k - 1)) && _boxed_on_store(ci, sig, a[k]) && return true
+        end
+    elseif st.head === :foreigncall
+        ats = a[3]
+        ats isa Core.SimpleVector || return false
+        for k in 1:min(length(ats), length(a) - 5)
+            ats[k] === Any && _boxed_on_store(ci, sig, a[5 + k]) && return true
+        end
+    elseif st.head === :call
+        if callee === Core.setfield! && length(a) >= 4
+            return _reference_slot(_store_slot_type(ci, sig, callee, st, 4)) && _boxed_on_store(ci, sig, a[4])
+        elseif callee === Core.memoryrefset! && length(a) >= 3
+            return _reference_slot(_store_slot_type(ci, sig, callee, st, 3)) && _boxed_on_store(ci, sig, a[3])
+        elseif callee === Core.setglobal! && length(a) >= 4
+            m = a[2] isa GlobalRef ? _static_callee(ci, a[2]) : a[2]
+            n = a[3] isa QuoteNode ? a[3].value : a[3]
+            FT = (m isa Module && n isa Symbol) ? Core.get_binding_type(m, n) : nothing
+            return _reference_slot(FT) && _boxed_on_store(ci, sig, a[4])
+        end
+    end
+    return false
+end
+
+# Is statement `pc` inlined from Base's task, lock or condition code, with none of the package's own
+# code inlined inside that? The proof tier asks the same of an allocation site's frames
+# (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
+function _stmt_in_scheduler(ci, pc::Int)
+    di = ci.debuginfo
+    sched = false
+    for _ in 1:64
+        di isa Core.DebugInfo || break
+        t = try
+            Core.Compiler.getdebugidx(di, pc)
+        catch
+            break
+        end
+        eidx = Int(t[2])
+        (1 <= eidx <= length(di.edges)) || break
+        e = di.edges[eidx]
+        e isa Core.DebugInfo || break
+        m = e.def isa Core.MethodInstance ? e.def.def : e.def
+        if m isa Method
+            root = Base.moduleroot(m.module)
+            sched = (root === Base || root === Core) && (sched || basename(string(m.file)) in _SCHEDULER_FILES)
+        end
+        di = e
+        pc = Int(t[3])
+    end
+    return sched
+end
+
 # The type a `:new` constructs. Optimized IR may name it with a `GlobalRef` (`%new(Base.ComplexF64, …)`)
 # instead of holding the `DataType`.
 _new_type(ci, st::Expr) = (a = st.args[1]; a isa Type ? a : _static_callee(ci, a))
@@ -1175,7 +1275,13 @@ function _scan_ci(
         if top && abscontainer === nothing && _abstract_container(T)
             abscontainer = eltype(T)
         end
-        # `:boxing` reads dispatch only: an allocation, a dictionary lookup and a union phi are other questions.
+        if !boxing && (Meta.isexpr(st, :new) || Meta.isexpr(st, :foreigncall)) && !dead[i] &&
+                _boxing_store(ci, sig, st) && !_stmt_in_scheduler(ci, i)
+            boxing = true
+            isnothing(trace) || push!(trace, (i, st, :boxing))
+        end
+        # `:boxing` reads dispatch and boxing stores: an allocation, a dictionary lookup and a union phi are
+        # other questions.
         if mode === :boxing && (st isa Core.PhiNode || Meta.isexpr(st, :foreigncall) || Meta.isexpr(st, :new))
             continue
         end
@@ -1309,6 +1415,11 @@ function _scan_ci(
             if !dictlookup && !dead[i] && callee isa Function && nameof(callee) in _DICT_ACCESSORS && length(st.args) >= 2
                 rt = _stmt_arg_type(ci, sig, st.args[2])
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
+            end
+            if !boxing && !dead[i] && (callee === Core.setfield! || callee === Core.memoryrefset! || callee === Core.setglobal!) &&
+                    _boxing_store(ci, sig, st, callee) && !_stmt_in_scheduler(ci, i)
+                boxing = true
+                isnothing(trace) || push!(trace, (i, st, :boxing))
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
                 if !(mode === :boxing || alloc || dead[i] || newsdead())

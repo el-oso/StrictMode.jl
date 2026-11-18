@@ -188,7 +188,7 @@ allocations — while **allowing** legitimate typed heap allocations (a `Vector`
 
 This is the relaxed sibling of [`@assert_noalloc`](@ref): use it for a hot path that may
 allocate a buffer but must never box (the runtime-tuple-index trap, captured-variable `Core.Box`,
-or accidental dynamic dispatch). Like `@assert_noalloc` it reads typed IR and therefore **reports
+an isbits value stored into a slot of abstract type, or accidental dynamic dispatch). Like `@assert_noalloc` it reads typed IR and therefore **reports
 rather than gates**; `StrictModeTest`'s `@test_noboxing` classifies AllocCheck's allocation
 instances and does gate. Each argument is evaluated once; the macro evaluates to the call's value;
 disabled builds expand to the bare call.

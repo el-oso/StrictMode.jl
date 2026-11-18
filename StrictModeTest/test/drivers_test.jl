@@ -64,13 +64,15 @@ end
 
 @testitem "proof_audit really is the PROOF, not the scan" begin
     using StrictMode, StrictModeTest
-    # `:noboxing` is a guarantee where the two engines disagree: the scan reads dispatch, and a
-    # `Float64` stored into a `Ref{Any}` is boxed without one. AllocCheck lists the box, so a
-    # `proof_audit` that had quietly fallen back to the scan would differ here.
+    # A finding says which engine reached it, so a `proof_findings` that had quietly fallen back to
+    # the scan would carry the scan's tier. The two agree on the verdict here: a `Float64` stored
+    # into a `Ref{Any}` is boxed.
     store!(r::Base.RefValue{Any}, x::Float64) = (r[] = x; nothing)
     T = (Base.RefValue{Any}, Float64)
-    @test !StrictMode._failed(only(StrictMode.findings(store!, T; guarantees = (:noboxing,))))
-    @test only(proof_findings(store!, T; guarantees = (:noboxing,))).status === :fail
+    scan = only(StrictMode.findings(store!, T; guarantees = (:noboxing,)))
+    proof = only(proof_findings(store!, T; guarantees = (:noboxing,)))
+    @test StrictMode._failed(scan) && scan.tier === :report
+    @test proof.status === :fail && proof.tier === :proof
 end
 
 @testitem "test_coverage gates on undeclared methods" begin

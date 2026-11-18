@@ -248,3 +248,58 @@ end
     site() = @assert_noboxing kernel(1.0)
     @test site() == 2.0
 end
+
+@testitem "a value boxed to be stored fails :noboxing, in both tiers" begin
+    using StrictMode, StrictModeTest
+    struct InlinePair
+        a::Int
+        b::Float64
+    end
+    struct HoldsVector
+        v::Vector{Float64}
+    end
+    mutable struct AnyField
+        x::Any
+    end
+    const RA = Base.RefValue{Any}
+    # An isbits value written to a slot that holds a reference is heap-allocated first.
+    ref_any!(r::RA, x::Float64) = (r[] = x; nothing)
+    ref_struct!(r::RA, x::InlinePair) = (r[] = x; nothing)
+    field!(m::AnyField, x::Int) = (m.x = x; nothing)
+    abstract_element!(v::Vector{Real}, x::Float64) = (v[1] = x; nothing)
+    union_with_reference!(r::Base.RefValue{Union{String, Int}}, x::Int) = (r[] = x; nothing)
+    construct(x::Float64) = Some{Any}(x)
+    iddict!(d::IdDict{Any, Int}, k::Symbol, x::Int) = (d[k] = x; nothing)   # a `jl_eqtable_put` taking `Any`
+    set_global!(x::Float64) = (global BOXED_GLOBAL = x; nothing)
+    # No box: the slot holds the value inline, or the reference stored already exists.
+    typed!(v::Vector{Float64}, x::Float64) = (v[1] = x; nothing)
+    isbits_union!(r::Base.RefValue{Union{Nothing, Int}}, x::Int) = (r[] = x; nothing)
+    literal!(r::RA) = (r[] = 1.5; nothing)
+    bool!(r::RA, x::Bool) = (r[] = x; nothing)
+    byte!(r::RA, x::UInt8) = (r[] = x; nothing)
+    singleton!(r::RA) = (r[] = nothing; nothing)
+    narrowed!(r::RA, q::RA) = (y = q[]; y isa Float64 && (r[] = y); nothing)
+    asserted!(r::RA, q::RA) = (r[] = q[]::Float64; nothing)
+    not_isbits!(r::RA, x::HoldsVector) = (r[] = x; nothing)
+    on_throw_path(r::RA, x::Float64) = x < 0 ? (r[] = x; error("negative")) : x
+    for (f, T, boxes) in (
+            (ref_any!, (RA, Float64), true), (ref_struct!, (RA, InlinePair), true), (field!, (AnyField, Int), true),
+            (abstract_element!, (Vector{Real}, Float64), true),
+            (union_with_reference!, (Base.RefValue{Union{String, Int}}, Int), true), (construct, (Float64,), true),
+            (iddict!, (IdDict{Any, Int}, Symbol, Int), true), (set_global!, (Float64,), true),
+            (typed!, (Vector{Float64}, Float64), false),
+            (isbits_union!, (Base.RefValue{Union{Nothing, Int}}, Int), false), (literal!, (RA,), false),
+            (bool!, (RA, Bool), false), (byte!, (RA, UInt8), false), (singleton!, (RA,), false),
+            (narrowed!, (RA, RA), false), (asserted!, (RA, RA), false), (not_isbits!, (RA, HoldsVector), false),
+            (on_throw_path, (RA, Float64), false),
+        )
+        scan = only(findings(f, T; guarantees = (:noboxing,)))
+        @test StrictMode._failed(scan) == boxes
+        @test StrictMode._failed(only(proof_findings(f, T; guarantees = (:noboxing,)))) == boxes
+        boxes && @test scan.code === :SM0003
+    end
+    r = Ref{Any}(0)
+    ref_any!(r, 1.0)
+    @test @allocated(ref_any!(r, 2.0)) == 16
+    @test @allocated(literal!(r)) == 0
+end

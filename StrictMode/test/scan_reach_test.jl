@@ -572,3 +572,38 @@ end
     grow(n::Int) = (a = Float64[]; push!(a, n); a)
     @test_logs (:warn, r"SM0002 allocates / boxes") StrictMode._assert_noalloc_scan("t", grow, (Int,))
 end
+
+@testitem "a boxing store is found in a followed callee and not in the scheduler's code" begin
+    using StrictMode, StrictModeTest
+    # Three of the package's own helpers down, below the depth the scan reads Base to.
+    @noinline store3!(r, x) = (r[] = x; nothing)
+    @noinline store2!(r, x) = (store3!(r, x); nothing)
+    @noinline store1!(r, x) = (store2!(r, x); nothing)
+    deep_store!(r::Base.RefValue{Any}, x::Float64) = store1!(r, x)
+    deep_typed!(r::Base.RefValue{Float64}, x::Float64) = store1!(r, x)
+    boxes(f, T; mode) = StrictMode._alloc_signals(f, T; mode).boxing
+    for mode in (:boxing, :alloc, :full)
+        @test boxes(deep_store!, (Base.RefValue{Any}, Float64); mode)
+        @test !boxes(deep_typed!, (Base.RefValue{Float64}, Float64); mode)
+    end
+    @test StrictMode._failed(only(findings(deep_store!, (Base.RefValue{Any}, Float64); guarantees = (:noboxing,))))
+
+    # `put!` hands an `Int` to a waiting task through `Task.result`, an `Any` field. The store is in
+    # `schedule` (task.jl), which is the scheduler's code: neither tier counts it.
+    hand_over(c::Channel{Int}, x::Int) = (put!(c, x); nothing)
+    @test !StrictMode._failed(only(findings(hand_over, (Channel{Int}, Int); guarantees = (:noboxing,))))
+    # A statement inlined from the scheduler's code is the scheduler's too. `t.result = x` inlines
+    # `setproperty!(::Task, …)` from task.jl, so the proof reads its box as a scheduler site.
+    own_result!(t::Task, x::Int) = (t.result = x; nothing)
+    sig = Tuple{typeof(own_result!), Task, Int}
+    ci = StrictMode._typed_body(sig)
+    stores = [
+        i for (i, st) in pairs(ci.code)
+            if st isa Expr && StrictMode._boxing_store(ci, sig, st, StrictMode._static_callee(ci, st.args[1]))
+    ]
+    @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, i), stores)
+    @test !StrictMode._failed(only(findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
+    @test !StrictMode._failed(only(proof_findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
+    ci = StrictMode._typed_body(Tuple{typeof(store3!), Base.RefValue{Any}, Float64})
+    @test !any(i -> StrictMode._stmt_in_scheduler(ci, i), eachindex(ci.code))
+end
