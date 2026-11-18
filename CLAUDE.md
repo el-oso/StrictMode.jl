@@ -132,7 +132,17 @@ StrictMode/src/
                         so a caller may act on true and must treat false as unknown
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
-                        spill_report/SpillReport, descend, _CACHE_BYTES
+                        spill_report/SpillReport, descend, _CACHE_BYTES. :vectorized, KernelReport.vectorized
+                        and scalar_fp_loops share ONE predicate, _vector_work: a statement naming a
+                        vector type that is not a load, an extractelement, a phi, or an in-order
+                        reduction (@llvm.vector.reduce.fadd/fmul without reassoc/fast). AArch64 turns
+                        a strict accumulation into vector loads feeding that reduction, which runs
+                        one scalar add per lane, so "a `<N x …>` type appears" passed a scalar loop
+                        there. A loop with BOTH real vector arithmetic and an in-order reduction
+                        still passes (any vector op in the loop passes, the rule x86 already had)
+                        and is counted in KernelReport.ordered_reduce_ops. _kernel_report and
+                        _scalar_fp_loops take IR TEXT, so a test classifies IR captured on another
+                        target; the vector-type patterns accept `<vscale x N x …>` (SVE/SME)
   static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)
   dispatch.jl         — _instability_cause (which declaration made a body unstable: a non-const
                         global, an abstract field, an abstract container eltype, reflection, or more

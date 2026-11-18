@@ -136,7 +136,7 @@ function _compiled_output_finding(
         fail = _inlined_survives(f, types) === true
         return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0; tier)
     elseif g === :vectorized
-        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body)", "", 0; tier)
+        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body other than loads and in-order reductions)", "", 0; tier)
     elseif g === :no_scalar_loops
         return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
     elseif g === :no_spill
