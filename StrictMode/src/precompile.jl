@@ -55,7 +55,10 @@ end
 
 function _run_workload()
     # A workload that printed would print at every install of StrictMode, so nothing it reports is shown.
-    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+    # The global logger is replaced for the duration. `with_logger` takes a closure, and Base's
+    # logger scope specialized on a closure of this function is a `CodeInstance` this method roots.
+    logger = Base.CoreLogging.global_logger(Base.CoreLogging.NullLogger())
+    try
         for gs in ((:typestable, :noalloc), (:noboxing,), (:noalloc, :noboxing), (:owned,))
             findings(PrecompileWorkload.kernel, (Vector{Float64}, Int); guarantees = gs)
             findings(PrecompileWorkloadAllocating.grow, (Int,); guarantees = gs)
@@ -80,6 +83,8 @@ function _run_workload()
         )
         # Nothing the workload leaves behind may outlive it: the memos hold the toy modules' bodies.
         clear_cache!()
+    finally
+        Base.CoreLogging.global_logger(logger)
     end
     return nothing
 end

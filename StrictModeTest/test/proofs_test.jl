@@ -252,4 +252,10 @@ end
     else
         @test !StrictMode._failed(f)
     end
+    # a site outside the scheduler makes it an ordinary allocation, as the scan reports it
+    wait_then_alloc(n::Int) = (join_pool(); zeros(n))
+    g = only(StrictModeTest._proof_findings(wait_then_alloc, (Int,), (:noalloc,)))
+    @test StrictMode._failed(g) && g.code !== :SM0017
+    @test !occursin("blocks in the task scheduler", g.reason)
+    @test only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,))).code === :SM0002
 end

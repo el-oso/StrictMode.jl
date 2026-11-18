@@ -94,9 +94,23 @@ StrictMode/src/
                         OFF while StrictMode's own workload runs (_KEEP_SCAN_SPECIALIZATIONS): the
                         compiler methods specialized on _ScanInterpreter must be in StrictMode's image, or
                         every scanning process compiles them (typeinf_local alone: 0.8 s).
-                        A :noalloc failure whose every origin is Base's task/lock/condition code is its own
-                        kind, code SM0017 "blocks in the task scheduler" (_scheduler_origin; the proof tier
-                        recognizes the same sites in StrictModeTest/src/proofs.jl `_scheduler_site`).
+                        ONE EXCEPTION to the private interpreter: a Base.@ccallable method checked while
+                        its package is generated is inferred by the compiler's OWN interpreter
+                        (_infer_for_image). The image compiles such a method whether or not anything
+                        calls it, so the compiler infers its whole tree when the image is written;
+                        inferring it privately first is that work twice (68 s -> 55 s on 40 entries
+                        over 1440 helpers, image unchanged). Those records are the image's, so they are
+                        put back when a window closes (_IMAGE_RECORDS, _WINDOW_DEPTH). Do NOT widen this
+                        to methods the image would not compile anyway: that is the image growth the
+                        private interpreter exists to prevent.
+                        A :noalloc failure whose every allocation is in Base's task/lock/condition code is
+                        its own kind, code SM0017 "blocks in the task scheduler" (_scheduler_origin; the
+                        proof tier recognizes the same sites in StrictModeTest/src/proofs.jl
+                        `_scheduler_site`). "Every" needs its own walk (_nonscheduler_origin): the verdict
+                        stops at the first allocation and reads Base only to _FAST_ALLOC_DEPTH, so a wait
+                        met first says nothing about an allocation three Base calls down. That walk
+                        follows Base to the end outside the scheduler's code, and a walk that cannot
+                        finish leaves the finding an ordinary SM0002.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an
@@ -236,7 +250,10 @@ StrictMode/src/
                         (_check_stable_once, _strict_scan) on a call that passes, one that allocates and
                         one that blocks, plus :trim_compatible and :vectorized/:no_spill, so the warnings
                         and the walk that words them are compiled too. Add a path here when a consumer's
-                        precompile is found compiling it (julia --trace-compile shows what)
+                        precompile is found compiling it (julia --trace-compile shows what). It silences
+                        its own output by replacing the global logger, NOT with_logger: Base's logger
+                        scope specialized on a closure of the workload is a CodeInstance in the
+                        workload method's roots, in every process that loads StrictMode
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
   trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate;

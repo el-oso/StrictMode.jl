@@ -671,6 +671,7 @@ end
 # of every `@strict` guard, and a proof of a guarded function then compiles all of it: AllocCheck
 # took 5 minutes on one guarded signature, against seconds.
 function _infer_body(mi::Core.MethodInstance, world::UInt)
+    _infer_for_image(mi, world)
     n = _window_open()
     interp = _ScanInterpreter(world)
     try
@@ -818,6 +819,16 @@ function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbo
     end
     isempty(o) && return ""
     x = first(o)
+    # A wait is the nearest only because the walk meets it first: when the call also allocates
+    # outside the scheduler, that allocation is the one to name.
+    if _sig_in_scheduler(x.signature)
+        y = try
+            _nonscheduler_origin(f, types)
+        catch
+            nothing
+        end
+        (isnothing(y) || ismissing(y)) || (x = y)
+    end
     st = first(x.statements)
     via = join((first(string(p), 70) for p in last(x.path, 3)), " -> ")
     return "; first at " * first(string(x.signature), 110) * " [" * first(string(st[2]), 90) * "]" *
@@ -836,13 +847,53 @@ function _sig_in_scheduler(@nospecialize(sig))
     return meth.module === Base && basename(string(meth.file)) in _SCHEDULER_FILES
 end
 
-# `nothing` unless every place the scan finds an allocation or boxing is in the task scheduler, in
-# which case the nearest one: the finding is then that the call can block, not that it allocates.
-# What the user can do about it differs, so it is reported as its own kind.
+# The nearest allocation or boxing the call reaches outside Base's task, lock and condition code:
+# `nothing` when there is none, `missing` when the walk could not finish (a body it could not read,
+# or more than `_SCAN_BODY_BUDGET` bodies).
+#
+# Base is followed to the end here, not to the scan's depth. The scan's verdict needs only one
+# allocation and stops at the first; the claim that a call does nothing but wait is about all of
+# them, and an allocation three Base calls down (`copyto!` to `unalias` to `unaliascopy`) is past
+# the depth the verdict reads to. What the scheduler's own code calls is the scheduler's.
+function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
+    parent = IdDict{Any, Any}()
+    queue = Any[_sigtype(f, types)]
+    seen = Base.IdSet{Any}()
+    while !isempty(queue)
+        s = popfirst!(queue)
+        s in seen && continue
+        length(seen) < _SCAN_BODY_BUDGET[] || return missing
+        push!(seen, s)
+        isnothing(_typed_body(s)) && return missing
+        trace, callees = _origin_node(s, :alloc)
+        if !isempty(trace)
+            path = Any[]
+            c = s
+            while haskey(parent, c)
+                c = parent[c]
+                pushfirst!(path, c)
+            end
+            return (; signature = s, path, statements = trace)
+        end
+        for mi in callees
+            mi = mi::Core.MethodInstance
+            (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi)) || _in_scheduler(mi)) && continue
+            haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
+            push!(queue, mi.specTypes)
+        end
+    end
+    return nothing
+end
+
+# `nothing` unless every allocation or boxing the call can reach is in the task scheduler, in which
+# case the nearest one: the finding is then that the call can block, not that it allocates. What the
+# user can do about it differs, so it is reported as its own kind. Every place the scan finds one
+# must be in the scheduler, and the walk outside the scheduler must end having found none.
 function _scheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     origins = _signal_origin(f, types; mode = :alloc)
     isempty(origins) && return nothing
     all(o -> _sig_in_scheduler(o.signature), origins) || return nothing
+    isnothing(_nonscheduler_origin(f, types)) || return nothing
     o = first(origins)
     via = join((first(string(p), 70) for p in last(o.path, 3)), " -> ")
     return (; call = first(string(o.signature), 100), statement = first(string(o.statements[1][2]), 80), via)
@@ -1650,21 +1701,65 @@ end
 # so that the compiler's methods specialized on `_ScanInterpreter` are compiled once, here, and not
 # in every process that scans (`typeinf_local` alone takes 0.8 s to compile). No record is taken
 # back while the workload runs.
+#
+# Windows nest, and one kind of record made inside them is the consumer's: what `_infer_for_image`
+# has the compiler infer. Those are set aside and put back whenever a window closes, and forgotten
+# once the outermost one has.
 const _KEEP_SCAN_SPECIALIZATIONS = Ref(false)
+const _WINDOW_DEPTH = Ref(0)
+const _IMAGE_RECORDS = Any[]
 
-_window_open() =
+function _window_open()
     (
         !_KEEP_SCAN_SPECIALIZATIONS[] && ccall(:jl_generating_output, Cint, ()) == 1 &&
-        isdefined(Base, :newly_inferred)
-    ) ? length(Base.newly_inferred) : -1
+            isdefined(Base, :newly_inferred)
+    ) || return -1
+    _WINDOW_DEPTH[] += 1
+    return length(Base.newly_inferred)
+end
 
 function _window_close(n::Int)
-    n >= 0 && length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
+    n >= 0 || return nothing
+    length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
+    append!(Base.newly_inferred, _IMAGE_RECORDS)
+    iszero(_WINDOW_DEPTH[] -= 1) && empty!(_IMAGE_RECORDS)
+    return nothing
+end
+
+# A `Base.@ccallable` method is compiled into the image of the package that defines it whether or
+# not anything calls it, so the compiler infers it and everything below it when the image is
+# written. While a package is being generated, such a method is therefore inferred by the compiler's
+# own interpreter, and the scan reads the results through `_scan_cache_lookup`: inferring it under
+# the scan's interpreter is the same work done a second time, with a result nothing keeps. The
+# compiler's results are the ones the image needs, so their records outlive the window.
+# Measured on Julia 1.13 with a package of 40 such entry points over a call tree of 1440 generic
+# helpers, checked with `(:typestable, :trim_compatible)`: its precompile takes 55 s with this and
+# 68 s without (51 s with checks off), and its image is 125.5 MB in all three.
+function _infer_for_image(mi::Core.MethodInstance, world::UInt)
+    m = mi.def
+    (m isa Method && isdefined(m, :ccallable) && mi.specTypes === m.sig) || return nothing
+    ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
+    isnothing(_record_of(mi, world)) || return nothing
+    n = isdefined(Base, :newly_inferred) ? length(Base.newly_inferred) : -1
+    interp = _CC.NativeInterpreter(world)
+    try
+        Base.invoke_interp_compiler(interp, :typeinf_type, interp, mi)
+    catch
+        # The scan then infers it under its own interpreter, as it does any other method.
+    end
+    if n >= 0 && _WINDOW_DEPTH[] > 0
+        for i in (n + 1):length(Base.newly_inferred)
+            push!(_IMAGE_RECORDS, Base.newly_inferred[i])
+        end
+    end
     return nothing
 end
 
 # The other readings of the compiler's inference answer under the same interpreter.
 function _return_types(@nospecialize(f), @nospecialize(types))
+    world = Base.get_world_counter()
+    mi = _sig_instance(_sigtype(f, types), world)
+    isnothing(mi) || _infer_for_image(mi, world)
     n = _window_open()
     interp = _ScanInterpreter()
     try

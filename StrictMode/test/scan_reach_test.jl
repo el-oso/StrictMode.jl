@@ -437,6 +437,56 @@ end
     @test StrictMode._sig_string((Int, Vector{Float64})) == "(" * join((Int, Vector{Float64}), ", ") * ")"
 end
 
+@testitem "a @ccallable entry checked at its package's precompile is inferred by the compiler, once" begin
+    using StrictMode
+    dir = mktempdir()
+    mkpath(joinpath(dir, "CcPkg", "src"))
+    # The image compiles `ccp_sum_64_` whether or not anything calls it; `plain_sum_64_` it does not.
+    write(
+        joinpath(dir, "CcPkg", "src", "CcPkg.jl"), """
+        module CcPkg
+        using StrictMode
+        @noinline function helper(p::Ptr{T}, n::Int) where {T}
+            s = zero(T)
+            for i in 1:n
+                s += unsafe_load(p, i)
+            end
+            return s
+        end
+        Base.@ccallable function ccp_sum_64_(n::Ptr{Int}, x::Ptr{Float64})::Float64
+            return helper(x, unsafe_load(n))
+        end
+        plain_sum_64_(n::Ptr{Int}, x::Ptr{Float32})::Float32 = helper(x, unsafe_load(n))
+        @strict_policy (:typestable, :noalloc) only = r"_64_\$"
+        for f in (ccp_sum_64_, plain_sum_64_)
+            world = Base.get_world_counter()
+            mi = StrictMode._sig_instance(only(methods(f)).sig, world)
+            native = !isnothing(StrictMode._record_of(mi, world))
+            recorded = any(ci -> ci isa Core.CodeInstance && ci.def === mi, Base.newly_inferred)
+            println(stderr, "CCP ", nameof(f), " native=", native, " recorded=", recorded)
+        end
+        println(stderr, "CCP depth=", StrictMode._WINDOW_DEPTH[], " kept=", length(StrictMode._IMAGE_RECORDS))
+        end
+        """
+    )
+    julia = Base.julia_cmd()
+    out = IOBuffer()
+    code = "using StrictMode; Base.compilecache(Base.identify_package(\"CcPkg\"))"
+    env = Dict(
+        "JULIA_LOAD_PATH" => join(["@", dir, "@stdlib"], Sys.iswindows() ? ";" : ":"),
+        "JULIA_DEPOT_PATH" => join(Base.DEPOT_PATH, Sys.iswindows() ? ";" : ":")
+    )
+    cmd = setenv(`$julia --startup-file=no --project=$(Base.active_project()) -e $code`, merge(Dict(ENV), env))
+    run(pipeline(cmd; stdout = out, stderr = out))
+    log = String(take!(out))
+    # The compiler's record of the entry exists after the check and is still listed for the image,
+    # although the check ran inside a window that takes the scan's own records back.
+    @test occursin("CCP ccp_sum_64_ native=true recorded=true", log)
+    @test occursin("CCP plain_sum_64_ native=false recorded=false", log)
+    @test occursin("CCP depth=0 kept=0", log)
+    @test !occursin("Warning", log)
+end
+
 @testitem "a call that waits in the task scheduler is its own kind of :noalloc finding" begin
     using StrictMode
     @noinline join_pool() = yield()
@@ -467,6 +517,42 @@ end
         end
         StrictMode._BARRIER_GEN[] += 1
         StrictMode.clear_cache!()
+    end
+end
+
+@testitem "a wait is SM0017 only when the call reaches no allocation outside the scheduler" begin
+    using StrictMode
+    @noinline join_pool() = yield()
+    only_waits(x::Int) = (join_pool(); x + 1)
+    wait_then_alloc(n::Int) = (join_pool(); zeros(n))
+    # `sort!` allocates its scratch several Base calls down, past the depth the verdict reads to.
+    wait_then_sort(v::Vector{Float64}) = (join_pool(); sort!(v))
+    tv = (Vector{Float64},)
+    @test isnothing(StrictMode._nonscheduler_origin(only_waits, (Int,)))
+    @test occursin("Sort", string(StrictMode._nonscheduler_origin(wait_then_sort, tv).signature))
+    g = only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,)))
+    @test StrictMode._failed(g) && g.code === :SM0002
+    # Whether `yield` reaches an allocation depends on Base's implementation of it; the rest needs one.
+    if StrictMode._alloc_signals(only_waits, (Int,)).alloc
+        @test only(StrictMode.findings(only_waits, (Int,); guarantees = (:noalloc,))).code === :SM0017
+        f = only(StrictMode.findings(wait_then_sort, tv; guarantees = (:noalloc,)))
+        @test StrictMode._failed(f) && f.code === :SM0002
+        @test !occursin("blocks in the task scheduler", f.reason)
+        @test isnothing(StrictMode._scheduler_origin(wait_then_sort, tv))
+        # the warning names the allocation, not the wait the walk met first
+        msg = StrictMode._alloc_message(
+            wait_then_sort, tv, StrictMode._alloc_signals(wait_then_sort, tv; mode = :alloc), "allocates / boxes"
+        )
+        @test startswith(msg, "SM0002") && occursin("Sort", msg)
+        # a walk that cannot finish has not shown that the call only waits
+        budget = StrictMode._SCAN_BODY_BUDGET[]
+        try
+            StrictMode._SCAN_BODY_BUDGET[] = 1
+            @test ismissing(StrictMode._nonscheduler_origin(only_waits, (Int,)))
+            @test isnothing(StrictMode._scheduler_origin(only_waits, (Int,)))
+        finally
+            StrictMode._SCAN_BODY_BUDGET[] = budget
+        end
     end
 end
 
