@@ -23,25 +23,28 @@ the wrong memory, racing, or failing on a branch no test ran.
 
 | Guarantee | Holds when | Section |
 |:--- |:--- |:--- |
-| `:memsafe` | the call reads and writes only inside its arrays, checked against guard pages | `@assert_memsafe` below |
-| `:noalias` | an array the call writes does not overlap one it reads | `@assert_noalias` below |
-| `:noescape` | a handle created in the frame does not outlive it | `@assert_noescape` below |
-| `:trusted` | data from outside is read only inside a declared trust boundary | [`@assert_trusted`](@ref) |
-| `:concurrency_safe` | no task writes state another task can see | [`@assert_concurrency_safe`](@ref), Promise scope below |
-| `:no_threadid_state` | no state is indexed by `threadid()` | [`@assert_no_threadid_state`](@ref) |
+| `:memsafe` | the call does not read or write past the end of an `Array` argument, checked against guard pages | `@assert_memsafe` below |
+| `:noalias` | an argument the call writes does not overlap one it reads | `@assert_noalias` below |
+| `:noescape` | a value of a registered scoped type, created in the frame, does not leave it | `@assert_noescape` below |
+| `:trusted` | data from outside is read only inside a declared trust boundary | `@assert_trusted` below |
+| `:concurrency_safe` | the call writes neither its shared argument (the first by default), nor anything reached through it, nor a mutable global | `@assert_concurrency_safe` below |
+| `:no_threadid_state` | no state indexed by `threadid()` is written and still in use after a point where the task can be suspended | `@assert_no_threadid_state` below |
 | `:trim_compatible` | the code still builds as a static binary with `juliac --trim` | `@assert_trim_compatible` below |
-| `test_calls` | every call resolves, including on branches no test runs | StrictModeTest |
-| `test_no_unsafe` | every `ccall`, raw pointer and `@inbounds` sits where the module allows it | `test_no_unsafe` below |
-| `test_layers` | modules depend on each other only in the declared direction | `test_layers` below |
-| `@golden`, `threadcount_invariant_report` | results stay bit-exact across edits and across thread counts | the API reference |
+| `test_calls` | every call reachable from the module's compiled signatures has a matching method and reads only defined names, including on branches no test runs | `test_calls` below |
+| `test_no_unsafe` | the module uses no `ccall`, `pointer`, `unsafe_` function or `@inbounds` beyond the ones it lists as allowed | `test_no_unsafe` below |
+| `test_layers` | each module extends only functions of the layers it declared, and reads only public names of the others | `test_layers` below |
+| `@golden` | a result matches the one recorded for it, bit for bit or within a stated number of ULPs | `@golden` below |
+| `test_threadcount_invariant` | a call returns the same bits at every thread count, and its threaded path ran | `test_threadcount_invariant` below |
 
 ### How StrictMode keeps its own verdicts correct
 
-- **A check that could not finish fails.** It never passes. A scan that read only part of the code
-  reports SM0207, "not established"; an analysis that errored reports the error. "Could not check"
-  never looks like "is fine".
-- **Certainty decides what stops a build.** A check that reads compiled output throws. A check
-  that infers from typed IR, such as the allocation scan, warns, and the proof in StrictModeTest
+- **A check that could not finish never passes.** A scan that read only part of the code reports
+  SM0207, "not established"; an analysis that errored reports the error as a failure; a scan that
+  could not follow a callee reports that callee as undecided. "Could not check" never looks like
+  "is fine".
+- **Certainty decides what stops a build.** A check that observes what it reports throws: compiled
+  output, the type the compiler assigned, or a store it read in the IR. A check that infers
+  something it cannot see, such as the allocation scan, warns, and the proof in StrictModeTest
   (AllocCheck, JET, TrimCheck) is the gate. See Promise scope below for which is which.
 - **The policy follows established practice.** Memory and calls into C follow Go; concurrency and
   unsafe code follow Rust; where they disagree, Julia's own semantics decide. See Compared with
@@ -1049,8 +1052,7 @@ you where to look.
 
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
-Every guarantee above is about **speed** — allocation, boxing, dispatch.
-[`@assert_memsafe`](@ref) is about **safety**: it catches an out-of-bounds array read or write
+[`@assert_memsafe`](@ref) is about memory safety: it catches an out-of-bounds array read or write
 in an unsafe hand-vectorized kernel *deterministically*, instead of the way these bugs usually
 surface — flakily, once in a long benchmark run, only when the next page happens to be unmapped.
 
@@ -1294,6 +1296,359 @@ A call that satisfies the assertion allocates nothing and costs about 2 ns per p
 affordable on a hot path. At a call site whose arguments infer to `Any` — a non-`const` global —
 the argument tuple is heap-allocated by the call itself, before any check sees it.
 
+## `@assert_concurrency_safe` — a shared argument the call must not write
+
+A plan, a table of coefficients or a workspace description is often built once and handed to many
+tasks. That is safe only while no call writes it. [`@assert_concurrency_safe`](@ref) checks one
+call: it holds when the call writes neither its shared argument, nor anything reached through that
+argument, nor a mutable `const` global. The shared argument is the first by default. Arguments the
+call is meant to write, such as the output and a scratch buffer each task owns, are not checked.
+
+```@example guide
+struct FilterPlan
+    taps::Vector{Float64}
+end
+
+function apply_filter!(plan::FilterPlan, x::Vector{Float64})
+    for i in eachindex(x, plan.taps)
+        x[i] *= plan.taps[i]            # reads the plan, writes only x
+    end
+    return x
+end
+
+@assert_concurrency_safe apply_filter!(FilterPlan(ones(4)), ones(4))
+```
+
+A plan that records something about each call is the usual way to break it:
+
+```julia
+mutable struct CountingPlan
+    taps::Vector{Float64}
+    calls::Int
+end
+
+function apply_counted!(plan::CountingPlan, x::Vector{Float64})
+    plan.calls += 1                     # every task sharing the plan writes this field
+    for i in eachindex(x, plan.taps)
+        x[i] *= plan.taps[i]
+    end
+    return x
+end
+
+@assert_concurrency_safe apply_counted!(CountingPlan(ones(4), 0), ones(4))
+# ERROR: StrictViolation (@concurrency_safe): guarantee not satisfied
+#   target:  apply_counted!(CountingPlan(ones(4), 0), ones(4))
+#   reason:  writes state that concurrent tasks share (the plan argument, or a global) — NOT safe
+#            to run concurrently (1 site(s)):
+#              [1] writes field `calls` of the plan argument directly (`setfield!`) — the plan is
+#                  mutated during apply
+#                    at …
+```
+
+The fix is to move what the call writes out of the shared object: return the count, or keep it in
+an argument that each task owns.
+
+### Naming the shared argument
+
+`self = N` names a different position, for a call whose first argument is the output:
+
+```julia
+@assert_concurrency_safe self=2 apply_into!(out, plan, x)   # `plan` is shared; `out` may be written
+```
+
+### What it follows
+
+The scan reads the optimized IR of the call. It marks every reference derived from the shared
+argument and reports a store through one. A scalar read out of the plan, such as `plan.n::Int`, is
+a copy and is not marked. From there it follows:
+
+- a callee that was not inlined and receives a marked value, down to `max_depth` calls (4 by
+  default);
+- a closure built from a marked value;
+- the body of a task that captures one, so a `Threads.@spawn` inside the call is read.
+
+A struct built around the plan is a different object, so a method that wraps its plan in a fresh
+struct and fills in that struct's own fields passes.
+
+### When it throws and when it warns
+
+The outcome follows how sure the scan is, finding by finding.
+
+**It throws on a write it read:**
+
+- a store whose target is reached through the shared argument;
+- a store into a mutable `const` global;
+- a marked value handed to one of the Base functions the scan knows to mutate, such as `push!`,
+  `resize!`, `copyto!` or `fill!`.
+
+**It warns on what it could not rule out:**
+
+- a marked value passed to a call that dispatches at run time;
+- a task whose body it could not read;
+- a call chain that reached `max_depth` before the scan saw a store.
+
+The warning says so: "cannot establish that the plan argument is read-only — sharing it across
+concurrent tasks is unproven, not disproven". For a chain that is too deep, raise `max_depth` or
+assert on the inner method.
+
+An atomic write, such as `@atomic plan.count += 1`, also warns. It cannot tear, but two calls that
+share the plan still both change it, and the scan cannot tell whether they are meant to.
+
+One certain finding is enough to throw, whatever else was found.
+
+### What it cannot see
+
+- **Aliasing.** If the scratch buffer you pass shares memory with something the plan owns, a write
+  to the scratch passes.
+- **A Base function it does not know to mutate.** Other calls into Base and Core are treated as
+  reads.
+- **Which part of a captured array a task writes.** A task that writes its own slice of a shared
+  output is reported, because which slice it writes depends on values.
+- **Other signatures.** The verdict is for the argument types of this call.
+
+`StrictModeTest` has no stronger answer for this guarantee. AllocCheck, JET and TrimCheck do not
+decide whether an argument is written, so both packages run this scan. Pair it with a test that
+runs the call from several tasks.
+
+[`audit`](@ref) also sweeps `:concurrency_safe` over a module. A sweep cannot be told which
+argument is shared, so it reads the first; Promise scope below describes what that means for a `!`
+method.
+
+## `@assert_no_threadid_state` — no per-thread state held across a suspension
+
+A buffer indexed by `Threads.threadid()` looks private to the task that uses it. It is private
+only until the task is suspended. Julia does not preempt a task, but at a `yield`, a `wait`, a
+`fetch`, a blocking `lock` or a `take!` on a channel it can move the task to another thread, or
+run another task on this one. A slot chosen before that point and used after it may then be in use
+by two tasks. [`@assert_no_threadid_state`](@ref) fails on that shape:
+
+```julia
+function count_work!(counts::Vector{Int})
+    i = Threads.threadid()
+    yield()                             # the task can resume on another thread
+    counts[i] += 1                      # `i` names a thread the task may have left
+    return counts
+end
+
+@assert_no_threadid_state count_work!(zeros(Int, Threads.nthreads()))
+# ERROR: StrictViolation (@no_threadid_state): guarantee not satisfied
+#   reason:  threadid-indexed mutable state (2 site(s)):
+#              [1] holds per-thread (`Threads.threadid()`-indexed) state across `yield`, which can
+#                  suspend the task: another task can then run on this thread and use the same state
+#              [2] writes mutable state indexed by `Threads.threadid()` (`memoryrefset!`) — unsafe
+#                  under task migration; index by a captured task-local id or a per-task buffer
+#                  instead
+```
+
+The fix is to give each task its own slot, chosen where the task starts and passed down:
+
+```@example guide
+function bump_slot!(counts::Vector{Int}, slot::Int)
+    counts[slot] += 1
+    return counts
+end
+
+@assert_no_threadid_state bump_slot!(zeros(Int, 4), 1)
+```
+
+A write to `buf[threadid()]` with no suspension point between choosing the slot and the last use
+of it passes: no other task can run on the thread in between.
+
+### What it detects
+
+- a store to `buf[threadid()]`, directly or through a local that holds the index;
+- a store into an object loaded out of such a slot: `buf[threadid()].field = …`,
+  `buf[threadid()][i] = …`, `rand(rngs[threadid()])`;
+- a slot's value passed to a callee that was not inlined, when the callee writes it or returns it
+  and the caller then writes it.
+
+The suspension point is looked for in callees too.
+
+### What it cannot see
+
+- A thread id stored into another array and read back later is not tracked.
+- A lock chosen by thread, `lock(locks[threadid()])`, is reported although it is not a data race:
+  taking the lock writes a field of an object chosen by `threadid()`. Choosing a lock by thread
+  gains nothing once tasks can move, so the report is still worth reading.
+
+### Throws or warns
+
+It throws when the scan read the suspension: the message says the call "can suspend the task". It
+warns when the suspension is inside a callee it could not read in full: the message says "may
+suspend the task (not read in full)".
+
+[`audit`](@ref) sweeps `:no_threadid_state` with nothing written at the call site. A signature for
+which the compiler proves the `notaskstate` effect passes without a scan. The guarantee is not
+part of [`@strict`](@ref).
+
+## `test_calls` — every call resolves
+
+A call with no matching method raises a `MethodError` when it runs, and only then. If it sits on a
+branch no test takes, the suite passes. The other gates do not see it either: they ask whether
+code allocates or dispatches at run time, and a call that cannot resolve is neither.
+`StrictModeTest.test_calls` runs JET's call analysis over every signature of a module that has
+compiled, and throws one `StrictViolation` that lists every call that does not resolve.
+
+```julia
+module MyPkg
+label(x::Int) = "n = $x"
+describe(x::Int) = x >= 0 ? label(x) : label(x, "negative")   # no two-argument `label`
+end
+
+MyPkg.describe(3)        # compiles describe(::Int); the negative branch never runs
+
+test_calls(MyPkg)
+# ERROR: StrictViolation (@test_calls): guarantee not satisfied
+#   target:  MyPkg
+#   reason:  StrictMode: 1 finding(s), 1 failing.
+#              [✗ calls SM0204] describe (Int64) — MethodErrorReport(no matching method found
+#              `label(::Int64, ::String)`: Main.MyPkg.label(x::Int64, "negative"))
+#                  at …
+#                  → a call on this path cannot resolve, so reaching it raises rather than
+#                    returning. Fix the call, or — when a guard makes the path unreachable and
+#                    inference cannot prove it — exclude the function by name with
+#                    `exempt = (:describe,)` and say why in a comment.
+```
+
+The fix here is to define the method or correct the call.
+
+Two kinds of JET report are gated: a call with no matching method, and a read of a name that is not
+defined. JET's other kinds are dropped. Most of them are reports on correct code, such as a
+function that checks its arguments and throws.
+
+### What it cannot see
+
+- **A signature that has not compiled.** The scope is the same as `test_compiled`, so run the
+  kernels before calling it. `only` and `exempt` filter by function name.
+- **A guard inference cannot follow.** `isnothing(ref[]) && (ref[] = build())` followed by a
+  second read of `ref[]` is the common case: the check narrows the first read and not the second,
+  so each use of the value is reported. Binding the read to a local once removes the report and
+  the type instability behind it. Where that is not possible, `exempt = (:name,)` excludes the
+  function.
+
+It always throws. It is a `StrictModeTest` driver, the analysis is JET's, and StrictMode has no
+reporting form of it.
+
+## `@golden` — a result that must not change
+
+[`@golden`](@ref) records the result of an expression in a file the first time it runs, and
+compares against that file on every later run. It is for a port or an optimization that must not
+change the numbers. It returns the result either way.
+
+```@example guide
+golden_dir = mktempdir()
+x = [0.1, 0.2, 0.3]
+
+@golden "running_total" cumsum(x) dir = golden_dir record = true   # no file yet: records
+@golden "running_total" cumsum(x) dir = golden_dir                 # file present: compares
+```
+
+A result that differs fails, naming the first element that does:
+
+```julia
+@golden "running_total" cumsum(reverse(x)) dir = golden_dir
+# ERROR: StrictViolation (@golden): guarantee not satisfied
+#   target:  running_total
+#   reason:  exact mismatch at index 1: expected 0.1, got 0.3 (ULP distance: 7205759403792793).
+#            Use `ulps=N` for tolerance or delete the golden to re-record.
+```
+
+What to do depends on why it changed:
+
+- **The change is a bug.** Fix the code.
+- **The change is intended.** Delete the file, or run once with `STRICTMODE_RECORD_GOLDEN=1`,
+  which re-records every `@golden` in the run.
+- **A SIMD reduction was reordered.** The compiler chooses the order in which vector lanes are
+  combined, so a sum can move by one unit in the last place (ULP) between Julia versions or CPUs.
+  `ulps = 1` accepts that much per element.
+
+The comparison is `===` on each element by default, so `0.0` and `-0.0` differ.
+
+### Where the file lives
+
+Without `dir`, the file is `golden/<name>.golden` next to the file that contains the call. Commit
+it. When the `CI` environment variable is set and the file is missing, `@golden` throws rather
+than recording, because recording would compare nothing and pass. `record = true` at the call
+site, or `STRICTMODE_RECORD_GOLDEN=1`, allows recording there.
+
+### When more than one answer is right
+
+`validator = f` replaces the file with a predicate on the result, for a problem with several valid
+outputs:
+
+```julia
+@golden "shortest" format_float(x) validator = s -> parse(Float64, s) === x
+```
+
+### What it cannot see
+
+- **Whether the recorded result was right.** It records what the code produced on the first run.
+- **Inputs you did not run.** It compares one result for one input.
+- **Types other than floating-point data.** It accepts a real scalar and an array of `Float32`,
+  `Float64`, `ComplexF32` or `ComplexF64`. Any other type, an integer array included, is an error.
+- **Integer scalars beyond `Float64`.** A real scalar is stored as a `Float64`, so two integers
+  that round to the same `Float64`, such as `2^60` and `2^60 + 1`, compare equal.
+
+It always throws on a mismatch, because it compares values it has in hand. It also runs when
+checks are disabled: it tests correctness, so `disable_checks!()` does not remove it.
+
+## `test_threadcount_invariant` — the same bits at every thread count
+
+A threaded kernel that splits its work by `Threads.nthreads()` can return a different answer on a
+machine with a different number of cores. The answers agree to rounding, so a test with a
+tolerance passes on both. [`threadcount_invariant_report`](@ref) runs a call in a fresh Julia
+process at each thread count and compares the bytes of the results.
+`StrictModeTest.test_threadcount_invariant` is the form that fails a test suite.
+
+```julia
+# in MyPkg: the chunk boundaries move with the thread count, and so does the rounding
+function psum(x)
+    chunks = Iterators.partition(eachindex(x), cld(length(x), Threads.nthreads()))
+    return sum(fetch.([Threads.@spawn sum(view(x, c)) for c in chunks]))
+end
+
+test_threadcount_invariant(
+    :MyPkg, "MyPkg.psum(x)";
+    setup = "using Random; Random.seed!(1); x = rand(10^6)",
+    witness = "MyPkg.pool_jobs() > 0", threads = (1, 4),
+)
+# ERROR: StrictViolation (@test_threadcount_invariant): guarantee not satisfied
+#   target:  MyPkg.psum(x)
+#   reason:  at -t 4 the result differs from the one at -t 1, first at byte ….
+```
+
+The fix is to make the split independent of the thread count: a fixed chunk length, with the
+partial results combined in a fixed order.
+
+```julia
+chunks = Iterators.partition(eachindex(x), 4096)
+```
+
+Julia fixes the thread count when the process starts, so `call` and `setup` are strings of code.
+Each is evaluated in a child process after `using MyPkg`.
+
+### The witness
+
+A call that never uses more than one thread returns the same bits at every thread count. Whether
+the threaded path ran can only be observed from inside the package, so `witness` is code that
+returns `true` when it did, such as a check on a counter that the package's pool increments.
+`test_threadcount_invariant` throws an `ArgumentError` when no witness is given. It fails when the
+witness returns `false` at a count above one, and when no process had more than one thread.
+
+### What it cannot see
+
+- **Other inputs.** It compares the results for the input that `setup` builds. `setup` must build
+  the same input in every process, so seed random data.
+- **Whether the witness is true.** It runs the code it is given.
+- **Results without a fixed bit pattern.** The result must be an `isbits` value, an array of them,
+  or a tuple of those.
+
+`threadcount_invariant_report` returns a [`ThreadcountInvariantReport`](@ref) and does not throw
+when results differ; it prints which counts differ and whether a witness was given.
+`test_threadcount_invariant` throws, because it compares bytes it has read. The default is every
+count from 1 to `Sys.CPU_THREADS`, one Julia process each, so pass a shorter `threads` where start
+time matters.
+
 ## Promise scope
 
 The checks fall into three groups, and the group decides how much a verdict is worth.
@@ -1323,7 +1678,8 @@ in the reporting list above, and [`@assert_concurrency_safe`](@ref) still raises
 write it can actually see. A chain that reached `max_depth` and stopped warns, because the scan never
 got to the store; raise `max_depth` or assert on the inner method. The module-sweep paths warn
 either way, since nothing there should be able to stop a module loading.
-[`@assert_typestable`](@ref) and [`@assert_trusted`](@ref) split their own signals the same way.
+[`@assert_typestable`](@ref), [`@assert_trusted`](@ref) and [`@assert_no_threadid_state`](@ref)
+split their own signals the same way.
 
 **Informational — these never fail.** The module sweeps: [`dispatch_report`](@ref),
 [`unsafe_report`](@ref), [`throw_report`](@ref), [`bang_report`](@ref),
@@ -1355,7 +1711,9 @@ measured in the field rather than reasoned about:
   guarantee holds trivially — and seeding it as shared taints every index derived from it, which
   made a store into a buffer the method allocated *itself* read as a write to the shared object.
 
-One property is explicitly out of scope: **bit-reproducibility**.
+One property is out of scope: **bit-for-bit agreement with a reference implementation**. `@golden`
+and `test_threadcount_invariant` compare a kernel with its own earlier output, or with its own
+output at another thread count; neither compares it with other code.
 
 SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction — how
 four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler and may
