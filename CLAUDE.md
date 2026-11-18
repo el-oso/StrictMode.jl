@@ -472,6 +472,15 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         one (a jl_safe_printf) that every wait reaches, as _string_n does for
                         jl_alloc_string. Judged by the nearest frame with a specialization: its typed
                         body must hold a varargs :foreigncall and no dispatch of its own.
+                        _raw_allocs is AllocCheck's sites PLUS _native_dispatches (F49): AllocCheck
+                        compiles through GPUCompiler with compilesig_invokes = false, so every
+                        callee is the specialization for the inferred types, while Julia invokes the
+                        method's compilation signature (a passed-along `Function` stays `Function`)
+                        and leaves a call dynamic when that signature is not compileable. The walk
+                        reads natively optimized bodies and reports each non-builtin :call as a
+                        DynamicDispatch. _is_boxing reads a heap allocation of an isbits type as a
+                        box; do NOT narrow it to `Any` slots: an abstract-eltype slot boxes the same
+                        way and the site carries no destination.
                         _opt_reports (JET,
                         wrapped in AnalysisError), _trim_validate (TrimCheck), _proof_findings/
                         proof_findings, ignore_barrier/set_ignore_barrier!
@@ -677,7 +686,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F38 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F49 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

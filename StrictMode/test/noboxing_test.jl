@@ -118,17 +118,12 @@ end
     @test any(f -> f.status === :fail, proof_findings(caller, (); guarantees = (:noalloc,)))
 end
 
-@testitem ":noboxing permits a typed allocation — the heuristic over-flags one, the proof does not" begin
+@testitem ":noboxing fails an isbits value stored into an abstract-eltype container, in both tiers" begin
     using StrictMode, StrictModeTest
-    # The other half of the correction, and the direction that actually matters: here the HEURISTIC
-    # is wrong. `bad` allocates a `Vector{_Foo}` (96 B measured) and dispatches over its abstract
-    # elements. That vector is a legitimate TYPED heap allocation, which `:noboxing` explicitly
-    # permits — so AllocCheck passing is correct. The heuristic fails it because it treats an
-    # abstract-eltype container as boxing, which is a code smell, not a boxing proof.
-    #
-    # Together with issue #17 (19/68 false failures on PureIPM, every one measuring 0 B), this is
-    # the honest summary: there is no measured case where the heuristic beats AllocCheck. Its one
-    # advantage is needing no backend, which is exactly why it is the tier that ships without one.
+    # `bad` fills a `Vector{_Foo}` with isbits structs. The vector's memory is a typed allocation,
+    # which `:noboxing` permits; each element is not, because a slot of abstract type holds a
+    # reference and the struct is heap-allocated to be stored there. AllocCheck lists that as an
+    # allocation of `_A`, which the proof reads as a box; the scan reports the container.
     abstract type _Foo end
     struct _A <: _Foo
         x::Int
@@ -150,7 +145,7 @@ end
     end
     bad(1)
     @test @allocated(bad(1)) > 0                             # it really does allocate...
-    @test all(f -> f.status === :pass, proof_findings(bad, (Int,); guarantees = (:noboxing,)))
+    @test any(f -> f.status === :fail, proof_findings(bad, (Int,); guarantees = (:noboxing,)))
     @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noboxing,)))
     # ...and :noalloc, which asks the broader question, agrees across both engines.
     @test any(StrictMode._failed, findings(bad, (Int,); guarantees = (:noalloc,)))

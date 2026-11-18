@@ -82,8 +82,9 @@ it never throws:
   and throws.
 - **`@assert_noboxing`** flags the *boxing / dynamic-dispatch* subclass from the same scan, so
   legitimate typed allocations pass. **`@test_noboxing`** classifies AllocCheck's own instances
-  (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime calls, `Core.Box`) — which is
-  where the distinction is actually proved.
+  (`DynamicDispatch`, `jl_box_*` / `jl_get_nth_field_checked` runtime calls, `Core.Box`, a heap
+  allocation of an isbits type) and adds the dynamic calls in the bodies Julia's own compiler
+  produces — which is where the distinction is actually proved.
 - **`@assert_typestable`** requires a concrete inferred return type (exact, so it throws) and adds
   two IR signals behind a concrete return, both heuristics, so both warn: internal dynamic
   dispatch, and a union-typed local that boxes a member on the way in. **`@test_typestable`**

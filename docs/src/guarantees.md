@@ -222,9 +222,12 @@ boxy(t) = (s = 0.0; for i in 1:3; s += t[i]; end; s)   # heterogeneous tuple, ru
 # ┌ Warning: StrictViolation (@noboxing): boxing / dynamic dispatch (value-free IR scan)
 ```
 
-AllocCheck classifies an allocation as *boxing* exactly, so `@test_noboxing` is where the
-distinction is proved. The scan treats an abstract-eltype container as boxing — a code smell,
-not a proof.
+`@test_noboxing` is where the distinction is proved. It reads AllocCheck's instances: a dynamic
+dispatch, a boxing runtime call, a `Core.Box`, and a heap allocation of an isbits type, which is a
+value boxed to be handed over as a reference (a `Float64` stored into a `Vector{Any}`). It adds the
+dynamic calls in the bodies Julia's own compiler produces, because AllocCheck compiles every callee
+for its inferred argument types and Julia does not: a function that only passes a `Function`
+argument along is compiled once for `Function`, and calls through it at run time.
 
 ## `@assert_typestable` / `@test_typestable` — concrete, stable types
 

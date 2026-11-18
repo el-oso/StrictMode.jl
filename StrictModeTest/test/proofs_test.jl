@@ -310,3 +310,78 @@ end
         @test StrictMode._failed(only(findings(f, T; guarantees = (:noboxing,)))) == boxes
     end
 end
+
+@testitem "a value boxed to be handed over as a reference fails @test_noboxing" begin
+    using StrictMode, StrictModeTest
+    const AC = StrictModeTest.AllocCheck
+    struct InlinePair
+        a::Int
+        b::Float64
+    end
+    push_any!(v::Vector{Any}, x::Float64) = (push!(v, x); nothing)
+    push_typed!(v::Vector{Float64}, x::Float64) = (push!(v, x); nothing)
+    runtime_field(p::InlinePair, s::Symbol) = getfield(p, s) === nothing
+
+    # AllocCheck lists the box as an allocation of the boxed type; an isbits type on the heap is a box.
+    raw = StrictModeTest._raw_allocs(push_any!, (Vector{Any}, Float64))
+    @test any(a -> a isa AC.AllocationSite && a.type === Float64 && StrictModeTest._is_boxing(a), raw)
+    raw = StrictModeTest._raw_allocs(runtime_field, (InlinePair, Symbol))
+    @test any(a -> a isa AC.AllocationSite && a.type === InlinePair && StrictModeTest._is_boxing(a), raw)
+
+    @test_throws "boxing / dynamic dispatch" @test_noboxing push_any!(Any[], 1.0)
+    @test_throws "boxing / dynamic dispatch" @test_noboxing runtime_field(InlinePair(1, 2.0), :a)
+    # Growing a `Vector{Float64}` allocates its memory and boxes nothing.
+    @test !any(StrictModeTest._is_boxing, StrictModeTest._raw_allocs(push_typed!, (Vector{Float64}, Float64)))
+    @test_noboxing push_typed!(Float64[], 1.0)
+
+    # An `Int` handed to a waiting task is boxed inside Base's scheduler, which neither tier counts.
+    hand_over(c::Channel{Int}, x::Int) = (put!(c, x); nothing)
+    raw = StrictModeTest._raw_allocs(hand_over, (Channel{Int}, Int))
+    @test any(a -> a isa AC.AllocationSite && a.type === Int && StrictModeTest._scheduler_site(a), raw)
+    @test !StrictMode._failed(only(StrictModeTest._proof_findings(hand_over, (Channel{Int}, Int), (:noboxing,))))
+    @test !StrictMode._failed(only(findings(hand_over, (Channel{Int}, Int); guarantees = (:noboxing,))))
+end
+
+@testitem "a dispatch in the code Julia compiles fails @test_noboxing" begin
+    using StrictMode, StrictModeTest
+    const AC = StrictModeTest.AllocCheck
+    # `by` is passed along and never called here, so Julia compiles `pass_along!` once, for
+    # `by::Function`, and that body looks `sort!`'s keyword method up at run time.
+    @noinline pass_along!(v, by::Function) = (sort!(v; by); nothing)
+    @noinline specialized!(v, by::F) where {F} = (sort!(v; by); nothing)
+    sort_wide!(v::Vector{Float64}) = pass_along!(v, abs)
+    sort_specialized!(v::Vector{Float64}) = specialized!(v, abs)
+    T = (Vector{Float64},)
+
+    # AllocCheck compiles `pass_along!` for `typeof(abs)` and finds no dispatch in either.
+    @test !any(a -> a isa AC.DynamicDispatch, AC.check_allocs(sort_wide!, T))
+    @test !isempty(StrictModeTest._native_dispatches(sort_wide!, T))
+    @test isempty(StrictModeTest._native_dispatches(sort_specialized!, T))
+    @test all(a -> a isa AC.DynamicDispatch && StrictModeTest._is_boxing(a), StrictModeTest._native_dispatches(sort_wide!, T))
+
+    @test_throws "boxing / dynamic dispatch" @test_noboxing sort_wide!([2.0, -1.0])
+    @test_noboxing sort_specialized!([2.0, -1.0])
+    # The scan reads the same bodies and agrees on both.
+    @test StrictMode._failed(only(findings(sort_wide!, T; guarantees = (:noboxing,))))
+    @test !StrictMode._failed(only(findings(sort_specialized!, T; guarantees = (:noboxing,))))
+
+    # The last branch of a union split takes an `Any`, which is not a signature Julia compiles: the
+    # call stays dynamic.
+    const HOOK = Ref{Any}(1.0)
+    @noinline pick(y::Float64, x::Float64) = y + x
+    @noinline pick(y, x::Float64) = x
+    split_fallback(x::Float64) = pick(HOOK[], x)
+    @test isempty(AC.check_allocs(split_fallback, (Float64,)))
+    for g in (:noboxing, :noalloc)
+        @test StrictMode._failed(only(StrictModeTest._proof_findings(split_fallback, (Float64,), (g,))))
+    end
+
+    # A dispatch that only a `catch` reaches is skipped, as AllocCheck skips it.
+    recover(x::Float64) = try
+        x < 0 ? throw(DomainError(x)) : sqrt(x)
+    catch
+        HOOK[](x)::Float64
+    end
+    @test isempty(StrictModeTest._native_dispatches(recover, (Float64,)))
+    @test StrictModeTest._catch_only_mask(Any[Core.EnterNode(3), Core.ReturnNode(1), Core.ReturnNode(2)]) == [false, false, true]
+end

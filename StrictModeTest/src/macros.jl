@@ -64,6 +64,11 @@ Fail unless AllocCheck proves `f(args...)` performs no boxing or dynamic dispatc
 **allowing** legitimate typed heap allocations (a `Vector`, a `Memory`, …). The proving counterpart
 to [`StrictMode.@assert_noboxing`](@ref).
 
+A heap allocation of an isbits type counts as boxing: the value is allocated only to be handed over
+as a reference, as a `Float64` stored into a `Vector{Any}` is. So does a dynamic call in a body as
+Julia's own compiler produces it, which AllocCheck does not see when Julia compiles a callee for a
+wider signature than the inferred one (a `Function` argument that is only passed along).
+
 ```julia
 @test_noboxing fill_buffer!(buf, xs)        # ok: allocates a buffer, but no boxing
 @test_noboxing sum_runtime_index(htuple)    # throws: jl_get_nth_field_checked (tuple boxing)

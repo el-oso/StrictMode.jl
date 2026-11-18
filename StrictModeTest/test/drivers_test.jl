@@ -64,17 +64,13 @@ end
 
 @testitem "proof_audit really is the PROOF, not the scan" begin
     using StrictMode, StrictModeTest
-    # `:noboxing` is the guarantee where the two engines are known to disagree — the scan calls an
-    # abstract-eltype container boxing, AllocCheck does not — so a `proof_audit` that had quietly
-    # fallen back to the scan would differ here.
-    abstract type _PA end
-    struct _PA1 <: _PA
-        x::Int
-    end
-    absc(n::Int) = (v = _PA[_PA1(n)]; length(v))
-    absc(1)
-    @test StrictMode._failed(only(StrictMode.findings(absc, (Int,); guarantees = (:noboxing,))))
-    @test only(proof_findings(absc, (Int,); guarantees = (:noboxing,))).status === :pass
+    # `:noboxing` is a guarantee where the two engines disagree: the scan reads dispatch, and a
+    # `Float64` stored into a `Ref{Any}` is boxed without one. AllocCheck lists the box, so a
+    # `proof_audit` that had quietly fallen back to the scan would differ here.
+    store!(r::Base.RefValue{Any}, x::Float64) = (r[] = x; nothing)
+    T = (Base.RefValue{Any}, Float64)
+    @test !StrictMode._failed(only(StrictMode.findings(store!, T; guarantees = (:noboxing,))))
+    @test only(proof_findings(store!, T; guarantees = (:noboxing,))).status === :fail
 end
 
 @testitem "test_coverage gates on undeclared methods" begin

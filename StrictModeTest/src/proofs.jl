@@ -119,8 +119,95 @@ end
 # `StrictMode.ignore_throw()` (default true): don't count allocations on never-taken error/throw branches
 # (BoundsError etc.) — they are not on the hot path and produce false positives on
 # runtime-zero-alloc code.
-_raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) =
-    AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw())
+_raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types)) = vcat(
+    AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
+    _native_dispatches(f, types)
+)
+
+# The dynamic calls in the code Julia's own compiler produces for `f(types...)` and for everything
+# that code invokes, each as an `AllocCheck.DynamicDispatch`.
+#
+# AllocCheck compiles through GPUCompiler, whose optimizer resolves every call to the specialization
+# for the inferred argument types (`compilesig_invokes = false`). Julia's own optimizer resolves a
+# call to the method's compilation signature, which widens an argument the method does not
+# specialize on (a `Function` it only passes along, a `@nospecialize` argument), and it leaves a call
+# dynamic when that signature is not one it compiles (an `Any` argument, as in the last branch of a
+# union split). The first runs a body in which the widened argument is called through
+# `jl_apply_generic`; the second is a `jl_apply_generic` itself. Neither is in the module AllocCheck
+# analyzes, so it reports no site for them.
+#
+# The bodies are read as the native interpreter optimizes them: the entry's, then each `:invoke`
+# target's, to the end of the call graph. A `:call` whose callee is not a builtin is compiled to
+# `jl_apply_generic`. Statements that only lead to a throw, or are only reached from a `catch`, are
+# skipped under `ignore_throw()`, as AllocCheck skips them. A body that cannot be read raises, so the
+# verdict is "unproven" and not a pass.
+#
+# What this does not report: a value boxed to be passed to a widened callee, with no dispatch.
+function _native_dispatches(@nospecialize(f), @nospecialize(types))
+    CC = Base.Compiler
+    world = Base.get_world_counter()
+    interp = CC.NativeInterpreter(world)
+    entry = Base.method_instance(f, types; world)
+    out = Any[]
+    entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
+    parent = IdDict{Any, Any}(entry => nothing)
+    work = Any[entry]
+    while !isempty(work)
+        mi = pop!(work)
+        src = CC.typeinf_code(interp, mi, true)
+        src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
+        skip = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) .| _catch_only_mask(src.code) :
+            falses(length(src.code))
+        for (i, st) in pairs(src.code)
+            skip[i] && continue
+            if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
+                callee = StrictMode._invoke_mi(st.args[1])
+                (isnothing(callee) || haskey(parent, callee)) && continue
+                parent[callee] = mi
+                push!(work, callee)
+            elseif Meta.isexpr(st, :call)
+                ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
+                ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
+                bt = Base.StackTraces.StackFrame[]
+                m = mi
+                while !isnothing(m)
+                    d = m.def
+                    push!(
+                        bt, d isa Method ?
+                            Base.StackTraces.StackFrame(d.name, d.file, Int(d.line), m, false, false, 0) :
+                            Base.StackTraces.StackFrame(Symbol("top-level scope"), :none, 0, m, false, false, 0)
+                    )
+                    m = parent[m]
+                end
+                c = StrictMode._static_callee(src, st.args[1])
+                push!(out, AllocCheck.DynamicDispatch(bt, c isa Function ? nameof(c) : Symbol(ft)))
+            end
+        end
+    end
+    return out
+end
+
+# Statements reached only through a `catch`: not reachable from the first statement without taking an
+# `EnterNode`'s edge to its handler.
+function _catch_only_mask(code::Vector{Any})
+    n = length(code)
+    reached = falses(n)
+    work = n > 0 ? [1] : Int[]
+    while !isempty(work)
+        i = pop!(work)
+        (1 <= i <= n && !reached[i]) || continue
+        reached[i] = true
+        st = code[i]
+        if st isa Core.GotoNode
+            push!(work, st.label)
+        elseif st isa Core.GotoIfNot
+            push!(work, st.dest, i + 1)
+        elseif !(st isa Core.ReturnNode)
+            push!(work, i + 1)
+        end
+    end
+    return map(!, reached)
+end
 
 function _raw_allocs(@nospecialize(f), @nospecialize(types))
     all = _raw_allocs_unfiltered(f, types)
@@ -157,6 +244,11 @@ _is_unattributed(@nospecialize(inst)) =
 
 # Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
 # uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?
+#
+# A heap object of an isbits type is a box: such a value lives in a register, on the stack or inline
+# in its container, and is allocated only to be handed over as a reference (a `Float64` stored into a
+# `Vector{Any}`, a struct passed to `jl_f_getfield` for a field named at run time). One made in
+# Base's task, lock or condition code is not counted, as the scan does not count boxing there.
 function _is_boxing(@nospecialize(inst))
     inst isa AllocCheck.DynamicDispatch && return !_c_varargs_call(inst)
     if inst isa AllocCheck.AllocatingRuntimeCall
@@ -165,7 +257,11 @@ function _is_boxing(@nospecialize(inst))
         # → boxing). Excludes array-grow / string runtime calls.
         return occursin("box", lowercase(n)) || occursin("get_nth_field", n)
     end
-    inst isa AllocCheck.AllocationSite && return inst.type === Core.Box   # captured-variable box
+    if inst isa AllocCheck.AllocationSite
+        T = inst.type
+        T === Core.Box && return true                                     # captured-variable box
+        return T isa Type && isbitstype(T) && !_scheduler_site(inst)
+    end
     # An instance shape this does not know is not evidence of anything, and answering "not boxing"
     # for it would make `:noboxing` go quiet on a whole class of allocation after an AllocCheck
     # release renames or adds one. Say so once; the verdict stays the conservative `false` so a
