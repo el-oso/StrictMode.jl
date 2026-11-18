@@ -39,6 +39,44 @@ end
     end
 end
 
+@testitem "@verify_strict guarantees = … checks only the named guarantees" begin
+    using StrictMode
+    using TypeContracts
+
+    StrictMode.clear_declarations!()
+    @strict_contract AbstractMetric3 begin
+        score3(::Self, xs::AbstractVector{<:Real})::Real
+    end
+    function score3 end
+
+    struct SlowMetric3 end
+    score3(::SlowMetric3, xs::AbstractVector{<:Real}) = sum(collect(xs))   # stable, allocates
+
+    ms = SlowMetric3()
+    xs = [1.0, 2.0, 3.0]
+    # :typestable only: the allocation is not checked here, so nothing warns.
+    @test_logs @verify_strict SlowMetric3 guarantees = (:typestable,) begin
+        score3(ms, xs)
+    end
+    # Each listed signature is registered with the named guarantees, for the test-time drivers.
+    @test StrictMode.declarations()[(score3, (SlowMetric3, Vector{Float64}))].guarantees == (:typestable,)
+
+    # Naming :noalloc brings the allocation warning back.
+    @test_logs (:warn,) match_mode = :any @verify_strict SlowMetric3 guarantees = (:noalloc,) begin
+        score3(ms, xs)
+    end
+
+    # An unstable call still stops the block under :typestable.
+    struct BadMetric3 end
+    const G3 = Ref{Any}(1.0)
+    score3(::BadMetric3, xs::AbstractVector{<:Real}) = G3[]
+    bm = BadMetric3()
+    @test_throws StrictViolation @verify_strict BadMetric3 guarantees = (:typestable,) begin
+        score3(bm, xs)
+    end
+    StrictMode.clear_declarations!()
+end
+
 
 # Regression: `@strict_contract` forwarded only 2 arguments to `TypeContracts.@contract`, so the
 # 3-argument (type, description, block) form — which @contract has always supported — failed with a
