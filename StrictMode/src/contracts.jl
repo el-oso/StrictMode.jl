@@ -151,7 +151,11 @@ function _verify_strict(__source__, __module__, T, block, guarantees)
     # concrete types, and TypeContracts reads conformance for an unannotated member from that cached
     # result instead of inferring the contract's abstract signature.
     push!(out, verify_call, :nothing)
-    return Expr(:block, out...)
+    # One local scope around the whole block. Each line binds its callee and arguments to fresh
+    # names, and at top level a bare block would make every one of them a new global of the calling
+    # module. Creating a global advances the world age, and the scans' caches are keyed on it, so
+    # each line would start from empty caches and re-read every callee it shares with the last.
+    return Expr(:let, Expr(:block), Expr(:block, out...))
 end
 
 # One listed call checked for exactly `guarantees`, through the funnel `@strict_function

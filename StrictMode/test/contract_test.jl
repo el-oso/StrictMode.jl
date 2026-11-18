@@ -251,3 +251,69 @@ end
     end
     StrictMode.clear_declarations!()
 end
+
+@testitem "@verify_strict registers the same declarations at top level, in a let and in a function" begin
+    using StrictMode
+    using TypeContracts
+
+    @strict_contract AbstractKernel7 begin
+        apply7(::Self, xs::AbstractVector{<:Real})::Real
+    end
+    function apply7 end
+    struct Kernel7 end
+    apply7(::Kernel7, xs::AbstractVector{<:Real}; alpha::Float64 = 1.0, shift = 0) = alpha * xs[begin] + shift
+
+    const K7 = Kernel7()
+    xs7 = [1.0, 2.0]
+    decls() = Dict(k => v.guarantees for (k, v) in StrictMode.declarations())
+
+    StrictMode.clear_declarations!()
+    @verify_strict Kernel7 guarantees = (:typestable,) begin
+        apply7(::Kernel7, ::Vector{Float32})
+        apply7(::Kernel7, ::Vector{Float64}; shift::Int, alpha::Float64)
+        apply7(K7, xs7)
+        apply7(K7, xs7; alpha = 2.0)
+    end
+    top = decls()
+    @test length(top) == 4
+
+    StrictMode.clear_declarations!()
+    let k = Kernel7(), ys = [3.0]
+        @verify_strict Kernel7 guarantees = (:typestable,) begin
+            apply7(::Kernel7, ::Vector{Float32})
+            apply7(::Kernel7, ::Vector{Float64}; shift::Int, alpha::Float64)
+            apply7(k, ys)
+            apply7(k, xs7; alpha = 2.0)
+        end
+    end
+    @test decls() == top
+
+    function in_function(k, ys)
+        a = 2.0
+        @verify_strict Kernel7 guarantees = (:typestable,) begin
+            apply7(::Kernel7, ::Vector{Float32})
+            apply7(::Kernel7, ::Vector{Float64}; shift::Int, alpha::Float64)
+            apply7(k, ys)
+            apply7(K7, ys; alpha = a)
+        end
+    end
+    StrictMode.clear_declarations!()
+    @test isnothing(in_function(Kernel7(), [4.0]))
+    @test decls() == top
+
+    # A block at top level leaves the world age where it found it. Each line binds its callee and
+    # arguments, and a binding that became a global would advance it once per name.
+    for opt in ((), (:(guarantees = (:typestable,)),))
+        block = :(
+            @verify_strict Kernel7 $(opt...) begin
+                apply7(::Kernel7, ::Vector{Float32})
+                apply7(K7, xs7; alpha = 2.0)
+            end
+        )
+        @test isnothing(Core.eval(@__MODULE__, block))
+        world = Base.get_world_counter()
+        Core.eval(@__MODULE__, block)
+        @test Base.get_world_counter() == world
+    end
+    StrictMode.clear_declarations!()
+end
