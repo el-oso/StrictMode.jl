@@ -9,9 +9,40 @@
 # REACTIVE: `explain_trim` translates raw `juliac --trim` verifier output into a source-mapped
 # explanation (via `TypeContracts.explain_trim_failure`).
 
-# `invoke` with the method's own argument types compiles one method for all targets; a plain call compiles one per function.
-_base_trim_report(@nospecialize(f), @nospecialize(types::Tuple)) =
-    Base.invoke(TypeContracts.trim_report, Tuple{Any, Type{<:Tuple}}, f, Tuple{types...})
+# `TypeContracts.trim_report` infers the signature twice under the compiler's own interpreter, and
+# with it every callee the scan has already inferred under its own. Both of its rules read one
+# optimized body statement by statement, so they are applied here to the body the other guarantees
+# read: the reflection rule through TypeContracts' own statement scanner, and the dynamic-dispatch
+# rule (a `:call` whose result infers to `Any`) as `TypeContracts._dynamic_call_issues` states it.
+# A signature with no readable body, or a TypeContracts without these functions, gets
+# `trim_report` itself. `test/trimsafe_test.jl` compares the two reports.
+const _TC_STATEMENT_RULES =
+    all(n -> isdefined(TypeContracts, n), (:_scan_trim_stmt!, :_is_trim_unsafe_callee, :_trim_truncate))
+
+function _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple))
+    ci = _TC_STATEMENT_RULES ? _typed_body(_sigtype(f, types)) : nothing
+    # `invoke` with the method's own argument types compiles one method for all targets; a plain call compiles one per function.
+    isnothing(ci) &&
+        return Base.invoke(TypeContracts.trim_report, Tuple{Any, Type{<:Tuple}}, f, Tuple{types...})
+    issues = String[]
+    try
+        for st in ci.code
+            TypeContracts._scan_trim_stmt!(issues, st)
+        end
+    catch
+        # `TypeContracts._trim_issues` keeps what it found before a statement it cannot read.
+    end
+    rts = ci.ssavaluetypes
+    for (i, st) in pairs(ci.code)
+        Meta.isexpr(st, :call) || continue
+        TypeContracts._is_trim_unsafe_callee(st.args[1]) && continue
+        (rts isa AbstractVector && checkbounds(Bool, rts, i) && rts[i] === Any) || continue
+        push!(issues, "dynamic dispatch (result inferred as `Any`): " * TypeContracts._trim_truncate(string(st)))
+    end
+    unique!(issues)
+    entry = string(nameof(f), _sig_string(types))
+    return TypeContracts.TrimReport(entry, issues, isempty(issues))
+end
 
 # The union-split rule (issue #13). `TypeContracts.trim_report` finds dynamic dispatch by asking
 # whether a call's RESULT infers to `Any`; this class infers a perfectly concrete result and is
@@ -37,11 +68,8 @@ function _union_split_findings(@nospecialize(f), @nospecialize(types::Tuple))
     out = String[]
     limit = Core.Compiler.InferenceParams().max_union_splitting
     sig = _sigtype(f, types)
-    ci = try
-        first(_code_typed(f, Tuple{types...}; optimize = true))[1]
-    catch
-        return out                      # unanalyzable here is the caller's problem to report
-    end
+    ci = _typed_body(sig)
+    isnothing(ci) && return out       # unanalyzable here is the caller's problem to report
     for st in ci.code
         Meta.isexpr(st, :call) || continue
         callee = _static_callee(ci, st.args[1])

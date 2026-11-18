@@ -144,6 +144,8 @@ end
     @test !any(StrictMode._failed, StrictMode._map_findings(StrictMode._scan_findings, items))
     @test_logs StrictMode._auto_check_module(W, (:typestable, :noalloc); only)
     StrictMode._precompile_workload()
+    # The workload keeps its compiler specializations only while it runs.
+    @test !StrictMode._KEEP_SCAN_SPECIALIZATIONS[]
     @test isempty(StrictMode._BODY_MEMO)
     @test isempty(StrictMode._TOP_SIGNAL_MEMO)
 end
@@ -377,11 +379,62 @@ end
     StrictMode._code_typed(top, (Vector{Float64},))
     @test !isempty(StrictMode._SCAN_CODE_CACHE.entries)
     @test iszero(scan_refs())
-    # A cached result answers only in the world it was inferred in.
+    # A cached result answers only in the world it was inferred in. `top` has never run, so the
+    # compiler holds no record of it to answer in its place.
     w = StrictMode._SCAN_CODE_CACHE.world[]
-    mi = first(keys(StrictMode._SCAN_CODE_CACHE.entries))
+    mi = StrictMode._sig_instance(Tuple{typeof(top), Vector{Float64}}, w)
+    @test haskey(StrictMode._SCAN_CODE_CACHE.entries, mi)
     @test !isnothing(StrictMode._scan_cache_lookup(StrictMode._SCAN_CODE_CACHE, mi, (w, w)))
     @test isnothing(StrictMode._scan_cache_lookup(StrictMode._SCAN_CODE_CACHE, mi, (w + 1, w + 1)))
+end
+
+@testitem "the scan infers a body once and takes Base from the compiler's own cache" begin
+    using StrictMode
+    @noinline function leaf(v::Vector{Float64})
+        s = 0.0
+        for x in v
+            s += sin(x)
+        end
+        return s
+    end
+    mid(v::Vector{Float64}) = leaf(v) + 1.0
+    grow(n::Int) = (a = Float64[]; push!(a, n); a)
+    # One block, so one world: a new global binding starts a new world, and the cache answers for one.
+    let
+        StrictMode.clear_cache!()
+        world = Base.get_world_counter()
+        leafsig = Tuple{typeof(leaf), Vector{Float64}}
+        @test only(StrictMode._return_types(mid, (Vector{Float64},))) === Float64
+        # Inferring `mid` inferred `leaf` as its callee, and the body of that inference was kept.
+        kept = StrictMode._scan_source(StrictMode._sig_instance(leafsig, world), world)
+        @test kept isa Core.CodeInfo
+        @test StrictMode._typed_body(leafsig) === kept
+        @test length(kept.code) == length(first(only(StrictMode._code_typed_by_type(leafsig))).code)
+        # A body read first is inferred into the cache, so the return type asked next is a lookup.
+        midsig = Tuple{typeof(mid), Vector{Float64}}
+        StrictMode.clear_cache!()
+        body = StrictMode._typed_body(midsig)
+        @test body isa Core.CodeInfo
+        @test haskey(StrictMode._SCAN_CODE_CACHE.entries, StrictMode._sig_instance(midsig, world))
+        @test StrictMode._typed_body(midsig) === body
+        # `sin(::Float64)` is in the system image: the scan uses the compiler's record of it.
+        sinmi = StrictMode._sig_instance(Tuple{typeof(sin), Float64}, world)
+        rec = StrictMode._scan_cache_lookup(StrictMode._SCAN_CODE_CACHE, sinmi, (world, world))
+        @test rec isa Core.CodeInstance && isnothing(rec.owner)
+        @test !haskey(StrictMode._SCAN_CODE_CACHE.entries, sinmi)
+        # The walk that words a warning scans a body once, however many warnings pass through it.
+        first_walk = StrictMode._signal_origin(grow, (Int,))
+        @test !isempty(first_walk)
+        @test !isempty(StrictMode._ORIGIN_MEMO)
+        again = StrictMode._signal_origin(grow, (Int,))
+        @test [o.signature for o in again] == [o.signature for o in first_walk]
+        @test all(i -> again[i].statements === first_walk[i].statements, eachindex(again))
+        StrictMode.clear_cache!()
+        @test isempty(StrictMode._ORIGIN_MEMO)
+        @test isempty(StrictMode._SCAN_CODE_CACHE.sources)
+    end
+    @test StrictMode._sig_string((Int, Vector{Float64})) == "(Int64, Vector{Float64})"
+    @test StrictMode._sig_string((Int, Vector{Float64})) == "(" * join((Int, Vector{Float64}), ", ") * ")"
 end
 
 @testitem "a call that waits in the task scheduler is its own kind of :noalloc finding" begin

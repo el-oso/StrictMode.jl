@@ -65,6 +65,20 @@ StrictMode/src/
                         CodeInstance in the caller method's `roots`) and both backedge writers
                         (finish!'s validation world, codeinst_as_edge), so the cache answers in ONE
                         world only — without backedges nothing would invalidate it.
+                        EACH BODY IS INFERRED ONCE, and only the checked package's own: a lookup that
+                        misses the scan's cache falls back to the compiler's (_scan_cache_lookup), which
+                        holds Base and every loaded package in any world; _typed_body infers a body it
+                        lacks in CACHED mode (_infer_body), so the return-type question that follows is a
+                        lookup (entered through Base.invoke_interp_compiler, NEVER a direct _CC call: a
+                        direct call puts all of inference in the static call graph of every @strict
+                        guard, and AllocCheck then took 5 minutes to prove one guarded signature); and
+                        the compiler hands the optimized body of every specialization it caches to
+                        codegen_cache (_keep_sources -> _scan_source), which is where a callee's
+                        body is read from instead of a second inference. Do NOT read a body the compiler
+                        holds COMPRESSED: it is what was compiled when the record was made, and differs
+                        from a fresh inference of the same signature (measured on 7 of 316 bodies), so
+                        a verdict would change once a call has run. _signal_origin's per-body scan is
+                        memoized (_ORIGIN_MEMO): every warning walks the graph below its call.
                         Every inference here goes through _code_typed/_return_types/
                         _infer_effects; do not call Base.return_types or Base.code_typed directly.
                         Do not destructure tuples whose type names a consumer's function (`for (f, t) in
@@ -75,9 +89,11 @@ StrictMode/src/
                         and a consumer's image keeps it): use _sigtype/_code_typed/_return_types, never
                         Base.signature_type/Base.return_types with `Tuple{types...}`; and every scan entry
                         runs inside _window_open/_window_close, which takes back the specializations
-                        recorded meanwhile (Base.newly_inferred) while a package is generated. TypeContracts'
-                        trim_report is the one callee that cannot be kept off the target: 5752 -> 680
-                        specializations on 100 checked targets with the window (8.6 MB -> 1.2 MB of image).
+                        recorded meanwhile (Base.newly_inferred) while a package is generated: 5752 -> 680
+                        specializations on 100 checked targets (8.6 MB -> 1.2 MB of image). The window is
+                        OFF while StrictMode's own workload runs (_KEEP_SCAN_SPECIALIZATIONS): the
+                        compiler methods specialized on _ScanInterpreter must be in StrictMode's image, or
+                        every scanning process compiles them (typeinf_local alone: 0.8 s).
                         A :noalloc failure whose every origin is Base's task/lock/condition code is its own
                         kind, code SM0017 "blocks in the task scheduler" (_scheduler_origin; the proof tier
                         recognizes the same sites in StrictModeTest/src/proofs.jl `_scheduler_site`).
@@ -209,11 +225,21 @@ StrictMode/src/
   precompile.jl       — a PrecompileTools workload that runs the scan, the module census and the module
                         check on a toy submodule, so a consumer's own precompile (where @strict_policy
                         runs them) does not compile the scan: 4.4 s -> 2.35 s on an 80-method module,
-                        0.8 s with checks off. Reads of a body at that precompile come from the compiler's
-                        cache, which keeps the optimized source only while a package image is generated
+                        0.8 s with checks off. It also runs what a @verify_strict block runs per call
+                        (_check_stable_once, _strict_scan) on a call that passes, one that allocates and
+                        one that blocks, plus :trim_compatible and :vectorized/:no_spill, so the warnings
+                        and the walk that words them are compiled too. Add a path here when a consumer's
+                        precompile is found compiling it (julia --trace-compile shows what)
   idioms.jl           — @unroll, staticval (fix for heterogeneous-tuple boxing)
   golden.jl           — @golden (gated bit-exact / ULP-tolerant regression harness)
   trimsafe.jl         — @assert_trim_safe, @assert_trim_compatible, explain_trim (juliac --trim gate;
+                        _base_trim_report applies TypeContracts' two statement rules to the body the
+                        scan already read (_typed_body) instead of calling TypeContracts.trim_report,
+                        which infers the signature twice under the NATIVE interpreter and with it the
+                        whole callee tree a second time, into the consumer's image. It reaches three
+                        TypeContracts internals (_scan_trim_stmt!, _is_trim_unsafe_callee,
+                        _trim_truncate) and falls back to trim_report without them; a test compares the
+                        two reports, so a rule added to TypeContracts fails it.
                         issue #13: a heuristic-path PASS logs a one-time _TRIM_HEURISTIC_CAVEAT note
                         that reachability-limit union-splits aren't covered — status/reason on the
                         structured StrictFinding are untouched, macro-path-only visibility)

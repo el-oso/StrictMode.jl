@@ -633,6 +633,9 @@ end
 # each depth and from every entry point, so it is read once. An entry stays valid while the compiler's
 # own record of the signature does (a method defined elsewhere does not end it), or, for a signature
 # the compiler holds no record of, while the world is the one it was read in.
+#
+# A body is taken from where it already exists, and inferred only when it exists nowhere: the
+# compiler's own record first, then what the scan's inference kept while it inferred a caller.
 const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any, Any}}()
 
 function _typed_body(@nospecialize(sig))
@@ -642,7 +645,10 @@ function _typed_body(@nospecialize(sig))
         rec = hit[3]
         (hit[1] == world || (rec isa Core.CodeInstance && rec.min_world <= world <= rec.max_world)) && return hit[2]
     end
-    ci = _compiled_body(sig, world)
+    mi = _sig_instance(sig, world)
+    ci = isnothing(mi) ? nothing : _compiled_body(mi, world)
+    isnothing(ci) && !isnothing(mi) && (ci = _scan_source(mi, world))
+    isnothing(ci) && !isnothing(mi) && (ci = _infer_body(mi, world))
     if isnothing(ci)
         cts = try
             _code_typed_by_type(sig; optimize = true)
@@ -651,14 +657,35 @@ function _typed_body(@nospecialize(sig))
         end
         ci = isempty(cts) ? nothing : first(cts[1])
     end
-    rec = isnothing(ci) ? nothing : _record_of(sig, world)
+    rec = (isnothing(ci) || isnothing(mi)) ? nothing : _record_of(mi, world)
     @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci, rec))
     return ci
 end
 
-# The compiler's record of a signature in `world`: the cached `CodeInstance` that says in which worlds
-# its inference holds.
-function _record_of(@nospecialize(sig), world::UInt)
+# Infers a specialization the way inference reaches a callee, so the result is cached for the walks
+# and the return-type questions that follow, and returns the optimized body the compiler handed over:
+# `nothing` when it kept none, as for a result that folds to a constant.
+#
+# The compiler is entered the way `Base.return_types` enters it, through a call it cannot resolve
+# statically. A direct call to `typeinf_type` puts the whole of inference in the static call graph
+# of every `@strict` guard, and a proof of a guarded function then compiles all of it: AllocCheck
+# took 5 minutes on one guarded signature, against seconds.
+function _infer_body(mi::Core.MethodInstance, world::UInt)
+    n = _window_open()
+    interp = _ScanInterpreter(world)
+    try
+        Base.invoke_interp_compiler(interp, :typeinf_type, interp, mi)
+    catch
+        return nothing
+    finally
+        _keep_sources(interp)
+        _window_close(n)
+    end
+    return _scan_source(mi, world)
+end
+
+# The one specialization a signature dispatches to in `world`, or `nothing` when there is not exactly one.
+function _sig_instance(@nospecialize(sig), world::UInt)
     m = try
         Base._which(sig; raise = false, world)
     catch
@@ -670,7 +697,12 @@ function _record_of(@nospecialize(sig), world::UInt)
     catch
         nothing
     end
-    mi isa Core.MethodInstance || return nothing
+    return mi isa Core.MethodInstance ? mi : nothing
+end
+
+# The compiler's record of a specialization in `world`: the cached `CodeInstance` that says in which
+# worlds its inference holds.
+function _record_of(mi::Core.MethodInstance, world::UInt)
     ci = isdefined(mi, :cache) ? mi.cache : nothing
     while ci isa Core.CodeInstance
         (isnothing(ci.owner) && ci.min_world <= world <= ci.max_world) && return ci
@@ -679,26 +711,16 @@ function _record_of(@nospecialize(sig), world::UInt)
     return nothing
 end
 
-# The optimized body the compiler already holds for a signature that has been run, when it keeps one
-# (a method compiled into a package image keeps none, and one cached compressed is not read here).
-# Reading it costs nothing; inferring the body again costs milliseconds.
-function _compiled_body(@nospecialize(sig), world::UInt)
-    m = try
-        Base._which(sig; raise = false, world)
-    catch
-        nothing
-    end
-    isnothing(m) && return nothing
-    mi = try
-        Base.specialize_method(m)
-    catch
-        nothing
-    end
-    mi isa Core.MethodInstance || return nothing
+# The optimized body the compiler holds uncompressed with its record of a specialization. A body it
+# holds compressed is not read: it is the body that was compiled when the record was made, which a
+# later inference of the same signature need not reproduce (it can inline a callee whose body was
+# not yet known then), so reading it would change what the scan reports once a call has run.
+function _compiled_body(mi::Core.MethodInstance, world::UInt)
     ci = isdefined(mi, :cache) ? mi.cache : nothing
     while ci isa Core.CodeInstance
-        if isnothing(ci.owner) && ci.min_world <= world <= ci.max_world && ci.inferred isa Core.CodeInfo
-            return ci.inferred
+        if isnothing(ci.owner) && ci.min_world <= world <= ci.max_world && isdefined(ci, :inferred)
+            src = @atomic :monotonic ci.inferred
+            src isa Core.CodeInfo && return src
         end
         ci = isdefined(ci, :next) ? ci.next : nothing
     end
@@ -721,10 +743,7 @@ function _signal_origin(
         s, depth = popfirst!(queue)
         s in seen && continue
         push!(seen, s)
-        ci = _typed_body(s)
-        isnothing(ci) && continue
-        trace = Any[]
-        _scan_ci(ci, s, 0, Base.IdSet{Any}([s]), mode, false, trace)
+        trace, callees = _origin_node(s, mode)
         if !isempty(trace)
             path = Any[]
             c = s
@@ -735,13 +754,8 @@ function _signal_origin(
             push!(out, (; signature = s, path, statements = trace))
             first_only && break
         end
-        dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
-        for (j, st) in enumerate(ci.code)
-            (Meta.isexpr(st, :invoke) && !dead[j]) || continue
-            a1 = st.args[1]
-            mi = a1 isa Core.CodeInstance ? a1.def : a1
-            (mi isa Core.MethodInstance && mi.def isa Method) || continue
-            _mi_is_strictmode(mi) && continue
+        for mi in callees
+            mi = mi::Core.MethodInstance
             if _mi_is_barrier(mi)
                 isnothing(stops) || push!(stops, mi.specTypes)
                 continue
@@ -755,6 +769,43 @@ function _signal_origin(
         end
     end
     return out
+end
+
+# One body of the walk above: the statements of its own that set `mode`'s signal, and the callees it
+# invokes off its throw paths. Every warning walks the call graph below its call, and the calls of
+# one package share most of that graph, so a body is scanned once per world and not once per warning.
+# Emptied with the other scan memos.
+const _ORIGIN_MEMO = IdDict{Any, Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
+
+function _origin_node(@nospecialize(s), mode::Symbol)
+    world = Base.get_world_counter()
+    hit = @lock _SIGNAL_MEMO_LOCK begin
+        bymode = get(_ORIGIN_MEMO, s, nothing)
+        isnothing(bymode) ? nothing : get(bymode, mode, nothing)
+    end
+    (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3]
+    trace = Any[]
+    callees = Any[]
+    ci = _typed_body(s)
+    if !isnothing(ci)
+        # `push!` and not `IdSet{Any}([s])`: a vector literal of a type is a method compiled for that type.
+        own = Base.IdSet{Any}()
+        push!(own, s)
+        _scan_ci(ci, s, 0, own, mode, false, trace)
+        dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+        for (j, st) in enumerate(ci.code)
+            (Meta.isexpr(st, :invoke) && !dead[j]) || continue
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            (mi isa Core.MethodInstance && mi.def isa Method) || continue
+            _mi_is_strictmode(mi) && continue
+            push!(callees, mi)
+        end
+    end
+    @lock _SIGNAL_MEMO_LOCK begin
+        get!(Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[mode] = (world, trace, callees)
+    end
+    return trace, callees
 end
 
 # The nearest place an allocation or boxing comes from, as a sentence for a warning: the callee, the
@@ -998,14 +1049,16 @@ function _ccall_ref_only(ci, uses, i::Int)
     return sawccall
 end
 
-function _new_allocates(ci, @nospecialize(sig), uses, dead, i::Int, newsdead)
+# `ssauses` and `newsdead` are thunks: the use lists and the escape analysis are built only for a
+# `:new` that the cheaper tests above them leave undecided.
+function _new_allocates(ci, @nospecialize(sig), ssauses, dead, i::Int, newsdead)
     st = ci.code[i]
     nt = _new_type(ci, st)
     nt isa Type || return true
     Base.isbitstype(nt) && return false
     _boxes_into_field(ci, sig, st, nt) && return true
-    nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, sig, uses, dead, i)
-    _ccall_ref_only(ci, uses, i) && return false
+    nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, sig, ssauses(), dead, i)
+    _ccall_ref_only(ci, ssauses(), i) && return false
     return !newsdead()
 end
 
@@ -1082,7 +1135,7 @@ function _scan_ci(
         elseif Meta.isexpr(st, :new)
             dead[i] && continue
             # Which non-isbits `:new`s allocate is decided by `_new_allocates`; see the note above it.
-            if !alloc && _new_allocates(ci, sig, ssauses(), dead, i, newsdead)
+            if !alloc && _new_allocates(ci, sig, ssauses, dead, i, newsdead)
                 alloc = true
                 isnothing(trace) || push!(trace, (i, st, :alloc))
             end
@@ -1454,25 +1507,50 @@ end
 # Without backedges an edit cannot invalidate a cached result, so the cache answers only in the
 # world it was filled in and is emptied when inference runs in another. A world number is meaningful
 # only in the process that counted it, so the comparison is inequality, not order.
-# Giving up reuse across worlds has a cost: 87 signatures checked with a method definition before each,
-# as `@strict_function` does at a precompile, take 4.0 s against 3.1 s.
+# What an emptied cache costs is the checked package's own code inferred again: Base and every loaded
+# package are answered from the compiler's cache in any world (`_scan_cache_lookup`). 87 signatures
+# checked with a method definition before each, as `@strict_function` does at a precompile, take 2.1 s.
 const _CC = Base.Compiler
 
 struct _ScanCacheOwner end
 
 struct _ScanCodeCache
     entries::IdDict{Core.MethodInstance, Core.CodeInstance}
+    sources::IdDict{Core.CodeInstance, Core.CodeInfo}
     world::Base.RefValue{UInt}
     lock::ReentrantLock
 end
-_ScanCodeCache() = _ScanCodeCache(IdDict{Core.MethodInstance, Core.CodeInstance}(), Ref(UInt(0)), ReentrantLock())
+_ScanCodeCache() = _ScanCodeCache(
+    IdDict{Core.MethodInstance, Core.CodeInstance}(), IdDict{Core.CodeInstance, Core.CodeInfo}(),
+    Ref(UInt(0)), ReentrantLock()
+)
+
+function Base.empty!(c::_ScanCodeCache)
+    @lock c.lock (empty!(c.entries); empty!(c.sources))
+    return c
+end
 
 const _SCAN_CODE_CACHE = _ScanCodeCache()
 
+# What the scan inferred itself, or else what the compiler already holds: Base, the standard
+# libraries and every loaded package come with their inference in the system and package images,
+# and inferring them a second time is most of what an empty cache costs. The compiler's entry
+# is the one its own inference of the same caller would use, so the body read is the body compiled.
 function _scan_cache_lookup(c::_ScanCodeCache, mi::Core.MethodInstance, worlds)
     world = first(worlds)
     world == last(worlds) || return nothing
-    return @lock c.lock (c.world[] == world ? get(c.entries, mi, nothing) : nothing)
+    ci = @lock c.lock (c.world[] == world ? get(c.entries, mi, nothing) : nothing)
+    isnothing(ci) || return ci
+    return get(_CC.WorldView(_CC.InternalCodeCache(nothing), _CC.WorldRange(world)), mi, nothing)
+end
+
+# The optimized body the scan's inference kept for a specialization it inferred as a callee.
+function _scan_source(mi::Core.MethodInstance, world::UInt)
+    c = _SCAN_CODE_CACHE
+    return @lock c.lock begin
+        ci = c.world[] == world ? get(c.entries, mi, nothing) : nothing
+        isnothing(ci) ? nothing : get(c.sources, ci, nothing)
+    end
 end
 
 Base.haskey(wvc::_CC.WorldView{_ScanCodeCache}, mi::Core.MethodInstance) =
@@ -1495,6 +1573,7 @@ function Base.setindex!(wvc::_CC.WorldView{_ScanCodeCache}, ci::Core.CodeInstanc
     @lock c.lock begin
         if world != c.world[]
             empty!(c.entries)
+            empty!(c.sources)
             c.world[] = world
         end
         c.entries[mi] = ci
@@ -1507,10 +1586,13 @@ struct _ScanInterpreter <: _CC.AbstractInterpreter
     inf_params::_CC.InferenceParams
     opt_params::_CC.OptimizationParams
     inf_cache::Vector{_CC.InferenceResult}
+    sources::IdDict{Core.CodeInstance, Core.CodeInfo}
 end
 
-_ScanInterpreter(world::UInt = Base.get_world_counter()) =
-    _ScanInterpreter(world, _CC.InferenceParams(), _CC.OptimizationParams(), _CC.InferenceResult[])
+_ScanInterpreter(world::UInt = Base.get_world_counter()) = _ScanInterpreter(
+    world, _CC.InferenceParams(), _CC.OptimizationParams(), _CC.InferenceResult[],
+    IdDict{Core.CodeInstance, Core.CodeInfo}()
+)
 
 _CC.InferenceParams(interp::_ScanInterpreter) = interp.inf_params
 _CC.OptimizationParams(interp::_ScanInterpreter) = interp.opt_params
@@ -1519,6 +1601,21 @@ _CC.get_inference_cache(interp::_ScanInterpreter) = interp.inf_cache
 _CC.cache_owner(::_ScanInterpreter) = _ScanCacheOwner()
 _CC.code_cache(interp::_ScanInterpreter) = _CC.WorldView(_SCAN_CODE_CACHE, _CC.WorldRange(interp.world))
 _CC.may_compress(::_ScanInterpreter) = false
+# The compiler hands the optimized body of every specialization it caches to this table, including
+# one too large to inline, whose body it keeps nowhere else. The walk reads those bodies next, so
+# they are kept (`_keep_sources`) and not inferred a second time.
+_CC.codegen_cache(interp::_ScanInterpreter) = interp.sources
+
+# One table per interpreter, since the compiler writes to it without a lock; merged into the shared
+# cache when the inference call returns, if the cache still answers for that world.
+function _keep_sources(interp::_ScanInterpreter)
+    isempty(interp.sources) && return nothing
+    c = _SCAN_CODE_CACHE
+    @lock c.lock begin
+        c.world[] == interp.world && merge!(c.sources, interp.sources)
+    end
+    return nothing
+end
 _CC.finish!(interp::_ScanInterpreter, caller::_CC.InferenceState, ::UInt, time_before::UInt64) =
     @invoke _CC.finish!(interp::_CC.AbstractInterpreter, caller::_CC.InferenceState, typemax(UInt)::UInt, time_before::UInt64)
 
@@ -1548,8 +1645,18 @@ end
 # measured on 100 checked signatures with `:trim_compatible`, 5752 specializations and 8.6 MB of image
 # against 748 and 1.0 MB.
 # No closure here: a closure over a `Type` is a method specialized on that type.
+#
+# StrictMode's own image is the one place those records belong: its precompile workload runs the scan
+# so that the compiler's methods specialized on `_ScanInterpreter` are compiled once, here, and not
+# in every process that scans (`typeinf_local` alone takes 0.8 s to compile). No record is taken
+# back while the workload runs.
+const _KEEP_SCAN_SPECIALIZATIONS = Ref(false)
+
 _window_open() =
-    (ccall(:jl_generating_output, Cint, ()) == 1 && isdefined(Base, :newly_inferred)) ? length(Base.newly_inferred) : -1
+    (
+        !_KEEP_SCAN_SPECIALIZATIONS[] && ccall(:jl_generating_output, Cint, ()) == 1 &&
+        isdefined(Base, :newly_inferred)
+    ) ? length(Base.newly_inferred) : -1
 
 function _window_close(n::Int)
     n >= 0 && length(Base.newly_inferred) > n && resize!(Base.newly_inferred, n)
@@ -1559,27 +1666,33 @@ end
 # The other readings of the compiler's inference answer under the same interpreter.
 function _return_types(@nospecialize(f), @nospecialize(types))
     n = _window_open()
+    interp = _ScanInterpreter()
     try
-        return Base.return_types(f, types; interp = _ScanInterpreter())
+        return Base.return_types(f, types; interp)
     finally
+        _keep_sources(interp)
         _window_close(n)
     end
 end
 
 function _infer_effects(@nospecialize(f), @nospecialize(types))
     n = _window_open()
+    interp = _ScanInterpreter()
     try
-        return Base.infer_effects(f, types; interp = _ScanInterpreter())
+        return Base.infer_effects(f, types; interp)
     finally
+        _keep_sources(interp)
         _window_close(n)
     end
 end
 
 function _code_ircode_by_type(@nospecialize(sig))
     n = _window_open()
+    interp = _ScanInterpreter()
     try
-        return Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp = _ScanInterpreter())
+        return Base.code_ircode_by_type(sig; optimize_until = _INLINING_PASS, interp)
     finally
+        _keep_sources(interp)
         _window_close(n)
     end
 end
@@ -1604,12 +1717,14 @@ end
 
 function _code_typed_by_type(@nospecialize(sig); optimize::Bool = true, debuginfo::Symbol = :default)
     n = _window_open()
+    interp = _ScanInterpreter()
     try
         return filter(
             p -> first(p) isa Core.CodeInfo,
-            Base.code_typed_by_type(sig; optimize, debuginfo, interp = _ScanInterpreter())
+            Base.code_typed_by_type(sig; optimize, debuginfo, interp)
         )
     finally
+        _keep_sources(interp)
         _window_close(n)
     end
 end

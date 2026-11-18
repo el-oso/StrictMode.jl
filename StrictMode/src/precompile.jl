@@ -20,10 +20,40 @@ module PrecompileWorkloadAllocating
     grow(n::Int) = (a = Float64[]; push!(a, n); a)
 end
 
+# A call that waits in the task scheduler, which a warning names by walking the call graph, and a
+# loop that vectorizes, which `:vectorized` and `:no_spill` read from compiled code.
+module PrecompileWorkloadKernels
+    const ready = Threads.Condition()
+    block() = (
+        lock(ready); try
+            wait(ready)
+        finally
+            unlock(ready)
+        end; nothing
+    )
+    function axpy!(y::Ptr{Float64}, x::Ptr{Float64}, n::Int)
+        @simd for i in 1:n
+            unsafe_store!(y, muladd(2.0, unsafe_load(x, i), unsafe_load(y, i)), i)
+        end
+        return nothing
+    end
+end
+
 # A module also defines `eval` and `include`, which are not what the workload is about and do not pass.
 const _WORKLOAD_FUNCTIONS = (:helper, :kernel)
 
 function _precompile_workload()
+    # The compiler methods the scan specializes on its interpreter belong in this image (`_window_open`).
+    _KEEP_SCAN_SPECIALIZATIONS[] = true
+    try
+        _run_workload()
+    finally
+        _KEEP_SCAN_SPECIALIZATIONS[] = false
+    end
+    return nothing
+end
+
+function _run_workload()
     # A workload that printed would print at every install of StrictMode, so nothing it reports is shown.
     Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
         for gs in ((:typestable, :noalloc), (:noboxing,), (:noalloc, :noboxing), (:owned,))
@@ -33,6 +63,21 @@ function _precompile_workload()
         items = _module_load_items(PrecompileWorkload, (:typestable, :noalloc); only = _WORKLOAD_FUNCTIONS)
         _map_findings(_scan_findings, items)
         _auto_check_module(PrecompileWorkload, (:typestable, :noalloc); only = _WORKLOAD_FUNCTIONS)
+        _auto_check_module(PrecompileWorkload, (:typestable, :trim_compatible); only = _WORKLOAD_FUNCTIONS)
+        # What a `@verify_strict` block runs for each call it lists, on a call that passes, one that
+        # allocates and one that blocks, so the warnings and the walk that words them are compiled too.
+        for (f, types) in (
+                (PrecompileWorkload.kernel, (Vector{Float64}, Int)),
+                (PrecompileWorkloadAllocating.grow, (Int,)), (PrecompileWorkloadKernels.block, ()),
+            )
+            _check_stable_once("workload", f, types)
+            _strict_scan("workload", f, types)
+        end
+        findings(PrecompileWorkloadKernels.block, (); guarantees = (:noalloc,))
+        findings(
+            PrecompileWorkloadKernels.axpy!, (Ptr{Float64}, Ptr{Float64}, Int);
+            guarantees = (:vectorized, :no_spill)
+        )
         # Nothing the workload leaves behind may outlive it: the memos hold the toy modules' bodies.
         clear_cache!()
     end

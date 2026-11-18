@@ -2,7 +2,24 @@
 # and no execution. Everything else (the registry, the agent audit, the Revise loop, and
 # `StrictModeTest`'s proofs) reuses this. Every guarantee is computed from `(f, types)` alone.
 
-_sig_string(@nospecialize(types::Tuple)) = "(" * join(types, ", ") * ")"
+# Printing a type searches the loaded modules for an alias that names it, and one signature is
+# printed for its exemption lookup, for its findings and for its trim report, so the text is kept
+# for the world it was printed in (a definition can add an alias).
+const _SIG_STRING_MEMO = IdDict{Any, Tuple{UInt, String}}()
+
+function _sig_string(@nospecialize(types::Tuple))
+    key = try
+        Tuple{types...}
+    catch
+        return "(" * join(types, ", ") * ")"
+    end
+    world = Base.get_world_counter()
+    hit = @lock _SIGNAL_MEMO_LOCK get(_SIG_STRING_MEMO, key, nothing)
+    (!isnothing(hit) && hit[1] == world) && return hit[2]
+    s = "(" * join(types, ", ") * ")"
+    @lock _SIGNAL_MEMO_LOCK (_SIG_STRING_MEMO[key] = (world, s))
+    return s
+end
 _func_name(@nospecialize(f)) = try
     string(nameof(f))
 catch

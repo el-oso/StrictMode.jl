@@ -177,3 +177,33 @@ end
     r3 = StrictMode._trim_report(UnionSplit.three, (Vector{Float64}, Bool, Bool, Bool))
     @test contains(only(filter(contains("max_union_splitting"), r3.findings)), "8 specializations")
 end
+
+@testitem "the trim scan of the scan's own body reports what TypeContracts.trim_report reports" begin
+    using StrictMode, TypeContracts
+    @test StrictMode._TC_STATEMENT_RULES
+    module TrimSame
+    clean(x::Int) = x * 2 + 1
+    reflects(x::Int) = length(Base.return_types(sin, (Float64,)))
+    const table = Any[sin, cos]
+    dispatches(i::Int) = table[i](1.0)
+    @noinline inner(x::Float64; scale::Float64 = 2.0) = x * scale
+    keywords(x::Float64) = inner(x; scale = 3.0)
+    both(i::Int) = table[i](1.0) + length(Base.which(sin, (Float64,)).sig.parameters)
+    end
+    for (f, types) in (
+            (TrimSame.clean, (Int,)), (TrimSame.reflects, (Int,)), (TrimSame.dispatches, (Int,)),
+            (TrimSame.keywords, (Float64,)), (TrimSame.both, (Int,)),
+            (Core.kwcall, (@NamedTuple{scale::Float64}, typeof(TrimSame.inner), Float64)),
+        )
+        ours = StrictMode._base_trim_report(f, types)
+        theirs = TypeContracts.trim_report(f, Tuple{types...})
+        @test ours.entry == theirs.entry
+        @test ours.findings == theirs.findings
+        @test ours.passed == theirs.passed
+    end
+    @test !StrictMode._base_trim_report(TrimSame.dispatches, (Int,)).passed
+    @test !StrictMode._base_trim_report(TrimSame.reflects, (Int,)).passed
+    # No method matches, so there is no body: the report is TypeContracts' own.
+    @test StrictMode._base_trim_report(TrimSame.clean, (String,)).passed ==
+        TypeContracts.trim_report(TrimSame.clean, Tuple{String}).passed
+end
