@@ -1,54 +1,54 @@
 # Guarantees
 
-A guarantee is a property you declare for a function and StrictMode checks: at the call site, when
-the module loads, or in the test suite. Once it is in place, any later edit that breaks the
-property is reported. The guarantees come in two kinds, and both are first-class: **speed**, the
-properties a hot path needs, and **correctness**, the properties that keep a program from reading
-the wrong memory, racing, or failing on a branch no test ran.
+A guarantee is a property you declare for a function. StrictMode checks it at the call site, when
+the module loads, or in the test suite, and reports any later edit that breaks it. Some guarantees
+are about **speed**: the properties a hot path needs. The others are about **correctness**: they
+keep a program from reading the wrong memory, racing, or failing on a branch no test ran.
 
 ### Speed
 
-| Guarantee | Holds when | Section |
+| Guarantee | What it checks | Section |
 |:--- |:--- |:--- |
-| `:noalloc` | the call allocates nothing on the heap | `@assert_noalloc` below |
-| `:noboxing` | no value is boxed and nothing dispatches at run time; buffers may still be allocated | `@assert_noboxing` below |
-| `:typestable` | the return type and the locals are concrete | `@assert_typestable` below |
+| `:noalloc` | no heap allocation | `@assert_noalloc` below |
+| `:noboxing` | no boxed value and no run-time dispatch; allocating a buffer is fine | `@assert_noboxing` below |
+| `:typestable` | concrete return type and locals | `@assert_typestable` below |
 | `:inlined` | a named callee is inlined into the caller | [`@assert_inlined`](@ref) |
-| `:vectorized`, `:no_scalar_loops` | the loops compile to vector arithmetic, not one element at a time | [`@assert_vectorized`](@ref), [Performance diagnostics](performance_diagnostics.md) |
+| `:vectorized`, `:no_scalar_loops` | loops compile to vector arithmetic rather than one element at a time | [`@assert_vectorized`](@ref), [Performance diagnostics](performance_diagnostics.md) |
 | `:no_spill` | the kernel's live values fit in registers | [`@assert_no_spill`](@ref) |
-| `:owned` | the hot path reaches its buffers by dispatch, not by a run-time lookup | Static ownership below |
+| `:owned` | the hot path finds its buffers by dispatch rather than a run-time lookup | Static ownership below |
 | `@test_no_gc_pause`, `test_latency` | no collection pauses the call; load and first-call time stay in budget | their sections below |
 
 ### Correctness
 
-| Guarantee | Holds when | Section |
+| Guarantee | What it checks | Section |
 |:--- |:--- |:--- |
-| `:memsafe` | the call does not read or write past the end of an `Array` argument, checked against guard pages | `@assert_memsafe` below |
-| `:noalias` | an argument the call writes does not overlap one it reads | `@assert_noalias` below |
-| `:noescape` | a value of a registered scoped type, created in the frame, does not leave it | `@assert_noescape` below |
+| `:memsafe` | no read or write past the end of an `Array` argument, checked against guard pages | `@assert_memsafe` below |
+| `:noalias` | no argument the call writes overlaps one it reads | `@assert_noalias` below |
+| `:noescape` | a value of a registered scoped type, created in the frame, stays in it | `@assert_noescape` below |
 | `:trusted` | data from outside is read only inside a declared trust boundary | `@assert_trusted` below |
-| `:concurrency_safe` | the call writes neither its shared argument (the first by default), nor anything reached through it, nor a mutable global | `@assert_concurrency_safe` below |
+| `:concurrency_safe` | no write to the shared argument (the first by default), to anything reached through it, or to a mutable global | `@assert_concurrency_safe` below |
 | `:no_threadid_state` | no state indexed by `threadid()` is written and still in use after a point where the task can be suspended | `@assert_no_threadid_state` below |
 | `:trim_compatible` | the code still builds as a static binary with `juliac --trim` | `@assert_trim_compatible` below |
-| `test_calls` | every call reachable from the module's compiled signatures has a matching method and reads only defined names, including on branches no test runs | `test_calls` below |
-| `test_no_unsafe` | the module uses no `ccall`, `pointer`, `unsafe_` function or `@inbounds` beyond the ones it lists as allowed | `test_no_unsafe` below |
+| `test_calls` | every call reachable from the module's compiled signatures has a matching method and reads only defined names, even on branches no test runs | `test_calls` below |
+| `test_no_unsafe` | no `ccall`, `pointer`, `unsafe_` function or `@inbounds` beyond the ones the module lists as allowed | `test_no_unsafe` below |
 | `test_layers` | each module extends only functions of the layers it declared, and reads only public names of the others | `test_layers` below |
 | `@golden` | a result matches the one recorded for it, bit for bit or within a stated number of ULPs | `@golden` below |
 | `test_threadcount_invariant` | a call returns the same bits at every thread count, and its threaded path ran | `test_threadcount_invariant` below |
 
-### How StrictMode keeps its own verdicts correct
+### How much a verdict is worth
 
-- **A check that could not finish never passes.** A scan that read only part of the code reports
-  SM0207, "not established"; an analysis that errored reports the error as a failure; a scan that
-  could not follow a callee reports that callee as undecided. "Could not check" never looks like
-  "is fine".
-- **Certainty decides what stops a build.** A check that observes what it reports throws: compiled
-  output, the type the compiler assigned, or a store it read in the IR. A check that infers
-  something it cannot see, such as the allocation scan, warns, and the proof in StrictModeTest
-  (AllocCheck, JET, TrimCheck) is the gate. See Promise scope below for which is which.
-- **The policy follows established practice.** Memory and calls into C follow Go; concurrency and
-  unsafe code follow Rust; where they disagree, Julia's own semantics decide. See Compared with
-  Rust below.
+A check that could not finish never passes. A scan that read only part of the code reports SM0207,
+"not established". An analysis that errored reports the error as a failure. A scan that could not
+follow a callee reports that callee as undecided.
+
+Whether a failure throws or warns depends on how sure the check is. A check that observes what it
+reports throws: it read compiled output, the type the compiler assigned, or a store in the IR. A
+check that infers something it cannot see, such as the allocation scan, warns, and the proof in
+StrictModeTest (AllocCheck, JET, TrimCheck) is the gate. Promise scope below says which is which.
+
+Where a guarantee needs a policy choice, it follows an established one: Go for memory and calls
+into C, Rust for concurrency and unsafe code, and Julia's own semantics where the two disagree.
+See Compared with Rust below.
 
 A speed guarantee keeps you on the fast path; it does not promise you have found the *fastest*
 path. For the gap between "passing" and "fast", `@explain` and the rest of the tools, see
@@ -1048,7 +1048,7 @@ you where to look.
 
 ## `@assert_memsafe` — deterministic out-of-bounds detection
 
-[`@assert_memsafe`](@ref) is about memory safety: it catches an out-of-bounds array read or write
+[`@assert_memsafe`](@ref) catches an out-of-bounds array read or write
 in an unsafe hand-vectorized kernel *deterministically*, instead of the way these bugs usually
 surface — flakily, once in a long benchmark run, only when the next page happens to be unmapped.
 
@@ -1296,9 +1296,9 @@ the argument tuple is heap-allocated by the call itself, before any check sees i
 
 A plan, a table of coefficients or a workspace description is often built once and handed to many
 tasks. That is safe only while no call writes it. [`@assert_concurrency_safe`](@ref) checks one
-call: it holds when the call writes neither its shared argument, nor anything reached through that
-argument, nor a mutable `const` global. The shared argument is the first by default. Arguments the
-call is meant to write, such as the output and a scratch buffer each task owns, are not checked.
+call for a write to its shared argument, to anything reached through that argument, or to a
+mutable `const` global. The shared argument is the first unless you say otherwise. Arguments the
+call is meant to write, such as the output or a scratch buffer each task owns, are not checked.
 
 ```@example guide
 struct FilterPlan
@@ -1344,63 +1344,48 @@ end
 The fix is to move what the call writes out of the shared object: return the count, or keep it in
 an argument that each task owns.
 
-### Naming the shared argument
-
-`self = N` names a different position, for a call whose first argument is the output:
+When the first argument is the output, name the shared one with `self = N`:
 
 ```julia
 @assert_concurrency_safe self=2 apply_into!(out, plan, x)   # `plan` is shared; `out` may be written
 ```
 
-### What it follows
+### What the scan follows
 
-The scan reads the optimized IR of the call. It marks every reference derived from the shared
-argument and reports a store through one. A scalar read out of the plan, such as `plan.n::Int`, is
-a copy and is not marked. From there it follows:
+The scan reads the call's optimized IR, marks every reference derived from the shared argument,
+and reports a store through one. A scalar read out of the plan, such as `plan.n::Int`, is a copy
+and is not marked. A marked value is followed into a callee that was not inlined, down to
+`max_depth` calls (4 by default), into a closure built from it, and into the body of a task that
+captures it, so a `Threads.@spawn` inside the call is read too.
 
-- a callee that was not inlined and receives a marked value, down to `max_depth` calls (4 by
-  default);
-- a closure built from a marked value;
-- the body of a task that captures one, so a `Threads.@spawn` inside the call is read.
-
-A struct built around the plan is a different object, so a method that wraps its plan in a fresh
+A struct built around the plan is a different object. A method that wraps its plan in a fresh
 struct and fills in that struct's own fields passes.
 
-### When it throws and when it warns
+### Throw or warn
 
-The outcome follows how sure the scan is, finding by finding.
+Each finding is judged on its own, by how sure the scan is.
 
-**It throws on a write it read:**
+It throws on a write it read: a store through the shared argument, a store into a mutable `const`
+global, or a marked value handed to one of the Base functions the scan knows to mutate, such as
+`push!`, `resize!`, `copyto!` or `fill!`. One such finding is enough to throw, whatever else was
+found.
 
-- a store whose target is reached through the shared argument;
-- a store into a mutable `const` global;
-- a marked value handed to one of the Base functions the scan knows to mutate, such as `push!`,
-  `resize!`, `copyto!` or `fill!`.
-
-**It warns on what it could not rule out:**
-
-- a marked value passed to a call that dispatches at run time;
-- a task whose body it could not read;
-- a call chain that reached `max_depth` before the scan saw a store.
-
-The warning says so: "cannot establish that the plan argument is read-only — sharing it across
-concurrent tasks is unproven, not disproven". For a chain that is too deep, raise `max_depth` or
-assert on the inner method.
+It warns on what it could not rule out: a marked value passed to a call that dispatches at run
+time, a task whose body it could not read, or a call chain that reached `max_depth` before the
+scan saw a store. The warning says so: "cannot establish that the plan argument is read-only —
+sharing it across concurrent tasks is unproven, not disproven". For a chain that is too deep,
+raise `max_depth` or assert on the inner method.
 
 An atomic write, such as `@atomic plan.count += 1`, also warns. It cannot tear, but two calls that
 share the plan still both change it, and the scan cannot tell whether they are meant to.
 
-One certain finding is enough to throw, whatever else was found.
+### Limits
 
-### What it cannot see
-
-- **Aliasing.** If the scratch buffer you pass shares memory with something the plan owns, a write
-  to the scratch passes.
-- **A Base function it does not know to mutate.** Other calls into Base and Core are treated as
-  reads.
-- **Which part of a captured array a task writes.** A task that writes its own slice of a shared
-  output is reported, because which slice it writes depends on values.
-- **Other signatures.** The verdict is for the argument types of this call.
+The scan does not model aliasing: if the scratch buffer you pass shares memory with something the
+plan owns, a write to the scratch passes. Apart from the Base functions it knows to mutate, calls
+into Base and Core are treated as reads. Which part of a captured array a task writes depends on
+values, so a task that writes its own slice of a shared output is reported. And the verdict covers
+the argument types of this call only.
 
 `StrictModeTest` has no stronger answer for this guarantee. AllocCheck, JET and TrimCheck do not
 decide whether an argument is written, so both packages run this scan. Pair it with a test that
@@ -1412,11 +1397,11 @@ method.
 
 ## `@assert_no_threadid_state` — no per-thread state held across a suspension
 
-A buffer indexed by `Threads.threadid()` looks private to the task that uses it. It is private
-only until the task is suspended. Julia does not preempt a task, but at a `yield`, a `wait`, a
-`fetch`, a blocking `lock` or a `take!` on a channel it can move the task to another thread, or
-run another task on this one. A slot chosen before that point and used after it may then be in use
-by two tasks. [`@assert_no_threadid_state`](@ref) fails on that shape:
+A buffer indexed by `Threads.threadid()` looks private to the task that uses it, and it is until
+the task is suspended. Julia does not preempt a task, but at a `yield`, a `wait`, a `fetch`, a
+blocking `lock` or a `take!` on a channel it can move the task to another thread, or run another
+task on this one. A slot chosen before that point and used after it may then be in use by two
+tasks. [`@assert_no_threadid_state`](@ref) fails on that:
 
 ```julia
 function count_work!(counts::Vector{Int})
@@ -1447,31 +1432,26 @@ end
 @assert_no_threadid_state bump_slot!(zeros(Int, 4), 1)
 ```
 
-A write to `buf[threadid()]` with no suspension point between choosing the slot and the last use
-of it passes: no other task can run on the thread in between.
+A write to `buf[threadid()]` passes when there is no suspension point between choosing the slot
+and the last use of it, because no other task can run on the thread in between.
 
 ### What it detects
 
-- a store to `buf[threadid()]`, directly or through a local that holds the index;
-- a store into an object loaded out of such a slot: `buf[threadid()].field = …`,
-  `buf[threadid()][i] = …`, `rand(rngs[threadid()])`;
-- a slot's value passed to a callee that was not inlined, when the callee writes it or returns it
-  and the caller then writes it.
+The scan reports a store to `buf[threadid()]`, whether the index is written in place or held in a
+local. It also reports a store into an object loaded out of such a slot, as in
+`buf[threadid()].field = …`, `buf[threadid()][i] = …` and `rand(rngs[threadid()])`. A slot's value
+passed to a callee that was not inlined counts when the callee writes it, or returns it and the
+caller then writes it. Suspension points are looked for in callees too.
 
-The suspension point is looked for in callees too.
+A thread id stored into another array and read back later is not tracked.
 
-### What it cannot see
+A lock chosen by thread, `lock(locks[threadid()])`, is reported although it is not a data race,
+because taking the lock writes a field of an object chosen by `threadid()`. Choosing a lock by
+thread gains nothing once tasks can move, so the report is still worth reading.
 
-- A thread id stored into another array and read back later is not tracked.
-- A lock chosen by thread, `lock(locks[threadid()])`, is reported although it is not a data race:
-  taking the lock writes a field of an object chosen by `threadid()`. Choosing a lock by thread
-  gains nothing once tasks can move, so the report is still worth reading.
-
-### Throws or warns
-
-It throws when the scan read the suspension: the message says the call "can suspend the task". It
-warns when the suspension is inside a callee it could not read in full: the message says "may
-suspend the task (not read in full)".
+The check throws when the scan read the suspension, and the message says the call "can suspend the
+task". When the suspension is inside a callee the scan could not read in full, it warns, and the
+message says "may suspend the task (not read in full)".
 
 [`audit`](@ref) sweeps `:no_threadid_state` with nothing written at the call site. A signature for
 which the compiler proves the `notaskstate` effect passes without a scan. The guarantee is not
@@ -1479,11 +1459,11 @@ part of [`@strict`](@ref).
 
 ## `test_calls` — every call resolves
 
-A call with no matching method raises a `MethodError` when it runs, and only then. If it sits on a
-branch no test takes, the suite passes. The other gates do not see it either: they ask whether
-code allocates or dispatches at run time, and a call that cannot resolve is neither.
-`StrictModeTest.test_calls` runs JET's call analysis over every signature of a module that has
-compiled, and throws one `StrictViolation` that lists every call that does not resolve.
+A call with no matching method raises a `MethodError` only when it runs. If it sits on a branch no
+test takes, the suite passes. The other gates miss it too: they ask whether code allocates or
+dispatches at run time, and a call that cannot resolve does neither. `StrictModeTest.test_calls`
+runs JET's call analysis over every signature of a module that has compiled, and throws one
+`StrictViolation` that lists every call that does not resolve.
 
 ```julia
 module MyPkg
@@ -1508,27 +1488,26 @@ test_calls(MyPkg)
 
 The fix here is to define the method or correct the call.
 
-Two kinds of JET report are gated: a call with no matching method, and a read of a name that is not
-defined. JET's other kinds are dropped. Most of them are reports on correct code, such as a
-function that checks its arguments and throws.
+Two kinds of JET report are gated: a call with no matching method, and a read of a name that is
+not defined. JET's other kinds are dropped, because most of them are reports on correct code, such
+as a function that checks its arguments and throws.
 
-### What it cannot see
+Like `test_compiled`, it sees only signatures that have compiled, so run the kernels before
+calling it. `only` and `exempt` filter by function name.
 
-- **A signature that has not compiled.** The scope is the same as `test_compiled`, so run the
-  kernels before calling it. `only` and `exempt` filter by function name.
-- **A guard inference cannot follow.** `isnothing(ref[]) && (ref[] = build())` followed by a
-  second read of `ref[]` is the common case: the check narrows the first read and not the second,
-  so each use of the value is reported. Binding the read to a local once removes the report and
-  the type instability behind it. Where that is not possible, `exempt = (:name,)` excludes the
-  function.
+It also reports a guard that inference cannot follow. The common case is
+`isnothing(ref[]) && (ref[] = build())` followed by a second read of `ref[]`: the check narrows
+the first read and not the second, so each use of the value is reported. Binding the read to a
+local once removes the report and the type instability behind it. Where that is not possible,
+`exempt = (:name,)` excludes the function.
 
-It always throws. It is a `StrictModeTest` driver, the analysis is JET's, and StrictMode has no
-reporting form of it.
+`test_calls` always throws. It is a `StrictModeTest` driver, the analysis is JET's, and StrictMode
+has no reporting form of it.
 
 ## `@golden` — a result that must not change
 
 [`@golden`](@ref) records the result of an expression in a file the first time it runs, and
-compares against that file on every later run. It is for a port or an optimization that must not
+compares against that file on every later run. Use it for a port or an optimization that must not
 change the numbers. It returns the result either way.
 
 ```@example guide
@@ -1549,43 +1528,37 @@ A result that differs fails, naming the first element that does:
 #            Use `ulps=N` for tolerance or delete the golden to re-record.
 ```
 
-What to do depends on why it changed:
-
-- **The change is a bug.** Fix the code.
-- **The change is intended.** Delete the file, or run once with `STRICTMODE_RECORD_GOLDEN=1`,
-  which re-records every `@golden` in the run.
-- **A SIMD reduction was reordered.** The compiler chooses the order in which vector lanes are
-  combined, so a sum can move by one unit in the last place (ULP) between Julia versions or CPUs.
-  `ulps = 1` accepts that much per element.
+If the change is a bug, fix the code. If it is intended, delete the file, or run once with
+`STRICTMODE_RECORD_GOLDEN=1`, which re-records every `@golden` in the run. The third case is a
+reordered SIMD reduction: the compiler chooses the order in which vector lanes are combined, so a
+sum can move by one unit in the last place (ULP) between Julia versions or CPUs. `ulps = 1`
+accepts that much per element.
 
 The comparison is `===` on each element by default, so `0.0` and `-0.0` differ.
-
-### Where the file lives
 
 Without `dir`, the file is `golden/<name>.golden` next to the file that contains the call. Commit
 it. When the `CI` environment variable is set and the file is missing, `@golden` throws rather
 than recording, because recording would compare nothing and pass. `record = true` at the call
 site, or `STRICTMODE_RECORD_GOLDEN=1`, allows recording there.
 
-### When more than one answer is right
-
-`validator = f` replaces the file with a predicate on the result, for a problem with several valid
-outputs:
+For a problem with several valid outputs, `validator = f` replaces the file with a predicate on
+the result:
 
 ```julia
 @golden "shortest" format_float(x) validator = s -> parse(Float64, s) === x
 ```
 
-### What it cannot see
+### Limits
 
-- **Whether the recorded result was right.** It records what the code produced on the first run.
-- **Inputs you did not run.** It compares one result for one input.
-- **Types other than floating-point data.** It accepts a real scalar and an array of `Float32`,
-  `Float64`, `ComplexF32` or `ComplexF64`. Any other type, an integer array included, is an error.
-- **Integer scalars beyond `Float64`.** A real scalar is stored as a `Float64`, so two integers
-  that round to the same `Float64`, such as `2^60` and `2^60 + 1`, compare equal.
+`@golden` records what the code produced on the first run, so it cannot tell you whether that
+result was right. It compares one result for one input and says nothing about inputs you did not
+run.
 
-It always throws on a mismatch, because it compares values it has in hand. It also runs when
+It accepts a real scalar and an array of `Float32`, `Float64`, `ComplexF32` or `ComplexF64`. Any
+other type, an integer array included, is an error. A real scalar is stored as a `Float64`, so two
+integers that round to the same `Float64`, such as `2^60` and `2^60 + 1`, compare equal.
+
+A mismatch always throws, because `@golden` compares values it has in hand. It also runs when
 checks are disabled: it tests correctness, so `disable_checks!()` does not remove it.
 
 ## `test_threadcount_invariant` — the same bits at every thread count
@@ -1631,13 +1604,13 @@ returns `true` when it did, such as a check on a counter that the package's pool
 `test_threadcount_invariant` throws an `ArgumentError` when no witness is given. It fails when the
 witness returns `false` at a count above one, and when no process had more than one thread.
 
-### What it cannot see
+The witness is not checked: the test runs the code it is given.
 
-- **Other inputs.** It compares the results for the input that `setup` builds. `setup` must build
-  the same input in every process, so seed random data.
-- **Whether the witness is true.** It runs the code it is given.
-- **Results without a fixed bit pattern.** The result must be an `isbits` value, an array of them,
-  or a tuple of those.
+### Limits
+
+Only the input that `setup` builds is compared. `setup` must build the same input in every
+process, so seed random data. The result needs a fixed bit pattern: an `isbits` value, an array of
+them, or a tuple of those.
 
 `threadcount_invariant_report` returns a [`ThreadcountInvariantReport`](@ref) and does not throw
 when results differ; it prints which counts differ and whether a witness was given.
@@ -1709,7 +1682,7 @@ measured in the field rather than reasoned about:
 
 One property is out of scope: **bit-for-bit agreement with a reference implementation**. `@golden`
 and `test_threadcount_invariant` compare a kernel with its own earlier output, or with its own
-output at another thread count; neither compares it with other code.
+output at another thread count. Neither compares it with other code.
 
 SIMD reduction order is LLVM-codegen-defined: the lane-combine order for a vector reduction — how
 four `<4 x double>` lanes are collapsed to a scalar, for example — is chosen by the compiler and may
