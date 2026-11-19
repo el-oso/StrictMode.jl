@@ -130,3 +130,27 @@ end
     @test uc(Assigned.cc) == [:ccall]
     @test uc(Assigned.gf) == [:unsafe_load]
 end
+
+@testitem "unsafe_report fails a method whose code it could not read" begin
+    using StrictMode
+
+    module UnreadUnsafe
+    @generated raises(x) = error("the generator raised")
+    @generated loads(p::Ptr{T}) where {T} = :(unsafe_load(p))
+    @generated clean(x::NTuple{N, T}) where {N, T} = :(x[1])
+    end
+
+    # A generator that raises leaves no code to read, which is not the same as code with no unsafe
+    # construct in it: the first is `nothing`, the second an empty list.
+    @test isnothing(StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.raises))))
+    @test isempty(StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.clean))))
+    @test StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.loads))) == [:unsafe_load]
+
+    fs = unsafe_report(UnreadUnsafe)
+    unread = only(filter(x -> x.func == "raises", fs))
+    @test StrictMode._failed(unread)
+    @test unread.code === :SM0203
+    @test occursin("could not be read", unread.reason)
+    @test only(filter(x -> x.func == "loads", fs)).code === :SM0206
+    @test !any(x -> x.func == "clean", fs)
+end

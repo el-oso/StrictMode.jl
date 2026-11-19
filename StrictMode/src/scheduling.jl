@@ -150,7 +150,9 @@ function _invoke_callees(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _assert_vectorized(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _vectorized(f, types) && return nothing
+    ir = _llvm_ir(f, types)
+    isempty(ir) && return _fail(:vectorized, target, _output_unread(f, types))
+    _ir_vectorized(ir) && return nothing
     # `@assert_vectorized` inspects the *leaf* compiled body. A thin dispatcher has no vector ops of
     # its own — point the user at the non-inlined callees where the SIMD actually is (F11).
     callees = _invoke_callees(f, types)
@@ -288,7 +290,33 @@ Base.@kwdef struct KernelReport
     ordered_reduce_ops::Int = 0
 end
 
+# A call runs the code compiled for its concrete argument types. For a signature that is not
+# concrete, `code_llvm` and `code_native` print a fallback that dispatches at run time (under
+# "WARNING: This code may not match what actually runs"): it holds none of the method's loops, so
+# every check of loops and registers reads it as clean. `_llvm_ir` and `_native_asm` therefore
+# return "" for it, as they do when the printer raises, and a guarantee reports an empty text as
+# unevaluated (`_output_unread`), never as a pass.
+#
+# The signature judged is the one asked about, not the one read. A forwarder is read at its
+# callee's compilation signature, which widens an argument the callee does not specialize on and is
+# still the code the call runs.
+function _has_compiled_body(@nospecialize(f), @nospecialize(types::Tuple))
+    return try
+        Base.isdispatchtuple(_sigtype(f, types))
+    catch
+        false
+    end
+end
+
+# Why `_llvm_ir` or `_native_asm` came back empty for `f(types...)`.
+_output_unread(@nospecialize(f), @nospecialize(types::Tuple)) =
+    _has_compiled_body(f, types) ?
+    "the compiled output could not be read (`code_llvm` / `code_native` raised or printed nothing)" :
+    "the signature is not concrete, so it names no compiled body to read; give the argument " *
+    "types a call would have"
+
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
@@ -300,6 +328,7 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
@@ -621,7 +650,9 @@ function _scalar_fp_loops(s::AbstractString)
 end
 
 function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::Tuple))
-    scalar_fp_loops(f, types) || return nothing
+    ir = _llvm_ir(f, types)
+    isempty(ir) && return _fail(:no_scalar_loops, target, _output_unread(f, types))
+    _scalar_fp_loops(ir) || return nothing
     _fail(
         :no_scalar_loops, target,
         "scalar hot loop (FP or integer) detected in a numeric path that did not vectorize. " *
@@ -920,8 +951,10 @@ A nonzero count means the kernel needs more live vector registers than the targe
 the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/
 reload instead of running from registers. Complements [`register_report`](@ref) (which reads
 zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-allocation LLVM IR
-and can't see spills at all). Empty/unavailable `code_native` output reports zero spills, matching
-[`scalar_fp_loops`](@ref)'s "can't analyze ⇒ don't fail" convention.
+and can't see spills at all). Assembly that cannot be read reports zero spills here, as
+[`scalar_fp_loops`](@ref) reports `false`: that is the case for a signature that is not concrete,
+which names no compiled body. The guarantees do not pass on it: `@assert_no_spill` and `:no_spill`
+report unread assembly as a failure.
 
 Each spill is placed by the loop its block is in, from LLVM's own loop annotations. `loop_spills`
 leaves out code that runs once per call — the prologue and the epilogue that stores a tile's
@@ -930,10 +963,12 @@ results — where a spill costs one store and one load per call rather than per 
 so it is not the same as the hot loop.
 """
 function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
-    target = _func_name(f) * _sig_string(types)
-    s = _native_asm(f, types)
-    isempty(s) && return SpillReport(target, 0, 0, 0)
-    total, inloop, ininner = _spill_counts(split(s, '\n'), Sys.ARCH)
+    return _spill_report(_func_name(f) * _sig_string(types), _native_asm(f, types))
+end
+
+function _spill_report(target::AbstractString, asm::AbstractString)
+    isempty(asm) && return SpillReport(target, 0, 0, 0)
+    total, inloop, ininner = _spill_counts(split(asm, '\n'), Sys.ARCH)
     return SpillReport(target, total, inloop, ininner)
 end
 
@@ -992,7 +1027,9 @@ function Base.show(io::IO, r::SpillReport)
 end
 
 function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple), scope::Symbol = :loops)
-    r = spill_report(f, types)
+    asm = _native_asm(f, types)
+    isempty(asm) && return _fail(:no_spill, target, _output_unread(f, types))
+    r = _spill_report(_func_name(f) * _sig_string(types), asm)
     n = _spill_count(r, scope)
     iszero(n) && return nothing
     where_ = scope === :function ? "" : scope === :loops ? " inside a loop" : " inside an innermost loop"

@@ -6,15 +6,23 @@
 
 # Best-effort inlining detection from `(f, types)` alone (no values, no execution): compile a
 # wrapper that calls `f`, scan its optimized IR for a surviving `:invoke` to `f`'s method.
-# Returns `true` if the call was *not* inlined, `false` if it was, `nothing` if undeterminable
-# (e.g. a builtin/intrinsic with no resolvable method — effectively always inlined).
+# Returns `true` if the call was *not* inlined, `false` if it was, and `nothing` when that cannot
+# be read: no single method matches, the wrapper has no typed body, or the signature is not
+# concrete (the wrapper then calls `f` through run-time dispatch, which leaves no `:invoke` and
+# would read as inlined). A builtin or an intrinsic is not a call that could survive, so `false`.
 # Force specialization on the callee type (`where {F}`), exactly as `_allocated` in static_checks.jl
 # does. `_inlined_survives` takes `f` under `@nospecialize`, so a wrapper closure built there captures
 # an unspecialized field: on Julia 1.13 the wrapper's IR is then `Core.getfield(_1, :f); (%1)(%2)` — a
 # dynamic `:call`, with no `:invoke` for the scan below to find, which silently reports every callee as
 # inlined. Building the closure through this specialized helper restores the `:invoke`.
 _inline_wrapper(f::F) where {F} = (args...) -> f(args...)
+
+const _INLINED_UNREAD = "whether the call is inlined could not be read: the signature is not " *
+    "concrete, no single method matches it, or the calling wrapper has no typed body"
+
 function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
+    f isa Union{Core.Builtin, Core.IntrinsicFunction} && return false
+    _has_compiled_body(f, types) || return nothing
     local m
     try
         m = which(f, types)
@@ -37,7 +45,9 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _assert_inlined(target, @nospecialize(f), @nospecialize(types::Tuple))
-    if _inlined_survives(f, types) === true
+    survives = _inlined_survives(f, types)
+    isnothing(survives) && return _fail(:inlined, target, _INLINED_UNREAD)
+    if survives
         _fail(
             :inlined, target,
             "call to `$(which(f, types).name)` was not inlined — it survives as an `:invoke` at " *

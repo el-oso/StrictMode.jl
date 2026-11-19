@@ -1192,3 +1192,26 @@ end
     @test tid(Wrapped.tup) === :info
     @test tid(Wrapped.root_calm) === :pass    # the callee cannot suspend
 end
+
+@testitem "a plan value handed to a callee the scan cannot read is recorded" begin
+    using StrictMode
+
+    struct UnreadPlan
+        buf::Vector{Float64}
+    end
+    # A callable struct with a field is not a singleton, and the scan reads a callee through its
+    # singleton, so this body is one it does not read.
+    struct UnreadWriter
+        k::Int
+    end
+    @noinline (w::UnreadWriter)(p::UnreadPlan) = (p.buf[w.k] = 1.0; nothing)
+    through_callable(p::UnreadPlan, w::UnreadWriter) = w(p)
+    reads_only(p::UnreadPlan) = p.buf[1]
+
+    vs = StrictMode.concurrency_findings(through_callable, (UnreadPlan, UnreadWriter))
+    @test length(vs) == 1
+    # Not a write the scan read, so it reports and does not gate.
+    @test !only(vs).certain
+    @test occursin("could not be read", only(vs).message)
+    @test isempty(StrictMode.concurrency_findings(reads_only, (UnreadPlan,)))
+end

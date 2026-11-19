@@ -55,7 +55,10 @@ StrictMode/src/
                         check here that reads VALUES, so :noalias is deliberately NOT in _GUARANTEES:
                         no sweep has values to give it)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
-  inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory)
+  inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory).
+                        _inlined_survives returns `nothing` when it cannot tell (a signature that
+                        is not concrete, no single method, no typed wrapper body); both tiers and
+                        the macro report that as unevaluated, never as inlined
   effects.jl          — _alloc_signals (the value-free IR scan used by noalloc/noboxing/owned). A
                         BOXING STORE sets `boxing` in every mode (_boxing_store, F50): an isbits value
                         written to a slot that holds a reference, by a :new, setfield!, memoryrefset!,
@@ -740,11 +743,21 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   instead of the intent.
 - `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly.
 - `ignore_throw() = true` is the default and lives in StrictMode (`effects.jl`) — throw-path allocations don't count, and BOTH tiers honor it, so the scan and AllocCheck answer the same question.
+- **A compiled-output guarantee reads compiled output or fails.** `_llvm_ir`/`_native_asm` return
+  `""` when the printer raises AND for a signature that is not concrete: `code_llvm` prints a
+  run-time-dispatch fallback for it (437 characters for `sum(::AbstractVector{Float64})`, no loop, no
+  spill), which every loop and register check read as clean. `:vectorized`, `:no_scalar_loops`,
+  `:no_spill` and `:inlined` turn an empty text (or `nothing` from `_inlined_survives`) into
+  `_unevaluated`, in `_compiled_output_finding` and in the `@assert_*` macros alike. The public
+  reports (`spill_report`, `scalar_fp_loops`, `kernel_report`, `register_report`) still return
+  their empty value for it. The same rule elsewhere: `_unsafe_constructs` returns `nothing` for a
+  method it could not read and `unsafe_report` fails it (SM0203); the concurrency scan records a
+  plan value handed to a callee whose typed IR it cannot read (a callable struct with fields).
 - `kernel_report` and `@assert_vectorized` work from `InteractiveUtils.code_llvm` — no backend needed. `_CACHE_BYTES` is a tunable `Ref` for cache-residency annotation thresholds.
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F52 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F53 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

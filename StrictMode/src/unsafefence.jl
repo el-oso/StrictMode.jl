@@ -81,26 +81,33 @@ end
 # method matching it, so a generic method was charged with the `@inbounds` and `unsafe_*` calls of
 # its more specific siblings. A `@generated` method has no lowered body of its own and is inferred,
 # keeping only its own result.
+#
+# `nothing` when the method's code cannot be read: a generator that raises, or a method that keeps
+# no source. That is not an empty list, which says the method was read and is clean.
 function _unsafe_constructs(m::Method)
     out = Set{Symbol}()
     if isdefined(m, :generator)
         cis = try
             _code_typed_by_type(m.sig; optimize = false)
         catch
-            return Symbol[]
+            return nothing
         end
+        read = false
         for pair in cis
             ci = pair isa Pair ? pair.first : pair
             ci isa Core.CodeInfo || continue
             mi = ci.parent
             (mi isa Core.MethodInstance && mi.def !== m) && continue
             _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a))
+            read = true
         end
+        # A generator that raises yields its `Method` in place of the code.
+        read || return nothing
     else
         src = try
             Base.uncompressed_ast(m)
         catch
-            return Symbol[]
+            return nothing
         end
         _scan_unsafe!(out, src, a -> _lowered_callee(src.code, a))
     end
@@ -151,6 +158,17 @@ function unsafe_report(mod::Module; only = nothing, exempt = (), allow = ())
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
         found = _unsafe_constructs(m)
+        if isnothing(found)
+            push!(
+                out, _unevaluated(
+                    nameof(mod), string(m.name), string(m.sig), :unsafe,
+                    "the method's code could not be read, so it was not checked for constructs " *
+                        "that leave Julia's safety guarantees";
+                    file = string(m.file), line = Int(m.line)
+                )
+            )
+            continue
+        end
         isempty(found) && continue
         reported = filter(n -> !(n in allowed), found)
         isempty(reported) && continue

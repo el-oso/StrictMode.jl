@@ -169,15 +169,22 @@ function _compiled_output_finding(
         )
         return _mkfinding(md, fn, sg, g, s.dictlookup || deep === :lookup, "runtime AbstractDict lookup on owned scratch (static-ownership violation)", s.file, s.line; tier)
     elseif g === :inlined
-        fail = _inlined_survives(f, types) === true
-        return _mkfinding(md, fn, sg, g, fail, "not inlined (survives as :invoke)", "", 0; tier)
+        survives = _inlined_survives(f, types)
+        isnothing(survives) && return _unevaluated(md, fn, sg, g, _INLINED_UNREAD; tier)
+        return _mkfinding(md, fn, sg, g, survives, "not inlined (survives as :invoke)", "", 0; tier)
     elseif g === :vectorized
-        return _mkfinding(md, fn, sg, g, !_vectorized(f, types), "did not vectorize (no `<N x …>` ops in this body other than loads and in-order reductions)", "", 0; tier)
+        ir = _llvm_ir(f, types)
+        isempty(ir) && return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
+        return _mkfinding(md, fn, sg, g, !_ir_vectorized(ir), "did not vectorize (no `<N x …>` ops in this body other than loads and in-order reductions)", "", 0; tier)
     elseif g === :no_scalar_loops
-        return _mkfinding(md, fn, sg, g, scalar_fp_loops(f, types), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
+        ir = _llvm_ir(f, types)
+        isempty(ir) && return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
+        return _mkfinding(md, fn, sg, g, _scalar_fp_loops(ir), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
     elseif g === :no_spill
         # Spills inside a loop, the same scope `@assert_no_spill` gates on by default.
-        r = spill_report(f, types)
+        asm = _native_asm(f, types)
+        isempty(asm) && return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
+        r = _spill_report(fn * sg, asm)
         return _mkfinding(md, fn, sg, g, r.loop_spills > 0, "vector register(s) spilled to the stack inside a loop ($(r.loop_spills) spill/reload line(s))", "", 0; tier)
     elseif g === :trusted
         # No proving counterpart: the scan reads a call on a type inference has already fixed, so

@@ -513,7 +513,8 @@ function _bail_frame_dispatches(@nospecialize(rep))
     cis = try
         Base.code_typed_by_type(mi.specTypes; optimize = true)
     catch
-        return out
+        # Unread is not clean: JET reported nothing from this frame's body either.
+        return push!(out, "$where: its body could not be read")
     end
     for pair in cis
         ci = pair isa Pair ? pair.first : pair

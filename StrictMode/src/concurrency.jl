@@ -836,7 +836,15 @@ function _recurse(
     end
     memo[key] = false   # cycle guard: assume non-tainting return until proven
     ci = _mi_codeinfo(mi)
-    ci === nothing && return false
+    if ci === nothing
+        # The callee holds a plan-reachable value and nothing says what it does with it.
+        _record!(
+            out, seen, chain,
+            "hands a plan-reachable value to `$label`, whose typed IR could not be read — " *
+                "not read, so not established", _Frame(label, string(m.file), Int(m.line))
+        )
+        return false
+    end
     # user param k (1-based) ↔ Core.Argument(k+1)
     callee_targs = Set{Int}(p + 1 for p in tainted_pos)
     callee_cargs = Dict{Int, Set{Int}}(p + 1 => v for (p, v) in cpos)

@@ -100,3 +100,47 @@ end
     eff = StrictMode.effects(vscale!, (Vector{Float64}, Vector{Float64}))
     @test StrictMode.effect_holds(eff, :terminates) isa Bool
 end
+
+@testitem "a compiled-output guarantee does not pass on output it could not read" begin
+    using StrictMode
+
+    absf(x::AbstractVector) = sum(x)
+    gs = (:no_scalar_loops, :no_spill, :vectorized, :inlined)
+
+    # A signature that is not concrete names no compiled body. `code_llvm` prints a fallback that
+    # dispatches at run time for it, which holds no loop and no spill, so reading it passed.
+    abstract_sig = (AbstractVector{Float64},)
+    @test isempty(StrictMode._llvm_ir(absf, abstract_sig))
+    @test isempty(StrictMode._native_asm(absf, abstract_sig))
+    @test isnothing(StrictMode._inlined_survives(absf, abstract_sig))
+    fs = findings(absf, abstract_sig; guarantees = gs)
+    @test length(fs) == 4
+    @test all(StrictMode._failed, fs)
+    @test all(x -> x.code === :SM0203, fs)
+    @test all(x -> occursin("not concrete", x.reason), fs)
+
+    # The same signature made concrete is read, and each guarantee gives its own verdict.
+    read = findings(absf, (Vector{Float64},); guarantees = gs)
+    @test !any(x -> x.code === :SM0203, read)
+    @test !isempty(StrictMode._llvm_ir(absf, (Vector{Float64},)))
+    @test StrictMode._inlined_survives(absf, (Vector{Float64},)) isa Bool
+
+    # The signature judged is the one asked about. `notify(c)` forwards to a keyword body that does
+    # not specialize on the value it passes along, so the body read has an `Any` in its signature
+    # and is still the code the call runs.
+    fwd = findings(notify, (Base.GenericCondition{ReentrantLock},); guarantees = (:no_scalar_loops, :no_spill))
+    @test !any(x -> x.code === :SM0203, fwd)
+
+    # More than one matching method leaves no single call to look for.
+    @test isnothing(StrictMode._inlined_survives(+, (Real, Real)))
+    # A builtin is not a call that could survive.
+    @test StrictMode._inlined_survives(getfield, (Tuple{Int}, Int)) === false
+
+    # The macros read the same output: the two that gate raise, the one that reports warns.
+    x = [1.0, 2.0]
+    @test_throws "not concrete" @assert_no_spill absf(x) types = (AbstractVector{Float64},)
+    @test_throws "could not be read" @assert_inlined absf(x) types = (AbstractVector{Float64},)
+    @test_throws "not concrete" @assert_vectorized absf(x) types = (AbstractVector{Float64},)
+    @test_logs (:warn, r"not concrete") match_mode = :any @assert_no_scalar_loops absf(x) types = (AbstractVector{Float64},)
+    @test (@assert_inlined absf(x)) == 3.0
+end
