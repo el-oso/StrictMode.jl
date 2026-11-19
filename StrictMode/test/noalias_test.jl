@@ -113,3 +113,76 @@ end
     @test StrictMode.explain(:SM0012) isa String
     @test occursin("shares memory", StrictMode.explain(:SM0012))
 end
+
+@testitem "@assert_noalias does not pass a pair it could not compare" begin
+    using StrictMode, LinearAlgebra
+
+    y = [1.0, 2.0, 3.0, 4.0]
+    x = [4.0, 3.0, 2.0, 1.0]
+
+    # The `!` default names argument 1. A scalar there holds no memory, so the default compares
+    # nothing: the call is rejected until `mutates` names what is written.
+    @test_throws ArgumentError @assert_noalias BLAS.axpy!(2.0, y, y)
+    @test_throws "argument 1 is a `Float64`, which holds no memory to write" @assert_noalias BLAS.axpy!(2.0, y, y)
+    @test_throws "mutates = (2,)" @assert_noalias BLAS.axpy!(2.0, y, y)
+    scale_into!(a, src, dst) = (dst .= a .* src; dst)
+    @test_throws "holds no memory to write" @assert_noalias scale_into!(2.0, x, y)
+    @test_throws "share memory: argument 3 (written) and argument 2" @assert_noalias mutates = (3,) BLAS.axpy!(2.0, y, y)
+    @test (@assert_noalias mutates = (3,) BLAS.axpy!(2.0, x, copy(y))) == [9.0, 8.0, 7.0, 6.0]
+    # A named position that cannot be written is the same mistake, spelled out.
+    @test_throws "mutates = 1, but argument 1 is a `Float64`" @assert_noalias mutates = (1,) scale_into!(2.0, x, y)
+    # A function or a type in the first position is no better than a scalar.
+    @test_throws "holds no memory to write" @assert_noalias map!(abs, y, y)
+    @test (@assert_noalias mutates = (2,) map!(abs, copy(y), x)) == x
+
+    # An array type with no `Base.dataids` method answers with its own identity, which never
+    # matches the vector it wraps.
+    struct Wrapped{T} <: AbstractVector{T}
+        data::Vector{T}
+    end
+    Base.size(w::Wrapped) = size(w.data)
+    Base.getindex(w::Wrapped, i::Int) = w.data[i]
+    Base.setindex!(w::Wrapped, v, i::Int) = (w.data[i] = v)
+    @test !Base.mightalias(Wrapped(y), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(Wrapped(y), y)
+    @test_throws "argument 1 (written) and argument 2" @assert_noalias copyto!(Wrapped(y), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(y, Wrapped(y))
+    @test (@assert_noalias copyto!(Wrapped(copy(y)), y)) isa Wrapped
+    # A wrapper that declares its ids is taken at its word.
+    struct Declared{T} <: AbstractVector{T}
+        data::Vector{T}
+    end
+    Base.size(w::Declared) = size(w.data)
+    Base.getindex(w::Declared, i::Int) = w.data[i]
+    Base.setindex!(w::Declared, v, i::Int) = (w.data[i] = v)
+    Base.dataids(w::Declared) = Base.dataids(w.data)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(Declared(y), y)
+    @test (@assert_noalias copyto!(Declared(copy(y)), y)) isa Declared
+
+    # A buffer held in a field of an argument that is not an array is shared memory the kernel
+    # may never read: reported, not raised.
+    struct Workspace
+        buf::Vector{Float64}
+    end
+    from_ws!(dst, ws) = (dst .= ws.buf; dst)
+    from_fact!(F, dst) = (dst .= F.factors; dst)
+    @test_logs (:warn, r"argument 1 \(written\) and argument 2 \(a buffer held in a field of argument 2, a `[^`]*Workspace`\)"s) match_mode = :any (@assert_noalias from_ws!(y, Workspace(y)))
+    @test_logs (@assert_noalias from_ws!(y, Workspace(x)))
+    # A factorization that is the first argument of a two-argument `ldiv!`: the written argument
+    # is the second, and the pair compared is the same one.
+    F = lu([4.0 1.0; 1.0 3.0])
+    @test_logs (:warn, r"argument 2 \(written\) and argument 1 \(a buffer held in a field of argument 1"s) match_mode = :any (@assert_noalias mutates = (2,) from_fact!(F, F.factors))
+    # The `!` default compares argument 1 with the rest, which finds the same shared buffer.
+    @test_logs (:warn, r"argument 1 \(written\) and argument 2 \(a buffer held in a field of argument 1"s) match_mode = :any (@assert_noalias from_fact!(F, F.factors))
+    @test_logs (@assert_noalias ldiv!(F, [1.0, 2.0]))
+
+    # Disjoint views of one parent are still told apart, and distinct arrays still cost nothing.
+    M = zeros(4, 4)
+    @test (@assert_noalias copyto!(view(M, :, 1), view(M, :, 2))) == zeros(4)
+    check(a, b) = StrictMode._assert_noalias("t", copyto!, (a, b); mutates = (1,))
+    fs = findings(check, (Vector{Float64}, Vector{Float64}); guarantees = (:noalloc, :noboxing))
+    @test all(f -> f.status === :pass, fs)
+    vcheck(a, b) = StrictMode._assert_noalias("t", copyto!, (a, b); mutates = (1,))
+    V = SubArray{Float64, 1, Matrix{Float64}, Tuple{Base.Slice{Base.OneTo{Int}}, Int}, true}
+    @test all(f -> f.status === :pass, findings(vcheck, (V, V); guarantees = (:noalloc,)))
+end

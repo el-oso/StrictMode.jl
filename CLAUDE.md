@@ -51,9 +51,18 @@ StrictMode/src/
                         __init__ is a juliac root, issue #28)
   static_checks.jl    — @assert_noalloc, @assert_noboxing, @assert_owned, @assert_noescape
                         (register_scoped! types, via the compiler's escape analysis), @assert_noalias
-                        (Base.mightalias between the written arguments and the read ones — the only
+                        (_overlap between the written arguments and the read ones — the only
                         check here that reads VALUES, so :noalias is deliberately NOT in _GUARANTEES:
-                        no sweep has values to give it)
+                        no sweep has values to give it. Two arrays that declare their dataids are
+                        answered by Base.mightalias alone, allocation-free, which is what keeps
+                        disjoint views of one parent apart. An array type with NO dataids method
+                        (_declares_ids: the fallback answers with the wrapper own objectid) and a
+                        non-array struct are read through their fields by _collect_ids!, which
+                        allocates. An overlap between two arrays GATES; one found only in a field
+                        of a non-array argument warns (gates = gates && arrays in _noalias_fail).
+                        A written position that holds no memory (_holds_memory: the scalar in
+                        axpy!(a, x, y), the function in map!(f, dest, src)) raises an ArgumentError
+                        — the `!` default would otherwise compare nothing and pass)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory).
                         _inlined_survives returns `nothing` when it cannot tell (a signature that

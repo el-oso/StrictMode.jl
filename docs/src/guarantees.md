@@ -1290,6 +1290,15 @@ slices of one workspace are accepted, which matters: a blocked kernel carving ti
 scratch is the normal case, and a predicate that compared only the parent would reject every one of
 them.
 
+`Base.mightalias` reads `Base.dataids`, which an array type has to define. A wrapper struct around
+a `Vector` that defines none answers with its own identity, and never matches the vector it holds.
+So an array type without a `dataids` method, and an argument that is not an array at all (a
+workspace struct, a factorization), is read through its fields, three levels down, and compared by
+the buffers found there.
+
+Two arrays that overlap raise. An overlap with a buffer held in a field of a non-array argument
+warns: the memory is shared, but nothing says the kernel reads that field.
+
 ### Which arguments count as written
 
 From the name: a trailing `!` means argument 1, Julia's convention. Anything else must say so with
@@ -1297,6 +1306,11 @@ From the name: a trailing `!` means argument 1, Julia's convention. Anything els
 compare no pair and accept every call, and a check that cannot fail is worse than no check. Where
 the callee is written as a plain name the rejection happens at macro expansion, before the call
 runs.
+
+The convention is not the whole truth: `ldiv!(F, B)` writes its second argument, and `axpy!(a, x, y)`
+its third. A written position that holds no memory — the scalar `a` — compares nothing, so that call
+raises an `ArgumentError` asking for `mutates = (3,)` in place of passing. For a two-argument call
+the default still compares the right pair, since there is only one.
 
 ### What it cannot promise
 

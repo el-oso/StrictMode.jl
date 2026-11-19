@@ -367,10 +367,14 @@ end
 
 # --- @assert_noalias: a written argument must not share memory with another argument ---
 
-# Julia's convention is that a trailing `!` marks a function that mutates its first argument
-# (`mul!`, `copyto!`, `ldiv!`), and that is the only default this can justify. A name without `!`
-# carries no such claim, so the caller must name the written positions: guessing would compare the
-# wrong pair and find nothing, which reads identically to "no aliasing here".
+# A trailing `!` says a function mutates at least one argument, and by convention the first
+# (`mul!(C, A, B)`, `copyto!(dest, src)`). That is the only default the name can justify, and it
+# is not always right: `ldiv!(F, B)` writes its second argument, `axpy!(a, x, y)` its third, and
+# `lmul!(a, B)`, `map!(f, dest, src)` and `rand!(rng, A)` write none of their first. So the default
+# is checked before it is used: an argument 1 that holds no memory cannot be what is written, and
+# the call is rejected until `mutates` names the position. A name without `!` carries no claim at
+# all, so the caller must name the written positions: guessing would compare the wrong pair and
+# find nothing, which reads identically to "no aliasing here".
 #
 # Resolved from the SOURCE name at expansion where the callee is written as a plain symbol, so the
 # passing path builds nothing. A computed or qualified callee (`ws.kernel!`, `(f())`) is not a name
@@ -403,29 +407,112 @@ const _NOALIAS_NO_BANG = "does not end in `!`, so which arguments it writes is n
     "them — `mutates = (1,)` — or drop the assertion. Defaulting to \"nothing is written\" would " *
     "compare no pair and pass every call."
 
+# Whether a value can be written through at all. A number, a function, a type or a string holds
+# no memory a kernel could write, so naming one as the written argument compares nothing.
+@inline _holds_memory(x) =
+    !isbits(x) && !(x isa Union{Type, Module, Function, Symbol, AbstractString, Number, Nothing, Missing})
+
+# Base's own array types define `dataids`, the protocol `Base.mightalias` reads. An array type that
+# does not is answered by the fallback, the object's own identity, which never matches the buffer
+# the wrapper holds.
+const _DeclaredArray = Union{Array, Memory, SubArray, Base.ReshapedArray, PermutedDimsArray, Base.ReinterpretArray, BitArray}
+@inline function _declares_ids(x::AbstractArray)
+    x isa _DeclaredArray && return true
+    ids = Base.dataids(x)
+    return !(ids isa Tuple{UInt} && ids[1] === UInt(objectid(x)))
+end
+
+const _ALIAS_FIELD_DEPTH = 3
+
+# The memory `x` can reach, as `Base.dataids` names it: an array that declares its ids is taken at
+# its word, and anything else (a wrapper array with no `dataids` method, a workspace struct, a
+# factorization) is read through its fields.
+function _collect_ids!(out::Vector{UInt}, @nospecialize(x), depth::Int)
+    _holds_memory(x) || return out
+    if x isa AbstractArray && _declares_ids(x)
+        append!(out, Base.dataids(x))
+        return out
+    end
+    depth <= 0 && return out
+    for i in 1:nfields(x)
+        isdefined(x, i) && _collect_ids!(out, getfield(x, i), depth - 1)
+    end
+    return out
+end
+
+@noinline function _deep_overlap(@nospecialize(a), @nospecialize(b))
+    ia = _collect_ids!(UInt[], a, _ALIAS_FIELD_DEPTH)
+    isempty(ia) && return :none
+    ib = _collect_ids!(UInt[], b, _ALIAS_FIELD_DEPTH)
+    isdisjoint(ia, ib) && return :none
+    return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
+end
+
+# How two arguments share memory: `:arrays` when both are arrays, `:fields` when the shared buffer
+# sits in a field of an argument that is not an array, `:none` otherwise. Two arrays that declare
+# their ids are answered by `Base.mightalias` alone, which knows disjoint views of one parent apart
+# and allocates nothing.
+@inline function _overlap(a, b)
+    if a isa AbstractArray && b isa AbstractArray
+        Base.mightalias(a, b) && return :arrays
+        (_declares_ids(a) && _declares_ids(b)) && return :none
+    end
+    (_holds_memory(a) && _holds_memory(b)) || return :none
+    return _deep_overlap(a, b)
+end
+
+@noinline function _noalias_unwritable(target, @nospecialize(f), @nospecialize(arg), p::Int, default::Bool)
+    what = "argument $p is a `$(typeof(arg))`, which holds no memory to write"
+    throw(
+        ArgumentError(
+            default ?
+                "@assert_noalias $target: $what, so it is not what `$(_func_name(f))` writes, and " *
+                "the `!` convention names no other argument. Name the written positions, for " *
+                "example `mutates = ($(p + 1),)`." :
+                "@assert_noalias $target: mutates = $p, but $what. Name the argument the call writes."
+        )
+    )
+end
+
 function _assert_noalias(
         target, @nospecialize(f), @nospecialize(args::Tuple);
-        mutates = nothing, gates::Bool = _guarantee_gates(:noalias)
+        mutates = nothing, default::Bool = isnothing(mutates), gates::Bool = _guarantee_gates(:noalias)
     )
     n = length(args)
     pos = isnothing(mutates) ? _runtime_mutated(f, n) : _check_mutates(mutates, n)
     isnothing(pos) &&
         throw(ArgumentError("@assert_noalias: `$(_func_name(f))` " * _NOALIAS_NO_BANG))
+    # A position that cannot be written compares nothing, and passing would say the call was checked.
+    for p in pos
+        _holds_memory(args[p]) || _noalias_unwritable(target, f, args[p], Int(p), default)
+    end
     # The scan returns on the first overlap and builds the message in a separate frame: a call that
     # satisfies the assertion must allocate nothing, or the assertion changes what it measures.
     for i in pos, j in 1:n
         i == j && continue
-        Base.mightalias(args[i], args[j]) && return _noalias_fail(target, args, pos, n, gates)
+        _overlap(args[i], args[j]) === :none || return _noalias_fail(target, args, pos, n, gates)
     end
     return nothing
 end
 
 @noinline function _noalias_fail(target, @nospecialize(args::Tuple), pos, n::Int, gates::Bool)
     overlaps = String[]
+    arrays = false
     for i in pos, j in 1:n
         i == j && continue
-        Base.mightalias(args[i], args[j]) && push!(overlaps, "argument $i (written) and argument $j")
+        kind = _overlap(args[i], args[j])
+        kind === :none && continue
+        arrays |= kind === :arrays
+        # The argument that is not an array is the one whose field holds the shared buffer.
+        holder = args[j] isa AbstractArray ? i : j
+        push!(
+            overlaps, kind === :arrays ? "argument $i (written) and argument $j" :
+                "argument $i (written) and argument $j (a buffer held in a field of argument " *
+                "$holder, a `$(typeof(args[holder]))`)"
+        )
     end
+    # Two arrays that overlap are what the kernel reads and writes. A buffer inside a struct
+    # argument is shared memory the kernel may never read, so that overlap alone reports.
     _fail(
         :noalias, target,
         "arguments share memory: " * join(overlaps, ", ") * ". A function that writes one " *
@@ -434,7 +521,7 @@ end
             "answer differently under another loop order, blocking, or Julia version. Pass a copy " *
             "of the input, write to a separate destination, or call an in-place form documented " *
             "to accept the overlap.";
-        gates = gates
+        gates = gates && arrays
     )
     return nothing
 end
@@ -459,7 +546,17 @@ the one `Base.unalias` uses to decide whether to copy.
 
 Which arguments are written comes from the name — a trailing `!` means argument 1 — and anything
 else must say so with `mutates = (…)`. A call that gives neither is rejected rather than passed,
-since "nothing is written" would compare no pair and accept everything.
+since "nothing is written" would compare no pair and accept everything. So is a written position
+that holds no memory: `axpy!(a, x, y)` takes a scalar first, so the `!` default names nothing a
+kernel could write, and the call raises an `ArgumentError` asking for `mutates = (3,)`. The
+convention is not checked beyond that: `ldiv!(F, B)` writes its second argument, and the default
+still compares argument 1 against the rest, which for a two-argument call is the same pair.
+
+An argument is compared by the memory it reaches. Two arrays are compared with `Base.mightalias`.
+An array type that defines no `Base.dataids` method (a wrapper struct around a `Vector`) and an
+argument that is not an array (a workspace struct, a factorization) are read through their fields,
+three levels down. An overlap between two arrays raises. An overlap with a buffer held in a field
+of a non-array argument warns: the memory is shared, but nothing says the kernel reads that field.
 
 ```julia
 A = rand(8, 8); C = similar(A)
@@ -470,8 +567,9 @@ A = rand(8, 8); C = similar(A)
 @assert_noalias mutates=(1, 2) swap!(x, y) # neither the name nor one position is enough
 ```
 
-A call that satisfies the assertion allocates nothing: the pair scan returns on the first overlap
-and the message is built in another frame. Costs about 2 ns per pair.
+A call on arrays that satisfies the assertion allocates nothing: the pair scan returns on the
+first overlap and the message is built in another frame. Costs about 2 ns per pair. Reading a
+struct argument through its fields allocates.
 
 Overlap is checked for the call that runs, not for every call the method could receive, so this
 narrows the property one site at a time rather than proving it once. Rust decides the same question
@@ -506,6 +604,7 @@ macro assert_noalias(args...)
     else
         nothing
     end
+    isdefault = !haskey(opts, :mutates)
 
     fe = esc(fexpr)
     argsyms = [gensym(:arg) for _ in eachindex(argexprs)]
@@ -514,7 +613,7 @@ macro assert_noalias(args...)
     checked = quote
         $(binds...)
         local _f = $fe
-        $(_assert_noalias)($target, _f, ($(argsyms...),); mutates = $mutates_expr)
+        $(_assert_noalias)($target, _f, ($(argsyms...),); mutates = $mutates_expr, default = $isdefault)
         _f($(argsyms...))
     end
     return _gate(checked, esc(call))
