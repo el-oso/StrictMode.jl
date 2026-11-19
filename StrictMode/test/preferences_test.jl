@@ -149,3 +149,59 @@ end
         end
     end
 end
+
+@testitem "a preference key StrictMode does not read is reported at load" begin
+    using StrictMode
+
+    mktempdir() do dir
+        oldproj, oldload = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH)
+        try
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            Base.set_active_project(joinpath(dir, "Project.toml"))
+            write(joinpath(dir, "Project.toml"), "[deps]\n")
+
+            # Nothing set, and the two keys StrictMode reads: nothing to report.
+            @test isempty(StrictMode.unknown_preferences())
+            prefs = joinpath(dir, "LocalPreferences.toml")
+            write(prefs, "[StrictMode]\nchecks_enabled = true\nbanner = false\n")
+            @test isempty(StrictMode.unknown_preferences())
+
+            # A misspelled key is ignored by Preferences.jl, so checks stay on. It is named, with
+            # its file. Another package's table is not StrictMode's to judge.
+            write(prefs, "[Other]\ncheck_enabled = 1\n\n[StrictMode]\n# a comment\ncheck_enabled = false\n\"baner\" = false\nbanner = true\n\n[Later]\nx = 1\n")
+            unknown = StrictMode.unknown_preferences()
+            @test unknown == ["check_enabled ($prefs)", "baner ($prefs)"]
+
+            # The project file's own table, and a path on `LOAD_PATH` (the `Pkg.test` shape).
+            rm(prefs)
+            write(joinpath(dir, "Project.toml"), "[deps]\n\n[preferences.StrictMode]\nchecks_enable = false\n")
+            @test StrictMode.unknown_preferences() == ["checks_enable ($(joinpath(dir, "Project.toml")))"]
+            Base.set_active_project(nothing)
+            @test isempty(StrictMode.unknown_preferences())
+            push!(Base.LOAD_PATH, dir)
+            @test length(StrictMode.unknown_preferences()) == 1
+
+            # What the load prints. The writer goes to the C `stderr`, so it is read back from a
+            # file the descriptor is pointed at.
+            if StrictMode.banner_enabled()
+                out = joinpath(dir, "stderr.txt")
+                open(out, "w") do io
+                    redirect_stderr(io) do
+                        StrictMode._warn_unknown_preferences()
+                        Libc.flush_cstdio()
+                    end
+                end
+                printed = read(out, String)
+                @test occursin("StrictMode: unknown preference checks_enable (", printed)
+                @test occursin("StrictMode reads `checks_enabled` and `banner`", printed)
+            end
+            # The note is a format string for the writer, so it holds no `%`.
+            @test !occursin('%', StrictMode._UNKNOWN_PREFERENCE_NOTE)
+        finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+end

@@ -752,8 +752,17 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   `kwargs...` without forwarding to explicit keywords, so an unknown one is a `MethodError` naming
   it. Guarantee names are checked BEFORE a sweep (`_audit`, `_compiled_items`, `_registry_items`,
   `test_signatures`): a module with nothing compiled reaches no per-method check, and
-  `audit(M; guarantees = (:noaloc,))` returned zero findings. `test/options_test.jl` holds the
-  list of macros and their accepted options, and fails when a macro gains one without it
+  `audit(M; guarantees = (:noaloc,))` returned zero findings. An `only` or `exempt` entry that
+  matches no function with a method in the module raises in `_check_name_filters`, which
+  `module_methods`, `_module_specializations` and `_coverage_findings` call first (the names are
+  the census's: demangled, so a keyword body and a closure answer to the function that wrote
+  them); a `stop` entry the reach walk never met raises in `reach_report`, and in `route_parity`
+  only when NEITHER route met it. A preference key StrictMode does not read WARNS at load
+  (`_warn_unknown_preferences`, called from `__init__`, so it scans the preference files by bytes
+  and is pinned trim-clean in `StrictModeTest/test/trim_test.jl`); it is gated on the `banner`
+  preference, which keeps a load with `banner = false` free of any `__init__` body.
+  `test/options_test.jl` holds the list of macros and their accepted options, and fails when a
+  macro gains one without it
 - `@contract`-style macro headers in the sibling TypeContracts package can't be module-qualified (e.g. `@contract Base.AbstractLock` fails to parse — needs `import Base: AbstractLock` first) — worth knowing if you're pairing `@strict_contract`/`@verify_strict` with a foreign type.
 - AllocCheck/JET/TrimCheck are **not dependencies of StrictMode at all** — not even weak ones. They are hard deps of `StrictModeTest`. Never import them from `src/`, and never add them back to `Project.toml`: `test/standalone` exists to fail if you do.
 - **Tier selection is the macro name, decided at expansion.** `@assert_noalloc` IS the value-free

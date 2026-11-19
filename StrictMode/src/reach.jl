@@ -261,6 +261,22 @@ function reach_report(
         @nospecialize(f), @nospecialize(types::Tuple); mod::Union{Nothing, Module} = nothing,
         stop = ()
     )
+    r, unmet = _reach_report(f, types; mod, stop)
+    isempty(unmet) || throw(ArgumentError(_stop_unmet("reach_report", r.target, unmet)))
+    return r
+end
+
+# A `stop` entry the walk never met cuts nothing. The caller named a hub this call does not
+# reach, or misspelled one, and the graph is the uncut one either way.
+_stop_unmet(caller::String, target, unmet) =
+    "$caller: `stop` names " * join(("`$(g)`" for g in unmet), ", ") * ", which $target does not " *
+    "reach, so nothing was cut there. Check the name, or drop the entry."
+
+# The report, and the `stop` entries the walk never met.
+function _reach_report(
+        @nospecialize(f), @nospecialize(types::Tuple); mod::Union{Nothing, Module} = nothing,
+        stop = ()
+    )
     target = _reach_target(f, types)
     cts = try
         _code_typed(f, types; optimize = true)
@@ -270,10 +286,11 @@ function reach_report(
     isempty(cts) && throw(ArgumentError("reach_report: no method matches $target"))
     stopkeys = Set{Tuple{Module, Symbol}}(_reach_key(g) for g in stop)
     r = _reach(Base.signature_type(f, types), stopkeys)
+    unmet = Any[g for g in stop if !haskey(r.found, _reach_key(g))]
     fs = collect(values(r.found))
     isnothing(mod) || filter!(x -> _reach_in_module(x.mod, mod), fs)
     sort!(fs; by = x -> (x.depth, string(x.mod), string(x.name)))
-    return ReachReport(target, fs, r.bodies, r.unread, r.dynamic)
+    return ReachReport(target, fs, r.bodies, r.unread, r.dynamic), unmet
 end
 
 """
@@ -423,8 +440,13 @@ StrictMode.status(p)
 ```
 """
 function route_parity(a::Pair, b::Pair; mod::Union{Nothing, Module} = nothing, stop = ())
-    ra = reach_report(a.first, Tuple(a.second); mod, stop)
-    rb = reach_report(b.first, Tuple(b.second); mod, stop)
+    ra, ua = _reach_report(a.first, Tuple(a.second); mod, stop)
+    rb, ub = _reach_report(b.first, Tuple(b.second); mod, stop)
+    # A hub one route reaches and the other does not is a difference between them, which is what
+    # this reports. One neither reaches cut nothing.
+    unmet = Any[g for g in ua if any(h -> h === g, ub)]
+    isempty(unmet) ||
+        throw(ArgumentError(_stop_unmet("route_parity", "neither " * ra.target * " nor " * rb.target, unmet)))
     entries = Set{Tuple{Module, Symbol}}((_reach_key(a.first), _reach_key(b.first)))
     keys_a = Set((x.mod, x.name) for x in ra.functions)
     keys_b = Set((x.mod, x.name) for x in rb.functions)

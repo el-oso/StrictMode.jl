@@ -84,3 +84,51 @@ end
     @test_throws MethodError kernel_report(OptValues.k, sig; isolate = false)
     @test_throws "the `isolate` option was removed" StrictMode.memsafe_report(OptValues.k, [1.0]; isolate = false)
 end
+
+@testitem "an only, exempt or stop entry that matches no function is rejected" begin
+    using StrictMode
+
+    module FilterNames
+    hot(x::Vector{Float64}) = sum(x)
+    cold(x::Vector{Float64}) = string(length(x))
+    withkw(x::Vector{Float64}; scale = 1.0) = scale * sum(x)
+    Base.show(io::IO, ::Val{:filter_names}) = print(io, "v")
+    end
+    FilterNames.hot([1.0]); FilterNames.cold([1.0]); FilterNames.withkw([1.0]; scale = 2.0)
+
+    # A misspelled `only` scopes the sweep to nothing, which returns the clean result of a module
+    # with nothing wrong in it.
+    @test_throws "`only` names `hto`, which matches no function with a method in `FilterNames`" audit(FilterNames; sweep = true, only = (:hto,))
+    @test_throws "A sweep scoped to nothing checks nothing" audit(FilterNames; sweep = true, only = (:hto,))
+    @test_throws "`only` names r\"^nothing_matches\$\"" unsafe_report(FilterNames; only = r"^nothing_matches$")
+    @test_throws "`exempt` names `colt`" unsafe_report(FilterNames; exempt = (:colt,))
+    @test_throws "An exemption that matches nothing exempts nothing" dispatch_report(FilterNames; exempt = [:colt])
+    @test_throws "`only` names `hto`" StrictMode.module_methods(FilterNames; only = [:hot, :hto])
+    @test_throws "`only` names `hto`" StrictMode.throw_report(FilterNames; only = [:hto])
+    @test_throws "`exempt` names `colt`" audit(FilterNames; require = :public, exempt = (:colt,))
+
+    # Entries that do match are taken as before: a name, a function, a regex, a keyword method by
+    # its written name, a method the module adds to another module's function, and a predicate.
+    @test length(first(StrictMode.module_methods(FilterNames; only = (:hot,)))) == 1
+    @test length(first(StrictMode.module_methods(FilterNames; only = (FilterNames.hot, :cold)))) == 2
+    @test length(first(StrictMode.module_methods(FilterNames; only = r"^(hot|cold)$"))) == 2
+    @test !isempty(first(StrictMode.module_methods(FilterNames; only = (:withkw,))))
+    @test length(first(StrictMode.module_methods(FilterNames; only = (:show,)))) == 1
+    @test isempty(first(StrictMode.module_methods(FilterNames; only = f -> false)))
+    @test audit(FilterNames; sweep = true, only = (:hot,), exempt = (:cold,)) isa Vector{StrictFinding}
+
+    # `stop` names a hub to cut the walk at. One the call never reaches cut nothing.
+    @noinline leaf(x) = x + 1
+    @noinline hub(x) = leaf(x) * 2
+    entry(x) = hub(x) - 1
+    other(x) = x
+    sig = (Int,)
+    @test StrictMode.reaches(StrictMode.reach_report(entry, sig; stop = (hub,)), hub)
+    @test !StrictMode.reaches(StrictMode.reach_report(entry, sig; stop = (hub,)), leaf)
+    @test_throws "reach_report: `stop` names `other`, which entry(Int64) does not reach" StrictMode.reach_report(entry, sig; stop = (other,))
+    @test_throws "nothing was cut there" StrictMode.reach_report(entry, sig; stop = (hub, other))
+    # Two routes: a hub only one of them reaches is the difference being reported.
+    direct(x) = leaf(x)
+    @test StrictMode.route_parity(entry => sig, direct => sig; stop = (hub,)) isa StrictMode.RouteParity
+    @test_throws "route_parity: `stop` names `other`, which neither" StrictMode.route_parity(entry => sig, direct => sig; stop = (other,))
+end

@@ -57,7 +57,7 @@ end
     @test only(one_left).func == "raw"
     @test isempty(unsafe_report(FenceAllow; allow = (:ccall, :unsafe_load, :pointer)))
     # …and the name filters work as they do on every other sweep.
-    @test isempty(unsafe_report(FenceAllow; only = r"^nothing_matches$"))
+    @test_throws "matches no function" unsafe_report(FenceAllow; only = r"^nothing_matches$")
     @test only(unsafe_report(FenceAllow; exempt = (:load,))).func == "raw"
 end
 

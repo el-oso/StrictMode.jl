@@ -127,6 +127,7 @@ function __init__()
     # trim-clean (issue #28).
     _GENERATION[] = UInt(time_ns())
     _announce_tier()
+    _warn_unknown_preferences()
     return nothing
 end
 

@@ -945,6 +945,58 @@ function _name_matcher(spec)
     return f -> _demangle(_callable_name(f)) in set
 end
 
+# The names an `only` or `exempt` entry can match in `mod`: every function with a method there,
+# under the name its keyword bodies and closures answer to.
+function _module_function_names(mod::Module)
+    scope = _scope_modules(mod)
+    out = Set{Symbol}()
+    Base.visit(Core.methodtable) do m
+        m isa Method || return nothing
+        any(s -> _in_module_tree(m.module, s), scope) || return nothing
+        push!(out, _demangle(m.name))
+        F = try
+            _method_function(m)
+        catch
+            nothing
+        end
+        if F isa DataType
+            _is_closure_type(F) ? push!(out, _closure_owner(F)) :
+                isdefined(F, :instance) && F.instance isa Function && push!(out, _demangle(nameof(F.instance)))
+        end
+        return nothing
+    end
+    return out
+end
+
+# An `only` or `exempt` entry that matches no function in `mod` is a mistake in the call. A
+# misspelled `only` scopes a sweep to nothing and a misspelled `exempt` exempts nothing, and both
+# return a result that reads like the one the caller asked for. A predicate function cannot be
+# judged this way and is taken as given.
+function _check_name_filters(mod::Module; only = nothing, exempt = ())
+    judged(spec) = !(spec === nothing || spec isa Function || (!(spec isa Regex) && isempty(spec)))
+    (judged(only) || judged(exempt)) || return nothing
+    names = _module_function_names(mod)
+    for (what, spec) in (("only", only), ("exempt", exempt))
+        judged(spec) || continue
+        if spec isa Regex
+            any(n -> occursin(spec, string(n)), names) || throw(
+                ArgumentError(_no_such_function(what, repr(spec), mod))
+            )
+            continue
+        end
+        for x in spec
+            _asname(x) in names || throw(ArgumentError(_no_such_function(what, "`" * string(_asname(x)) * "`", mod)))
+        end
+    end
+    return nothing
+end
+
+_no_such_function(what::String, entry::String, mod::Module) =
+    "`$what` names $entry, which matches no function with a method in `$(nameof(mod))`. " * (
+    what == "only" ? "A sweep scoped to nothing checks nothing and returns a clean result." :
+        "An exemption that matches nothing exempts nothing."
+) * " Check the spelling, or drop the entry."
+
 # --- the census: every method a module defines ------------------------------------------------
 
 # A package's loaded extensions, alongside the package itself. An extension is a ROOT module —
@@ -1015,6 +1067,7 @@ its name is bound in `Base`. Those are frequently a package's hottest methods. M
 StrictMode itself: 574 methods here, of which a walk over `names(mod; all = true)` finds 363.
 """
 function module_methods(mod::Module; only = nothing, exempt = (), include_exempt::Bool = false)
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
     scope = _scope_modules(mod)
@@ -1053,6 +1106,7 @@ end
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
 function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
     for nm in names(mod; all = true)
@@ -1223,6 +1277,7 @@ end
 # exempted. Turns "every kernel declares its guarantees" from a convention into a red test.
 # Not a checkable guarantee — findings are built directly, never routed through the engines.
 function _coverage_findings(mod::Module; only = nothing, exempt = ())
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
     registered = Set{Any}(k[1] for k in keys(declarations()))

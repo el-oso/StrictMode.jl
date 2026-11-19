@@ -218,6 +218,156 @@ function direct_dependency()
     end
 end
 
+# The preference keys StrictMode reads. `__clear__` is Preferences.jl's own.
+const _KNOWN_PREFERENCES = ("checks_enabled", "banner", "__clear__")
+
+# The keys the preference file `f` sets in the table `header` that StrictMode does not read,
+# pushed onto `out` as `key (file)`. A key it does not read is ignored by Preferences.jl without a
+# word, so `check_enabled = false` leaves checks on. Scans the bytes line by line for the same
+# reason `_names_strictmode` does: this runs from `__init__`, and a TOML parser is not something
+# `juliac --trim` can resolve.
+function _unknown_preference_keys!(out::Vector{String}, f::String, header::String)
+    isfile(f) || return out
+    io = open(f)
+    buf = Vector{UInt8}(undef, 1 << 16)
+    n = readbytes!(io, buf, length(buf))
+    close(io)
+    intable = false
+    pos = 1
+    while pos <= n
+        stop = pos
+        while stop <= n && buf[stop] != UInt8('\n')
+            stop += 1
+        end
+        a, b = _trim_bytes(buf, pos, stop - 1)
+        pos = stop + 1
+        (a > b || buf[a] == UInt8('#')) && continue
+        if buf[a] == UInt8('[')
+            intable = _bytes_equal(buf, a, b, header)
+            continue
+        end
+        intable || continue
+        eq = a
+        while eq <= b && buf[eq] != UInt8('=')
+            eq += 1
+        end
+        eq > b && continue
+        ka, kb = _trim_bytes(buf, a, eq - 1)
+        ka > kb && continue
+        known = false
+        for k in _KNOWN_PREFERENCES
+            known |= _bytes_equal(buf, ka, kb, k)
+        end
+        known && continue
+        entry = String(buf[ka:kb]) * " (" * f * ")"
+        any(==(entry), out) || push!(out, entry)
+    end
+    return out
+end
+
+# The span of `buf[a:b]` without the blanks and quotes around it. Bytes, not `strip` on a
+# `SubString`: the string functions reach error paths that build their message with `print`.
+function _trim_bytes(buf::Vector{UInt8}, a::Int, b::Int)
+    blank(c::UInt8) = c == UInt8(' ') || c == UInt8('\t') || c == UInt8('\r') || c == UInt8('"')
+    while a <= b && blank(buf[a])
+        a += 1
+    end
+    while b >= a && blank(buf[b])
+        b -= 1
+    end
+    return a, b
+end
+
+function _bytes_equal(buf::Vector{UInt8}, a::Int, b::Int, s::String)
+    (b - a + 1) == ncodeunits(s) || return false
+    for i in 1:ncodeunits(s)
+        buf[a + i - 1] == codeunit(s, i) || return false
+    end
+    return true
+end
+
+# The directory holding the file `p`, by its last separator. `dirname` is not something
+# `juliac --trim` resolves.
+function _parent_dir(p::String)
+    bytes = codeunits(p)
+    i = length(bytes)
+    while i >= 1 && bytes[i] != UInt8('/') && !(Sys.iswindows() && bytes[i] == UInt8('\\'))
+        i -= 1
+    end
+    i == 1 && return "/"
+    i == 0 && return "."
+    out = UInt8[]
+    for k in 1:(i - 1)
+        push!(out, bytes[k])
+    end
+    return String(out)
+end
+
+function _preference_files!(out::Vector{String}, @nospecialize(p))
+    p isa String || return out
+    dir = isfile(p) ? _parent_dir(p) : p
+    _unknown_preference_keys!(out, joinpath(dir, "LocalPreferences.toml"), "[StrictMode]")
+    _unknown_preference_keys!(out, joinpath(dir, "JuliaLocalPreferences.toml"), "[StrictMode]")
+    _unknown_preference_keys!(out, joinpath(dir, "Project.toml"), "[preferences.StrictMode]")
+    _unknown_preference_keys!(out, joinpath(dir, "JuliaProject.toml"), "[preferences.StrictMode]")
+    return out
+end
+
+"""
+    StrictMode.unknown_preferences() -> Vector{String}
+
+The keys set for StrictMode in this session's preference files that StrictMode does not read, each
+with the file it was found in. StrictMode reads `checks_enabled` and `banner`. Any other key is
+ignored, so a misspelled one leaves the setting it was meant to change at its default:
+`check_enabled = false` leaves checks on.
+
+Searched: `LocalPreferences.toml` (table `[StrictMode]`) and the project file (table
+`[preferences.StrictMode]`) of the active project and of every explicit path on `LOAD_PATH`.
+StrictMode prints a warning at load for each key this returns, unless the `banner` preference is
+off. Anything unreadable counts as nothing found.
+"""
+function unknown_preferences()
+    out = String[]
+    try
+        _preference_files!(out, Base.ACTIVE_PROJECT[])
+        for e in Base.LOAD_PATH
+            startswith(e, '@') && continue
+            _preference_files!(out, e)
+        end
+    catch
+    end
+    return out
+end
+
+# `%` doubled, byte by byte: `replace` reaches code `juliac --trim` cannot resolve.
+function _escape_percent(s::String)
+    bytes = UInt8[]
+    for b in codeunits(s)
+        push!(bytes, b)
+        b == UInt8('%') && push!(bytes, b)
+    end
+    return String(bytes)
+end
+
+const _UNKNOWN_PREFERENCE_NOTE = "│ StrictMode reads `checks_enabled` and `banner`. Any other key is ignored,\n" *
+    "└ so the setting it was meant to change is still at its default.\n"
+
+function _warn_unknown_preferences()
+    # With the banner off a load is silent, and `__init__` keeps no body for `juliac --trim` to
+    # verify.
+    BANNER_ENABLED || return nothing
+    # Quiet while a dependent package is being precompiled, as the tier banner is.
+    iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
+    unknown = unknown_preferences()
+    isempty(unknown) && return nothing
+    for k in unknown
+        # The message is the format string, so a `%` in a key or a path must not be read as one.
+        _eprint("┌ StrictMode: unknown preference " * _escape_percent(k) * "\n")
+    end
+    _eprint(_UNKNOWN_PREFERENCE_NOTE)
+    return nothing
+end
+
 function _announce_tier()
     # A compile-time const, so with the banner off this whole function folds to `nothing` and
     # `juliac --trim` never sees the write at all.

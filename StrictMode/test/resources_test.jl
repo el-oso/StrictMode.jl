@@ -54,7 +54,7 @@
     @test occursin("could not follow", by["stash!"].suggestion)
 
     # The name filters behave as on every other sweep.
-    @test isempty(resource_leak_report(Leaks; only = r"^nothing_matches$"))
+    @test_throws "matches no function" resource_leak_report(Leaks; only = r"^nothing_matches$")
     @test !haskey(
         Dict(f.func => f for f in resource_leak_report(Leaks; exempt = (:borrow_escapes,))),
         "borrow_escapes"

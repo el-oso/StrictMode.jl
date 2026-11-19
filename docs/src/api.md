@@ -22,6 +22,11 @@ A name the macro does not have is an error at macro expansion that lists the acc
 misspelled or removed option is never dropped with the call left to run at its defaults. The same
 holds for a guarantee name in `guarantees = (…)`, which is checked before a sweep starts.
 
+An `only` or `exempt` entry that matches no function with a method in the module raises too, and so
+does a `stop` entry the walk of `reach_report` never meets: a misspelled `only` scopes a sweep to
+nothing and returns the clean result of a module with nothing wrong in it. A predicate function is
+taken as given.
+
 ```@docs
 @assert_noalloc
 @assert_noboxing
@@ -323,12 +328,18 @@ environment this session loads from names StrictMode itself. A package that uses
 its own `src` is a dependency of projects that never named it, and loading such a package says
 nothing about a tier its users can act on, so those sessions stay silent.
 
+StrictMode reads two preference keys, `checks_enabled` and `banner`. Preferences.jl ignores any
+other key without a word, so `check_enabled = false` leaves checks on. StrictMode names each such key
+in a warning at load, with the file it is in, and `unknown_preferences` returns the same list. The
+warning follows the `banner` preference.
+
 ```@docs
 enable_checks!
 disable_checks!
 checks_enabled
 banner_enabled
 StrictMode.direct_dependency
+StrictMode.unknown_preferences
 proofs_loaded
 assert_enabled
 mca_available

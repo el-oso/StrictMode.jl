@@ -252,6 +252,11 @@ end
     # why `direct_dependency` reads the `Base.ACTIVE_PROJECT` slot directly.
     ok3, why3 = StrictModeTest._trim_validate(StrictMode.direct_dependency, ())
     @test ok3 || error("direct_dependency is not trim-clean:\n  " * join(why3, "\n  "))
+
+    # The scan for preference keys StrictMode does not read runs from `__init__` too, and reads
+    # the preference files without a TOML parser for that reason.
+    ok4, why4 = StrictModeTest._trim_validate(StrictMode._warn_unknown_preferences, ())
+    @test ok4 || error("_warn_unknown_preferences is not trim-clean:\n  " * join(why4, "\n  "))
 end
 
 @testitem "the child loads the modules a signature needs, not the function's own" begin

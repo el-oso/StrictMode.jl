@@ -53,7 +53,7 @@
     @test occursin("@assert_noalias", only_one.suggestion)
 
     # The name filters behave as on every other sweep.
-    @test isempty(alias_guard_report(AliasGuards; only = r"^nothing_matches$"))
+    @test_throws "matches no function" alias_guard_report(AliasGuards; only = r"^nothing_matches$")
     @test isempty(alias_guard_report(AliasGuards; exempt = (:shift_add!,)))
 
     # It is a REPORT: no gating counterpart, and `:alias_guard` is not a swept guarantee — the
