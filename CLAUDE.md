@@ -224,6 +224,29 @@ StrictMode/src/
                         partition is a property of values. Anything unresolvable is RECORDED, never
                         skipped. pool_balance_report RAISES _UnanalyzableSignature when it cannot
                         read a signature, because a count of nothing balances
+                        THREE ways a write reaches the plan without a store in the frame, each with
+                        its own certainty. (1) A BASE callee that was not inlined is read like a
+                        package's own when its name ends in `!` or its result can hold a reference
+                        into an argument (_may_alias_result), _BASE_EXTRA_DEPTH frames past
+                        max_depth; the body decides which argument is written, so a store read
+                        there is `certain`. Do NOT replace this with "a Base `!` callee writes
+                        whatever plan value it is given": `mul!(out, plan.A, x)` and
+                        `copyto!(out, plan.buf)` read the plan, and _BASE_MUTATORS matching at any
+                        position failed 19 read-only LinearAlgebra signatures (`A \ b`, `rank(A)`,
+                        `cholesky(A)`, through an `unsafe_copyto!` FROM the plan) with a certain
+                        record. _mutator_dest names the written position. (2) A :foreigncall
+                        follows Go's cgo rule: a C function is assumed to write through every
+                        pointer it gets, so it is a record with certain = false — except the ones
+                        _FCALL_WRITES names (memmove/memcpy/memset write their destination, which
+                        is certain; memcmp and the copying runtime calls write nothing), and
+                        _FCALL_ALIASES, whose RESULT is the argument's memory (jl_ptr_to_array_1d
+                        behind unsafe_wrap). Only the declared arguments are read, never the GC
+                        roots after them. Every BLAS/LAPACK routine is unnamed, so a plan matrix
+                        passed to dgemv reports. (3) A lock, condition, atomic, event, channel or
+                        semaphore carries NO taint (_is_sync_type at a projection, a PiNode, a
+                        callee parameter and the seed): what `lock(plan.lk)` writes is the
+                        synchronization. _recurse_closure_body returns before the depth check for a
+                        struct with no call method outside Base — it is data, with no body to read
   strict_function.jl  — @strict_function (load-time enforcement; `signatures = [...]` verifies
                         concrete instantiations a generic declaration cannot name, since such a
                         declaration infers to `Any`), @strict_stable (per-specialization instead:
@@ -717,8 +740,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
   by definition, because AllocCheck/JET/TrimCheck are full machinery rather than a scan. `_fail`
   takes a `gates` keyword for exactly this, so one guarantee can do both: `_ConcViol` carries
-  `certain`, set at the three record sites where the scan READ a write (a store, or a named
-  `_BASE_MUTATORS` callee) and left `false` at the six "flagged conservatively" sites, and
+  `certain`, set at the record sites where the scan READ a write (a store, a named
+  `_BASE_MUTATORS` callee with the plan at its written position, or a `memmove`-class foreign
+  function with the plan at its destination) and left `false` at every "flagged conservatively" or
+  "not read" site, a foreign function with no known effect among them, and
   `_assert_concurrency_safe` raises only when `any(v -> v.certain, vs)`. `typestability.jl` and
   `trusted.jl` do the same for their own uncertain signals. The DEFAULT on a new record is
   `certain = false`, so an unclassified one warns.

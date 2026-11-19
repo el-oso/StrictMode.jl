@@ -1215,3 +1215,91 @@ end
     @test occursin("could not be read", only(vs).message)
     @test isempty(StrictMode.concurrency_findings(reads_only, (UnreadPlan,)))
 end
+
+@testitem "a write that reaches the plan through Base or through C is read" begin
+    using StrictMode, LinearAlgebra
+
+    struct BPlan
+        buf::Vector{Float64}
+        d::Dict{Symbol, Vector{Float64}}
+        A::Matrix{Float64}
+        lk::ReentrantLock
+    end
+    sig = (BPlan, Vector{Float64})
+    records(f) = StrictMode.concurrency_findings(f, sig)
+    written(f) = any(v -> v.certain && !v.deliberate, records(f))
+
+    # A Base callee that is not inlined: the scan reads its body and finds the store.
+    w_sort(p, x) = (sort!(p.buf); nothing)
+    w_sortby(p, x) = (sort!(p.buf; by = abs); nothing)
+    w_reverse(p, x) = (reverse!(p.buf); nothing)
+    w_delete(p, x) = (delete!(p.d, :a); nothing)
+    w_getbang(p, x) = (get!(p.d, :c, x); nothing)
+    w_circshift(p, x) = (circshift!(p.buf, 1); nothing)
+    w_cumsum(p, x) = (cumsum!(p.buf, x); nothing)
+    # A store made by a C function whose destination argument is known.
+    w_copyto(p, x) = (copyto!(p.buf, x); nothing)
+    w_memset(p, x) = (ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), p.buf, 0, 8); nothing)
+    w_memmove(p, x) = (ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), p.buf, x, 8); nothing)
+    w_unsafecopy(p, x) = (unsafe_copyto!(pointer(p.buf), pointer(x), 2); nothing)
+    # A reference a Base call returns is still the plan's memory.
+    w_dictget(p, x) = (get(p.d, :a, x)[1] = 0.0; nothing)
+    w_unsafewrap(p, x) = (a = unsafe_wrap(Array, pointer(p.buf), 2); a[1] = 0.0; nothing)
+    for f in (
+            w_sort, w_sortby, w_reverse, w_delete, w_getbang, w_circshift, w_cumsum, w_copyto,
+            w_memset, w_memmove, w_unsafecopy, w_dictget, w_unsafewrap,
+        )
+        @test written(f)
+    end
+    @test any(v -> occursin("`memmove` writes its destination", v.message), records(w_copyto))
+    @test any(v -> occursin("reached via reverse!", v.message), records(w_reverse))
+
+    # A foreign function the scan has no entry for is assumed to write through its pointers. The
+    # scan read no store, so the record reports and does not raise.
+    w_axpy(p, x) = (BLAS.axpy!(2.0, x, p.buf); nothing)
+    w_scal(p, x) = (BLAS.scal!(2.0, p.buf); nothing)
+    r_dot(p, x) = BLAS.dot(p.buf, x)
+    for f in (w_axpy, w_scal, r_dot)
+        vs = records(f)
+        @test !isempty(vs)
+        @test !any(v -> v.certain, vs)
+        @test any(v -> occursin("foreign function", v.message) && occursin("assumed to write", v.message), vs)
+    end
+
+    # The plan is read and something else is written: a source argument of a copy, a fresh buffer
+    # built from plan data, a reference returned by a Base call that is only read, a lock.
+    r_copyfrom(p, x) = (copyto!(x, p.buf); nothing)
+    r_memmove(p, x) = (ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), x, p.buf, 8); nothing)
+    r_freshsort(p, x) = (t = copy(p.buf); sort!(t); reverse!(t); t[1])
+    r_sortcopy(p, x) = sort(p.buf)[1]
+    r_freshfill(p, x) = (t = similar(p.buf); fill!(t, 1.0); t .= p.buf .+ x; sum(t))
+    r_freshdict(p, x) = (d = Dict{Symbol, Vector{Float64}}(); d[:a] = x; delete!(d, :a); length(d))
+    r_dictget(p, x) = (x[1] = get(p.d, :a, x)[1]; nothing)
+    r_copysort(p, x) = (sort!(x); x[1] + p.buf[1])
+    r_map(p, x) = (map!(abs, x, p.buf); nothing)
+    r_cumsum(p, x) = (cumsum!(x, p.buf); nothing)
+    r_show(p, x) = length(repr(p.buf))
+    r_sum(p, x) = sum(p.buf) + maximum(abs, p.A)
+    r_locked(p, x) = lock(() -> (x[1] = p.buf[1]; nothing), p.lk)
+    r_lock(p, x) = (lock(p.lk); x[1] = p.buf[1]; unlock(p.lk); nothing)
+    r_throw(p, x) = (
+        length(x) == length(p.buf) || throw(DimensionMismatch("$(length(x)) and $(length(p.buf))"));
+        x[1] = p.buf[1]; nothing
+    )
+    for f in (
+            r_copyfrom, r_memmove, r_freshsort, r_sortcopy, r_freshfill, r_freshdict, r_dictget,
+            r_copysort, r_map, r_cumsum, r_show, r_sum, r_locked, r_lock, r_throw,
+        )
+        @test isempty(records(f))
+    end
+
+    # A lock is not a plan: every task that uses one writes it.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+
+    p = BPlan(rand(4), Dict(:a => rand(4)), rand(4, 4), ReentrantLock())
+    x = rand(4)
+    @test_throws "`memmove` writes its destination" @assert_concurrency_safe w_copyto(p, x)
+    @test_throws StrictMode.StrictViolation @assert_concurrency_safe w_reverse(p, x)
+    @test_logs (:warn, r"cannot establish that the plan argument is read-only.*foreign function"s) match_mode = :any @assert_concurrency_safe w_axpy(p, x)
+    @test (@assert_concurrency_safe r_copyfrom(p, x)) === nothing
+end

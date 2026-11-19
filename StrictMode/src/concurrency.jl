@@ -61,9 +61,23 @@ end
 #     its parameters (bounded depth, memoised) — so a plan that accidentally calls a child's
 #     *convenience/embedded-scratch path* (`child_apply!(child_plan)` that writes
 #     `child_plan.default_scratch.data`) is caught even though the store is one frame down. A
-#     tainted value handed to a *known Base mutator* (`push!`/`resize!`/`copyto!`/…) is flagged; a
-#     tainted value handed to an *unresolved dynamic dispatch* is flagged (prefer a false positive
-#     over a confident false pass).
+#     tainted value at the destination position of a *known Base mutator* (`push!`/`resize!`/
+#     `copyto!`/…) is flagged; a tainted value handed to an *unresolved dynamic dispatch* is
+#     flagged (prefer a false positive over a confident false pass).
+#   * BASE CALLEES are read like a package's own when the name declares a write (`sort!`,
+#     `reverse!`, `delete!`) or the result can be a reference into an argument (`get`,
+#     `reshape`, `unsafe_wrap`), `_BASE_EXTRA_DEPTH` frames past `max_depth`. The body says which
+#     argument is written, so `mul!(out, plan.A, x)` and `copyto!(out, plan.buf)` read the plan
+#     and `sort!(copy(plan.buf))` writes a fresh buffer. Any other Base callee is treated as
+#     non-mutating.
+#   * FOREIGN CALLS follow Go's rule for cgo: a C function is assumed to write through every
+#     pointer it is given. `_FCALL_WRITES` names the ones whose effect is known (`memmove` writes
+#     its first argument and reads its second; `memcmp` writes nothing), and a store through one
+#     of those is a write the scan read. A plan pointer handed to any other foreign function —
+#     every BLAS and LAPACK routine among them — is a record that reports and does not raise.
+#     `_FCALL_ALIASES` names the ones whose result is the same memory under another type.
+#   * A LOCK, a condition, an atomic, an event, a channel or a semaphore read out of the plan
+#     carries no taint: what `lock(plan.lk)` writes is the synchronization.
 #
 # WHAT IT CANNOT CATCH (honest limits — PureFFT's runtime concurrency test is the load-bearing
 # backstop; this static proof is complementary):
@@ -71,13 +85,14 @@ end
 #     writing "x" is really writing the plan. No alias analysis is done — a caller passing
 #     `alloc_scratch(plan)` (a fresh buffer) is fine; deliberately aliasing plan-owned storage is
 #     not detected.
-#   * Base/Core mutation is caught only for a KNOWN set of mutating functions; a plan-reachable
-#     buffer mutated by some other non-inlined Base method is out of scope.
+#   * A Base callee whose name does not end in `!` and whose result cannot hold a reference is
+#     not read, so a write it makes is missed: `write(plan.io, x)`, `put!`-free channel traffic.
 #   * Recursion is depth-bounded (`max_depth`, default 4); beyond it a still-tainted call is
-#     flagged conservatively rather than followed.
-#   * `foreigncall`/`llvmcall` stores (e.g. raw `memmove` into a tainted pointer) are not modelled
-#     (modern Julia lowers array writes to `memoryrefset!`, which IS modelled).
-#   * Taint does not flow through the *return value* of an opaque (Base/Core/unresolved) call.
+#     flagged conservatively rather than followed. A Base callee past its own bound is flagged
+#     only when its name ends in `!`.
+#   * `llvmcall` stores are not modelled.
+#   * A callee returning a struct BUILT AROUND a plan value (a wrapper, not a projection) returns
+#     no taint, and neither does a callee the walk did not read or a dynamic call.
 
 # ── taint primitives ──────────────────────────────────────────────────────────────────────────
 
@@ -198,6 +213,54 @@ function _mi_codeinfo(mi::Core.MethodInstance)
     return isempty(cts) ? nothing : cts[1].first
 end
 
+# The same for a callee that need not be a singleton function: a constructor, a callable object.
+function _mi_codeinfo_by_type(mi::Core.MethodInstance)
+    cts = try
+        _code_typed_by_type(mi.specTypes; optimize = true)
+    catch
+        return nothing
+    end
+    return isempty(cts) ? nothing : cts[1].first
+end
+
+# How many frames of Base the walk reads beyond `max_depth`. Base reaches its stores through more
+# layers than a package's kernel does: `sort!(v)` is five calls above the first element it moves.
+const _BASE_EXTRA_DEPTH = 8
+
+# Whether a call's result can be a reference into one of its arguments. A `String`, a `Symbol` and
+# a plain-data value are copies; a pointer is not.
+function _may_alias_result(@nospecialize(T))
+    W = _widen_taint(T)
+    W isa Type || return true
+    W === Union{} && return false
+    # An exception is built to be thrown, and what it holds is only printed.
+    W <: Exception && return false
+    W <: Union{AbstractString, Symbol, Nothing, Missing, Type, Module, Function} && return false
+    return !isbitstype(W) || _holds_ptr(W)
+end
+
+# Foreign functions whose effect on their pointer arguments is known, by the positions (among the
+# declared arguments) they write through. An empty tuple reads only. A foreign function this does
+# not name is assumed to write through every pointer it is given.
+const _FCALL_WRITES = Dict{Symbol, Tuple{Vararg{Int}}}(
+    :memmove => (1,), :memcpy => (1,), :memset => (1,),
+    :jl_genericmemory_copyto => (1, 2),
+    :memcmp => (), :memchr => (), :strlen => (), :memhash => (), :memhash_seed => (),
+    :memhash32_seed => (), :jl_object_id => (), :jl_egal => (), :jl_types_equal => (),
+    :jl_genericmemory_copy_slice => (), :jl_genericmemory_copy => (), :jl_array_copy => (),
+    :jl_pchar_to_string => (), :jl_symbol_n => (), :jl_eqtable_get => (),
+    :jl_eqtable_nextind => (), :jl_string_ptr => (), :jl_gc_add_finalizer_th => (),
+    :jl_stored_inline => (), :jl_array_isassigned => (),
+)
+
+# Foreign functions whose result is the memory a pointer argument names, under another type.
+const _FCALL_ALIASES = Set{Symbol}(
+    (
+        :jl_ptr_to_genericmemory, :jl_ptr_to_array, :jl_ptr_to_array_1d, :jl_value_ptr,
+        :jl_pointer_to_objref, :jl_genericmemory_slice, :jl_reshape_array,
+    )
+)
+
 # Container-operand position (1-based among the call's DATA args, i.e. after the callee).
 const _PROJECT_OPS = Dict(
     :getfield => 1, :getproperty => 1, :memoryrefget => 1, :memoryrefnew => 1,
@@ -261,6 +324,10 @@ const _BASE_MUTATORS = Set{Symbol}(
         :_deleteend!, :_deletebeg!,
     )
 )
+
+# Which argument a named mutator writes. A plan value at any other position is a source:
+# `copyto!(out, plan.buf)` reads the plan.
+_mutator_dest(nm::Symbol) = nm === :map! ? 2 : 1
 
 # `certain` separates a write this scan READ from one it could not rule out. StrictMode throws only
 # where it is 100% sure and warns otherwise, so the two cannot share a verdict. The default is
@@ -367,7 +434,9 @@ function _taint_scan_ci(
             if st isa Core.PiNode
                 isdefined(st, :val) && einset(st.val) && setelem(i)
                 isdefined(st, :val) && gtainted(st.val) && !(i in gset) && (push!(gset, i); changed = true)
-                isdefined(st, :val) && _op_tainted(st.val, tset, targs) && settaint(true)
+                # A value narrowed to a lock or a condition is a synchronization object from here on.
+                isdefined(st, :val) && _op_tainted(st.val, tset, targs) &&
+                    settaint(!_is_sync_type(Core.Compiler.widenconst(types[i])))
                 continue
             elseif st isa Core.PhiNode || st isa Core.PhiCNode
                 st isa Core.PhiNode && any(k -> isassigned(st.values, k) && einset(st.values[k]), eachindex(st.values)) && setelem(i)
@@ -436,6 +505,38 @@ function _taint_scan_ci(
                         _operand_type(a, types), chain, depth, max_depth, memo, out, seen, fr; fields = tflds
                     )
                     break
+                end
+                continue
+            elseif Meta.isexpr(st, :foreigncall)
+                # The declared arguments only: what follows them are the values kept alive for the
+                # call, which the foreign function never receives.
+                argtypes = st.args[3]
+                nfargs = argtypes isa Core.SimpleVector ? length(argtypes) : length(st.args) - 5
+                fargs = @view st.args[6:min(lastindex(st.args), 5 + nfargs)]
+                handed = Int[k for k in eachindex(fargs) if _op_tainted(fargs[k], tset, targs)]
+                isempty(handed) && continue
+                fname = _fcall_name(st)
+                if fname in _FCALL_ALIASES
+                    settaint(true)
+                    continue
+                end
+                written = get(_FCALL_WRITES, fname, nothing)
+                if isnothing(written)
+                    # Go's rule for cgo: a C function is assumed to keep and use the pointers it
+                    # is given. Nothing here read a store, so this reports and does not raise.
+                    _record!(
+                        out, seen, chain,
+                        "hands a plan-reachable pointer to " *
+                            (isnothing(fname) ? "a foreign function" : "the foreign function `$fname`") *
+                            " — a foreign function is assumed to write through the pointers it is " *
+                            "given, and StrictMode cannot read it (flagged conservatively)", fr
+                    )
+                elseif any(in(written), handed)
+                    _record!(
+                        out, seen, chain,
+                        "stores into a buffer reachable from the plan (`$fname` writes its " *
+                            "destination) — a heap write the plan can observe", fr; certain = true
+                    )
                 end
                 continue
             end
@@ -521,6 +622,10 @@ function _taint_scan_ci(
                     end
                     isref = (nm === :memoryrefnew || nm === :memoryref) ? true :
                         (_may_ref(types[i]) || _holds_ptr(Core.Compiler.widenconst(types[i])))
+                    # A lock, a condition or a channel read out of the plan is how the tasks
+                    # sharing it synchronize, and what `lock` writes inside it is the
+                    # synchronization, not shared data.
+                    isref = isref && !_is_sync_type(Core.Compiler.widenconst(types[i]))
                     if _op_tainted(src, tset, targs)
                         settaint(isref)
                     else
@@ -574,6 +679,14 @@ function _taint_scan_ci(
 
             # a plain call that receives a tainted (plan-reachable) reference: follow it
             tainted_pos = Int[k for k in eachindex(dataargs) if _op_tainted(dataargs[k], tset, targs)]
+            # A plan value typed `Any` here and narrowed to a lock in the callee is still a lock.
+            if isinvoke
+                mi0 = _invoke_mi(st.args[1])
+                if !isnothing(mi0) && mi0.specTypes isa DataType
+                    ps = mi0.specTypes.parameters
+                    filter!(k -> !(k + 1 <= length(ps) && _is_sync_type(ps[k + 1])), tainted_pos)
+                end
+            end
             # Container arguments travel too, with their field map: the writes that matter often
             # happen in a callee that received the fresh wrapper, so losing the distinction at the
             # call boundary loses it entirely.
@@ -590,18 +703,31 @@ function _taint_scan_ci(
                 if m isa Method && !_is_base_core(m.module)
                     rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen; cpos)
                     settaint(rt && _may_ref(types[i]))
-                elseif nm !== nothing && nm in _BASE_MUTATORS
+                elseif nm !== nothing && nm in _BASE_MUTATORS && _mutator_dest(nm) in tainted_pos
                     _record!(
                         out, seen, chain,
                         "hands a plan-reachable value to `$nm`, a mutating operation", fr;
                         certain = true
                     )
+                elseif m isa Method
+                    # A Base callee is read when its name declares a write (`sort!`, `delete!`) or
+                    # when what it returns can be a reference into the plan (`get`, `reshape`,
+                    # `unsafe_wrap`): the body says which argument is written and whether the
+                    # result is the plan's memory or a fresh copy. Any other Base callee (a
+                    # reduction, a `throw_boundserror`) is treated as non-mutating.
+                    bang = endswith(String(_demangle(m.name)), "!")
+                    if bang || _may_alias_result(types[i])
+                        rt = _recurse(
+                            mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen;
+                            cpos, base = true, bang
+                        )
+                        settaint(rt && _may_ref(types[i]))
+                    end
                 end
-                # other Base/Core invokes (reads, `throw_boundserror`, …) are treated as non-mutating
                 continue
             else
                 # dynamic `:call`
-                if nm !== nothing && nm in _BASE_MUTATORS
+                if nm !== nothing && nm in _BASE_MUTATORS && _mutator_dest(nm) in tainted_pos
                     _record!(
                         out, seen, chain,
                         "hands a plan-reachable value to `$nm`, a mutating operation", fr;
@@ -712,6 +838,11 @@ function _recurse_closure_body(
     key = (T, :closure, fields)
     haskey(memo, key) && return nothing
     memo[key] = false
+    ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+    ms isa Vector || return nothing
+    # A struct with no call method of its own is data, not a closure: there is no body to read,
+    # at any depth.
+    any(match -> !_is_base_core(match.method.module), ms) || return nothing
     if depth >= max_depth
         _record!(
             out, seen, chain,
@@ -720,8 +851,6 @@ function _recurse_closure_body(
         )
         return nothing
     end
-    ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
-    ms isa Vector || return nothing
     for match in ms
         m = match.method
         # The closure's own call methods only: a generic method on `Function` matches too.
@@ -816,7 +945,7 @@ end
 function _recurse(
         mi::Core.MethodInstance, m::Method, tainted_pos::Vector{Int}, chain::Vector{String},
         depth::Int, max_depth::Int, memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String};
-        cpos::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(),
+        cpos::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(), base::Bool = false, bang::Bool = false,
     )
     # Canonical, and comparable: sorting the pairs directly falls through to comparing the `Set`
     # values whenever two keys tie, and `isless` has no method for `Set`. Measured on a real
@@ -824,9 +953,13 @@ function _recurse(
     # memo key rather than from anything about the method.
     key = (mi, sort(tainted_pos), [k => sort!(collect(v)) for (k, v) in sort!(collect(cpos); by = first)])
     haskey(memo, key) && return memo[key]
-    label = string(m.name)
-    if depth >= max_depth
-        _record!(
+    label = string(_demangle(m.name))
+    # A Base callee that is not read is reported only when its name declares a write. Base's
+    # other functions do not write their arguments, and a record for each one the walk stopped
+    # at would report every reduction and every `show` of a plan value.
+    quiet = base && !bang
+    if depth >= max_depth + (base ? _BASE_EXTRA_DEPTH : 0)
+        quiet || _record!(
             out, seen, chain,
             "hands a plan-reachable value to `$label` at recursion depth $depth (≥ max_depth=$max_depth) — " *
                 "not read, so not established; pass a larger `max_depth` to check it", _Frame(label, string(m.file), Int(m.line))
@@ -835,10 +968,10 @@ function _recurse(
         return false
     end
     memo[key] = false   # cycle guard: assume non-tainting return until proven
-    ci = _mi_codeinfo(mi)
+    ci = base ? _mi_codeinfo_by_type(mi) : _mi_codeinfo(mi)
     if ci === nothing
         # The callee holds a plan-reachable value and nothing says what it does with it.
-        _record!(
+        quiet || _record!(
             out, seen, chain,
             "hands a plan-reachable value to `$label`, whose typed IR could not be read — " *
                 "not read, so not established", _Frame(label, string(m.file), Int(m.line))
@@ -897,6 +1030,8 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     # arrays, which reported a write to the plan.
     out = _ConcViol[]
     (1 <= self_arg <= length(types) && _may_ref(types[self_arg])) || return out
+    # A lock or a channel is written by every task that uses it; that is what it is for.
+    _is_sync_type(types[self_arg]) && return out
     targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
     _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Bool}(), out, Set{String}())
     return out
@@ -951,13 +1086,21 @@ whose container is plan-reachable. It **follows calls**: a plan-reachable value 
 non-inlined child method is scanned recursively (bounded by `max_depth`), so a plan that
 accidentally calls a child's embedded-scratch *convenience path* — mutating
 `plan.children[i].scratch.data` one frame down — is still caught; a plan-reachable value handed to
-a known Base mutator or to dynamic dispatch is flagged conservatively.
+dynamic dispatch is flagged conservatively. A Base function that is not inlined is read the same
+way when its name ends in `!` or its result can be a reference into an argument, so `sort!(plan.buf)`
+and `get(plan.cache, k, x)[1] = v` are writes and `copyto!(out, plan.buf)` is not.
+
+A foreign call follows Go's rule for cgo: a C function is assumed to write through every pointer it
+is given. `memmove`, `memcpy` and `memset` are known to write their destination, so a plan buffer
+there is a write the scan read; a plan pointer handed to any other foreign function, a BLAS routine
+included, is reported as one the scan could not rule out. A lock, condition, atomic or channel held
+by the plan is not shared data: locking it is not a write to the plan.
 
 **Failing and warning are different outcomes here, and which one you get follows how sure the scan
-is.** A write it READ — a store whose container is plan-reachable, or a hand-off to a known Base
-mutator — raises `StrictViolation`. A record it could only *not rule out* warns instead: a callee
-behind dynamic dispatch, a task body whose closure type did not resolve, or a chain that reached
-`max_depth` and stopped. So a real write far enough down the call chain warns rather than fails,
+is.** A write it READ — a store whose container is plan-reachable, a hand-off to a known Base
+mutator, or a `memmove` into a plan buffer — raises `StrictViolation`. A record it could only *not
+rule out* warns instead: a callee behind dynamic dispatch, a foreign function with no known effect,
+a task body whose closure type did not resolve, or a chain that reached `max_depth` and stopped. So a real write far enough down the call chain warns rather than fails,
 because the scan never saw it — raise `max_depth` to reach it, or assert on the inner method
 directly.
 
@@ -966,8 +1109,8 @@ written, so `StrictModeTest` runs this same scan and inherits the same split —
 is informational there too. That is unlike `@test_noalloc`, where AllocCheck replaces the guess.
 
 This is a **complementary static proof**, not a total one: it does no alias analysis (if the
-scratch you pass secretly aliases plan-owned storage it will not notice), models Base mutation
-only for a known set, and bounds recursion depth — so pair it with a runtime concurrency test.
+scratch you pass secretly aliases plan-owned storage it will not notice), does not read a Base
+function whose name carries no `!` and whose result holds no reference, and bounds recursion depth — so pair it with a runtime concurrency test.
 It prefers false positives over a confident false pass. Value-free (no AllocCheck/JET backend);
 each argument is evaluated once; disabled builds expand to the bare call.
 
@@ -1029,6 +1172,8 @@ function _fcall_name(st)
     Meta.isexpr(fn, :tuple) && !isempty(fn.args) && (fn = fn.args[1])
     fn isa QuoteNode && (fn = fn.value)
     fn isa Tuple && !isempty(fn) && (fn = fn[1])
+    # Base names the MPFR and GMP entry points by string: `("mpfr_add", libmpfr)`.
+    fn isa String && (fn = Symbol(fn))
     return fn isa Symbol ? fn : nothing
 end
 

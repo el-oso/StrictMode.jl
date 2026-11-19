@@ -1372,18 +1372,31 @@ captures it, so a `Threads.@spawn` inside the call is read too.
 A struct built around the plan is a different object. A method that wraps its plan in a fresh
 struct and fills in that struct's own fields passes.
 
+A Base function that was not inlined is read the same way when its name ends in `!` (`sort!`,
+`reverse!`, `delete!`) or when what it returns can be a reference into an argument (`get`,
+`reshape`, `unsafe_wrap`). Its body says which argument it writes and whether its result is the
+plan's memory or a copy, so `sort!(plan.buf)` and `get(plan.cache, k, x)[1] = v` are writes, and
+`copyto!(out, plan.buf)`, `mul!(out, plan.A, x)` and `sort!(copy(plan.buf))` are not.
+
+A lock, a condition, an atomic, an event, a channel or a semaphore held by the plan is not marked.
+What `lock(plan.lk)` writes inside the lock is the synchronization, not shared data.
+
 ### Throw or warn
 
 Each finding is judged on its own, by how sure the scan is.
 
 It throws on a write it read: a store through the shared argument, a store into a mutable `const`
-global, or a marked value handed to one of the Base functions the scan knows to mutate, such as
-`push!`, `resize!`, `copyto!` or `fill!`. One such finding is enough to throw, whatever else was
+global, a marked value at the destination of one of the Base functions the scan knows to mutate
+(`push!`, `resize!`, `copyto!`, `fill!`), or a marked buffer as the destination of `memmove`,
+`memcpy` or `memset`. One such finding is enough to throw, whatever else was
 found.
 
 It warns on what it could not rule out: a marked value passed to a call that dispatches at run
-time, a task whose body it could not read, or a call chain that reached `max_depth` before the
-scan saw a store. The warning says so: "cannot establish that the plan argument is read-only —
+time, a task whose body it could not read, a call chain that reached `max_depth` before the
+scan saw a store, or a marked pointer handed to a foreign function. The last follows Go's rule for
+cgo: a C function is assumed to write through every pointer it is given, and the scan cannot read
+it. That includes every BLAS and LAPACK routine, so `mul!(out, plan.A, x)` on `Float64` matrices
+warns that `dgemv` received a pointer into the plan. The warning says so: "cannot establish that the plan argument is read-only —
 sharing it across concurrent tasks is unproven, not disproven". For a chain that is too deep,
 raise `max_depth` or assert on the inner method.
 
@@ -1393,8 +1406,8 @@ share the plan still both change it, and the scan cannot tell whether they are m
 ### Limits
 
 The scan does not model aliasing: if the scratch buffer you pass shares memory with something the
-plan owns, a write to the scratch passes. Apart from the Base functions it knows to mutate, calls
-into Base and Core are treated as reads. Which part of a captured array a task writes depends on
+plan owns, a write to the scratch passes. A Base function whose name does not end in `!` and
+whose result holds no reference is treated as a read, so `write(plan.io, x)` passes. Which part of a captured array a task writes depends on
 values, so a task that writes its own slice of a shared output is reported. And the verdict covers
 the argument types of this call only.
 
