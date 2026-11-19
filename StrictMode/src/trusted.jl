@@ -74,8 +74,15 @@ Register `f` as a validating crossing: the one place [`@assert_trusted`](@ref) p
 still holds the original buffer and can write to it afterwards, which is why the kernel's
 `copy_from_user` copies rather than aliasing. Neither property is checked; registering `f` asserts
 both.
+
+Clears the findings cache, since a registration changes `:trusted` results.
 """
-trust_boundary!(@nospecialize(f)) = (push!(_TRUST_BOUNDARIES, f); f)
+function trust_boundary!(@nospecialize(f))
+    push!(_TRUST_BOUNDARIES, f)
+    # A `:trusted` verdict depends on this set, and the findings cache does not key on it.
+    clear_cache!()
+    return f
+end
 
 # The calls that read the payload. `Base.getfield === Core.getfield`, so one entry covers both
 # spellings. `getproperty` is here even though the override above already throws on it: reporting

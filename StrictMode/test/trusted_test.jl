@@ -102,3 +102,19 @@ end
     fo = only(findings(TrustedFixtures.reads_other_field, (Vector{Any},); guarantees = (:trusted,)))
     @test !StrictMode._failed(fo)
 end
+
+@testitem "registering a trust boundary drops the verdicts cached before it" begin
+    using StrictMode
+
+    late_boundary(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
+    sig = (Untrusted{Vector{UInt8}},)
+    late_boundary(Untrusted(UInt8[1]))
+
+    before = only(findings(late_boundary, sig; guarantees = (:trusted,)))
+    @test StrictMode._failed(before)
+    StrictMode.trust_boundary!(late_boundary)
+    after = only(findings(late_boundary, sig; guarantees = (:trusted,)))
+    @test after.status === :pass
+    delete!(StrictMode._TRUST_BOUNDARIES, late_boundary)
+    StrictMode.clear_cache!()
+end

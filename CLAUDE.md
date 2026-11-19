@@ -188,7 +188,9 @@ StrictMode/src/
                         Julia form of the kernel's `__user` annotation). Dispatch enforces the type
                         with no checker at all; the scan covers what the language cannot, reading
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
-                        boundary inlines and its getfield would surface in an innocent caller
+                        boundary inlines and its getfield would surface in an innocent caller.
+                        trust_boundary! calls clear_cache!, like every registration a verdict
+                        depends on (register_scoped!, register_alloc_barrier!, _exempt!)
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves
