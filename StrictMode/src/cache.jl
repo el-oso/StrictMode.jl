@@ -6,10 +6,10 @@
 # The key names the *checked* method, not its callees, so an edit one level down leaves it
 # identical. That is covered separately: each entry also holds the `CodeInstance`s the verdict was
 # read from, and Julia caps their `max_world` when a callee changes. A method that has never been
-# compiled has no instance to watch, and only there is `clear_cache!()` still needed.
+# compiled has no instance to watch, so its entry answers only in the world it was made in.
 
-# The findings, plus the `CodeInstance`s they were read from — see `_watch_instances`.
-const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}}}()
+# The findings, the `CodeInstance`s they were read from (see `_watch_instances`), and the world.
+const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}, UInt}}()
 const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
@@ -38,7 +38,7 @@ end
 # callee edit and capped after it, while `objectid(which(...))` and `primary_world` were unchanged.
 #
 # A method nothing has compiled yet has no instance to watch, so a verdict for it cannot be
-# invalidated this way — `clear_cache!()` remains the answer there.
+# invalidated this way, and `_entry_valid` keeps it for its own world only.
 function _watch_instances(@nospecialize(f), @nospecialize(types::Tuple))
     out = Core.CodeInstance[]
     m = try
@@ -63,20 +63,26 @@ end
 
 _instances_valid(cis) = all(ci -> ci.max_world == typemax(UInt), cis)
 
-"""
-    StrictMode.clear_cache!()
+# Whether a cache entry made in `world` with `watched` still answers. With nothing to watch, any
+# definition since may be an edit to a callee, so only the same world does.
+_entry_valid(watched, world::UInt) =
+    isempty(watched) ? world == Base.get_world_counter() : _instances_valid(watched)
 
-Drop the incremental `findings` cache.
-
-A cached verdict is dropped on its own when the compiled code it was read from is invalidated, which
-covers editing a *callee* of a checked method. A method that has not been compiled at all has no
-compiled code to watch, so reach for this after editing a callee of one of those.
-"""
 # What the scan keeps is worth keeping in a session, where the next check reuses it, and not at a
 # precompile, where nothing asks again and a process that is about to write a package image holds
 # it as live heap: 282 MB after a module check of 300 methods.
 _release_after_load_check() = ccall(:jl_generating_output, Cint, ()) == 1 ? clear_cache!() : nothing
 
+"""
+    StrictMode.clear_cache!()
+
+Drop the incremental `findings` cache.
+
+A cached verdict is dropped on its own when the method it names or a callee is edited: the compiled
+code it was read from is invalidated, and a verdict on a method with no compiled code is kept only
+until the next definition. This is for what no definition announces, such as a changed setting a
+verdict depends on.
+"""
 function clear_cache!()
     @lock _CACHE_LOCK begin
         empty!(_CACHE)

@@ -411,3 +411,31 @@ end
     StrictMode.set_ignore_throw!(StrictMode.ignore_throw())
     @test StrictModeTest._raw_allocs_unfiltered(entry, T) !== kept
 end
+
+@testitem "an allocation proof follows a redefined method or callee, in both directions" begin
+    using StrictMode, StrictModeTest
+
+    const RP_SINK = Any[]
+    rp_clean(x::Int) = x + 1
+    rp_allocating(x::Int) = (push!(RP_SINK, x); x + 1)
+    rp_generic(x) = x + 1
+    @noinline rp_callee(x::Int) = x + 1
+    rp_caller(x::Int) = rp_callee(x) + rp_callee(x)
+    rp_clean(1); rp_allocating(1); rp_generic(1); rp_caller(1)
+    failed(f) = StrictMode._failed(only(proof_findings(f, (Int,); guarantees = (:noalloc,))))
+
+    @test !failed(rp_clean)
+    @test failed(rp_allocating)
+    @test !failed(rp_generic)
+    @test !failed(rp_caller)
+
+    @eval rp_clean(x::Int) = (push!(RP_SINK, x); x + 1)
+    @eval rp_allocating(x::Int) = x + 1
+    @eval rp_generic(x::Int) = (push!(RP_SINK, x); x + 1)      # a more specific method takes over
+    @eval @noinline rp_callee(x::Int) = (push!(RP_SINK, x); x + 1)
+
+    @test failed(rp_clean)
+    @test !failed(rp_allocating)
+    @test failed(rp_generic)
+    @test failed(rp_caller)
+end

@@ -459,6 +459,32 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     )
 end
 
+# When something was read from a signature: the world, the specialization the signature dispatched
+# to, and the compiler's record of that specialization (`_record_of`).
+struct _ReadStamp
+    world::UInt
+    mi::Union{Nothing, Core.MethodInstance}
+    record::Union{Nothing, Core.CodeInstance}
+end
+
+# Whether what was read from `sig` at `s` is what would be read now. It is in the world of the read.
+# In a later world it is while both hold: the compiler's record is valid, which Julia ends when
+# anything the inference of the specialization depended on changes (a callee, a binding); and `sig`
+# still dispatches to that specialization. The second is not implied by the first: Julia ends the
+# records of the callers of a replaced method and leaves the replaced method's own record valid,
+# and a more specific method added later takes over a signature without touching the record of the
+# method that used to answer it.
+function _read_holds(s::_ReadStamp, @nospecialize(sig), world::UInt = Base.get_world_counter())
+    s.world == world && return true
+    r = s.record
+    (!isnothing(r) && r.min_world <= world <= r.max_world) || return false
+    return _sig_instance(sig, world) === s.mi
+end
+
+# `s` as of `world`, for a read found to hold there: the next question in that world is answered
+# by the first comparison, without asking dispatch again.
+_as_of(s::_ReadStamp, world::UInt) = s.world == world ? s : _ReadStamp(world, s.mi, s.record)
+
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
 #
 # Typed IR still contains the `Vector{Float64}(undef, n)` that LLVM later removes because the array
@@ -486,7 +512,10 @@ end
 # `Core.Compiler.EscapeAnalysis` is a compiler internal with no stability guarantee across Julia
 # versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behavior
 # without this. A missing analysis must never quiet a guarantee.
-const _ESCAPE_MEMO = IdDict{Any, Bool}()
+#
+# Kept while the read it came from holds (`_read_holds`): the analysis reads the signature's own
+# inferred body, so a redefinition changes the answer in either direction.
+const _ESCAPE_MEMO = IdDict{Any, Tuple{_ReadStamp, Bool}}()
 const _ESCAPE_MEMO_LOCK = ReentrantLock()
 
 # The pass `code_ircode_by_type` must stop at, by the name this compiler uses for it. The compiler
@@ -500,8 +529,13 @@ const _INLINING_PASS = let CC = Core.Compiler
 end
 
 function _all_news_nonescaping(@nospecialize(sig))
+    world = Base.get_world_counter()
     cached = @lock _ESCAPE_MEMO_LOCK get(_ESCAPE_MEMO, sig, nothing)
-    isnothing(cached) || return cached
+    if !isnothing(cached) && _read_holds(cached[1], sig, world)
+        cached[1].world == world ||
+            @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = (_as_of(cached[1], world), cached[2]))
+        return cached[2]
+    end
     v = try
         _compute_all_news_nonescaping(sig)
     catch err
@@ -514,7 +548,9 @@ function _all_news_nonescaping(@nospecialize(sig))
             sprint(showerror, err) maxlog = 1
         false
     end
-    @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = v)
+    mi = _sig_instance(sig, world)
+    stamp = _ReadStamp(world, mi, isnothing(mi) ? nothing : _record_of(mi, world))
+    @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = (stamp, v))
     return v
 end
 
@@ -655,20 +691,20 @@ end
 
 # The optimized body of a signature, or `nothing` when none can be read. Inferring a body is most of
 # what a scan costs, and the same body is reached again by every walk that passes through it, at
-# each depth and from every entry point, so it is read once. An entry stays valid while the compiler's
-# own record of the signature does (a method defined elsewhere does not end it), or, for a signature
-# the compiler holds no record of, while the world is the one it was read in.
+# each depth and from every entry point, so it is read once. An entry stays valid while what it was
+# read from does (`_read_holds`; a method defined elsewhere does not end it).
 #
 # A body is taken from where it already exists, and inferred only when it exists nowhere: the
 # compiler's own record first, then what the scan's inference kept while it inferred a caller.
-const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any, Any}}()
+const _BODY_MEMO = IdDict{Any, Tuple{_ReadStamp, Any}}()
 
 function _typed_body(@nospecialize(sig))
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
-    if !isnothing(hit)
-        rec = hit[3]
-        (hit[1] == world || (rec isa Core.CodeInstance && rec.min_world <= world <= rec.max_world)) && return hit[2]
+    if !isnothing(hit) && _read_holds(hit[1], sig, world)
+        hit[1].world == world ||
+            @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (_as_of(hit[1], world), hit[2]))
+        return hit[2]
     end
     mi = _sig_instance(sig, world)
     ci = isnothing(mi) ? nothing : _compiled_body(mi, world)
@@ -683,7 +719,7 @@ function _typed_body(@nospecialize(sig))
         ci = isempty(cts) ? nothing : first(cts[1])
     end
     rec = (isnothing(ci) || isnothing(mi)) ? nothing : _record_of(mi, world)
-    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci, rec))
+    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (_ReadStamp(world, mi, rec), ci))
     return ci
 end
 

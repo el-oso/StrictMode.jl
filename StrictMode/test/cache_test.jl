@@ -55,3 +55,45 @@ end
 
     StrictMode.clear_cache!()
 end
+
+@testitem "a verdict follows a redefined method or callee, in both directions" begin
+    using StrictMode
+
+    const RD_SINK = Any[]
+    rd_clean(x::Int) = x + 1
+    rd_allocating(x::Int) = (push!(RD_SINK, x); x + 1)
+    rd_stable(x::Int) = x + 1
+    rd_generic(x) = x + 1
+    @noinline rd_callee(x::Int) = x + 1
+    rd_caller(x::Int) = rd_callee(x) + rd_callee(x)
+    @noinline rd_callee_cold(x::Int) = x + 1
+    rd_caller_cold(x::Int) = rd_callee_cold(x) + rd_callee_cold(x)
+    # Everything but `rd_caller_cold` is compiled, so the compiler holds a record of it that
+    # outlives the edit; `rd_caller_cold` is the method with no compiled code to watch.
+    rd_clean(1); rd_allocating(1); rd_stable(1); rd_generic(1); rd_caller(1)
+    status(f, g) = only(findings(f, (Int,); guarantees = (g,))).status
+
+    @test status(rd_clean, :noalloc) === :pass
+    @test status(rd_allocating, :noalloc) === :fail
+    @test status(rd_stable, :typestable) === :pass
+    @test status(rd_generic, :noalloc) === :pass
+    @test status(rd_caller, :noalloc) === :pass
+    @test status(rd_caller_cold, :noalloc) === :pass
+
+    @eval rd_clean(x::Int) = (push!(RD_SINK, x); x + 1)
+    @eval rd_allocating(x::Int) = x + 1
+    @eval rd_stable(x::Int) = x > 0 ? 1 : "s"
+    @eval rd_generic(x::Int) = (push!(RD_SINK, x); x + 1)      # a more specific method takes over
+    @eval @noinline rd_callee(x::Int) = (push!(RD_SINK, x); x + 1)
+    @eval @noinline rd_callee_cold(x::Int) = (push!(RD_SINK, x); x + 1)
+
+    @test status(rd_clean, :noalloc) === :fail
+    @test status(rd_allocating, :noalloc) === :pass
+    @test status(rd_stable, :typestable) === :fail
+    @test status(rd_generic, :noalloc) === :fail
+    @test status(rd_caller, :noalloc) === :fail
+    @test status(rd_caller_cold, :noalloc) === :fail
+
+    @eval @noinline rd_callee(x::Int) = x + 1                  # and back
+    @test status(rd_caller, :noalloc) === :pass
+end

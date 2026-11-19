@@ -185,20 +185,21 @@ function findings(
     if !isnothing(key)
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
         if !isnothing(cached)
-            fs, watched = cached
+            fs, watched, world = cached
             # The key cannot see an edit to a CALLEE; the compiled code the verdict was read from
             # can. A hit whose instances have been invalidated is dropped rather than handed back.
-            if _instances_valid(watched)
+            if _entry_valid(watched, world)
                 @lock _CACHE_LOCK (_CACHE_HITS[] += 1)
                 return copy(fs)
             end
             @lock _CACHE_LOCK delete!(_CACHE, key)
         end
     end
+    world = Base.get_world_counter()
     fs = _findings_uncached(f, types, guarantees)
     if !isnothing(key)
         @lock _CACHE_LOCK begin
-            _CACHE[key] = (fs, _watch_instances(f, types))
+            _CACHE[key] = (fs, _watch_instances(f, types), world)
             _CACHE_MISSES[] += 1
         end
     end

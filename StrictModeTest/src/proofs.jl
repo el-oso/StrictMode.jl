@@ -123,7 +123,7 @@ function _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types))
     world = Base.get_world_counter()
     # AllocCheck and the walk infer outside the compiler's cache. Inferring the entry into it makes
     # the record that lets these sites hold in a later world.
-    entry() = (Base.return_types(f, Tuple{types...}; world); Base.method_instance(f, types; world))
+    entry() = Base.return_types(f, Tuple{types...}; world)
     return _kept(_SITES_MEMO, StrictMode._sigtype(f, types), world, entry) do
         vcat(
             AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
@@ -141,19 +141,23 @@ end
 # record of the specialization it was read from is valid: Julia ends that record when a method or a
 # binding that the inference of the specialization, or of anything it calls statically, depended on
 # changes. A specialization the compiler holds no record of is read again in every new world.
+# A read kept by signature also needs the signature to dispatch to the same specialization still
+# (`StrictMode._read_holds`): the record of a method that was replaced stays valid. A read kept by
+# specialization names its subject, and is reached only from a caller whose own record ends when the
+# call resolves elsewhere.
 # Every setting a proof reads (`ignore_throw`, the barriers, the exemptions) clears StrictMode's
 # cache when it is changed, which advances `_GENERATION` and ends every kept read.
 struct _Stamp
-    world::UInt
+    read::StrictMode._ReadStamp
     generation::UInt
-    record::Union{Nothing, Core.CodeInstance}
 end
 
-function _holds(s::_Stamp)
+function _holds(s::_Stamp, @nospecialize(key))
     s.generation == StrictMode._GENERATION[] || return false
+    key isa Core.MethodInstance || return StrictMode._read_holds(s.read, key)
     world = Base.get_world_counter()
-    s.world == world && return true
-    r = s.record
+    s.read.world == world && return true
+    r = s.read.record
     return !isnothing(r) && r.min_world <= world <= r.max_world
 end
 
@@ -163,17 +167,23 @@ const _SITES_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
 # By specialization: what the native walk reads from its body (`_walk_body`).
 const _WALK_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
 
-# `read()`, or what an earlier call kept under `key`. `world` is the world `read` reads in, and
-# `entry()` the specialization it reads from, asked after the read because the read is often what
-# makes the compiler record it. A read that raises keeps nothing.
+# `read()`, or what an earlier call kept under `key`, a signature type or a specialization. `world`
+# is the world `read` reads in. `entry()` is called after the read and makes the compiler record the
+# specialization read from, where the read itself does not. A read that raises keeps nothing.
 function _kept(read, memo::IdDict, @nospecialize(key), world::UInt, entry)
     hit = @lock _MEMO_LOCK get(memo, key, nothing)
-    !isnothing(hit) && _holds(hit[1]) && return hit[2]
+    if !isnothing(hit) && _holds(hit[1], key)
+        now = Base.get_world_counter()
+        hit[1].read.world == now ||
+            @lock _MEMO_LOCK (memo[key] = (_Stamp(StrictMode._as_of(hit[1].read, now), hit[1].generation), hit[2]))
+        return hit[2]
+    end
     generation = StrictMode._GENERATION[]
     value = read()
-    mi = entry()
+    entry()
+    mi = key isa Core.MethodInstance ? key : StrictMode._sig_instance(key, world)
     record = mi isa Core.MethodInstance && Base.get_world_counter() == world ? StrictMode._record_of(mi, world) : nothing
-    @lock _MEMO_LOCK (memo[key] = (_Stamp(world, generation, record), value))
+    @lock _MEMO_LOCK (memo[key] = (_Stamp(StrictMode._ReadStamp(world, mi, record), generation), value))
     return value
 end
 
@@ -234,7 +244,7 @@ end
 # What the walk reads from one optimized body, in statement order: the specialization of each
 # `:invoke` (a `MethodInstance`) and the callee name of each dynamic call (a `Symbol`).
 function _walk_body(interp, world::UInt, mi::Core.MethodInstance)
-    return _kept(_WALK_MEMO, mi, world, () -> mi) do
+    return _kept(_WALK_MEMO, mi, world, Returns(nothing)) do
         src = Base.Compiler.typeinf_code(interp, mi, true)
         src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
         skip = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) .| _catch_only_mask(src.code) :

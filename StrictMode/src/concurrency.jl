@@ -1212,13 +1212,16 @@ function _suspends_on(@nospecialize(T))
     return isconcretetype(T) ? :yes : :maybe
 end
 
-const _SUSPEND_MEMO = Dict{Any, Symbol}()   # callee signature => :yes, :maybe or :no
+# Callee signature and world => :yes, :maybe or :no. The world is part of the key because the reach
+# follows run-time dispatch, which a method defined anywhere can change.
+const _SUSPEND_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
 const _SUSPEND_LOCK = ReentrantLock()
 
 # Whether a callee can suspend, from the Base functions its call graph reaches. The graph names a
 # function, not the object it acts on, so an operation in `_SUSPEND_ON` reached there is `:maybe`.
 function _sig_may_suspend(@nospecialize(sig))
-    hit = @lock _SUSPEND_LOCK get(_SUSPEND_MEMO, sig, nothing)
+    key = (sig, Base.get_world_counter())
+    hit = @lock _SUSPEND_LOCK get(_SUSPEND_MEMO, key, nothing)
     isnothing(hit) || return hit
     r = try
         _reach(sig, Set{Tuple{Module, Symbol}}())
@@ -1234,7 +1237,7 @@ function _sig_may_suspend(@nospecialize(sig))
     else
         :no
     end
-    @lock _SUSPEND_LOCK (_SUSPEND_MEMO[sig] = v)
+    @lock _SUSPEND_LOCK (_SUSPEND_MEMO[key] = v)
     return v
 end
 

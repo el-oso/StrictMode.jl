@@ -272,7 +272,18 @@ StrictMode/src/
   cache.jl            — (method, world, signature, guarantees) → findings cache. Each entry also
                         holds the CodeInstances its verdict was read from (_watch_instances): the
                         key cannot see an edit to a CALLEE, but Julia caps those instances'
-                        max_world when one changes, so a stale entry is dropped on lookup
+                        max_world when one changes, so a stale entry is dropped on lookup. A
+                        method with no compiled code has nothing to watch, so its entry answers
+                        only in the world it was made in (_entry_valid). The memos under it that
+                        outlive a world (_BODY_MEMO, _ESCAPE_MEMO in effects.jl; _SITES_MEMO in
+                        StrictModeTest) carry a _ReadStamp and answer through _read_holds: the
+                        compiler's record of the specialization must still be valid AND the
+                        signature must still dispatch to that specialization. The second is not
+                        implied by the first — Julia caps the records of a replaced method's
+                        CALLERS and leaves the replaced method's own record at max_world = ∞
+                        (measured on 1.12 and 1.13), and a more specific method added later takes
+                        a signature over without touching the old record. No memo depends on a
+                        Revise callback or on clear_cache!() to follow an edit
   report.jl           — StrictViolation exception, _fail, _guarantee_gates (which guarantees
                         THROW from StrictMode and which only WARN — observation vs. inference)
   backend.jl          — the llvm-mca seam ONLY (`_be_mca_*`, mca_available). The analysis tier is
@@ -479,7 +490,9 @@ StrictMode/src/
 StrictMode/ext/
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
   StrictModeCpuIdExt.jl     — CPU-specific _CACHE_BYTES override (weak dep, `using CpuId`)
-  StrictModeReviseExt.jl    — cache invalidation on code change
+  StrictModeReviseExt.jl    — watch()/unwatch(): re-check the registry after each Revise edit and
+                              print what fails. It clears no cache; the caches follow an edit on
+                              their own (see cache.jl)
   StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,
                               ~680MiB — never a test/CI default, see test/mca_test.jl's live-path guard)
 StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder, test-environment only
@@ -716,7 +729,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F50 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F51 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,
