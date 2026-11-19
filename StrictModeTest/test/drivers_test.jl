@@ -229,3 +229,35 @@ end
     @test !StrictMode._is_exempt(LeakB.build_q, (Int,), :noalloc)
     @test_throws StrictViolation test_compiled(LeakB; guarantees = (:noalloc,))
 end
+
+@testitem "test_signatures fails a signature that always throws; a sweep notes it" begin
+    using StrictMode, StrictModeTest
+
+    module ProofAlwaysThrows
+    bad(x::Int) = x + "a"                               # no `+(::Int, ::String)`
+    kwreq(x::Int; n::Int) = x + n                       # `n` is required
+    wrongsig(v::AbstractVector, k) = v[k] = "s"         # a `String` into a `Vector{Float64}`
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    ok(x::Int) = x + 1
+    end
+    A = ProofAlwaysThrows
+    gs = (:typestable, :noalloc, :noboxing, :trim_compatible)
+
+    for (f, types) in ((A.bad, (Int,)), (A.kwreq, (Int,)), (A.wrongsig, (Vector{Float64}, Int)))
+        fs = proof_findings(f, types; guarantees = gs)
+        @test all(x -> x.status === :info && x.code === :SM0208 && x.tier === :proof, fs)
+        @test_throws StrictViolation test_signatures([(f, types)]; guarantees = gs)
+        @test_throws "always throws" test_signatures([(f, types)]; guarantees = gs)
+    end
+    @test length(test_signatures([(A.ok, (Int,))]; guarantees = gs)) == 4
+
+    # A module's error helper is not a defect, so the sweep carries the note and passes.
+    try
+        A.need(nothing, :a)
+    catch
+    end
+    A.ok(1)
+    swept = test_compiled(A; guarantees = (:typestable, :noalloc))
+    @test any(x -> x.func == "need" && x.code === :SM0208, swept)
+    @test_throws MethodError @test_noalloc A.bad(1)
+end

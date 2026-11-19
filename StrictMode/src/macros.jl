@@ -315,6 +315,9 @@ function _check_stable_once_body(target, @nospecialize(f), @nospecialize(types::
         gates = true
     )
     T = length(rts) == 1 ? only(rts) : reduce(Base.promote_type, rts; init = Union{})
+    # A listed call is one its author expects to return, and it is not performed here, so nothing
+    # else would say that it cannot: a line that leaves out a required keyword argument infers so.
+    T === Union{} && _fail(:typestable, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"; gates = true)
     _is_typestable_return(T) || _fail(
         :typestable, target, "return type is not concrete for this signature: inferred $T"
     )

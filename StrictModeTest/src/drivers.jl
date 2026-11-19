@@ -35,6 +35,9 @@ function _gate(items, kind::Symbol, target::AbstractString)
     finally
         empty!(_TRIM_BATCH)
     end
+    # A listed signature is one its author expects to return; in a sweep, a signature that always
+    # throws is an error helper and stays a note.
+    kind === :test_signatures && (fs = StrictMode._gate_always_throws(fs))
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))

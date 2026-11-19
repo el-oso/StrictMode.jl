@@ -10,7 +10,7 @@
 # Prove `guarantees` and raise if any fails. `kind` names the macro in the exception, so a
 # composite reports as `@strict`/`@kernel` rather than as whichever of its parts failed first.
 function _test_guarantee(kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple))
-    fs = _proof_findings(f, types, guarantees)
+    fs = StrictMode._gate_always_throws(_proof_findings(f, types, guarantees))
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return nothing
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))

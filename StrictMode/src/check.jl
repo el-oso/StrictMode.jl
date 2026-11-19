@@ -40,6 +40,42 @@ end
 _unevaluated(md, fn, sg, g, why; tier::Symbol = :report, file = "", line = 0) =
     StrictFinding(md, fn, sg, g, :fail, file, line, why, _suggestion(g), tier, :SM0203)
 
+# A signature whose inferred return is `Union{}` returns on no path: every one throws (or never
+# ends). Each guarantee then passes on nothing, because nothing is left to check once the paths
+# that only throw are set aside: no value is returned to be unstable, and no statement runs on a
+# returning path to allocate or dispatch. That is what a deliberate error helper looks like, and
+# also a kernel called with a wrong argument type or without a required keyword argument, so a
+# pass is replaced by a finding that says which of the two the reader has to decide.
+#
+# It is `:info` as the scan and the proofs produce it, which is what a sweep reports: a module's
+# error helpers are not defects (#36). A caller that named the signature asked about a path that
+# returns, and turns it into a failure with `_gate_always_throws`.
+function _always_throws(@nospecialize(f), @nospecialize(types::Tuple))
+    rts = _return_types_memo(f, types)
+    return !isempty(rts) && all(T -> T === Union{}, rts)
+end
+
+const _ALWAYS_THROWS_WHY = "always throws: the inferred return type is `Union{}`, so nothing on a " *
+    "returning path was checked"
+const _ALWAYS_THROWS_FIX = "if this is not an error helper, a call in its body matches no method " *
+    "for these argument types, or the signature leaves out a required keyword argument; run the " *
+    "call to see which"
+
+_always_throws_finding(x::StrictFinding, status::Symbol) = StrictFinding(
+    x.mod, x.func, x.signature, x.guarantee, status, x.file, x.line,
+    _ALWAYS_THROWS_WHY, _ALWAYS_THROWS_FIX, x.tier, :SM0208, x.policy
+)
+
+# The findings of a signature that always throws: each pass becomes the `:info` note. A failure
+# stays, since it reports something the analysis did read (a throw path, with `ignore_throw` off).
+_mark_always_throws(fs::Vector{StrictFinding}) =
+    StrictFinding[x.status === :pass ? _always_throws_finding(x, :info) : x for x in fs]
+
+# For a caller that named the signature: the note is a failure.
+_gate_always_throws(fs::Vector{StrictFinding}) = StrictFinding[
+    (x.code === :SM0208 && x.status === :info) ? _always_throws_finding(x, :fail) : x for x in fs
+]
+
 # The method's source location for a signature, or `("", 0)` when it cannot be resolved.
 function _method_loc(@nospecialize(f), @nospecialize(types::Tuple))
     m = try
@@ -257,7 +293,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         if !isnothing(shared)
             push!(out, shared)
         elseif g === :typestable
-            rts = _return_types(f, Tuple(types))
+            rts = _return_types_memo(f, types)
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))
             # A concrete return can hide internal runtime dispatch; the IR boxing signal catches
             # that shape, so this checks both.
@@ -329,5 +365,5 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             throw(ArgumentError("unknown guarantee :$g; expected one of $(_GUARANTEES)"))
         end
     end
-    return out
+    return _always_throws(f, types) ? _mark_always_throws(out) : out
 end

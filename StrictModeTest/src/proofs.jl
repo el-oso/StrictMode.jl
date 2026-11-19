@@ -1202,7 +1202,8 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             throw(ArgumentError("unknown guarantee :$g; expected one of $(StrictMode._GUARANTEES)"))
         end
     end
-    return out
+    # A proof of a signature that returns on no path proved nothing about one that does.
+    return StrictMode._always_throws(f, types) ? StrictMode._mark_always_throws(out) : out
 end
 
 # Two layers, both authoritative here: the inferred return type must be concrete, and JET's

@@ -44,7 +44,7 @@ _warn_parametric_decl(target) = @warn "@strict_function $target: the signature i
 function _verify_strict_def(
         @nospecialize(f), @nospecialize(types::Tuple), target;
         warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing,
-        source::AbstractString = "", guarantees = nothing
+        source::AbstractString = "", guarantees = nothing, listed::Bool = false
     )
     Base.isdispatchtuple(Tuple{types...}) || return begin
         # Silent when the caller supplied `signatures =`: they have already answered which concrete
@@ -55,7 +55,7 @@ function _verify_strict_def(
         nothing
     end
     isnothing(guarantees) ||
-        return _verify_strict_guarantees(f, types, target, guarantees; mod, source)
+        return _verify_strict_guarantees(f, types, target, guarantees; mod, source, listed)
     # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
     # StrictModeTest.test_registered) re-check it.
     register_strict!(f, types; mod, source)
@@ -67,6 +67,10 @@ function _verify_strict_def(
     isempty(rts) && _fail(
         :strict_function, target,
         "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
+    # A signature listed in `signatures = [...]` is one its author expects to return.
+    listed && all(T -> T === Union{}, rts) && _fail(
+        :strict_function, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"
     )
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         _fail(
@@ -112,7 +116,7 @@ function _verify_strict_signatures(
     )
     for s in sigs
         types = s isa Tuple ? s : Tuple(s)
-        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source, guarantees)
+        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source, guarantees, listed = true)
     end
     return nothing
 end
@@ -121,11 +125,16 @@ end
 # uses, so each one gates or warns as `_guarantee_gates` says.
 function _verify_strict_guarantees(
         @nospecialize(f), @nospecialize(types::Tuple), target, guarantees;
-        mod::Union{Nothing, Module} = nothing, source::AbstractString = ""
+        mod::Union{Nothing, Module} = nothing, source::AbstractString = "", listed::Bool = true
     )
     hasmethod(f, Tuple{types...}) || _fail(
         :strict_function, target,
         "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
+    # A listed signature or call is one its author expects to return; a declaration on a
+    # definition gets the `:info` note the scan gives it.
+    listed && _always_throws(f, types) && _fail(
+        :strict_function, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"
     )
     gs = _check_guarantees(guarantees)
     register_strict!(f, types; guarantees = gs, mod, source)

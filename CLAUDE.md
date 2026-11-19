@@ -260,7 +260,15 @@ StrictMode/src/
                         guarantee here serves both tiers at once. A guarantee in _GUARANTEES that
                         this does not cover and proofs.jl does not branch on throws
                         `unknown guarantee` from a message that lists it as expected — a
-                        StrictModeTest testitem enumerates _GUARANTEES to pin that shut
+                        StrictModeTest testitem enumerates _GUARANTEES to pin that shut.
+                        _always_throws/_mark_always_throws/_gate_always_throws: a signature whose
+                        inferred return is Union{} returns on no path, so every guarantee passed
+                        on nothing. Each pass becomes an :info SM0208 note in both tiers (a
+                        failure stays), which is what a sweep reports — an error helper is not a
+                        defect, issue #36. The callers that LIST a signature turn the note into
+                        a failure: test_signatures, @test_*, a @verify_strict line, and
+                        @strict_function signatures = [...]. test_compiled, test_registered,
+                        audit, @strict_policy and a @strict_function on a definition keep the note
   findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, `code`, and
                         `policy`: the macro line that required the guarantee),
                         format_findings,
@@ -718,6 +726,13 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   Do NOT make StrictMode's allocation verdicts gate: a heuristic false positive aborting a
   consumer's precompile is issue #18, and it made checks-on unusable in PureBLAS. The proofs in
   `StrictModeTest` gate unconditionally — that is what that package is.
+- **A signature that always throws is not a pass.** Its inferred return is `Union{}`, and with the
+  throw paths set aside nothing is left for a guarantee to read, so every one of them used to pass:
+  `bad(x::Int) = x + "a"` and a call that leaves out a required keyword argument passed
+  `test_signatures` for `(:typestable, :noalloc, :noboxing, :trim_compatible)`. The verdict is the
+  SM0208 note, `:info` in a sweep and `:fail` where the signature was listed (see check.jl in the
+  map). An `@assert_*` or `@test_*` macro performs its call, so there the call's own error is raised
+  and no verdict is given.
 - **A finding the analysis could not evaluate is `:fail`**, carrying the error text (`_unevaluated`
   in check.jl, `_errored_findings` in registry.jl). Never `:pass`: "could not check" and "is fine"
   rendering the same is how a crashed backend reported success for every method in a sweep. Tests
@@ -729,7 +744,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F51 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F52 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

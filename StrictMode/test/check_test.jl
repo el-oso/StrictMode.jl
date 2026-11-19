@@ -163,3 +163,69 @@ end
     # End to end: the override still pins the positional types, and the call is proved as-is.
     @test (@test_noalloc g(1; k = 2) types = (Int,)) === 3
 end
+
+@testitem "a signature that always throws is a note in a sweep and a failure where it is listed" begin
+    using StrictMode
+
+    module AlwaysThrows
+    using StrictMode
+    bad(x::Int) = x + "a"                               # no `+(::Int, ::String)`
+    kwreq(x::Int; n::Int) = x + n                       # `n` is required
+    wrongsig(v::AbstractVector, k) = v[k] = "s"         # a `String` into a `Vector{Float64}`
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    ok(x::Int) = x + 1
+    end
+    A = AlwaysThrows
+    gs = (:typestable, :noalloc, :noboxing)
+
+    # Nothing on a returning path exists to check, so no guarantee passes: each is the note.
+    for (f, types) in ((A.bad, (Int,)), (A.kwreq, (Int,)), (A.wrongsig, (Vector{Float64}, Int)), (A.need, (Nothing, Symbol)))
+        @test only(Base.return_types(f, types)) === Union{}
+        fs = findings(f, types; guarantees = gs)
+        @test all(x -> x.status === :info && x.code === :SM0208, fs)
+        @test all(x -> occursin("always throws", x.reason), fs)
+        @test !any(StrictMode._failed, fs)
+    end
+    @test all(x -> x.status === :pass, findings(A.ok, (Int,); guarantees = gs))
+    @test occursin("throws", StrictMode.explain(:SM0208))
+
+    # A sweep reports the note and does not fail on it: an error helper is not a defect (#36).
+    try
+        A.need(nothing, :a)
+    catch
+    end
+    A.ok(1)
+    swept = audit(A; sweep = true, guarantees = gs)
+    @test any(x -> x.func == "need" && x.code === :SM0208, swept)
+    @test nfailures(swept) == 0
+    @test_nowarn @eval module AlwaysThrowsPolicy
+    using StrictMode
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    plus(x::Int) = x + 1
+    @strict_policy :default
+    end
+    # So does a declaration on the definition itself.
+    @test_nowarn @eval module AlwaysThrowsDecl
+    using StrictMode
+    @strict_function need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    end
+
+    # A listed signature is one its author expects to return, and none of these forms performs
+    # the call, so the failure is the only thing that says it cannot.
+    struct Impl end
+    @test_throws "always throws" @eval @verify_strict Impl begin
+        AlwaysThrows.kwreq(::Int)                       # the required keyword is left out
+    end
+    @test_throws "always throws" @eval @verify_strict Impl guarantees = (:noalloc,) begin
+        AlwaysThrows.kwreq(::Int)
+    end
+    @test_throws "always throws" @eval @strict_function AlwaysThrows.bad signatures = [(Int,)]
+    @test_throws "always throws" @eval @strict_function AlwaysThrows.bad signatures = [(Int,)] guarantees = (:noalloc,)
+    @test_nowarn @eval @verify_strict Impl begin
+        AlwaysThrows.kwreq(::Int; n::Int)
+        AlwaysThrows.ok(::Int)
+    end
+
+    # A macro that performs its call raises the call's own error, so it gives no verdict to trust.
+    @test_throws MethodError @assert_typestable A.bad(1)
+end
