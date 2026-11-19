@@ -137,6 +137,11 @@ RegisterReport: my_kernel!(Matrix{Float64})
 
 `register_report` is meaningful only for x86-64 AVX-512 kernels; other targets return zeros.
 
+The reports on this page read compiled output. When there is none to read — a signature that is
+not concrete names no compiled body — `kernel_report`, `register_report`, `spill_report` and
+`scalar_fp_loops` raise `StrictMode._UnanalyzableSignature`, naming the signature and the reason,
+rather than return a report of zeros.
+
 ## `@assert_no_spill` — the hard-gate sibling of `register_report`
 
 `register_report` is advisory: it tells you a kernel is saturated, but it never fails. When you've

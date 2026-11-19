@@ -339,6 +339,16 @@ function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
     return String(take!(io))
 end
 
+# The text a public report is built from, or a raise. A report built from no text shows zero
+# spills, no scalar loop and no vector work, which is how a clean kernel reads.
+function _report_text(
+        reader, report::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
+    )
+    s = reader(f, types)
+    isempty(s) && throw(_UnanalyzableSignature(report, f, types, _output_unread(f, types)))
+    return s
+end
+
 function _kr_bound(r::KernelReport)
     !r.vectorized && return :scalar
     # Use FP intensity if available; fall back to integer intensity for integer-only kernels
@@ -430,7 +440,9 @@ from `@simd`/`@fastmath` — counted into `fp_ops` like any other FP work, but a
 separately and printed as an explicit warning: these flags permit floating-point reassociation and
 NaN/Inf assumptions that can change numerical RESULTS, not just codegen, so a nonzero count is a
 numerics-risk signal worth a second look, not just a tuning note).
-**Heuristic and advisory** — it never fails, and does not replace a profiler/roofline.
+**Heuristic and advisory** — it judges nothing, and does not replace a profiler/roofline. IR that
+cannot be read raises `_UnanalyzableSignature`, naming the signature and the reason, rather than
+returning a report of zeros: that is the case for a signature that is not concrete.
 
 Pass `working_set_bytes` to get a cache-residency annotation: if the working set fits L1/L2,
 low intensity is expected and acceptable; if it spills L2 and the kernel is already
@@ -448,7 +460,10 @@ function kernel_report(
         @nospecialize(f), @nospecialize(types::Tuple);
         working_set_bytes::Union{Nothing, Int} = nothing
     )
-    return _kernel_report(_func_name(f) * _sig_string(types), _llvm_ir(f, types), working_set_bytes)
+    return _kernel_report(
+        _func_name(f) * _sig_string(types), _report_text(_llvm_ir, :kernel_report, f, types),
+        working_set_bytes
+    )
 end
 
 # `kernel_report` over text IR: the classification depends on the IR alone, so IR captured on one
@@ -614,10 +629,12 @@ function's numeric intent was already fully vectorized by hand, so a second, sep
 loop is real glue work even if LLVM partially rescued it with its own vectorization attempt.
 
 Use it as a triage signal: a `true` result means "look here for a vectorization opportunity"; a
-`false` result does not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for
+`false` result does not prove every loop is vectorized. IR that cannot be read (a signature that is
+not concrete names no compiled body) raises `_UnanalyzableSignature` rather than returning `false`. See [`@assert_vectorized`](@ref) for
 per-kernel vectorization enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
 """
-scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool = _scalar_fp_loops(_llvm_ir(f, types))
+scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool =
+    _scalar_fp_loops(_report_text(_llvm_ir, :scalar_fp_loops, f, types))
 
 function _scalar_fp_loops(s::AbstractString)
     isempty(s) && return false
@@ -860,10 +877,12 @@ A saturated kernel with spills (32/32, N > 0) is at the LLVM portable-compiler c
 more ILP will only spill further and may regress. The last ~15% over LLVM-compiled Rust requires
 hand-written assembly.
 
-Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros.
+Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros. Assembly that
+cannot be read raises `_UnanalyzableSignature` rather than returning zeros, so a zero count always
+describes assembly that was read.
 """
 function register_report(@nospecialize(f), @nospecialize(types::Tuple))
-    c = _zmm_counts(_native_asm(f, types))
+    c = _zmm_counts(_report_text(_native_asm, :register_report, f, types))
     return RegisterReport(_func_name(f) * _sig_string(types), c.used, c.total, c.spills)
 end
 
@@ -951,10 +970,9 @@ A nonzero count means the kernel needs more live vector registers than the targe
 the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/
 reload instead of running from registers. Complements [`register_report`](@ref) (which reads
 zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-allocation LLVM IR
-and can't see spills at all). Assembly that cannot be read reports zero spills here, as
-[`scalar_fp_loops`](@ref) reports `false`: that is the case for a signature that is not concrete,
-which names no compiled body. The guarantees do not pass on it: `@assert_no_spill` and `:no_spill`
-report unread assembly as a failure.
+and can't see spills at all). Assembly that cannot be read raises
+`_UnanalyzableSignature`, naming the signature and the reason, rather than reporting zero spills:
+that is the case for a signature that is not concrete, which names no compiled body.
 
 Each spill is placed by the loop its block is in, from LLVM's own loop annotations. `loop_spills`
 leaves out code that runs once per call — the prologue and the epilogue that stores a tile's
@@ -963,7 +981,9 @@ results — where a spill costs one store and one load per call rather than per 
 so it is not the same as the hot loop.
 """
 function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
-    return _spill_report(_func_name(f) * _sig_string(types), _native_asm(f, types))
+    return _spill_report(
+        _func_name(f) * _sig_string(types), _report_text(_native_asm, :spill_report, f, types)
+    )
 end
 
 function _spill_report(target::AbstractString, asm::AbstractString)

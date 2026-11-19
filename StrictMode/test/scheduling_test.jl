@@ -144,3 +144,33 @@ end
     @test_logs (:warn, r"not concrete") match_mode = :any @assert_no_scalar_loops absf(x) types = (AbstractVector{Float64},)
     @test (@assert_inlined absf(x)) == 3.0
 end
+
+@testitem "a public report raises on compiled output it could not read" begin
+    using StrictMode
+
+    absf(x::AbstractVector) = sum(x)
+    abstract_sig = (AbstractVector{Float64},)
+
+    # A report built from no text reads as a clean kernel: zero spills, no scalar loop.
+    @test_throws StrictMode._UnanalyzableSignature spill_report(absf, abstract_sig)
+    @test_throws "could not analyze `absf(AbstractVector{Float64})`" spill_report(absf, abstract_sig)
+    @test_throws "the signature is not concrete" spill_report(absf, abstract_sig)
+    @test_throws "@spill_report" spill_report(absf, abstract_sig)
+    @test_throws "the signature is not concrete" scalar_fp_loops(absf, abstract_sig)
+    @test_throws "@scalar_fp_loops" scalar_fp_loops(absf, abstract_sig)
+    @test_throws "the signature is not concrete" kernel_report(absf, abstract_sig)
+    @test_throws "@kernel_report" kernel_report(absf, abstract_sig)
+    @test_throws "the signature is not concrete" register_report(absf, abstract_sig)
+    @test_throws "@register_report" register_report(absf, abstract_sig)
+
+    # A signature no method matches is concrete and still has no output to read.
+    @test_throws "compiled output could not be read" spill_report(absf, (Int,))
+    @test_throws "compiled output could not be read" kernel_report(absf, (Int,))
+
+    # The same reports on a concrete signature return their value.
+    sig = (Vector{Float64},)
+    @test spill_report(absf, sig) isa SpillReport
+    @test scalar_fp_loops(absf, sig) isa Bool
+    @test kernel_report(absf, sig) isa StrictMode.KernelReport
+    @test register_report(absf, sig) isa StrictMode.RegisterReport
+end

@@ -169,7 +169,12 @@ StrictMode/src/
                         passes :vectorized and fails :no_scalar_loops, as on x86. The reductions are
                         counted in KernelReport.ordered_reduce_ops. _kernel_report and
                         _scalar_fp_loops take IR TEXT, so a test classifies IR captured on another
-                        target; the vector-type patterns accept `<vscale x N x …>` (SVE/SME)
+                        target; the vector-type patterns accept `<vscale x N x …>` (SVE/SME).
+                        The four PUBLIC reports (kernel_report, register_report, spill_report,
+                        scalar_fp_loops) read their text through _report_text, which RAISES
+                        _UnanalyzableSignature on an empty one (a signature that is not concrete,
+                        or a printer that raised): a report of zeros reads as a clean kernel. The
+                        guarantees do not go through it — they turn an empty text into :fail
   static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)
   dispatch.jl         — _instability_cause (which declaration made a body unstable: a non-const
                         global, an abstract field, an abstract container eltype, reflection, or more
