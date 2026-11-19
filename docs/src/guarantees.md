@@ -980,9 +980,17 @@ test_no_unsafe(MyKernels)                            # …and fail if there are 
 test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, the rest held
 ```
 
-It looks for `ccall`, `pointer`, and any function whose name begins with `unsafe_`. `allow` is per
-construct, so excusing a pointer read still holds a `ccall` elsewhere — a deliberate escape ends up
-recorded where the policy is written rather than silently tolerated.
+It looks for `ccall`, `@cfunction`, `pointer`, any function whose name begins with `unsafe_`, the
+pointer intrinsics (`pointerref`, `pointerset`), `llvmcall`, `cglobal`, the C allocator
+(`Libc.malloc`, `Libc.free`), a pointer made from an integer (`Ptr{T}(addr)`), and a `memoryrefnew`
+or `getfield` whose bounds check is a literal `false`. A function counts wherever the method names
+it: `map(unsafe_load, ps)`, `unsafe_load.(ps)`, a splat, a keyword call and a local alias are
+reported like the plain call. [`unsafe_report`](@ref) lists each construct with the name `allow`
+takes.
+
+`allow` is per construct, so excusing a pointer read still holds a `ccall` elsewhere — a deliberate
+escape ends up recorded where the policy is written rather than silently tolerated. An `allow` entry
+that names no construct raises, listing the accepted names.
 
 ### Why it reads unoptimized IR
 

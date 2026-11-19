@@ -154,3 +154,115 @@ end
     @test only(filter(x -> x.func == "loads", fs)).code === :SM0206
     @test !any(x -> x.func == "clean", fs)
 end
+
+@testitem "unsafe_report catches every spelling of an unsafe construct" begin
+    using StrictMode
+
+    # One method per spelling. Each must be reported, with the construct named.
+    module FenceSpellings
+    plain(p) = unsafe_load(p)
+    kwcall(p) = unsafe_wrap(Array, p, 2; own = false)
+    broadcasted(ps) = unsafe_load.(ps)
+    mapped(ps) = map(unsafe_load, ps)
+    splatted(args) = unsafe_load(args...)
+    aliased(p) = (f = unsafe_load; f(p))
+    returned() = unsafe_load
+    qualified(p) = Base.unsafe_load(p)
+    qualified_mapped(ps) = map(Base.unsafe_load, ps)
+    composed(p) = (identity ∘ unsafe_load)(p)
+    closure(p) = map(q -> unsafe_load(q), [p])
+    doblock(p) = open(devnull) do io
+        unsafe_load(p)
+    end
+    intrinsic_ref(p) = Core.Intrinsics.pointerref(p, 1, 1)
+    intrinsic_set(p) = Core.Intrinsics.pointerset(p, 0.0, 1, 1)
+    llvm(x) = Base.llvmcall("ret i64 %0", Int, Tuple{Int}, x)
+    cglob() = cglobal(:jl_options)
+    cfun() = @cfunction(sin, Float64, (Float64,))
+    malloc() = Libc.malloc(8)
+    free(p) = Libc.free(p)
+    calloc() = Libc.calloc(1, 8)
+    freed_all(ps) = foreach(Libc.free, ps)
+    ptr_from_int(x::Int) = Ptr{Float64}(x)
+    ptr_cvoid(x::UInt) = Ptr{Cvoid}(x)
+    ptr_reinterpret(x::UInt) = reinterpret(Ptr{Float64}, x)
+    ptr_param(::Type{T}, x::UInt) where {T} = Ptr{T}(x)
+    memref_new(v) = Base.memoryrefnew(v.ref, 100, false)
+    memref_get(v) = Base.memoryrefget(v.ref, :not_atomic, false)
+    memref_set(v) = Base.memoryrefset!(v.ref, 0.0, :not_atomic, false)
+    tuple_unchecked(t, i) = getfield(t, i, false)
+    objref(x) = pointer_from_objref(x)
+    end
+
+    expect = Dict(
+        "plain" => "unsafe_load", "kwcall" => "unsafe_wrap", "broadcasted" => "unsafe_load",
+        "mapped" => "unsafe_load", "splatted" => "unsafe_load", "aliased" => "unsafe_load",
+        "returned" => "unsafe_load", "qualified" => "unsafe_load",
+        "qualified_mapped" => "unsafe_load", "composed" => "unsafe_load",
+        "intrinsic_ref" => "pointerref", "intrinsic_set" => "pointerset", "llvm" => "llvmcall",
+        "cglob" => "cglobal", "cfun" => "@cfunction", "malloc" => "malloc", "free" => "free",
+        "calloc" => "calloc", "freed_all" => "free", "ptr_from_int" => "Ptr",
+        "ptr_cvoid" => "Ptr", "ptr_reinterpret" => "Ptr", "ptr_param" => "Ptr",
+        "memref_new" => "memoryrefnew", "memref_get" => "memoryrefget",
+        "memref_set" => "memoryrefset!", "tuple_unchecked" => "getfield",
+        "objref" => "pointer_from_objref",
+    )
+    fs = unsafe_report(FenceSpellings)
+    by = Dict{String, String}()
+    for f in fs
+        by[f.func] = get(by, f.func, "") * f.reason
+    end
+    for (name, construct) in expect
+        @test haskey(by, name)
+        @test occursin("`" * construct * "`", get(by, name, ""))
+    end
+    # A closure and a `do` block are methods of their own, named after the function that wrote them.
+    @test any(f -> occursin("closure", f.func) && occursin("`unsafe_load`", f.reason), fs)
+    @test any(f -> occursin("doblock", f.func) && occursin("`unsafe_load`", f.reason), fs)
+    @test all(StrictMode._failed, fs)
+
+    # The same shapes with nothing unsafe in them must stay clean.
+    module FenceClean
+    struct Buf
+        data::Vector{Float64}
+    end
+    plain(v) = v[1]
+    kwcall(v) = sort(v; rev = true)
+    broadcasted(v) = abs.(v)
+    mapped(v) = map(abs, v)
+    splatted(args) = max(args...)
+    aliased(v) = (f = sum; f(v))
+    returned() = sum
+    qualified(v) = Base.sum(v)
+    closure(v) = map(q -> q + 1, v)
+    free(b::Buf) = empty!(b.data)             # a package's own `free` is not `Libc.free`
+    release(b::Buf) = free(b)
+    takes_ptr(p::Ptr{Float64}) = p            # passing a pointer along dereferences nothing
+    ptr_typed(v) = Ptr{Float64}[]             # naming the type builds no pointer
+    is_null(p::Ptr{Cvoid}) = p == C_NULL
+    field(t) = getfield(t, 1)
+    field_checked(t, i) = getfield(t, i, true)
+    memref(v) = Base.memoryrefnew(v.ref, 1, true)
+    typed(x)::Float64 = x
+    converts(x) = convert(Float64, x) + reinterpret(Float64, UInt64(x))
+    tuple_get(t) = t[2]
+    stringy(x) = string("unsafe_load(", x, ")")
+    symbolic() = :unsafe_load
+    compares(f) = f === unsafe_load || f == pointer
+    end
+    @test isempty(unsafe_report(FenceClean))
+
+    # `allow` excuses a spelling as it does the plain call, by the construct's name.
+    @test isempty(
+        unsafe_report(
+            FenceSpellings;
+            allow = (
+                :unsafe_load, :unsafe_wrap, :pointerref, :pointerset, :llvmcall, :cglobal,
+                :cfunction, :malloc, :free, :calloc, :Ptr, :memoryrefnew, :memoryrefget,
+                :memoryrefset!, :getfield, :pointer_from_objref,
+            )
+        )
+    )
+    @test_throws "`allow` names `pointr`" unsafe_report(FenceSpellings; allow = (:pointr,))
+    @test_throws "not a construct this scan reports" unsafe_report(FenceSpellings; allow = (:inbound,))
+end

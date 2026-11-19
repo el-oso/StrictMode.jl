@@ -474,6 +474,20 @@ StrictMode/src/
                         _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
                         @propagate_inbounds method is clean and the caller that wrote @inbounds
                         carries the finding. Gating form: StrictModeTest.test_no_unsafe
+                        A function counts wherever the method NAMES it, since lowering gives a
+                        global its own statement and the call that receives it may be map,
+                        broadcasted, Core.kwcall or Core._apply_iterate: _scan_unsafe! judges each
+                        name at its uses (callee, argument, stored local, returned value) and
+                        skips a comparison, so `f === unsafe_load` is clean. _UNSAFE_NAMES adds the
+                        intrinsics (pointerref, pointerset, llvmcall, cglobal); _UNSAFE_LIBC is
+                        matched by IDENTITY, because a package may define its own `free`; :Ptr is a
+                        call of a Ptr type or a reinterpret to one (Ptr{T} is apply_type in a
+                        statement of its own, which _lowered_callee resolves to the type being
+                        parameterized) — a Ptr argument or annotation is not; :cfunction is a
+                        statement head; a memoryref builtin or getfield with a literal `false`
+                        bounds check is reported under its name. _check_allow RAISES on an `allow`
+                        entry that is no construct; a misspelling that still begins with
+                        `unsafe_` cannot be told from a real name and is accepted
   latency.jl          — latency_report/LatencyReport (load time + first-call time). Both are
                         properties of a COLD process, so every number comes from a child that
                         inherits this session's active project; nothing in typed IR predicts them.

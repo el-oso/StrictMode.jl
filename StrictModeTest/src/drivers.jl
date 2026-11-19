@@ -474,9 +474,13 @@ Prove that no method in `mod` leaves Julia's safety guarantees, and throw a
 `StrictMode.StrictViolation` naming every one that does.
 
 The Julia form of Rust's `#![forbid(unsafe_code)]`. A module that must stay inside the language
-declares it by calling this; `ccall`, `pointer`, and any function whose name begins with `unsafe_`
-are what it looks for. Julia cannot enforce this on its own, since those are ordinary calls that any
-module may make.
+declares it by calling this. Julia cannot enforce it on its own, since a `ccall` and an
+`unsafe_load` are ordinary calls that any module may make.
+
+`ccall`, `@cfunction`, `pointer`, any function whose name begins with `unsafe_`, the pointer
+intrinsics, `llvmcall`, `cglobal`, the C allocator and a pointer made from an integer are what it
+looks for, in any spelling: a plain call, a broadcast, a `map`, a splat, a keyword call or a local
+alias. [`StrictMode.unsafe_report`](@ref) has the full table.
 
 `allow` names the constructs this module may use anyway, so a deliberate, reviewed escape is
 recorded where the policy is written rather than silently tolerated:
