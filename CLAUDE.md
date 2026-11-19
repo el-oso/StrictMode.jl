@@ -771,6 +771,18 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   cross-package insert there is discarded on the consumer's next cached load, and the consumer's test
   process then sees an empty registry however much its `src/` declares — which makes a default-deny
   coverage gate call the whole package undeclared. `test/consumer` pins this.
+- **The same holds for every registration a verdict depends on.** `trust_boundary!`,
+  `register_scoped!` and `register_alloc_barrier!` each push onto a constant in the root module of the
+  package that owns the function or type (`__strict_trust_boundaries__`, `__strict_scoped_types__`,
+  `__strict_barriers__`), and the readers (`_is_trust_boundary`, `_scoped_types`,
+  `_barrier_functions`) union the loaded packages' stores with this session's set. Measured before
+  this: after a cached load `:trusted` failed on the registered boundary itself and `:noescape`
+  passed with no type registered. The first two write the constant ONLY while a package image is
+  being generated (`_keep_registration!`): in a session the session's set is the registration, and
+  a test that empties it to take a registration back must not find it again in `Main`. A store
+  that cannot be written during a precompile (the type belongs to another, closed, package) RAISES
+  and asks for `mod = @__MODULE__`; registering for the precompile only is the failure being
+  prevented. `test/consumer` pins all three.
 - **Certainty decides throw-vs-warn, and it can be per FINDING, not only per guarantee.** StrictMode
   throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
   by definition, because AllocCheck/JET/TrimCheck are full machinery rather than a scan. `_fail`

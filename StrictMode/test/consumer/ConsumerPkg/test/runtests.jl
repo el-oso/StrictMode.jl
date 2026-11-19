@@ -39,3 +39,32 @@ using ConsumerPkg, StrictMode, StrictModeTest, Test
     )
     @test test_signatures([(ConsumerPkg.clean, (Float64,))]) isa Vector{StrictMode.StrictFinding}
 end
+
+@testset "registrations made in src/ are in force after a cached load" begin
+    # ConsumerPkg came from its cache, and nothing was registered in this session: what the
+    # checks below find was stored in ConsumerPkg at its own precompile.
+    @test !isnothing(Base.pkgorigins[Base.PkgId(ConsumerPkg)].cachepath)
+    @test isempty(StrictMode._TRUST_BOUNDARIES)
+    @test isempty(StrictMode._SCOPED_TYPES)
+
+    # A trust boundary: the registered reader passes, the unregistered one still fails.
+    sig = (Untrusted{Vector{UInt8}},)
+    @test only(findings(ConsumerPkg.parse_len, sig; guarantees = (:trusted,))).status === :pass
+    @test StrictMode._failed(only(findings(ConsumerPkg.peek_len, sig; guarantees = (:trusted,))))
+
+    # A scoped type: with nothing registered `:noescape` passes every signature unchecked.
+    leak = only(findings(ConsumerPkg.leak_handle, (Ptr{Cvoid},); guarantees = (:noescape,)))
+    @test leak.status !== :pass
+    @test occursin("Handle", leak.reason)
+    @test only(findings(ConsumerPkg.use_handle, (Ptr{Cvoid},); guarantees = (:noescape,))).status === :pass
+
+    # An allocation barrier.
+    @test only(findings(ConsumerPkg.uses_table, (); guarantees = (:noalloc,))).status === :pass
+
+    # A type another package owns is refused when the call does not name this package, and
+    # stored here when it does.
+    @test occursin("could not be stored in `Base`", ConsumerPkg.FOREIGN_UNNAMED)
+    @test occursin("mod = @__MODULE__", ConsumerPkg.FOREIGN_UNNAMED)
+    @test StrictMode._is_scoped_type(Base.Filesystem.File)
+    @test !StrictMode._is_scoped_type(Base.Libc.RawFD)
+end

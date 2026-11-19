@@ -67,6 +67,69 @@ function _store_modules()
     return mods
 end
 
+# A registration a verdict depends on (a trust boundary, a scoped type), kept where it survives.
+# The session's own set is lost when a package registers at its top level and is then loaded from
+# its cache: StrictMode comes from its own image by then, and holds nothing the package added
+# while it precompiled. So each registration is also pushed onto a constant in the package's root
+# module, which is serialized with the package, and every reader takes the union.
+const _REGISTRATION_GEN = Ref(0)
+const _REGISTRATION_MEMO = Dict{Symbol, Tuple{UInt, Int, Int, Vector{Any}}}()
+const _REGISTRATION_LOCK = ReentrantLock()
+
+function _keep_registration!(@nospecialize(x), mod::Module, name::Symbol, call::AbstractString)
+    @lock _REGISTRATION_LOCK _REGISTRATION_GEN[] += 1
+    # Only while a package image is being written. In a session the session's own set is the
+    # registration, and a constant added to a loaded module would outlive a caller that empties
+    # that set to take a registration back.
+    ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
+    stored = try
+        store = _local_store!(mod, name, Any[])
+        any(y -> y === x, store) || push!(store, x)
+        true
+    catch
+        false
+    end
+    # A registration that is in force for the precompile and gone at every load after it is the
+    # failure this exists to prevent, so a module that cannot take the constant is an error.
+    stored || throw(
+        ArgumentError(
+            "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`, " *
+                "which is closed while another package precompiles, so it would be lost when " *
+                "that package is next loaded from its cache. Name the package making it: " *
+                "`$call` with `mod = @__MODULE__`."
+        )
+    )
+    return nothing
+end
+
+# This session's registrations and each loaded package's own, in one vector. Rebuilt when the
+# session's set changes size, when anything registers, or when the world moves, which a package
+# load does.
+function _registrations(session, name::Symbol)
+    w = Base.get_world_counter()
+    n = length(session)
+    return @lock _REGISTRATION_LOCK begin
+        m = get(_REGISTRATION_MEMO, name, nothing)
+        if !isnothing(m) && m[1] == w && m[2] == n && m[3] == _REGISTRATION_GEN[]
+            m[4]
+        else
+            out = Any[]
+            for x in session
+                push!(out, x)
+            end
+            for mod in _store_modules()
+                s = _store_for(mod, name)
+                s isa AbstractVector || continue
+                for x in s
+                    any(y -> y === x, out) || push!(out, x)
+                end
+            end
+            _REGISTRATION_MEMO[name] = (w, n, _REGISTRATION_GEN[], out)
+            out
+        end
+    end
+end
+
 """
     StrictMode.declarations() -> Dict
 

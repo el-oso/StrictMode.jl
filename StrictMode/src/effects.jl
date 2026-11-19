@@ -1570,6 +1570,10 @@ end
 # the point the question can be answered.
 const _SCOPED_TYPES = Any[]
 const _SCOPED_LOCK = ReentrantLock()
+const _LOCAL_SCOPED = :__strict_scoped_types__
+
+# Every scoped type in scope: this session's, and each loaded package's own.
+_scoped_types() = _registrations(_SCOPED_TYPES, _LOCAL_SCOPED)
 
 """
     register_scoped!(T::Type) -> T
@@ -1605,12 +1609,17 @@ visible. The two cover different halves and neither subsumes the other.
 Registration is by type because the analysis runs on IR after inlining, where a small accessor has
 been inlined into its caller and the callee boundary no longer exists. The type does.
 
+The registration is kept in the package that owns `T` as well as in this session, so one made at
+a package's top level is still in force when the package is loaded from its precompile cache.
+`mod` names that package; pass `mod = @__MODULE__` to register a type another package owns.
+
 See also [`@assert_noescape`](@ref), [`register_alloc_barrier!`](@ref).
 """
-function register_scoped!(@nospecialize(T::Type))
+function register_scoped!(@nospecialize(T::Type); mod::Module = parentmodule(T))
     @lock _SCOPED_LOCK begin
         any(S -> S === T, _SCOPED_TYPES) || push!(_SCOPED_TYPES, T)
     end
+    _keep_registration!(T, mod, _LOCAL_SCOPED, "register_scoped!($T)")
     clear_cache!()
     return T
 end
@@ -1624,7 +1633,7 @@ function _is_scoped_type(@nospecialize(T))
     # skipped, because `Union{A,B} <: A` is false, and a handle hiding in one branch of a producer
     # that did not inline would go unexamined rather than being reported as undecided.
     T isa Union && return _is_scoped_type(T.a) || _is_scoped_type(T.b)
-    @lock _SCOPED_LOCK for S in _SCOPED_TYPES
+    for S in _scoped_types()
         T <: S && return true
     end
     return false
@@ -1644,7 +1653,7 @@ elsewhere has to be asked about where the handle is created.
 """
 function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
-    isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
+    isempty(_scoped_types()) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
     irs = _code_ircode_by_type(sig)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))

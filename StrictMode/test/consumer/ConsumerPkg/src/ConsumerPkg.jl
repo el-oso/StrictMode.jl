@@ -26,4 +26,35 @@ dot3(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = a[1] * b[1] + a[2] * b[2] +
 
 guarded(a::NTuple{3, Float64}, b::NTuple{3, Float64}) = @strict dot3(a, b)
 
+# Registrations a verdict depends on, made at top level the way a package makes them. Each is
+# stored in this package, so it is still in force when a later process loads the package from its
+# cache: held in StrictMode alone it would be gone, like a declaration.
+struct Handle
+    p::Ptr{Cvoid}
+end
+StrictMode.register_scoped!(Handle)
+const KEPT = Ref{Any}(nothing)
+leak_handle(p::Ptr{Cvoid}) = (h = Handle(p); KEPT[] = h; nothing)
+use_handle(p::Ptr{Cvoid}) = (h = Handle(p); h.p === C_NULL)
+
+parse_len(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
+StrictMode.trust_boundary!(parse_len)
+peek_len(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))    # reads the payload, unregistered
+
+const TABLE = Ref{Vector{Float64}}()
+@noinline table() = (isassigned(TABLE) || (TABLE[] = zeros(4)); TABLE[])
+StrictMode.register_alloc_barrier!(table)
+uses_table() = sum(table())
+
+# A type another package owns: its module is closed while this one precompiles, so the constant
+# cannot go there, and the call says so in place of registering for this precompile only. Naming
+# this package stores it here.
+const FOREIGN_UNNAMED = try
+    StrictMode.register_scoped!(Base.Libc.RawFD)
+    "registered"
+catch err
+    sprint(showerror, err)
+end
+StrictMode.register_scoped!(Base.Filesystem.File; mod = @__MODULE__)
+
 end # module

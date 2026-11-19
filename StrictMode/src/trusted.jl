@@ -63,6 +63,11 @@ check fails on the call site.
 @noinline unsafe_trust(u::Untrusted) = getfield(u, :x)
 
 const _TRUST_BOUNDARIES = Base.IdSet{Any}()
+const _LOCAL_TRUST = :__strict_trust_boundaries__
+
+# Every boundary in scope: this session's, and each loaded package's own.
+_is_trust_boundary(@nospecialize(f)) =
+    f in _TRUST_BOUNDARIES || any(g -> g === f, _registrations(_TRUST_BOUNDARIES, _LOCAL_TRUST))
 
 """
     trust_boundary!(f) -> f
@@ -75,10 +80,15 @@ still holds the original buffer and can write to it afterwards, which is why the
 `copy_from_user` copies rather than aliasing. Neither property is checked; registering `f` asserts
 both.
 
+The registration is kept in the package that owns `f` as well as in this session, so one made at
+a package's top level is still in force when the package is loaded from its precompile cache.
+`mod` names that package; pass `mod = @__MODULE__` to register a function another package owns.
+
 Clears the findings cache, since a registration changes `:trusted` results.
 """
-function trust_boundary!(@nospecialize(f))
+function trust_boundary!(@nospecialize(f); mod::Module = parentmodule(f))
     push!(_TRUST_BOUNDARIES, f)
+    _keep_registration!(f, mod, _LOCAL_TRUST, "trust_boundary!($(_func_name(f)))")
     # A `:trusted` verdict depends on this set, and the findings cache does not key on it.
     clear_cache!()
     return f
@@ -112,7 +122,7 @@ end
 # and a type the scan cannot narrow is not a type it has cleared. `nothing` when the typed IR could
 # not be obtained, which a caller must not read as "none".
 function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
-    f in _TRUST_BOUNDARIES && return (Symbol[], Symbol[])
+    _is_trust_boundary(f) && return (Symbol[], Symbol[])
     cts = try
         _code_typed(f, types; optimize = false)
     catch
