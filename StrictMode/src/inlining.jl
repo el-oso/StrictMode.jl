@@ -80,7 +80,7 @@ to the bare call.
 ```
 """
 macro assert_inlined(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_inlined", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_inlined needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_inlined; types = get(opts, :types, nothing))

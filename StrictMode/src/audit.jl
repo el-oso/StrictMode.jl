@@ -119,6 +119,9 @@ function _audit(
                 "`:json` rendering runs past 100 kB, which is why formatting is the caller's choice."
         )
     )
+    # Checked before anything is swept: a target with no declared or compiled method reaches no
+    # per-method check, and a misspelled guarantee would return an empty result.
+    isnothing(guarantees) || _check_guarantees(guarantees)
     isnothing(require) || require in (:public, :all) ||
         throw(ArgumentError("$name: require must be :public or :all (or nothing), got $(require)"))
     isnothing(require) || target isa Module ||

@@ -163,7 +163,7 @@ for a real build failure, is [`explain_trim`](@ref).
     consumer who builds it. `StrictModeTest.@test_trim_compatible` runs the real verifier.
 """
 macro assert_trim_compatible(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_trim_compatible", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_trim_compatible needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_trim_compatible; types = get(opts, :types, nothing))

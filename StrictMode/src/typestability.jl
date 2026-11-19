@@ -146,7 +146,7 @@ g(::Type{T}) where {T} = Vector{T}(undef, 1)
 ```
 """
 macro assert_typestable(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_typestable", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_typestable needs a call expression"))
     call = pos[1]
     target = string(call)

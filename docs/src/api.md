@@ -17,6 +17,11 @@ These go at a call site. Each one evaluates its arguments once and hands back th
 you can wrap an expression and leave the rest of your code alone. With checks disabled they expand
 to the bare call.
 
+An option is written `name = value` before the call, as in `@assert_noalloc types = (Vector{Float64},) f(x)`.
+A name the macro does not have is an error at macro expansion that lists the accepted ones, so a
+misspelled or removed option is never dropped with the call left to run at its defaults. The same
+holds for a guarantee name in `guarantees = (…)`, which is checked before a sweep starts.
+
 ```@docs
 @assert_noalloc
 @assert_noboxing

@@ -188,7 +188,7 @@ diagnostics when a loop vectorizes but is still slow.
 ```
 """
 macro assert_vectorized(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_vectorized", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_vectorized needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_vectorized; types = get(opts, :types, nothing))
@@ -220,7 +220,7 @@ them (and influence codegen), use `Base.@assume_effects`. Each argument is evalu
 ```
 """
 macro assert_effects(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_effects", args, (:types,))
     length(pos) >= 2 || throw(ArgumentError("@assert_effects needs a call expression and a required-effects tuple"))
     call, required = pos[1], pos[2]
     checked = _guarantee_expr(call, _assert_effects, esc(required); types = get(opts, :types, nothing))
@@ -697,7 +697,7 @@ to the bare call.
 ```
 """
 macro assert_no_scalar_loops(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_no_scalar_loops", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_no_scalar_loops needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_no_scalar_loops; types = get(opts, :types, nothing))
@@ -1088,7 +1088,7 @@ loops only, which can include a remainder loop; `:function` counts every spill.
 ```
 """
 macro assert_no_spill(args...)
-    pos, opts = _macro_call(args, (:types, :scope))
+    pos, opts = _macro_call("@assert_no_spill", args, (:types, :scope))
     isempty(pos) && throw(ArgumentError("@assert_no_spill needs a call expression"))
     call = pos[1]
     scope = get(opts, :scope, QuoteNode(:loops))

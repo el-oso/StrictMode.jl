@@ -1029,7 +1029,15 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     # on a method whose first argument is an `Int` and whose only stores go into its own fresh
     # arrays, which reported a write to the plan.
     out = _ConcViol[]
-    (1 <= self_arg <= length(types) && _may_ref(types[self_arg])) || return out
+    # A position the call does not have names no argument, and an empty result would read as
+    # "that argument is not written".
+    1 <= self_arg <= length(types) || throw(
+        ArgumentError(
+            "concurrency_findings: self_arg = $self_arg is out of range for " *
+                "`$(_func_name(f))$(_sig_string(types))`, which takes $(length(types)) argument(s)"
+        )
+    )
+    _may_ref(types[self_arg]) || return out
     # A lock or a channel is written by every task that uses it; that is what it is for.
     _is_sync_type(types[self_arg]) && return out
     targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
@@ -1118,11 +1126,21 @@ Options: `@assert_concurrency_safe self=2 f(out, plan)` picks a different plan s
 `max_depth=N` bounds interprocedural recursion (default 4).
 """
 macro assert_concurrency_safe(args...)
-    pos, opts = _macro_call(args, (:self, :max_depth, :types))
+    pos, opts = _macro_call("@assert_concurrency_safe", args, (:self, :max_depth, :types))
     self_arg = haskey(opts, :self) ? opts[:self]::Int : 1
     max_depth = haskey(opts, :max_depth) ? opts[:max_depth]::Int : 4
     isempty(pos) && throw(ArgumentError("@assert_concurrency_safe needs a call expression"))
     call = pos[1]
+    # Checked here where the call is written out, so a wrong position is reported without running it.
+    if Meta.isexpr(call, :call)
+        _, argexprs, kwexprs = _callinfo(call)
+        (isempty(kwexprs) && !haskey(opts, :types) && !(1 <= self_arg <= length(argexprs))) && throw(
+            ArgumentError(
+                "@assert_concurrency_safe: self = $self_arg is out of range for a call with " *
+                    "$(length(argexprs)) positional argument(s)"
+            )
+        )
+    end
     target = string(call)
     p = _call_parts(call; types = get(opts, :types, nothing))
     checked = quote
@@ -1631,7 +1649,7 @@ task rather than the thread, but striping locks by thread buys nothing once task
 Not part of [`@strict`](@ref). Disabled builds expand to the bare call.
 """
 macro assert_no_threadid_state(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_no_threadid_state", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_no_threadid_state needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_no_threadid_state; types = get(opts, :types, nothing))
@@ -1783,6 +1801,11 @@ function _concurrency_safe_finding(
     # The convention is a property of the name the author wrote, and a mangled body carries the
     # same name with the lowering's decoration around it.
     bang = endswith(String(_demangle(Symbol(fn))), "!")
+    # A method with no argument at that position shares nothing a call could write.
+    self <= length(types) || return _mkfinding(
+        md, fn, sg, :concurrency_safe, false,
+        "takes no argument that could be shared (value-free IR scan)", "", 0; tier
+    )
     vs = try
         concurrency_findings(f, types; self_arg = self)
     catch

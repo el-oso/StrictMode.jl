@@ -115,6 +115,8 @@ end
 ```
 """
 macro verify_strict(T, opt, block)
+    (Meta.isexpr(opt, :(=)) && opt.args[1] isa Symbol && opt.args[1] !== :guarantees) &&
+        throw(ArgumentError(_unknown_option("@verify_strict", opt.args[1], (:guarantees,))))
     Meta.isexpr(opt, :(=)) && opt.args[1] === :guarantees || throw(
         ArgumentError(
             "@verify_strict: expected `guarantees = (...)` before the block, got: $opt"

@@ -522,6 +522,7 @@ end
 # unscoped, one package's gate then judges another package's kernels. `_registry_breakdown` makes
 # that visible even when nobody scopes.
 function _registry_items(guarantees = nothing; modules = nothing)
+    isnothing(guarantees) || _check_guarantees(guarantees)
     names = isnothing(modules) ? nothing : Set{Symbol}(m isa Module ? nameof(m) : Symbol(m) for m in modules)
     return Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
@@ -1017,6 +1018,9 @@ end
 # module that mixes hot and cold helpers is noisy unless scoped with `only`/`exempt`.
 # `StrictModeTest.test_compiled` builds the same list, so both tiers sweep the same set.
 function _compiled_items(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    # Before the sweep, not per method: a module with nothing compiled would never reach the
+    # per-method check, and a misspelled guarantee would return an empty, passing sweep.
+    _check_guarantees(guarantees)
     items = Any[]
     _module_specializations(mod; only, exempt) do f, tt
         push!(items, (f, tt, guarantees))

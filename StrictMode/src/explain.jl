@@ -168,7 +168,7 @@ component(s, i) = s[i]
 ```
 """
 macro explain(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@explain", args, (:types,))
     isempty(pos) && throw(ArgumentError("@explain needs a call expression"))
     call = pos[1]
     target = string(call)

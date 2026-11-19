@@ -742,6 +742,18 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 - **No Python**. No PythonCall/PyCall, no pip deps.
 - **No new main-Project.toml deps** for test-only packages — those go in `test/Project.toml`.
 - `_gate(checked, fallback)` in `preferences.jl` is the zero-cost expansion switch — every macro routes through it. The `checks_enabled` preference is a compile-time const baked at precompile; changing it requires a restart.
+- **A name an entry point does not know raises, naming it and the accepted ones.** Every macro that
+  takes `key = value` options parses them through `_macro_call(name, args, allowed)` (macros.jl),
+  which throws at EXPANSION on a key outside `allowed`; taking it for a positional argument reported
+  a malformed call, or one definition too many, and never the option. A macro with a fixed argument
+  list (`@assert_reaches`, `@test_reaches`, `@strict_stable`) has a varargs method that ends in
+  `_reject_options`. An option a macro has dropped goes in `hidden`, so it is parsed, rejected with
+  its own message, and not listed. A function keyword is left to Julia: no public function takes
+  `kwargs...` without forwarding to explicit keywords, so an unknown one is a `MethodError` naming
+  it. Guarantee names are checked BEFORE a sweep (`_audit`, `_compiled_items`, `_registry_items`,
+  `test_signatures`): a module with nothing compiled reaches no per-method check, and
+  `audit(M; guarantees = (:noaloc,))` returned zero findings. `test/options_test.jl` holds the
+  list of macros and their accepted options, and fails when a macro gains one without it
 - `@contract`-style macro headers in the sibling TypeContracts package can't be module-qualified (e.g. `@contract Base.AbstractLock` fails to parse — needs `import Base: AbstractLock` first) — worth knowing if you're pairing `@strict_contract`/`@verify_strict` with a foreign type.
 - AllocCheck/JET/TrimCheck are **not dependencies of StrictMode at all** — not even weak ones. They are hard deps of `StrictModeTest`. Never import them from `src/`, and never add them back to `Project.toml`: `test/standalone` exists to fail if you do.
 - **Tier selection is the macro name, decided at expansion.** `@assert_noalloc` IS the value-free

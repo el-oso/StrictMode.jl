@@ -63,6 +63,8 @@ test_signatures([
 ```
 """
 function test_signatures(pairs; guarantees = (:typestable, :noalloc))
+    # A name no guarantee has is a mistake in the call, not a failing signature.
+    StrictMode._check_guarantees(guarantees)
     items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
     return _gate(items, :test_signatures, "signatures")
 end

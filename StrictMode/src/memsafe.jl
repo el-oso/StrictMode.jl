@@ -779,9 +779,11 @@ the check proceeds over the `Array` arguments.
 ```
 """
 macro assert_memsafe(args...)
-    # `:isolate` stays in the allowed set only so it can be rejected here: dropping it would make
-    # `isolate=false` parse as a positional argument and misreport as "needs a call expression".
-    pos, opts = _macro_call(args, (:isolate, :align, :using_module, :timeout, :reuse))
+    # `:isolate` is parsed so that it is rejected below with what replaced it, and not as an
+    # option the macro never had.
+    pos, opts = _macro_call(
+        "@assert_memsafe", args, (:align, :using_module, :timeout, :reuse); hidden = (:isolate,)
+    )
     haskey(opts, :isolate) && throw(ArgumentError(_ISOLATE_REMOVED))
     isempty(pos) && throw(ArgumentError("@assert_memsafe needs a call expression"))
     call = pos[1]

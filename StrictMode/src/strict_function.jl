@@ -198,7 +198,7 @@ trades load-time failure for open coverage. With checks disabled this is just th
 ```
 """
 macro strict_function(args...)
-    pos, opts = _macro_call(args, (:signatures, :guarantees))
+    pos, opts = _macro_call("@strict_function", args, (:signatures, :guarantees))
     length(pos) == 1 || throw(
         ArgumentError("@strict_function expects one function definition, got $(length(pos))")
     )
@@ -324,7 +324,7 @@ for any other guarantee, which is what keeps `guarantees = (:noalloc,)` from qui
 type stability too.
 """
 macro strict_exempt(args...)
-    pos, opts = _macro_call(args, (:guarantees, :reason, :types))
+    pos, opts = _macro_call("@strict_exempt", args, (:guarantees, :reason, :types))
     isempty(pos) && throw(
         ArgumentError("@strict_exempt expects a definition, a function name, or a `begin … end` block")
     )
@@ -529,6 +529,10 @@ macro strict_stable(def)
     )
 end
 
+macro strict_stable(args...)
+    return _reject_options("@strict_stable", args, "one function definition")
+end
+
 """
     @strict_policy guarantees
     @strict_policy guarantees check = false
@@ -585,7 +589,7 @@ Allocation verdicts here only warn — the same rule `@strict_function` follows,
 consumer's own precompile the proofs are not loadable and a structural guess must not break a build.
 """
 macro strict_policy(args...)
-    pos, opts = _macro_call(args, (:check, :only, :exempt))
+    pos, opts = _macro_call("@strict_policy", args, (:check, :only, :exempt))
     isempty(pos) && throw(ArgumentError("@strict_policy needs a guarantee or a collection of them"))
     check = get(opts, :check, true)
     spec = pos[1]

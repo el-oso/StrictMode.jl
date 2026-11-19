@@ -136,7 +136,7 @@ name the real call-site specialization.
 ```
 """
 macro assert_noalloc(args...)
-    pos, opts = _macro_call(args, (:static, :types))
+    pos, opts = _macro_call("@assert_noalloc", args, (:static, :types))
     mode = _noalloc_mode(haskey(opts, :static) ? opts[:static]::Bool : nothing)
     isempty(pos) && throw(ArgumentError("@assert_noalloc needs a call expression"))
     call = pos[1]
@@ -199,7 +199,7 @@ disabled builds expand to the bare call.
 ```
 """
 macro assert_noboxing(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_noboxing", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_noboxing needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_noboxing; types = get(opts, :types, nothing))
@@ -269,7 +269,7 @@ batch API honor.
 ```
 """
 macro assert_owned(args...)
-    pos, opts = _macro_call(args, (:types, :depth))
+    pos, opts = _macro_call("@assert_owned", args, (:types, :depth))
     isempty(pos) && throw(ArgumentError("@assert_owned needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -351,7 +351,7 @@ handle it came from stays marked unconfined. A bare handle — created in the fr
 wrapped — is answered soundly in both directions.
 """
 macro assert_noescape(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_noescape", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_noescape needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -581,7 +581,7 @@ value is returned. Keyword-argument calls are not supported, since `mutates` nam
 positions and a keyword has none.
 """
 macro assert_noalias(args...)
-    pos, opts = _macro_call(args, (:mutates,))
+    pos, opts = _macro_call("@assert_noalias", args, (:mutates,))
     isempty(pos) && throw(ArgumentError("@assert_noalias needs a call expression"))
     call = pos[1]
     fexpr, argexprs, kwexprs = _callinfo(call)

@@ -21,7 +21,7 @@ end
 # prove the guarantees, hand the value back. One `_proof_findings` call covers a composite, so
 # `@test_kernel` runs AllocCheck once rather than once per bundled guarantee.
 function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, args)
-    pos, opts = StrictMode._macro_call(args, (:types,))
+    pos, opts = StrictMode._macro_call(macroname, args, (:types,))
     isempty(pos) && throw(ArgumentError("$macroname needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -222,7 +222,7 @@ ws = Workspace()
 Each argument is evaluated once, before the warmup calls, so the same values are reused throughout.
 """
 macro test_steady_state(args...)
-    pos, opts = StrictMode._macro_call(args, (:warmups, :repeats, :fresh_task))
+    pos, opts = StrictMode._macro_call("@test_steady_state", args, (:warmups, :repeats, :fresh_task))
     isempty(pos) && throw(ArgumentError("@test_steady_state needs a call expression"))
     call = pos[1]
     p = StrictMode._call_parts(call)
@@ -305,7 +305,7 @@ Each argument is evaluated once, before the warmup calls, so the same values are
 """
 macro test_no_gc_pause(args...)
     pos, opts = StrictMode._macro_call(
-        args, (:samples, :warmups, :max_collections, :max_q99_ms, :slow_factor)
+        "@test_no_gc_pause", args, (:samples, :warmups, :max_collections, :max_q99_ms, :slow_factor)
     )
     isempty(pos) && throw(ArgumentError("@test_no_gc_pause needs a call expression"))
     call = pos[1]
@@ -378,7 +378,7 @@ use [`StrictMode.allocated_bytes`](@ref), which takes the argument tuple.
 ```
 """
 macro test_allocated_zero(args...)
-    pos, opts = StrictMode._macro_call(args, (:warmups, :windows))
+    pos, opts = StrictMode._macro_call("@test_allocated_zero", args, (:warmups, :windows))
     isempty(pos) && throw(ArgumentError("@test_allocated_zero needs a call expression"))
     call = pos[1]
     p = StrictMode._call_parts(call)
@@ -418,10 +418,16 @@ The macro returns the call's value.
 ```
 """
 macro test_reaches(call, g)
+    (Meta.isexpr(g, :(=)) && g.args[1] isa Symbol) &&
+        throw(ArgumentError(StrictMode._unknown_option("@test_reaches", g.args[1], ())))
     p = StrictMode._call_parts(call)
     return quote
         $(p.binds...)
         $(_check_reaches)($(string(call)), $(p.checkfn), $(p.types), $(esc(g)))
         $(p.litcall)
     end
+end
+
+macro test_reaches(args...)
+    return StrictMode._reject_options("@test_reaches", args, "a call and a target function")
 end

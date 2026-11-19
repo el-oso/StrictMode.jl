@@ -335,7 +335,7 @@ using LLVM_full_jll
 ```
 """
 macro assert_mca(args...)
-    pos, opts = _macro_call(args, (:types, :mcpu, :region, :max_rthroughput, :min_ipc))
+    pos, opts = _macro_call("@assert_mca", args, (:types, :mcpu, :region, :max_rthroughput, :min_ipc))
     isempty(pos) && throw(ArgumentError("@assert_mca needs a call expression"))
     call = pos[1]
     target = string(call)

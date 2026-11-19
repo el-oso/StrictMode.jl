@@ -351,8 +351,16 @@ The macro returns the call's value, and the check runs once per call site and ar
 ```
 """
 macro assert_reaches(call, g)
+    # The target is an expression for a function, so `key = value` there is an option the macro
+    # does not have, not a target.
+    (Meta.isexpr(g, :(=)) && g.args[1] isa Symbol) &&
+        throw(ArgumentError(_unknown_option("@assert_reaches", g.args[1], ())))
     checked = _guarantee_expr(call, _assert_reaches, esc(g))
     return _gate(checked, esc(call))
+end
+
+macro assert_reaches(args...)
+    return _reject_options("@assert_reaches", args, "a call and a target function")
 end
 
 # --- two entries ------------------------------------------------------------------------------
