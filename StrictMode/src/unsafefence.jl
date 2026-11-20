@@ -264,7 +264,8 @@ end
     unsafe_report(mod::Module; only = nothing, exempt = (), allow = ()) -> Vector{StrictFinding}
 
 Every method in `mod` that leaves Julia's safety guarantees: one `:fail` finding per method that
-uses any of these.
+uses any of these. Constructors, top-level anonymous functions and callables with no name of their
+own are read like every other method.
 
 | construct | reported as |
 |---|---|
@@ -324,7 +325,11 @@ method that actually wrote it. Lowered code needs no inference, so the scan is c
 function unsafe_report(mod::Module; only = nothing, exempt = (), allow = ())
     allowed = _check_allow(allow)
     out = StrictFinding[]
-    methods_, _ = module_methods(mod; only, exempt)
+    # A constructor, a top-level lambda and a callable with no name are code like any other; the
+    # census leaves them out only because no declaration can name them. A keyword method's
+    # `Core.kwcall` entry stays out: it forwards to the body, and the default values it evaluates
+    # are evaluated by the positional method too, which is read.
+    methods_, _ = module_methods(mod; only, exempt, keep = (:constructor, :closure, :unreadable))
     for m in methods_
         found = _unsafe_constructs(m)
         if isnothing(found)

@@ -331,3 +331,40 @@ end
     @test only(fs).func == "unchecked"
     @test occursin("`getfield`", only(fs).reason)
 end
+
+@testitem "unsafe_report reads constructors, top-level lambdas and union callables" begin
+    using StrictMode
+
+    module CtorFence
+    struct Buf
+        p::Ptr{UInt8}
+    end
+    Buf(n::Int) = Buf(convert(Ptr{UInt8}, Libc.malloc(n)))
+    struct Raw
+        x::Int
+        Raw(v::Vector{Float64}) = new(Int(unsafe_load(pointer(v))))
+    end
+    const LOAD = p -> unsafe_load(p)
+    struct KA end
+    struct KB end
+    (k::Union{KA, KB})(x) = ccall(:abs, Cint, (Cint,), x)
+    end
+
+    fs = unsafe_report(CtorFence)
+    @test length(fs) == 4
+    @test all(StrictMode._failed, fs)
+    reasons = [f.reason for f in fs]
+    @test any(r -> occursin("`malloc`", r) && occursin("`Ptr`", r), reasons)
+    @test any(r -> occursin("`pointer`", r) && occursin("`unsafe_load`", r), reasons)
+    @test count(r -> occursin("`unsafe_load`", r), reasons) == 2
+    @test any(r -> occursin("`ccall`", r), reasons)
+    # A constructor answers to its type's name; a callable with no name of its own matches no `only`.
+    @test length(unsafe_report(CtorFence; only = (:Buf,))) == 1
+    @test length(unsafe_report(CtorFence; exempt = (:Buf, :Raw))) == 2
+
+    # A keyword default is evaluated by the positional method as well as by `Core.kwcall`'s.
+    module KwDefaultFence
+    first_load(p; n = unsafe_load(p)) = n
+    end
+    @test any(f -> f.func == "first_load" && occursin("`unsafe_load`", f.reason), unsafe_report(KwDefaultFence))
+end

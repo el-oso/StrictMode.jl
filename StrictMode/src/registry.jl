@@ -1167,7 +1167,7 @@ function _census_skip(m::Method)
 end
 
 """
-    StrictMode.module_methods(mod::Module; only = nothing, exempt = (), include_exempt = false)
+    StrictMode.module_methods(mod::Module; only = nothing, exempt = (), include_exempt = false, keep = ())
         -> (methods::Vector{Method}, skipped::Dict{Symbol, Int})
 
 Every method `mod` (or a module beneath it, or one of its loaded extensions) defines, with the ones
@@ -1177,12 +1177,24 @@ no declaration could name counted in `skipped` by reason rather than dropped sil
 subject *is* the exempt code: `StrictModeTest.test_exemptions`, which asks whether an exemption is
 still needed.
 
+`keep` names skip reasons whose methods are returned anyway, for a scan that reads every method's
+code rather than asking what a declaration covers: `:constructor` (a constructor answers `only` and
+`exempt` by its type's name), `:closure` and `:unreadable` (a method whose callable has no type to
+name it by, such as `(k::Union{A, B})(x)`; it matches no `only`). Any other entry raises.
+
 It reads the global method table, not the module's bindings, because a method on a **foreign**
 function — `Base.getindex`, `Base.size`, `Base.show` — belongs to the module that wrote it while
 its name is bound in `Base`. Those are frequently a package's hottest methods. Measured on
 StrictMode itself: 574 methods here, of which a walk over `names(mod; all = true)` finds 363.
 """
-function module_methods(mod::Module; only = nothing, exempt = (), include_exempt::Bool = false)
+function module_methods(
+        mod::Module; only = nothing, exempt = (), include_exempt::Bool = false, keep = ()
+    )
+    for k in keep
+        k in (:constructor, :closure, :unreadable) || throw(
+            ArgumentError("module_methods: `keep` names `$k`; accepted: :constructor, :closure, :unreadable")
+        )
+    end
     _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
@@ -1194,18 +1206,19 @@ function module_methods(mod::Module; only = nothing, exempt = (), include_exempt
         m isa Method || return nothing
         any(s -> _in_module_tree(m.module, s), scope) || return nothing
         reason = _census_skip(m)
-        isnothing(reason) || return bump!(reason)
+        isnothing(reason) || reason in keep || return bump!(reason)
         F = try
             _method_function(m)
         catch
             nothing
         end
-        f = isdefined(F, :instance) ? F.instance : nothing
+        f = reason === :constructor ? F.parameters[1] : isdefined(F, :instance) ? F.instance : nothing
         # A capturing closure has no instance. A filter by name still answers for it through its
         # type; a filter that is the caller's own function expects a function, so it cannot, and the
         # closure stays in the census.
         isnothing(f) && _is_closure_type(F) && !(only isa Function) && !(exempt isa Function) &&
             (f = F)
+        reason === :unreadable && !isnothing(onlypred) && return bump!(:filtered)
         if !isnothing(f)
             ((!include_exempt && _is_exempt(f)) || (!isnothing(exemptpred) && exemptpred(f))) &&
                 return bump!(:exempt)
