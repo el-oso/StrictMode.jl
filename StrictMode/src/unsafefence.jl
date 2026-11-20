@@ -215,6 +215,26 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
     return out
 end
 
+# Scan generated method `m`'s code at signature `sig` into `out`; `false` when there is none to
+# read. A generator that raises, or one that needs types `sig` leaves free, yields no `CodeInfo`.
+function _generated_constructs!(out::Set{Symbol}, m::Method, @nospecialize(sig))
+    cis = try
+        _code_typed_by_type(sig; optimize = false)
+    catch
+        return false
+    end
+    read = false
+    for pair in cis
+        ci = pair isa Pair ? pair.first : pair
+        ci isa Core.CodeInfo || continue
+        mi = ci.parent
+        (mi isa Core.MethodInstance && mi.def !== m) && continue
+        _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a))
+        read = true
+    end
+    return read
+end
+
 # The unsafe constructs in one method's body, as a sorted, deduplicated list of names. `ccall`
 # stands for a `:foreigncall` statement, which is what a `ccall` becomes.
 #
@@ -223,29 +243,26 @@ end
 # seconds on a large generic kernel, and for an abstract signature it returned the code of every
 # method matching it, so a generic method was charged with the `@inbounds` and `unsafe_*` calls of
 # its more specific siblings. A `@generated` method has no lowered body of its own and is inferred,
-# keeping only its own result.
+# keeping only its own result: at its declared signature, or at each compiled specialization when
+# the generator needs the argument types.
 #
-# `nothing` when the method's code cannot be read: a generator that raises, or a method that keeps
-# no source. That is not an empty list, which says the method was read and is clean.
+# `nothing` when the method's code cannot be read: a generator that raises or has not run for any
+# types yet, or a method that keeps no source. That is not an empty list, which says the method was
+# read and is clean.
 function _unsafe_constructs(m::Method)
     out = Set{Symbol}()
     if isdefined(m, :generator)
-        cis = try
-            _code_typed_by_type(m.sig; optimize = false)
-        catch
-            return nothing
+        # Julia runs a generator at the declared signature only when it does not use the type
+        # parameters left free there. Otherwise the code exists per argument types, and each
+        # specialization compiled so far is read; every one must read, or the method was not.
+        if !_generated_constructs!(out, m, m.sig)
+            # Reading at `m.sig` itself leaves an instance at that signature, with no code.
+            specs = filter(mi -> Base.isdispatchtuple(mi.specTypes), _specializations(m))
+            isempty(specs) && return nothing
+            for mi in specs
+                _generated_constructs!(out, m, mi.specTypes) || return nothing
+            end
         end
-        read = false
-        for pair in cis
-            ci = pair isa Pair ? pair.first : pair
-            ci isa Core.CodeInfo || continue
-            mi = ci.parent
-            (mi isa Core.MethodInstance && mi.def !== m) && continue
-            _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a))
-            read = true
-        end
-        # A generator that raises yields its `Method` in place of the code.
-        read || return nothing
     else
         src = try
             Base.uncompressed_ast(m)
@@ -318,6 +335,11 @@ proved and tested.
 A `Base.@propagate_inbounds` method is clean on its own, and the finding lands on the caller that
 wrote `@inbounds`, which is the method that made the claim.
 
+A `@generated` method has no lowered body. It is read at its declared signature when its generator
+does not use the argument types, and otherwise at each specialization compiled so far, so the
+types it is read for are the ones it has been called with. Before its first call such a method is a
+`:fail` finding saying its code could not be read.
+
 Read from each method's own lowered code on purpose. A small wrapper around a pointer load inlines
 under optimization, so its `unsafe_load` would surface in an innocent caller and vanish from the
 method that actually wrote it. Lowered code needs no inference, so the scan is cheap on any module.
@@ -337,7 +359,12 @@ function unsafe_report(mod::Module; only = nothing, exempt = (), allow = ())
                 out, _unevaluated(
                     nameof(mod), string(m.name), string(m.sig), :unsafe,
                     "the method's code could not be read, so it was not checked for constructs " *
-                        "that leave Julia's safety guarantees";
+                        "that leave Julia's safety guarantees" *
+                        (
+                        isdefined(m, :generator) ?
+                            ". A `@generated` method whose generator needs its argument types " *
+                            "is read at each compiled specialization: call it first" : ""
+                    );
                     file = string(m.file), line = Int(m.line)
                 )
             )

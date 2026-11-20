@@ -368,3 +368,25 @@ end
     end
     @test any(f -> f.func == "first_load" && occursin("`unsafe_load`", f.reason), unsafe_report(KwDefaultFence))
 end
+
+@testitem "unsafe_report reads a generated method at each compiled specialization" begin
+    using StrictMode
+
+    module GenTyped
+    @generated sumtup(t::NTuple{N, Float64}) where {N} = Expr(:call, :+, (:(t[$i]) for i in 1:N)...)
+    @generated loadtup(p::NTuple{N, Ptr{Float64}}) where {N} =
+        Expr(:call, :+, (:(unsafe_load(p[$i])) for i in 1:N)...)
+    end
+    # The generator needs the argument types, so before any call there is no code to read.
+    r = only(unsafe_report(GenTyped; only = (:sumtup,)))
+    @test StrictMode._failed(r)
+    @test occursin("could not be read", r.reason)
+
+    @test GenTyped.sumtup((1.0, 2.0)) == 3.0
+    v = [1.0, 2.0]
+    GC.@preserve v begin
+        @test GenTyped.loadtup((pointer(v), pointer(v, 2))) == 3.0
+    end
+    @test isempty(unsafe_report(GenTyped; only = (:sumtup,)))
+    @test occursin("`unsafe_load`", only(unsafe_report(GenTyped; only = (:loadtup,))).reason)
+end
