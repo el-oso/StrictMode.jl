@@ -257,6 +257,9 @@ StrictMode/src/
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves
+                        :notaskstate and runs the taint scan only otherwise. It GATES, because a
+                        reported site is a store read from typed IR, not an unprovable inference —
+                        its limit is recall, a threadid store in an unfollowable callee.
                         A sweep has nowhere to name WHICH argument is shared, so it reads argument
                         1: a `!` method therefore gets :info (its name declares that write), unless
                         the scan read a write to a constant global, which stays :fail, and an
@@ -264,11 +267,17 @@ StrictMode/src/
                         and seeding it taints every index derived from it, which made a store into
                         the method own fresh buffer read as a shared write). Both measured in the
                         field: 92 of 134 and 755 of 762 sweep failures were `!` methods.
-                        :notaskstate and runs the taint scan only otherwise. It GATES, because a
-                        reported site is a store read from typed IR, not an unprovable inference —
-                        its limit is recall, a threadid store in an unfollowable callee.
                         The taint scan crosses TWO boundaries the statement loop would otherwise
                         drop: Expr(:new) passes taint to the struct built from a tainted value (an
+                        INLINABLE wrapper is caught anyway, since inlining routes the store back
+                        through the argument — only a @noinline one needs this), and a
+                        :foreigncall to jl_new_task follows the task's closure body via
+                        code_typed_by_type with the CLOSURE ITSELF tainted, since a capture reads
+                        as getfield(self, …) and _PROJECT_OPS carries it on. Field-insensitive, so
+                        a task writing a disjoint slice of a captured output still reports — a
+                        partition is a property of values. Anything unresolvable is RECORDED, never
+                        skipped. pool_balance_report RAISES _UnanalyzableSignature when it cannot
+                        read a signature, because a count of nothing balances.
                         TWO taint levels, because "is the plan" and "holds a reference to the plan"
                         are different facts: a fresh `Factor(sym, …)` points AT the plan and the
                         plan does not point back, so writing its own fields is not writing the
@@ -279,15 +288,6 @@ StrictMode/src/
                         a container so jl_new_task follows it at that level. One level either made
                         the fresh wrapper BE the plan (four passing assertions in a consumer broke
                         for three releases) or lost a store through it into the plan arrays.
-                        INLINABLE wrapper is caught anyway, since inlining routes the store back
-                        through the argument — only a @noinline one needs this), and a
-                        :foreigncall to jl_new_task follows the task's closure body via
-                        code_typed_by_type with the CLOSURE ITSELF tainted, since a capture reads
-                        as getfield(self, …) and _PROJECT_OPS carries it on. Field-insensitive, so
-                        a task writing a disjoint slice of a captured output still reports — a
-                        partition is a property of values. Anything unresolvable is RECORDED, never
-                        skipped. pool_balance_report RAISES _UnanalyzableSignature when it cannot
-                        read a signature, because a count of nothing balances
                         THREE ways a write reaches the plan without a store in the frame, each with
                         its own certainty. (1) A BASE callee that was not inlined is read like a
                         package's own when its name ends in `!` or its result can hold a reference
@@ -890,15 +890,15 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 - `_gate(checked, fallback)` in `preferences.jl` is the zero-cost expansion switch — every macro routes through it. The `checks_enabled` preference is a compile-time const baked at precompile; changing it requires a restart.
 - **A name an entry point does not know raises, naming it and the accepted ones.** Every macro that
   takes `key = value` options parses them through `_macro_call(name, args, allowed)` (macros.jl),
-  which throws at EXPANSION on a key outside `allowed`; taking it for a positional argument reported
-  a malformed call, or one definition too many, and never the option. A macro with a fixed argument
+  which throws at EXPANSION on a key outside `allowed`; taken for a positional argument, the key would be
+  reported as a malformed call, or one definition too many, and never as the option. A macro with a fixed argument
   list (`@assert_reaches`, `@test_reaches`, `@strict_stable`) has a varargs method that ends in
   `_reject_options`. An option a macro has dropped goes in `hidden`, so it is parsed, rejected with
   its own message, and not listed. A function keyword is left to Julia: no public function takes
   `kwargs...` without forwarding to explicit keywords, so an unknown one is a `MethodError` naming
   it. Guarantee names are checked BEFORE a sweep (`_audit`, `_compiled_items`, `_registry_items`,
-  `test_signatures`): a module with nothing compiled reaches no per-method check, and
-  `audit(M; guarantees = (:noaloc,))` returned zero findings. An `only` or `exempt` entry that
+  `test_signatures`): a module with nothing compiled reaches no per-method check, so
+  `audit(M; guarantees = (:noaloc,))` would otherwise return zero findings. An `only` or `exempt` entry that
   matches no function with a method in the module raises in `_check_name_filters`, which
   `module_methods`, `_module_specializations` and `_coverage_findings` call first (the names are
   the census's: demangled, so a keyword body and a closure answer to the function that wrote
@@ -936,9 +936,9 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   `register_scoped!` and `register_alloc_barrier!` each push onto a constant in the root module of the
   package that owns the function or type (`__strict_trust_boundaries__`, `__strict_scoped_types__`,
   `__strict_barriers__`), and the readers (`_is_trust_boundary`, `_scoped_types`,
-  `_barrier_functions`) union the loaded packages' stores with this session's set. Measured before
-  this: after a cached load `:trusted` failed on the registered boundary itself and `:noescape`
-  passed with no type registered. The first two write the constant ONLY while a package image is
+  `_barrier_functions`) union the loaded packages' stores with this session's set. A set inside
+  StrictMode alone is lost at a cached load: `:trusted` then fails on the registered boundary itself
+  and `:noescape` passes with no type registered. The first two write the constant ONLY while a package image is
   being generated (`_keep_registration!`): in a session the session's set is the registration, and
   a test that empties it to take a registration back must not find it again in `Main`. During a
   precompile `_persist_registration!` decides, the same for all three: only a store THIS PROCESS
@@ -1019,7 +1019,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F70 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F74 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,
