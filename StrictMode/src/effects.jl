@@ -356,6 +356,19 @@ _is_base_barrier_type(@nospecialize(p)) = p isa Type && any(bt -> p <: bt, _BASE
 _mi_is_strictmode(mi::Core.MethodInstance) =
     mi.def isa Method && Base.moduleroot(mi.def.module) === @__MODULE__
 
+# The type of the callable whose keyword body `mi` is, or `nothing` for any other method. Lowering
+# passes a keyword body its keyword values first and the callable after them, and records how many
+# keyword values there are in the method's `nkw`. The name is no guide: a callable object's keyword
+# body is named `#_#N`.
+function _kwbody_self(mi::Core.MethodInstance)
+    m = mi.def
+    (m isa Method && m.nkw > 0) || return nothing
+    st = mi.specTypes
+    st isa DataType || return nothing
+    ps = st.parameters
+    return length(ps) >= m.nkw + 2 ? ps[m.nkw + 2] : nothing
+end
+
 # A registered function called with keywords is reached through two more methods: `Core.kwcall`, which
 # carries the function at parameter 3, and the keyword-sorted body `#f#N`, which carries it after the
 # keyword values. Both are the barrier: the allocation is the registered function's own.

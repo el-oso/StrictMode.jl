@@ -20,6 +20,11 @@ _inline_wrapper(f::F) where {F} = (args...) -> f(args...)
 const _INLINED_UNREAD = "whether the call is inlined could not be read: the signature is not " *
     "concrete, no single method matches it, or the calling wrapper has no typed body"
 
+# The call `f(types...)` runs as one of three bodies: the method it matches, the method that method
+# forwards to when it only fills in a default argument (`_forwarded_call`), and the callable's
+# keyword body, which a keyword call reaches through `Core.kwcall` and a positional call through its
+# forwarder. The forwarders are small and inline, so a surviving `:invoke` of any of the three is
+# the call not inlined.
 function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     f isa Union{Core.Builtin, Core.IntrinsicFunction} && return false
     _has_compiled_body(f, types) || return nothing
@@ -29,6 +34,12 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     catch
         return nothing
     end
+    fm = try
+        which(_forwarded_call(f, types)...)
+    catch
+        m
+    end
+    owner = f === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : Core.Typeof(f)
     wrapper = _inline_wrapper(f)
     cts = _code_typed(wrapper, types; optimize = true)
     isempty(cts) && return nothing
@@ -38,7 +49,9 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
             # `MethodInstance`); older Julia uses the `MethodInstance` directly.
             a1 = stmt.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
-            mi isa Core.MethodInstance && mi.def === m && return true
+            mi isa Core.MethodInstance || continue
+            (mi.def === m || mi.def === fm) && return true
+            !isnothing(owner) && _kwbody_self(mi) === owner && return true
         end
     end
     return false
