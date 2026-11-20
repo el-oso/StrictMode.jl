@@ -373,7 +373,7 @@ function _call_findings(mod::Module; only = nothing, exempt = ())
     out = StrictMode.StrictFinding[]
     for (f, tt, _) in StrictMode._compiled_items(mod; guarantees = (:typestable,), only, exempt)
         types = Tuple(tt)
-        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
+        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f, types)
         reps = _call_reports("test_calls", f, types, mod)
         if isempty(reps)
             push!(out, StrictMode._mkfinding(md, fn, sg, :calls, false, "", "", 0; tier = :proof))

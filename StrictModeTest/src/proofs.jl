@@ -1252,7 +1252,7 @@ const _EXEMPT_ONLY_FIX = "every allocation is inside a function exempted from :n
 function _proof_findings(
         @nospecialize(f), @nospecialize(types::Tuple), guarantees; allow_exempt::Bool = false
     )
-    fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
+    fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f, types)
     target = fn * sg
     # AllocCheck runs at most once per signature even when both allocation guarantees are asked
     # for: the boxing verdict is a filter over the same instance list.

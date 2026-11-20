@@ -276,5 +276,7 @@ end
     Untrusted(ForeignGate.MyT(7)).x; ForeignGate.own(1)
     @test_throws "getproperty" test_compiled(ForeignGate; guarantees = (:trusted,))
     @test test_compiled(ForeignGate; guarantees = (:trusted,), exempt = (:getproperty,)) isa Vector
+    r = only(StrictModeTest.proof_findings(getproperty, (Untrusted{ForeignGate.MyT}, Symbol); guarantees = (:trusted,)))
+    @test r.mod === :ForeignGate
     Base.delete_method(which(getproperty, (Untrusted{ForeignGate.MyT}, Symbol)))
 end

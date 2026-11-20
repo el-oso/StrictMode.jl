@@ -508,7 +508,7 @@ function dispatch_suggestions(@nospecialize(f), @nospecialize(types::Tuple))
     # specializations), so the naming and the `which` lookup wait until there is a finding to carry
     # them rather than being paid per specialization.
     (isempty(dyn) && isempty(cl)) && return out
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
     m = try
         which(f, types)
     catch

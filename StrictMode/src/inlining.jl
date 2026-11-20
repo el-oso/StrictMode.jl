@@ -233,7 +233,7 @@ function inline_suggestions(
         @nospecialize(f), @nospecialize(types::Tuple);
         include_base::Bool = false, only_flagged::Bool = false,
     )
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
     callees = _noninlined_callees(f, types)
     sort!(callees; by = c -> (_callee_priority(c), -c.count))
     out = StrictFinding[]

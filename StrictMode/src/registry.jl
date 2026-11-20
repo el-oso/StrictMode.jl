@@ -548,7 +548,7 @@ exempt_strict() = STRICT_EXEMPT
 # method it never checked, which is the same "could not check" == "is fine" conflation that made a
 # crashed backend report `:pass`. Emit a failing finding naming the method and the error instead.
 function _errored_findings(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
-    fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
+    fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f, types)
     why = "analysis errored for this signature: " * sprint(showerror, err)
     return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in gs]
 end
@@ -615,7 +615,7 @@ end
 function _split_exempt(@nospecialize(f), @nospecialize(types), gs)
     live = Symbol[]
     notes = StrictFinding[]
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(Tuple(types))
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(Tuple(types))
     for g in gs
         e = _matching_exemption(f, types, g)
         if isnothing(e)

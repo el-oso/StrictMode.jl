@@ -30,6 +30,13 @@ _mod_sym(@nospecialize(f)) = try
 catch
     :Main
 end
+# The module that wrote the method `f` reaches for `types`. A finding is named after it: a method a
+# package defines on `Base.getproperty` is the package's code, not Base's.
+_mod_sym(@nospecialize(f), @nospecialize(types)) = try
+    nameof(which(f, Tuple(types)).module)
+catch
+    _mod_sym(f)
+end
 
 # A guarantee the analysis could not evaluate. `:fail`, never `:pass`: "I could not check this" and
 # "this is fine" must not render the same, which is how a crashed AllocCheck/JET run reported
@@ -279,7 +286,7 @@ end
 function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     n = _window_open()
     try
-        return _findings_fast(f, types, guarantees, _mod_sym(f), _func_name(f), _sig_string(types))
+        return _findings_fast(f, types, guarantees, _mod_sym(f, types), _func_name(f), _sig_string(types))
     finally
         _window_close(n)
     end

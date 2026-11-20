@@ -12,6 +12,9 @@ record feeds the human (`:text`) and agent (`:json`) reporting paths.
 Fields: `mod`, `func`, `signature`, `guarantee` (`:typestable`/`:noalloc`/`:noboxing`/`:owned`/
 `:inlined`/…), `status`, `file`, `line`, `reason`, `suggestion`, `tier`.
 
+`mod` is the module that wrote the method checked, so a package's method on a function Base owns,
+such as its `Base.getproperty`, is named after the package.
+
 `status` is one of:
 - `:pass` / `:fail` — a verdict to act on. A guarantee the analysis could not evaluate is `:fail`
   carrying the error text, never `:pass`: "could not check" and "is fine" must not render the same.

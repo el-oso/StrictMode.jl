@@ -169,7 +169,7 @@ audit(MyPkg; static_ownership_suggest = true)
 """
 function static_ownership_suggestions(@nospecialize(f), @nospecialize(types::Tuple);
         _code::IdDict{Any, Any} = IdDict{Any, Any}())
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
     finding = _static_ownership_finding(f, types, md, fn, sg, _code)
     return finding.status === :info ? StrictFinding[finding] : StrictFinding[]
 end

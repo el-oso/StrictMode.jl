@@ -363,6 +363,9 @@ end
     fs = swept(; guarantees = (:trusted,))
     read = only(f for f in fs if f.func == "getproperty")
     @test StrictMode._failed(read)
+    # Named after the module that wrote the method, not the one that owns the function.
+    @test read.mod === :ForeignMethods
+    @test only(findings(getproperty, (Untrusted{F.MyT}, Symbol); guarantees = (:trusted,))).mod === :ForeignMethods
     @test occursin("reads an `Untrusted` payload", read.reason)
     @test any(f -> f.func == "own" && f.status === :pass, fs)
     # Only the method written here: `getproperty` has many others, and they are Base's.
@@ -399,6 +402,7 @@ end
     rs = [f for f in fs if f.func == "getproperty"]
     @test length(rs) == 1
     @test StrictMode._failed(only(rs))
+    @test only(rs).mod === :Sub
     @test any(f -> f.func == "own" && f.status === :pass, fs)
     Base.delete_method(which(getproperty, (Untrusted{N.Sub.MyT}, Symbol)))
 end
