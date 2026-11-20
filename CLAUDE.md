@@ -217,9 +217,14 @@ StrictMode/src/
                         read whose result is STORED is the right-hand side of an assignment in
                         unoptimized IR (`_3 = (%1)(_2)`), which _call_callee_and_args unwraps;
                         read as a non-call it passed `b = unsafe_trust(u)`. An erased read of
-                        field 1 is dropped when the same operand also has another field read
-                        (_reads_another_field): that is a `for` loop taking element and state
-                        from what iterate returned, not an Untrusted, which has one field
+                        field 1 is dropped when the SAME VALUE also has another field read
+                        (_same_value_has_another_field: same operand, no branch, no jump target
+                        and no reassignment between the two statements, so a read on the other
+                        arm of a type test clears nothing), and when the operand is what
+                        iterate/indexed_iterate returned. An erased `getproperty` is NOT
+                        reported: Base.getproperty on an Untrusted raises whatever the name, so
+                        untyped `p.x` reads no payload; erased getfield and unsafe_trust are
+                        reported, and getproperty on a value typed <:Untrusted is certain
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves
@@ -944,7 +949,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F68 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F69 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

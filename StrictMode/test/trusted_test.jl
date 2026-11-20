@@ -271,3 +271,41 @@ end
     destructure_any(t) = ((a, b) = t; a + b)
     @test status(destructure_any, (Any,)).status === :pass
 end
+
+@testitem "a field read by name on an untyped value is not a payload read" begin
+    using StrictMode
+
+    module UntypedProperty
+    using StrictMode
+    struct Pt
+        x::Float64
+        y::Float64
+    end
+    const D = Dict{Symbol, Any}(:a => Pt(1.0, 2.0))
+    # `p.x` is `getproperty`, which raises on an `Untrusted` whatever the name. It cannot read a
+    # payload, so on a value of unknown type it is an ordinary field read, stored or not.
+    stored(k::Symbol) = (p = D[k]; abs(p.x))
+    direct(k::Symbol) = abs(D[k].x)
+    both(k::Symbol) = (p = D[k]; a = p.x; b = p.y; abs(a) + abs(b))
+    # `getfield` and `unsafe_trust` do read one, so on an untyped value they cannot be ruled out.
+    by_getfield(k::Symbol) = (p = D[k]; getfield(p, :x))
+    by_unsafe_trust(k::Symbol) = (p = D[k]; unsafe_trust(p))
+    # On a value typed as `Untrusted` the read is refused at check time, where it would raise.
+    typed(u::Untrusted{Vector{UInt8}}) = length(u.x)
+    end
+    U = UntypedProperty
+    status(f, T = (Symbol,)) = only(findings(f, T; guarantees = (:trusted,)))
+    for f in (U.stored, U.direct, U.both)
+        @test status(f).status === :pass
+    end
+    for f in (U.by_getfield, U.by_unsafe_trust)
+        r = status(f)
+        @test StrictMode._failed(r)
+        @test occursin("may read an `Untrusted` payload", r.reason)
+    end
+    r = status(U.typed, (Untrusted{Vector{UInt8}},))
+    @test StrictMode._failed(r) && occursin("getproperty", r.reason)
+
+    # A module of such methods loads under a policy.
+    @test Core.eval(@__MODULE__, Meta.parse("module UntypedPolicy; using StrictMode; struct Pt; x::Float64; end; const D = Dict{Symbol, Any}(:a => Pt(1.0)); norm1(k::Symbol) = (p = D[k]; abs(p.x)); @strict_policy :trusted; end")) isa Module
+end

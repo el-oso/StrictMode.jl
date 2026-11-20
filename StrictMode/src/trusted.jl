@@ -149,7 +149,10 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         T isa Type || continue
         if T <: Untrusted
             push!(certain, nameof(callee))
+        # `getproperty` raises on an `Untrusted` whatever the name, so on a value whose type is
+        # not known it reads no payload: `p.x` there is a field of something else, or an error.
         elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
+                callee !== Base.getproperty &&
                 !_same_value_has_another_field(ci, other, i, args[1]) &&
                 !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
@@ -288,9 +291,10 @@ them in that one method.
 
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized
 typed IR, with no execution, backend, or timing — and it **gates**, because it observes a call on a
-type inference has already fixed rather than guessing at a cost. Its limits are all missed
-violations, never false alarms: a payload that infers as `Any` is invisible, only compiled
-specializations are swept, and nothing verifies that a registered boundary really validates or
+type inference has already fixed rather than guessing at a cost. A value inference could not type is handled by what the
+call can do: `getfield` and `unsafe_trust` on it are reported as reads that cannot be ruled out,
+and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
+name. Its other limits are missed violations: only compiled specializations are swept, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
