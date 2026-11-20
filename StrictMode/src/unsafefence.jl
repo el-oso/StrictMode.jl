@@ -207,7 +207,9 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
             push!(out, :Ptr)
         elseif callee isa Core.Builtin && length(st.args) >= 3 && st.args[end] === false
             nm = nameof(callee)
-            nm in _UNCHECKED_BUILTINS && !(nm === :getfield && length(st.args) != 4) && push!(out, nm)
+            # `getfield(x, i, false)` and `getfield(x, i, order, false)` both take the flag last;
+            # with two operands the last one is the field.
+            nm in _UNCHECKED_BUILTINS && !(nm === :getfield && !(length(st.args) in (4, 5))) && push!(out, nm)
         end
     end
     return out

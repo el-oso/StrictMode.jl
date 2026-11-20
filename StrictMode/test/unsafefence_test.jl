@@ -319,3 +319,15 @@ end
     end
     @test isempty(unsafe_report(FenceLocalsClean))
 end
+
+@testitem "unsafe_report reads getfield's unchecked form with a memory order" begin
+    using StrictMode
+
+    module FenceOrdered
+    unchecked(t, i) = getfield(t, i, :not_atomic, false)
+    checked(t, i) = getfield(t, i, :not_atomic, true)
+    end
+    fs = unsafe_report(FenceOrdered)
+    @test only(fs).func == "unchecked"
+    @test occursin("`getfield`", only(fs).reason)
+end
