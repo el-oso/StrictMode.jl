@@ -36,9 +36,10 @@ What it pins:
    and loads them from their caches: a registration made in a dependency's `__init__` (which also
    runs while its dependent precompiles, and must not raise there), a function or type of another
    package registered at top level (refused without `mod = @__MODULE__`, leaving nothing registered
-   even in the precompile that refused it, and including when its owner
-   already holds a store of that kind), and a callable object (a trust boundary by value, an
-   allocation barrier by its type, with one instance refused).
+   even in the precompile that refused it, and including when its owner already holds a store of
+   that kind, or when the registrant is the owner's extension or a package nested in the owner's
+   directory), and a callable object (a trust boundary by value, an allocation barrier by its
+   type, with one instance refused).
 
 ## Two builds
 

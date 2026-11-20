@@ -904,9 +904,11 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   any frame of that name): a dependency's `__init__` runs while its dependent precompiles, with
   the dependency's module closed, and it runs again at every load. And a call made by the OWNING
   package's own code (`_registered_by_owner`: the first stack frame outside StrictMode and Base
-  lies in that package's directory, read from the frame's file because an inlined frame keeps no
-  method): a table a package registers on first use, first used by a dependent's precompile
-  workload, must not break that precompile.
+  runs a method of that package, or, when it has no method — an inlined call or top-level code —
+  its file lies in the directory of the package's own source file. Not the package directory: an
+  extension in `ext/` or a package nested under it is another package): a table a package
+  registers on first use, first used by a dependent's precompile workload, must not break that
+  precompile.
   `jl_generating_output() == 1` alone does not say whose code is running. A callable object
   belongs to the module of its type (`_owner_module`). A TRUST BOUNDARY is registered by value
   (`findings(f, types)` has the value). An ALLOC BARRIER is registered as its TYPE and covers every

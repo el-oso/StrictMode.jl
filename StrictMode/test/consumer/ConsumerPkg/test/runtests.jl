@@ -96,6 +96,7 @@ end
             "unnamed_refused_at_precompile",
             "named_scoped", "named_trust", "named_barrier", "callable_trust", "callable_barrier",
             "lazy_owner_no_error", "lazy_not_stored", "lazy_in_session",
+            "nested_ext_refused", "nested_sub_refused",
         )
         @test get(facts, name, "missing") == "true"
     end

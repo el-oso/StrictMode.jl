@@ -1,7 +1,8 @@
 # Three packages, one depending on the other two, built in a scratch directory and loaded from their
 # caches, for the registrations a single package cannot exercise: one made in an `__init__`, one
 # of a function or type another package owns, one of a callable object, and one a package makes of
-# its own function when a dependent first calls it.
+# its own function when a dependent first calls it. The owner also has an extension and a package
+# nested in its directory, which register its types as another package would.
 #
 #     julia dependents.jl WORKDIR STRICTMODE_DIR
 #
@@ -52,6 +53,55 @@ function lazy_setup!()
     StrictMode.trust_boundary!(lazy_reader)
     StrictMode.register_alloc_barrier!(lazy_table)
     return nothing
+end
+
+# Left for this package's extension and for the package in its `lib/` to register.
+struct ExtTop
+    p::Ptr{Cvoid}
+end
+struct ExtLent
+    p::Ptr{Cvoid}
+end
+@noinline ext_lent_table() = zeros(4)
+struct SubTop
+    p::Ptr{Cvoid}
+end
+end
+"""
+
+const ATTEMPT = raw"""
+attempt(f) = try
+    f()
+    "registered"
+catch err
+    sprint(showerror, err)
+end
+"""
+
+# RegOwner's extension, and a package in RegOwner's `lib/`. Both lie in RegOwner's directory and
+# both are packages of their own, so registering RegOwner's types without naming themselves is
+# refused, from top-level code and from a function of theirs alike.
+const EXT_SRC = "module RegOwnerDatesExt\nusing RegOwner, Dates, StrictMode\n" * ATTEMPT * raw"""
+const TOP_LEVEL = try
+    StrictMode.register_scoped!(RegOwner.ExtTop)
+    "registered"
+catch err
+    sprint(showerror, err)
+end
+const UNNAMED_SCOPED = attempt(() -> StrictMode.register_scoped!(RegOwner.ExtLent))
+@noinline setup() = StrictMode.register_alloc_barrier!(RegOwner.ext_lent_table)
+const UNNAMED_BARRIER = attempt(setup)
+end
+"""
+
+const SUB_SRC = raw"""
+module RegSub
+using RegOwner, StrictMode
+const TOP_LEVEL = try
+    StrictMode.register_scoped!(RegOwner.SubTop)
+    "registered"
+catch err
+    sprint(showerror, err)
 end
 end
 """
@@ -127,7 +177,7 @@ end
 """
 
 const CHECK = raw"""
-using StrictMode, RegOwner, RegInit, RegDependent
+using StrictMode, RegOwner, RegInit, RegDependent, Dates, RegSub
 say(name, value) = println(name, " = ", value)
 cached(M) = !isnothing(Base.pkgorigins[Base.PkgId(M)].cachepath)
 say("loaded_from_cache", cached(RegOwner) && cached(RegInit) && cached(RegDependent))
@@ -151,6 +201,9 @@ say("lazy_owner_no_error", RegDependent.LAZY_OWNER == "registered" && RegDepende
 say("lazy_not_stored", !StrictMode._is_trust_boundary(RegOwner.lazy_reader) && !StrictMode._is_scoped_type(RegOwner.Lazy) && !barrier(RegOwner.lazy_table))
 RegOwner.lazy_setup!()
 say("lazy_in_session", StrictMode._is_trust_boundary(RegOwner.lazy_reader) && StrictMode._is_scoped_type(RegOwner.Lazy) && barrier(RegOwner.lazy_table))
+ext = Base.get_extension(RegOwner, :RegOwnerDatesExt)
+say("nested_ext_refused", !isnothing(ext) && refused(ext.TOP_LEVEL) && refused(ext.UNNAMED_SCOPED) && refused(ext.UNNAMED_BARRIER) && !StrictMode._is_scoped_type(RegOwner.ExtTop) && !StrictMode._is_scoped_type(RegOwner.ExtLent) && !barrier(RegOwner.ext_lent_table))
+say("nested_sub_refused", refused(RegSub.TOP_LEVEL) && !StrictMode._is_scoped_type(RegOwner.SubTop))
 """
 
 mkpath(WORK)
@@ -161,16 +214,29 @@ cd(WORK) do
     write(joinpath("RegInit", "src", "RegInit.jl"), INIT_SRC)
     write(joinpath("RegOwner", "src", "RegOwner.jl"), OWNER_SRC)
     write(joinpath("RegDependent", "src", "RegDependent.jl"), DEPENDENT_SRC)
+    mkpath(joinpath("RegOwner", "ext"))
+    write(joinpath("RegOwner", "ext", "RegOwnerDatesExt.jl"), EXT_SRC)
+    cd(() -> Pkg.generate("RegSub"; io = devnull), mkpath(joinpath("RegOwner", "lib")))
+    sub = joinpath(WORK, "RegOwner", "lib", "RegSub")
+    write(joinpath(sub, "src", "RegSub.jl"), SUB_SRC)
     write("check.jl", CHECK)
     specs = [Pkg.PackageSpec(path = p) for p in (STRICTMODE, joinpath(WORK, "RegOwner"), joinpath(WORK, "RegInit"), joinpath(WORK, "RegDependent"))]
     for own in ("RegOwner", "RegInit")
         Pkg.activate(joinpath(WORK, own); io = devnull)
         Pkg.develop(specs[1]; io = devnull)
     end
+    owner = joinpath(WORK, "RegOwner", "Project.toml")
+    dates = string(Base.identify_package("Dates").uuid)
+    write(owner, read(owner, String) * "\n[weakdeps]\nDates = \"$dates\"\n\n[extensions]\nRegOwnerDatesExt = \"Dates\"\n")
+    Pkg.activate(joinpath(WORK, "RegOwner"); io = devnull)
+    Pkg.resolve(; io = devnull)
+    Pkg.activate(sub; io = devnull)
+    Pkg.develop(specs[1:2]; io = devnull)
     Pkg.activate(joinpath(WORK, "RegDependent"); io = devnull)
     Pkg.develop(specs[1:3]; io = devnull)
     Pkg.activate(joinpath(WORK, "env"); io = devnull)
-    Pkg.develop(specs; io = devnull)
+    Pkg.develop([specs; Pkg.PackageSpec(path = sub)]; io = devnull)
+    Pkg.add("Dates"; io = devnull)
     # Each package is compiled in a process of its own, as a user's would be. The first run of the
     # check does that and prints nothing to rely on; the second loads both from their caches.
     check = `$(Base.julia_cmd()) --startup-file=no --project=$(joinpath(WORK, "env")) check.jl`

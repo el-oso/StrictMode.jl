@@ -142,17 +142,24 @@ end
 _is_module_init(m::Method) = m.nargs == 1 && isdefined(m.module, :__init__) &&
     m.sig === Tuple{typeof(getglobal(m.module, :__init__))}
 
-# Whether the code that called the registration function belongs to the package that owns `mod`:
-# the first frame outside StrictMode and Base lies in that package's directory. Read from the
-# frame's file, which an inlined frame keeps and a method lookup does not.
+# Whether the code that called the registration function belongs to the package that owns `mod`,
+# judged by the first frame outside StrictMode and Base. A frame that runs a method of its own
+# belongs to that method's package. One without a method (an inlined call, or top-level code) keeps
+# only its file, which must lie in the directory of the owner's own source file. The owner's
+# directory as a whole is not enough: an extension in `ext/` and a package nested under it are
+# other packages, and a registration they make is lost like any other dependent's.
 function _registered_by_owner(mod::Module)
-    dir = pkgdir(Base.moduleroot(mod))
-    isnothing(dir) && return false
+    root = Base.moduleroot(mod)
+    path = pathof(root)
+    isnothing(path) && return false
+    src = joinpath(dirname(path), "")
     for fr in stacktrace()
         file = String(fr.file)
         # Base's own frames carry a relative path.
         (isabspath(file) && !startswith(file, @__DIR__)) || continue
-        return startswith(file, joinpath(dir, ""))
+        m = _frame_method(fr)
+        m isa Method && return Base.moduleroot(m.module) === root
+        return startswith(file, src)
     end
     return false
 end
