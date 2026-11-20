@@ -573,10 +573,16 @@ StrictMode/src/
                         parameterized), and so is convert to one, whatever is converted, since
                         lowered code carries no types — a Ptr argument or annotation is not; a
                         local assigned ONCE is followed to its value (_single_assignment:
-                        `B = Base; B.unsafe_load(p)`, `T = Ptr{Float64}; T(a)`); a module global
+                        `B = Base; B.unsafe_load(p)`, `T = Ptr{Float64}; T(a)`), and the module
+                        operand of `M.name` to EVERY module it can hold (_lowered_modules: each
+                        assignment of a local assigned more than once, through the convert/
+                        typeassert of a typed local); a module global
                         read by a run-time name cannot be resolved and is reported as
                         :dynamic_global (_dynamic_global_read: getglobal always, getproperty and
-                        getfield only when the first operand resolves to a Module); a
+                        getfield only when the first operand can be a Module); code evaluated at
+                        run time (Core.eval, Base.eval, include_string, include, and any
+                        Core.EvalInto/Base.IncludeInto — a module's own eval/include) is :eval,
+                        named as a callee or as a value, for the same reason; a
                         name read through a module (`f = Base.unsafe_load`, getglobal(Base, …)) is
                         resolved by _lowered_global_read, as a statement or as a stored value; :cfunction is a
                         statement head; a memoryref builtin or getfield with a literal `false`

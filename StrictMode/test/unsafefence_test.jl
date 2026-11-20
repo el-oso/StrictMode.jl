@@ -410,3 +410,18 @@ end
     end
     @test isempty(unsafe_report(FenceLocalsManyClean))
 end
+
+@testitem "unsafe_report reports code evaluated at run time" begin
+    using StrictMode
+
+    module FenceEval
+    by_eval(p, nm::Symbol) = Core.eval(Base, nm)(p)
+    run_c(x::Int) = @eval ccall(:abs, Cint, (Cint,), $x)
+    own_eval(ex) = eval(ex)
+    by_string(s) = include_string(@__MODULE__, s)
+    end
+    fs = unsafe_report(FenceEval)
+    @test length(fs) == 4
+    @test all(f -> StrictMode._failed(f) && occursin("`eval`", f.reason), fs)
+    @test isempty(unsafe_report(FenceEval; allow = (:eval,)))
+end

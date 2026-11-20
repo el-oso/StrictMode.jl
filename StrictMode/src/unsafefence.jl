@@ -25,10 +25,18 @@ const _UNSAFE_LIBC = Base.IdSet{Any}(
 )
 
 # The construct names that are not the name of a function: a `ccall` statement, an `@cfunction`,
-# `@inbounds`, a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`), and a
+# `@inbounds`, a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`), a
 # global of a module read by a name that is a run-time value (`getglobal(Base, nm)`), which may be
-# any function the module holds.
-const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr, :dynamic_global)
+# any function the module holds, and code evaluated at run time (`eval`, `include_string`), which
+# may do anything.
+const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr, :dynamic_global, :eval)
+
+# The functions that evaluate code at run time. What that code does is a value of the call, so,
+# like a `dynamic_global` read, it cannot be read from the method or cleared. A module's own `eval`
+# and `include` are instances of the two types, one per module.
+const _EVAL_FUNCS = Base.IdSet{Any}((Core.eval, Base.eval, Base.include_string, Base.include))
+const _EVAL_TYPES = Tuple(getglobal(M, n) for (M, n) in ((Core, :EvalInto), (Base, :IncludeInto)) if isdefined(M, n))
+_is_eval(@nospecialize(v)) = v in _EVAL_FUNCS || any(T -> v isa T, _EVAL_TYPES)
 
 # The builtins that take a bounds-check flag as their last argument. A literal `false` there reads
 # or writes without the check, as `@inbounds` does.
@@ -55,6 +63,7 @@ _is_unsafe_name(nm::Symbol) = nm in _UNSAFE_NAMES || startswith(String(nm), "uns
 # function as an argument of some other call, or as a value.
 function _unsafe_function(@nospecialize(v))
     (v isa Function || v isa Core.IntrinsicFunction) || return nothing
+    _is_eval(v) && return :eval
     v in _UNSAFE_LIBC && return nameof(v)::Symbol   # by identity, so before the name test
     nm = try
         nameof(v)
@@ -343,6 +352,7 @@ own are read like every other method.
 | a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)` | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 | a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
+| code evaluated at run time: `eval`, `@eval`, `Core.eval`, `include_string`, `include`, whether called or passed on | `:eval` |
 
 A function counts wherever the method names it, not only where it calls it: `map(unsafe_load, ps)`,
 `unsafe_load.(ps)`, `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own = false)` and
