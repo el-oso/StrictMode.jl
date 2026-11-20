@@ -283,8 +283,34 @@ const _STORE_OPS = Dict(
     :memoryrefswap! => 1, :memoryrefmodify! => 1, :memoryrefreplace! => 1,
     :memoryrefsetonce! => 1,
 )
-# Value-carrying: the result holds its operands, so it is tainted if any is.
-const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse))
+# Value-carrying: the result holds its operands, so it is tainted if any is. `svec` is how optimized
+# IR packs the collections of a splatted call, and `compilerbarrier` (`Base.inferencebarrier`)
+# returns its argument.
+const _CARRY_OPS = Set{Symbol}((:tuple, :ifelse, :svec, :compilerbarrier))
+
+# Builtins that call a function they are handed: the position of that function among the data
+# arguments, and the position the arguments it is called with start at. `_apply_iterate` splats each
+# collection from there on; `finalizer` calls its function on the object later.
+const _CALLING_BUILTIN_ARGS = Dict{Symbol, Tuple{Int, Int}}(
+    :_apply_iterate => (2, 3), :_call_latest => (1, 2), :invokelatest => (1, 2), :invoke => (1, 3),
+    :invoke_in_world => (2, 3), :_call_in_world => (2, 3), :_call_in_world_total => (2, 3),
+    :finalizer => (1, 2),
+)
+
+# The arguments a calling builtin passes to its function, as far as the IR states them. A splatted
+# collection is read when it is a literal `tuple`/`svec`; the list stops before the first one that
+# is not, since what follows it lands at positions the IR does not give.
+function _called_args(bn::Symbol, dataargs, astart::Int, code)
+    astart <= length(dataargs) || return Any[]
+    bn === :_apply_iterate || return collect(Any, @view dataargs[astart:end])
+    args = Any[]
+    for c in @view dataargs[astart:end]
+        s = c isa Core.SSAValue ? code[c.id] : nothing
+        (Meta.isexpr(s, :call) && _callee_name(s.args[1]) in (:tuple, :svec)) || break
+        append!(args, @view s.args[2:end])
+    end
+    return args
+end
 
 # Is this dynamic callee a builtin or intrinsic that cannot mutate? A builtin cannot dispatch, so
 # it is not the unresolved call the conservative record is for — but `_STORE_OPS` and
@@ -302,7 +328,8 @@ const _NEVER_READONLY = Set{Symbol}(
     )
 )
 
-function _is_readonly_builtin(@nospecialize(callee))
+# The name of the builtin or intrinsic a callee resolves to, or `nothing` when it is neither.
+function _builtin_name(@nospecialize(callee))
     # Optimized IR names a builtin through a binding or holds the builtin itself as the callee.
     v = if callee isa Core.Builtin || callee isa Core.IntrinsicFunction
         callee
@@ -310,23 +337,28 @@ function _is_readonly_builtin(@nospecialize(callee))
         try
             getglobal(callee.mod, callee.name)
         catch
-            return false
+            return nothing
         end
     else
-        return false
+        return nothing
     end
-    (v isa Core.Builtin || v isa Core.IntrinsicFunction) || return false
-    # Judged on the RESOLVED name, not the spelling at the call site: `import Core: setfield! as
-    # st!` reaches the same builtin under a name no table lists, and clearing it would be a silent
-    # pass on a write.
-    true_name = try
+    (v isa Core.Builtin || v isa Core.IntrinsicFunction) || return nothing
+    return try
         nameof(v)
     catch
-        return false
+        nothing
     end
+end
+
+function _is_readonly_builtin(@nospecialize(callee))
+    # Judged on the RESOLVED name, not the spelling at the call site: `import Core: setfield! as
+    # st!` reaches the same builtin under a name no table lists, and clearing it would be a silent
+    # pass on a write. A builtin that calls the function it is handed does whatever that does.
+    true_name = _builtin_name(callee)
+    isnothing(true_name) && return false
     return !(
         haskey(_STORE_OPS, true_name) || true_name in _BASE_MUTATORS ||
-            true_name in _NEVER_READONLY
+            true_name in _NEVER_READONLY || haskey(_CALLING_BUILTIN_ARGS, true_name)
     )
 end
 const _BASE_MUTATORS = Set{Symbol}(
@@ -642,8 +674,10 @@ function _taint_scan_ci(
                 pos = _PROJECT_OPS[nm]
                 if 1 <= pos <= length(dataargs)
                     src = dataargs[pos]
-                    maybe(src) && (nm === :memoryrefnew || nm === :memoryref || _may_ref(types[i]) ||
-                        _holds_ptr(Core.Compiler.widenconst(types[i]))) && setmaybe(i)
+                    maybe(src) && (
+                        nm === :memoryrefnew || nm === :memoryref || _may_ref(types[i]) ||
+                            _holds_ptr(Core.Compiler.widenconst(types[i]))
+                    ) && setmaybe(i)
                     if gtainted(src) && _may_ref(types[i]) && !_is_lock_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
                         push!(gset, i); changed = true
                     end
@@ -836,6 +870,30 @@ function _taint_scan_ci(
                         "hands a plan-reachable value to `$nm`, a mutating operation", fr;
                         certain = true
                     )
+                elseif haskey(_CALLING_BUILTIN_ARGS, something(_builtin_name(callee), :_))
+                    # `invokelatest(fill!, plan.buf, 0.0)`, `push!(plan.log, xs...)`: the call is
+                    # the function handed in, on the arguments that follow it.
+                    bn = _builtin_name(callee)
+                    fpos, astart = _CALLING_BUILTIN_ARGS[bn]
+                    inner = fpos <= length(dataargs) ? _callee_name(dataargs[fpos]) : nothing
+                    iargs = _called_args(bn, dataargs, astart, code)
+                    if !isnothing(inner) && inner in _BASE_MUTATORS &&
+                            _mutator_dest(inner) <= length(iargs) &&
+                            _op_tainted(iargs[_mutator_dest(inner)], tset, targs)
+                        _record!(
+                            out, seen, chain,
+                            "hands a plan-reachable value to `$inner` (through `$bn`), a mutating operation", fr;
+                            certain = true
+                        )
+                    else
+                        _record!(
+                            out, seen, chain,
+                            "hands a plan-reachable value to " *
+                                (isnothing(inner) ? "a function it does not resolve" : "`$inner`") *
+                                " through `$bn` — StrictMode cannot prove it treats the plan as " *
+                                "read-only (flagged conservatively)", fr
+                        )
+                    end
                 elseif _is_readonly_builtin(callee)
                     # A builtin or intrinsic, which cannot dispatch and cannot mutate unless it is
                     # one of the named writes. Classified by what the callee RESOLVES to, never by
@@ -947,8 +1005,10 @@ const _ATOMIC_POINTER_WRITES = (
 )
 
 # A type whose objects are how tasks synchronize; a value of it read out of a global is not shared data.
-_is_sync_type(@nospecialize(T)) = T isa Type && (T <: Base.AbstractLock || T <: Threads.Atomic ||
-    T <: Base.GenericCondition || T <: Base.Event || T <: Channel || T <: Base.Semaphore)
+_is_sync_type(@nospecialize(T)) = T isa Type && (
+    T <: Base.AbstractLock || T <: Threads.Atomic ||
+        T <: Base.GenericCondition || T <: Base.Event || T <: Channel || T <: Base.Semaphore
+)
 
 # The call methods of a closure, or of any struct with a call method of its own, built from a plan
 # value. Each is scanned with only the captured fields that received a plan value tainted, so a fresh
@@ -982,8 +1042,10 @@ function _recurse_closure_body(
         _is_base_core(m.module) && continue
         # A compiled specialization for this closure type has concrete argument types, so a task
         # it spawns has a concrete closure type; the declared signature is the fallback.
-        sigs = Any[mi.specTypes for mi in Base.specializations(m)
-            if mi isa Core.MethodInstance && mi.specTypes isa DataType && mi.specTypes.parameters[1] === T]
+        sigs = Any[
+            mi.specTypes for mi in Base.specializations(m)
+                if mi isa Core.MethodInstance && mi.specTypes isa DataType && mi.specTypes.parameters[1] === T
+        ]
         isempty(sigs) && push!(sigs, Tuple{T, Base.unwrap_unionall(m.sig).parameters[2:end]...})
         for sig in sigs
             cts = try
@@ -1232,10 +1294,10 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
         io,
         sure ?
             "writes state that concurrent tasks share (the plan argument, or a global) — NOT safe to " *
-                "run concurrently" :
+            "run concurrently" :
             _only_global_atomics(vs) ?
             "makes atomic writes to global state that every concurrent call shares; the plan " *
-                "argument is not written. The writes cannot tear, and the state is still shared" :
+            "argument is not written. The writes cannot tear, and the state is still shared" :
             "cannot establish that the plan argument is read-only — sharing it across concurrent " *
             "tasks is unproven, not disproven",
         " (", _conc_counts(groups), "):"
@@ -1677,20 +1739,22 @@ function _held_across_suspension(
         end
         return false
     end
-    reaches(i, j) = (blk[i] == blk[j] && i < j) || (begin
-        seenb = falses(length(cfg.blocks)); stack = copy(succs(blk[i])); found = false
-        while !isempty(stack) && !found
-            b = pop!(stack); seenb[b] && continue; seenb[b] = true
-            found = b == blk[j]; append!(stack, succs(b))
+    reaches(i, j) = (blk[i] == blk[j] && i < j) || (
+        begin
+            seenb = falses(length(cfg.blocks)); stack = copy(succs(blk[i])); found = false
+            while !isempty(stack) && !found
+                b = pop!(stack); seenb[b] && continue; seenb[b] = true
+                found = b == blk[j]; append!(stack, succs(b))
+            end
+            found
         end
-        found
-    end)
+    )
     # Where each tainted value is used. A phi uses its incoming value on the edge it arrives by, so the
     # use is placed at that edge's last statement, not at the phi: a value that arrives only on the
     # loop's entry edge is not used after a suspension the back edge carries.
     uses = Dict{Int, Vector{Int}}()
     function adduses!(@nospecialize(x), at::Int)
-        if x isa Core.SSAValue
+        return if x isa Core.SSAValue
             x.id in tainted && push!(get!(Vector{Int}, uses, x.id), at)
         elseif x isa Expr
             foreach(a -> adduses!(a, at), x.args)
@@ -1728,8 +1792,10 @@ function _held_across_suspension(
                 ": another task can then run on this thread and use the same state"
             # The writes are certain, but the hazard is as certain as its suspension and no more.
             sure = how === :yes
-            return [_ConcViol(msg, fr.file, fr.line, sure, false);
-                [_ConcViol(w.message, w.file, w.line, sure && w.certain, w.deliberate) for w in writes]]
+            return [
+                _ConcViol(msg, fr.file, fr.line, sure, false);
+                [_ConcViol(w.message, w.file, w.line, sure && w.certain, w.deliberate) for w in writes]
+            ]
         end
     end
     return _ConcViol[]

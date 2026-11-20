@@ -1515,3 +1515,32 @@ end
     @test occursin("argument 1 is not written; global state every concurrent call shares is written atomically", f.reason)
     @test !occursin("cannot prove argument 1 is read-only", f.reason)
 end
+
+@testitem "a builtin that calls the function it is handed passes the plan on to it" begin
+    using StrictMode
+
+    module CallingBuiltins
+    struct P
+        log::Vector{Float64}
+        buf::Vector{Float64}
+    end
+    splat!(p::P, xs::Vector{Float64}) = (push!(p.log, xs...); nothing)
+    late!(p::P) = (Base.invokelatest(fill!, p.buf, 0.0); nothing)
+    late_any(p::P, f::Function) = (Base.invokelatest(f, p.buf); nothing)
+    barrier!(p::P) = (b = Base.inferencebarrier(p.buf); b[1] = 0.0; nothing)
+    end
+    C = CallingBuiltins
+    # The inner callee is a known mutator and the plan sits where it writes: a write the scan read.
+    for (f, sig, nm) in ((C.splat!, (C.P, Vector{Float64}), "push!"), (C.late!, (C.P,), "fill!"))
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test any(v -> v.certain && occursin(nm, v.message), vs)
+    end
+    # An inner callee the scan cannot name is a site it could not rule out.
+    vs = StrictMode.concurrency_findings(C.late_any, (C.P, Function))
+    @test !isempty(vs)
+    @test all(v -> !v.certain, vs)
+    # A barrier returns its argument, so the value behind it is still the plan's.
+    @test any(v -> v.certain, StrictMode.concurrency_findings(C.barrier!, (C.P,)))
+    @test_throws StrictViolation @assert_concurrency_safe C.late!(C.P(Float64[], [1.0]))
+end
+
