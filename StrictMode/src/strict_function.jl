@@ -290,7 +290,8 @@ subject follows it.
 Subjects:
 
 - a **definition** — defines the function and exempts it. A qualified name works, so a method on a
-  foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`.
+  foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`. That excuses the
+  methods of `Base.length` this module defines, and no other module's.
 - a **name** — `@strict_exempt foo` or `@strict_exempt :foo`, exempting every signature of it.
 - a **block** — `@strict_exempt begin … end`, exempting every function it defines. One visible
   marker for a cold region instead of one per definition; each definition still records this line,

@@ -362,7 +362,9 @@ StrictMode/src/
                         the one enumerator behind every compiled sweep (audit sweep, test_compiled,
                         inline/dispatch/static-ownership suggestions), walks the module own
                         functions and then takes from the census each method the module defines
-                        on a function ANOTHER module owns, sweeping that method only; _coverage_all_findings
+                        on a function ANOTHER module owns, sweeping that method only; an
+                        exemption of such a function excuses only the declaring module's methods
+                        (_exempt_in, asked per method by _is_exempt(f, m)); _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function
                         form; _is_parametric_def keeps a `where` definition out of the registry.
                         _STORES/_store_for memoize each module's store so a reader never touches a

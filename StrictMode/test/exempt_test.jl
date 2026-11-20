@@ -351,3 +351,37 @@ end
     @test StrictMode._failed(nf(Scoped6.shower))          # an unrelated `string` is not excused
     @test nf(Scoped6.uses_mine).status === :info           # its own callee is
 end
+
+@testitem "an exemption of a method on another module's function excuses only that method" begin
+    using StrictMode
+
+    # Two modules add methods to the same function, `Base.length`, and one of them also extends a
+    # function the other owns. Only the module that wrote `@strict_exempt` has a method excused.
+    module SweptOwner
+    struct Grows
+        n::Int
+    end
+    Base.length(g::Grows) = length(zeros(g.n))
+    owned(g::Grows) = length(zeros(g.n))
+    end
+    module Exempter
+    using StrictMode
+    import ..SweptOwner
+    struct Foo end
+    @strict_exempt Base.length(::Foo) = 1
+    @strict_exempt SweptOwner.owned(::Foo) = 2
+    end
+    B, A = SweptOwner, Exempter
+    length(B.Grows(3)); B.owned(B.Grows(3))
+
+    fs = audit(B; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    @test count(f -> f.func == "length", fs) == 1
+    @test count(f -> f.func == "owned", fs) == 1
+    ms, skipped = StrictMode.module_methods(B)
+    @test count(m -> m.name === :length, ms) == 1
+    @test count(m -> m.name === :owned, ms) == 1
+    # The exempting module's own methods are still excused.
+    ms, skipped = StrictMode.module_methods(A)
+    @test !any(m -> m.name in (:length, :owned), ms)
+    @test get(skipped, :exempt, 0) == 2
+end

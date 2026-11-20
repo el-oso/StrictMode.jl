@@ -443,19 +443,21 @@ const STRICT_EXEMPT = Exemption[]
 
 # Whether `e` covers this function, signature and guarantee. A field left `nothing` matches
 # anything, so the common whole-function form keeps its meaning while a narrow one binds tightly.
+# `types` may also be one `Method`, which matches any signature.
 function _covers(e::Exemption, name::Symbol, @nospecialize(types), g::Union{Nothing, Symbol})
     e.func === name || return false
     isnothing(e.guarantees) || isnothing(g) || g in e.guarantees || return false
-    isnothing(e.types) || isnothing(types) || Tuple(types) == e.types || return false
+    isnothing(e.types) || isnothing(types) || types isa Method || Tuple(types) == e.types || return false
     return true
 end
 
-# The coarse question the module sweeps ask: is this function opted out of everything? A narrow
-# exemption must NOT answer yes here — it would silence guarantees it never claimed.
-function _is_exempt(@nospecialize(f))
+# The coarse question the module sweeps ask: is this function, or its method `at`, opted out of
+# everything? A narrow exemption must NOT answer yes here — it would silence guarantees it never
+# claimed.
+function _is_exempt(@nospecialize(f), at::Union{Nothing, Method} = nothing)
     name = _demangle(_callable_name(f))
     for (mod, e) in _scoped_exemptions()
-        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && _exempt_in(mod, e, f, nothing) && return true
+        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && _exempt_in(mod, e, f, at) && return true
     end
     return false
 end
@@ -487,7 +489,10 @@ end
 
 # An exemption covers the declaring module's own code only: the function it owns, or its method of a
 # function it extends. Matched by name alone, one module's exemption of `build_q` silenced the checks
-# on every other module's `build_q`. One declared outside any module matches by name.
+# on every other module's `build_q`. One declared outside any module matches by name. `types` is a
+# signature, one `Method`, or `nothing` for the whole function, which a function another module owns
+# has covered only when every method of it is the declaring module's: the sweeps drop a function the
+# coarse question excuses, with every method another module wrote for it.
 function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f), @nospecialize(types))
     mod = something(e.mod, store, Some(nothing))
     isnothing(mod) && return true
@@ -498,21 +503,21 @@ function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f
         nothing
     end
     owner === root && return true
-    ms = if isnothing(types)
-        try
+    types isa Method && return types.module === root
+    if isnothing(types)
+        ms = try
             methods(f)
         catch
             Method[]
         end
-    else
-        m = try
-            which(f, Tuple{types...})
-        catch
-            nothing
-        end
-        isnothing(m) ? Method[] : [m]
+        return !isempty(ms) && all(m -> m.module === root, ms)
     end
-    return any(m -> m.module === root, ms)
+    m = try
+        which(f, Tuple{types...})
+    catch
+        nothing
+    end
+    return !isnothing(m) && m.module === root
 end
 
 function _exempt!(
@@ -865,7 +870,7 @@ function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
         startswith(String(m.name), "@") && return nothing
         ft = _method_function(m)
         (ft isa DataType && isdefined(ft, :instance)) || return nothing   # a callable object's
-        any(g -> _is_exempt(ft.instance, nothing, g), policy) && return nothing
+        any(g -> _is_exempt(ft.instance, m, g), policy) && return nothing
     end
     return length(ms)
 end
@@ -1220,7 +1225,7 @@ function module_methods(
             (f = F)
         reason === :unreadable && !isnothing(onlypred) && return bump!(:filtered)
         if !isnothing(f)
-            ((!include_exempt && _is_exempt(f)) || (!isnothing(exemptpred) && exemptpred(f))) &&
+            ((!include_exempt && _is_exempt(f, m)) || (!isnothing(exemptpred) && exemptpred(f))) &&
                 return bump!(:exempt)
             isnothing(onlypred) || onlypred(f) || return bump!(:filtered)
         end
