@@ -170,7 +170,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
     # loop over a loosely typed collection reads as a possible payload read.
     other = _other_field_reads(ci)
-    overridden = _untrusted_getproperty_overridden()
+    overridden = (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3))
     # A keyword function's positional and `Core.kwcall` methods only forward to its body function,
     # where the code the caller wrote is; that body is read as part of `f`'s own.
     m = ci.parent isa Core.MethodInstance ? ci.parent.def : nothing
@@ -201,16 +201,27 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             push!(certain, nameof(callee))
             # StrictMode's two-argument `getproperty` raises on an `Untrusted` whatever the name, so on
             # a value whose type is not known `p.x` reads no payload: it is a field of something else,
-            # or an error. That holds only while that method is the one an `Untrusted` reaches. The
-            # three-argument form, `getproperty(p, :x, order)`, is Base's, and reads the field.
-        elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
-                (callee !== Base.getproperty || length(args) != 2 || overridden) &&
+            # or an error. The three-argument form, `getproperty(p, :x, order)`, is Base's, and reads
+            # the field it names. A method a package adds for an `Untrusted` returns what it chooses
+            # whatever the name, so once one exists every erased read of that arity may be a payload read.
+        elseif typeintersect(T, Untrusted) !== Union{} &&
+                _erased_read(callee, args, overridden) &&
                 !_same_value_has_another_field(ci, other, i, args[1]) &&
                 !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
         end
     end
     return (certain, erased)
+end
+
+# Whether an erased call to a payload-reading function reads the `Untrusted` field. `overridden`
+# holds `_untrusted_getproperty_overridden` for two and three arguments.
+function _erased_read(@nospecialize(callee), args, overridden::Tuple{Bool, Bool})
+    if callee === Base.getproperty && length(args) in (2, 3)
+        overridden[length(args) - 1] && return true
+        length(args) == 2 && return false
+    end
+    return _reads_untrusted_field(callee, args)
 end
 
 # Whether an operand is what `iterate` or `indexed_iterate` returned: a tuple of an element and
@@ -222,13 +233,16 @@ function _iteration_result(ci, @nospecialize(a))
     return callee === Base.indexed_iterate || callee === Base.iterate
 end
 
-# Whether some `Untrusted` reaches a `getproperty` method other than StrictMode's own: a package
-# that gave its wrapped type a method returning the payload. Read from the method table as it is
-# now, so the answer changes when such a method is defined or deleted.
-function _untrusted_getproperty_overridden()
-    ms = Base._methods_by_ftype(Tuple{typeof(getproperty), Untrusted, Symbol}, -1, Base.get_world_counter())
+# Whether some `Untrusted` reaches a `getproperty` method of `nargs` arguments (2, or 3 with a
+# memory order) other than StrictMode's own and Base's generic one: a package that gave its wrapped
+# type a method returning the payload. Read from the method table as it is now, so the answer
+# changes when such a method is defined or deleted.
+function _untrusted_getproperty_overridden(nargs::Int = 2)
+    sig = nargs == 2 ? Tuple{typeof(getproperty), Untrusted, Symbol} :
+        Tuple{typeof(getproperty), Untrusted, Symbol, Symbol}
+    ms = Base._methods_by_ftype(sig, -1, Base.get_world_counter())
     ms isa Vector || return true
-    return any(match -> Base.moduleroot(match.method.module) !== @__MODULE__, ms)
+    return any(match -> !(Base.moduleroot(match.method.module) in (@__MODULE__, Base)), ms)
 end
 
 # Each `getfield` of a field `Untrusted` does not have, as statement index => operand.
@@ -377,7 +391,9 @@ call can do: `getfield` and `unsafe_trust` on it are reported as reads that cann
 and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
 name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the field, so it is
 reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
-from then on `p.x` on an untyped value is reported like the other two. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`reinterpret(UInt32, u)`, `show`) is not seen, and nothing verifies that a registered boundary really validates or
+from then on `p.x`, `p.v` or a property of any name read from an untyped value is reported like
+the other two, since that method returns what it chooses whatever the name. A method for the form
+with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`reinterpret(UInt32, u)`, `show`) is not seen, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to

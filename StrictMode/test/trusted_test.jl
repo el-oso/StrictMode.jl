@@ -324,9 +324,12 @@ end
     const D = Dict{Symbol, Any}(:a => Pt(1.0), :u => Untrusted(MyT(7)))
     norm1(k::Symbol) = (p = D[k]; abs(p.x))
     erased_caller(k::Symbol) = (p = D[k]; p.x)
+    other_name(k::Symbol) = (p = D[k]; p.v)
+    any_name(k::Symbol, n::Symbol) = getproperty(D[k], n)
+    ordered_name(k::Symbol) = getproperty(D[k], :v, :not_atomic)
     end
     O = OverrideCallers
-    status(f) = only(findings(f, (Symbol,); guarantees = (:trusted,)))
+    status(f, T = (Symbol,)) = only(findings(f, T; guarantees = (:trusted,)))
 
     # StrictMode's own method is the only one for an `Untrusted`, and it raises: `p.x` on an
     # untyped value reads no payload. Both callers are compiled first, so each verdict cached below
@@ -337,6 +340,9 @@ end
     @test !StrictMode._untrusted_getproperty_overridden()
     @test status(O.norm1).status === :pass
     @test status(O.erased_caller).status === :pass
+    @test status(O.other_name).status === :pass
+    @test status(O.any_name, (Symbol, Symbol)).status === :pass
+    @test status(O.ordered_name).status === :pass
 
     # A package gives its own wrapped type a `getproperty` that returns the payload. From then on
     # `p.x` on an untyped value can read one, and the verdicts above, which were cached, no longer hold.
@@ -348,6 +354,11 @@ end
         @test StrictMode._failed(r)
         @test occursin("may read an `Untrusted` payload", r.reason)
     end
+    # The method chooses its result whatever the name, so a read of any other name, or of a name
+    # known only at run time, can return the payload too.
+    @test Base.invokelatest(O.other_name, :u) === O.MyT(7)
+    @test StrictMode._failed(Base.invokelatest(status, O.other_name))
+    @test StrictMode._failed(Base.invokelatest(status, O.any_name, (Symbol, Symbol)))
     # At a call site it warns and does not raise: the scan did not see a read on a value typed
     # `Untrusted`, only one it cannot rule out.
     @test_logs (:warn, r"may read an `Untrusted` payload"s) match_mode = :any Base.invokelatest(() -> @assert_trusted O.erased_caller(:u))
@@ -359,6 +370,13 @@ end
     Base.delete_method(which(getproperty, (Untrusted{O.MyT}, Symbol)))
     @test !StrictMode._untrusted_getproperty_overridden()
     @test Base.invokelatest(status, O.norm1).status === :pass
+
+    # The same holds for the form with a memory order, which a package overrides separately.
+    Core.eval(O, :(Base.getproperty(u::Untrusted{MyT}, s::Symbol, o::Symbol) = getfield(u, :x)))
+    @test Base.invokelatest(O.ordered_name, :u) === O.MyT(7)
+    @test StrictMode._failed(Base.invokelatest(status, O.ordered_name))
+    Base.delete_method(which(getproperty, (Untrusted{O.MyT}, Symbol, Symbol)))
+    @test Base.invokelatest(status, O.ordered_name).status === :pass
 end
 
 @testitem "getproperty with a memory order on an untyped value may read the payload" begin

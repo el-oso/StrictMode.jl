@@ -35,7 +35,8 @@ function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    overridden = :trusted in guarantees ? _untrusted_getproperty_overridden() : nothing
+    overridden = :trusted in guarantees ?
+        (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3)) : nothing
     return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
 end
 
