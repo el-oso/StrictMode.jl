@@ -390,3 +390,23 @@ end
     @test isempty(unsafe_report(GenTyped; only = (:sumtup,)))
     @test occursin("`unsafe_load`", only(unsafe_report(GenTyped; only = (:loadtup,))).reason)
 end
+
+@testitem "unsafe_report follows every module a local can hold" begin
+    using StrictMode
+
+    module FenceLocalsMany
+    twice(p, c::Bool) = (M = Core; c && (M = Base); M.unsafe_load(p))
+    typed(p) = (M::Module = Base; M.unsafe_load(p))
+    twice_by_name(p, c::Bool, nm) = (M = Core; c && (M = Base); getfield(M, nm)(p))
+    end
+    found(nm) = only(f for f in unsafe_report(FenceLocalsMany) if f.func == String(nm)).reason
+    @test occursin("`unsafe_load`", found(:twice))
+    @test occursin("`unsafe_load`", found(:typed))
+    @test occursin("`dynamic_global`", found(:twice_by_name))
+
+    module FenceLocalsManyClean
+    twice(v, c::Bool) = (M = Core; c && (M = Base); M.sum(v))
+    typed(v) = (M::Module = Base; M.sum(v))
+    end
+    @test isempty(unsafe_report(FenceLocalsManyClean))
+end

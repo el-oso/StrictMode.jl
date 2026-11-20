@@ -102,7 +102,8 @@ function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
     a isa QuoteNode && return a.value
     if a isa Core.SlotNumber
         # `B = Base; B.unsafe_load(p)` and `T = Ptr{Float64}; T(a)`. A local assigned more than
-        # once holds no one value, and each of its assignments is judged where it is written.
+        # once holds no one value; where it is a module operand, `_lowered_modules` follows each
+        # of its assignments.
         rhs = _single_assignment(code, a)
         return rhs === nothing ? a : _lowered_callee(code, rhs, depth + 1)
     end
@@ -145,7 +146,7 @@ function _dynamic_global_read(code::Vector{Any}, @nospecialize(s))
     nm = s.args[3]
     (nm isa QuoteNode || nm isa Symbol) && return false
     (nm isa Core.SSAValue && code[nm.id] isa QuoteNode) && return false
-    return reader === getglobal || _lowered_callee(code, s.args[2], 1) isa Module
+    return reader === getglobal || !isempty(_lowered_modules(code, s.args[2]))
 end
 
 # The value `M.name` reads: `getproperty(M, :name)`, `getfield(M, :name)` or `getglobal(M, :name)`
@@ -158,12 +159,59 @@ function _lowered_global_read(code::Vector{Any}, @nospecialize(s), depth::Int)
     return (M isa Module && nm isa Symbol && isdefined(M, nm)) ? getglobal(M, nm) : nothing
 end
 
+# Every module a value can be, for the module operand of `M.name`. A local assigned more than once
+# can hold the value of each of its assignments, and a typed local (`M::Module = Base`) is assigned
+# through `convert` and `typeassert`, which hand a module back unchanged.
+function _lowered_modules(code::Vector{Any}, @nospecialize(a), seen::Set{Int} = Set{Int}(), depth::Int = 0)
+    out = Module[]
+    depth > 16 && return out
+    if a isa Core.SlotNumber
+        a.id in seen && return out
+        push!(seen, a.id)
+        for st in code
+            (Meta.isexpr(st, :(=)) && st.args[1] == a) || continue
+            append!(out, _lowered_modules(code, st.args[2], seen, depth + 1))
+        end
+        return out
+    end
+    a isa Core.SSAValue && return _lowered_modules(code, code[a.id], seen, depth + 1)
+    if Meta.isexpr(a, :call) && length(a.args) == 3
+        f = _lowered_callee(code, a.args[1])
+        f === convert && return _lowered_modules(code, a.args[3], seen, depth + 1)
+        f === Core.typeassert && return _lowered_modules(code, a.args[2], seen, depth + 1)
+    end
+    v = _lowered_callee(code, a)
+    v isa Module && push!(out, v)
+    return out
+end
+
+# Every value `M.name` can read, one per module `M` can be: `getproperty(M, :name)`,
+# `getfield(M, :name)` or `getglobal(M, :name)`.
+function _lowered_global_reads(code::Vector{Any}, @nospecialize(s))
+    out = Any[]
+    (Meta.isexpr(s, :call) && length(s.args) == 3) || return out
+    _lowered_callee(code, s.args[1], 1) in (getproperty, getfield, getglobal) || return out
+    nm = s.args[3] isa QuoteNode ? s.args[3].value : s.args[3]
+    nm isa Symbol || return out
+    for M in _lowered_modules(code, s.args[2])
+        isdefined(M, nm) && push!(out, getglobal(M, nm))
+    end
+    return out
+end
+
 function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
     # One finding per method, so the span an `@inbounds` block covers does not matter: a bare
     # `@inbounds a[i]` flags one statement and `@inbounds for …` flags most of the loop, and both
     # mean the same thing about this method.
     any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
     note(@nospecialize(v)) = (nm = _unsafe_function(v); isnothing(nm) || push!(out, nm); nothing)
+    # A value used by name, and when it is `M.name` with `M` a local that can hold several
+    # modules, the global of each.
+    function noteval(@nospecialize(a))
+        note(resolve(a))
+        foreach(note, _lowered_global_reads(ci.code, a isa Core.SSAValue ? ci.code[a.id] : a))
+        return nothing
+    end
     dynamic(@nospecialize(s)) = _dynamic_global_read(ci.code, s)
     # A value a statement can hold by name: lowering gives a global its own statement, so the
     # name is judged where it is USED. A use as a callee, an argument, a stored local or a
@@ -175,10 +223,10 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         # `f = unsafe_load` as one around the name.
         if Meta.isexpr(st, :(=))
             st = st.args[2]
-            (named(st) || Meta.isexpr(st, :call)) && note(resolve(st))
+            (named(st) || Meta.isexpr(st, :call)) && noteval(st)
         end
         if st isa Core.ReturnNode
-            isdefined(st, :val) && named(st.val) && note(resolve(st.val))
+            isdefined(st, :val) && named(st.val) && noteval(st.val)
             continue
         end
         st isa Expr || continue
@@ -197,7 +245,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         # The method table a call goes through does not make the call unsafe, so the function a
         # keyword call, a splat, a broadcast or a `map` is handed counts as much as a callee.
         for a in st.args
-            named(a) && note(resolve(a))
+            named(a) && noteval(a)
         end
         isnothing(callee) && continue
         if _is_ptr_type(callee)
@@ -299,9 +347,10 @@ own are read like every other method.
 A function counts wherever the method names it, not only where it calls it: `map(unsafe_load, ps)`,
 `unsafe_load.(ps)`, `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own = false)` and
 `f = unsafe_load; f(p)` are all reported as `unsafe_load` or `unsafe_wrap`. The name may be
-qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. A module or a
-pointer type kept in a local that is assigned once is followed: `B = Base; B.unsafe_load(p)` and
-`T = Ptr{Float64}; T(addr)` are reported. A lookup whose name is not written in the code,
+qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. A pointer type
+kept in a local that is assigned once is followed, `T = Ptr{Float64}; T(addr)`, and so is a module
+kept in a local to every module it is assigned, typed or not: `B = Base; B.unsafe_load(p)` and
+`M = Core; c && (M = Base); M.unsafe_load(p)` are reported. A lookup whose name is not written in the code,
 `getglobal(Base, nm)`, cannot be resolved to a function, so it is reported as `dynamic_global`
 instead of passing. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
