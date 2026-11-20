@@ -247,3 +247,41 @@ end
     @test occursin("matches no method", f.suggestion)
     @test occursin("never returns", StrictMode.explain(:SM0208))
 end
+
+@testitem "a signature no method matches is unevaluated in both tiers" begin
+    using StrictMode, StrictModeTest
+    h(x::Float64) = x + 1
+    gs = (:owned, :no_threadid_state)
+    # The compiler's effects for a signature with no match start from "every effect holds", and the
+    # scan of no body finds nothing, so either would read as a pass.
+    for fs in (findings(h, (Int,); guarantees = gs), proof_findings(h, (Int,); guarantees = gs))
+        @test length(fs) == 2
+        @test all(StrictMode._failed, fs)
+        @test all(x -> x.code === :SM0203, fs)
+        @test all(x -> occursin("no typed body", x.reason), fs)
+    end
+    @test_throws "no typed body" test_signatures([(h, (Int,))]; guarantees = gs)
+end
+
+@testitem "a signature that is not concrete is not read as one of its methods" begin
+    using StrictMode, StrictModeTest
+    k(x::Real, y::Real) = x + y
+    k(x::Int, y::Int) = Dict(x => y)[x]
+    # A call with concrete types reaches the specific method, and the scan sees what it does.
+    @test StrictMode._failed(only(findings(k, (Int, Int); guarantees = (:owned,))))
+    # The abstract signature matches both methods, and the scan reads one body.
+    for fs in (
+            findings(k, (Real, Real); guarantees = (:noalloc, :noboxing, :owned)),
+            proof_findings(k, (Real, Real); guarantees = (:owned,)),
+        )
+        @test all(StrictMode._failed, fs)
+        @test all(x -> x.code === :SM0203, fs)
+        @test all(x -> occursin("not concrete", x.reason), fs)
+    end
+    # :typestable infers the return over every matching method, so it fails as itself.
+    u(x::Int) = 1
+    u(x::Float64) = "s"
+    f = only(findings(u, (Union{Int, Float64},); guarantees = (:typestable,)))
+    @test StrictMode._failed(f)
+    @test f.code !== :SM0203
+end

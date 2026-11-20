@@ -147,14 +147,35 @@ _barrier_note(md, fn, sg, g::Symbol, barrier::Symbol, file, line; tier::Symbol =
     "", tier, _code(g, nothing)
 )
 
+const _NO_BODY_WHY = "no typed body could be read for this signature (no method matches, or its generator raised)"
+
+# The guarantees `_compiled_output_finding` answers.
+const _SHARED_GUARANTEES = (
+    :owned, :inlined, :vectorized, :no_scalar_loops, :no_spill, :trusted, :noescape,
+    :concurrency_safe, :no_threadid_state,
+)
+
+# The guarantees read from ONE typed body by the value-free scan. A signature that is not concrete
+# can match several methods, and the scan reads one of them, so a verdict there says nothing about
+# the others. Such a signature is unevaluated for these, as it is for the guarantees read from
+# compiled output. `:typestable` is not among them: its return type is inferred over every matching
+# method.
+const _ONE_BODY_GUARANTEES = (:noalloc, :noboxing, :owned)
+
 # Guarantees computed from compiled output rather than from an allocation/inference engine — the
 # same answer whichever tier asks, so `StrictModeTest` delegates here for these instead of keeping
 # a second copy. Returns `nothing` for a guarantee this does not cover.
+#
+# A signature with no typed body is unevaluated here for every guarantee: with no method to read,
+# the scans find nothing and the compiler's effects start from "every effect holds".
 function _compiled_output_finding(
         g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg;
         tier::Symbol = :report
     )
+    g in _SHARED_GUARANTEES || return nothing
+    isnothing(_typed_body(_sigtype(f, types))) && return _unevaluated(md, fn, sg, g, _NO_BODY_WHY; tier)
     if g === :owned
+        _has_compiled_body(f, types) || return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
         s.dictlookup || isnothing(s.barrier_dict) ||
             return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
@@ -279,14 +300,13 @@ end
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
     # A verdict read from no body is not a verdict, for any guarantee: "could not check" must not
     # render as a pass. The body is memoized, and every guarantee below reads it.
-    if isnothing(_typed_body(_sigtype(f, types)))
-        why = "no typed body could be read for this signature (no method matches, or its generator raised)"
-        return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in guarantees]
-    end
+    isnothing(_typed_body(_sigtype(f, types))) &&
+        return StrictFinding[_unevaluated(md, fn, sg, g, _NO_BODY_WHY) for g in guarantees]
+    concrete = _has_compiled_body(f, types)
     # `:noalloc` is decided by the first allocation or boxing, so its scan stops there; `:noboxing`
     # reads dispatch alone, to the end of the call graph.
-    sig = :noalloc in guarantees ? _alloc_signals(f, types; mode = :alloc) : nothing
-    boxsig = :noboxing in guarantees ? _alloc_signals(f, types; mode = :boxing) : nothing
+    sig = concrete && :noalloc in guarantees ? _alloc_signals(f, types; mode = :alloc) : nothing
+    boxsig = concrete && :noboxing in guarantees ? _alloc_signals(f, types; mode = :boxing) : nothing
     # typestable asks a DIFFERENT question than noalloc/noboxing: is THIS function's OWN IR dispatch-
     # free? A resolved `:invoke` to a callee that boxes internally (e.g. the complex `_l3ws` IdDict
     # `get!`, whose abstract result is narrowed by a `::L3Workspace{T}` assert) is not the caller's
@@ -303,6 +323,8 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         shared = _compiled_output_finding(g, f, types, md, fn, sg)
         if !isnothing(shared)
             push!(out, shared)
+        elseif !concrete && g in _ONE_BODY_GUARANTEES
+            push!(out, _unevaluated(md, fn, sg, g, _output_unread(f, types)))
         elseif g === :typestable
             rts = _return_types_memo(f, types)
             badret = length(rts) != 1 || !_is_typestable_return(only(rts))

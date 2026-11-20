@@ -383,6 +383,12 @@ StrictMode/src/
                         this does not cover and proofs.jl does not branch on throws
                         `unknown guarantee` from a message that lists it as expected — a
                         StrictModeTest testitem enumerates _GUARANTEES to pin that shut.
+                        The seam itself refuses (SM0203) a signature with no typed body, for
+                        every guarantee it answers and in both tiers: with no method, a scan
+                        finds nothing and infer_effects reports every effect but nothrow.
+                        _ONE_BODY_GUARANTEES (noalloc/noboxing/owned) are also refused on a
+                        signature that is not concrete, since the scan reads one of the methods
+                        it matches; :typestable is not, its return is inferred over all of them.
                         _always_throws/_mark_always_throws/_gate_always_throws: a signature whose
                         inferred return is Union{} returns on no path, so every guarantee passed
                         on nothing. Each pass becomes an :info SM0208 note in both tiers (a
