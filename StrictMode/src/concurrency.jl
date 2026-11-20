@@ -1115,6 +1115,11 @@ function _recurse_closure_body(
     return nothing
 end
 
+# Counts the task bodies any analysis has read. The compiled code of the method that spawns a task
+# holds no edge to what the task calls, so a verdict that read one cannot be invalidated through
+# that code: `findings` keeps a verdict for its own world only when this moved while it was made.
+const _TASK_BODY_READS = Threads.Atomic{Int}(0)
+
 # A task's body is a method of its own, reached through `jl_new_task` rather than through a call, so
 # the main scan never enters it and a write to a captured buffer reads as no write at all.
 #
@@ -1128,6 +1133,7 @@ function _recurse_task_body(
         memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame;
         fields::Union{Nothing, Set{Int}} = nothing,
     )
+    Threads.atomic_add!(_TASK_BODY_READS, 1)
     held = "spawns a task holding a plan-reachable value"
     if isnothing(T)
         _record!(

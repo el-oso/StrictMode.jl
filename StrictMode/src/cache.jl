@@ -6,7 +6,9 @@
 # The key names the *checked* method, not its callees, so an edit one level down leaves it
 # identical. That is covered separately: each entry also holds the `CodeInstance`s the verdict was
 # read from, and Julia caps their `max_world` when a callee changes. A method that has never been
-# compiled has no instance to watch, so its entry answers only in the world it was made in.
+# compiled has no instance to watch, and neither has a verdict that read the body of a task the
+# method spawns (that code holds no edge to what the task calls), so such an entry answers only in
+# the world it was made in.
 
 # The findings, the `CodeInstance`s they were read from (see `_watch_instances`), and the world.
 const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}, UInt}}()
@@ -79,8 +81,8 @@ _release_after_load_check() = ccall(:jl_generating_output, Cint, ()) == 1 ? clea
 Drop the incremental `findings` cache.
 
 A cached verdict is dropped on its own when the method it names or a callee is edited: the compiled
-code it was read from is invalidated, and a verdict on a method with no compiled code is kept only
-until the next definition. This is for what no definition announces, such as a changed setting a
+code it was read from is invalidated, and a verdict on a method with no compiled code, or one that
+read the body of a task the method spawns, is kept only until the next definition. This is for what no definition announces, such as a changed setting a
 verdict depends on.
 """
 function clear_cache!()

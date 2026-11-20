@@ -97,3 +97,18 @@ end
     @eval @noinline rd_callee(x::Int) = x + 1                  # and back
     @test status(rd_caller, :noalloc) === :pass
 end
+
+@testitem "a cached verdict follows a function called only inside a spawned task" begin
+    using StrictMode
+    # A task's body is reached through `jl_new_task`, not a call, so the checked method's compiled
+    # code holds no edge to what the task calls and an edit there does not invalidate it.
+    tk_helper!(v) = nothing
+    tk_run(v::Vector{Int}) = (t = Threads.@spawn tk_helper!(v); wait(t); nothing)
+    tk_run([1])
+    StrictMode.clear_cache!()
+    verdict() = only(findings(tk_run, (Vector{Int},); guarantees = (:concurrency_safe,)))
+    @test !StrictMode._failed(verdict())
+    @eval tk_helper!(v) = (v[1] = 0; nothing)
+    Base.@invokelatest tk_run([1])
+    @test StrictMode._failed(Base.@invokelatest verdict())
+end

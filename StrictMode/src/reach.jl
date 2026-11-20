@@ -187,6 +187,7 @@ function _reach_scan!(
             end
         elseif st.head === :foreigncall && _fcall_name(st) === :jl_new_task
             T = _sw_task(ci, i, st, sig).T
+            Threads.atomic_add!(_TASK_BODY_READS, 1)
             isnothing(T) ? (r.unread += 1) : push!(queue, (Tuple{T}, depth))
         end
     end

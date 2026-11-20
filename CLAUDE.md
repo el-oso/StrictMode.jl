@@ -385,9 +385,11 @@ StrictMode/src/
                         holds the CodeInstances its verdict was read from (_watch_instances): the
                         key cannot see an edit to a CALLEE, but Julia caps those instances'
                         max_world when one changes, so a stale entry is dropped on lookup. A
-                        method with no compiled code has nothing to watch, so its entry answers
-                        only in the world it was made in (_entry_valid). The memos under it that
-                        outlive a world (_BODY_MEMO, _ESCAPE_MEMO in effects.jl; _SITES_MEMO in
+                        method with no compiled code has nothing to watch, nor has a verdict that
+                        read a spawned task's body (_TASK_BODY_READS in concurrency.jl moved while
+                        it was made: no edge leads from the spawner to what the task calls), so
+                        such an entry answers only in the world it was made in (_entry_valid). The
+                        memos under it that outlive a world (_BODY_MEMO, _ESCAPE_MEMO in effects.jl; _SITES_MEMO in
                         StrictModeTest) carry a _ReadStamp and answer through _read_holds: the
                         compiler's record of the specialization must still be valid AND the
                         signature must still dispatch to that specialization. The second is not

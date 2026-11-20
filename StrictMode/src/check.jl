@@ -239,10 +239,13 @@ function findings(
         end
     end
     world = Base.get_world_counter()
+    tasks = _TASK_BODY_READS[]
     fs = _findings_uncached(f, types, guarantees)
     if !isnothing(key)
+        # A verdict that read a task body has nothing to watch for an edit there (`_TASK_BODY_READS`).
+        watched = _TASK_BODY_READS[] == tasks ? _watch_instances(f, types) : Core.CodeInstance[]
         @lock _CACHE_LOCK begin
-            _CACHE[key] = (fs, _watch_instances(f, types), world)
+            _CACHE[key] = (fs, watched, world)
             _CACHE_MISSES[] += 1
         end
     end
