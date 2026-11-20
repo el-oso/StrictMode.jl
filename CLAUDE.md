@@ -48,7 +48,11 @@ StrictMode/src/
                         (the load-time banner naming which TIER a session is in), direct_dependency
                         (whether an environment this session loads from names StrictMode — the
                         reporting banner's audience test, written to stay trim-clean because
-                        __init__ is a juliac root, issue #28)
+                        __init__ is a juliac root, issue #28), unknown_preferences (keys set for
+                        StrictMode that it does not read, from a byte scan of the preference
+                        files — no TOML parser, same trim reason — covering inline tables too; a
+                        file that exists and cannot be read is named ONCE via _eprint, tracked
+                        in _UNREADABLE_PREFERENCES, never counted as setting nothing)
   static_checks.jl    — @assert_noalloc, @assert_noboxing, @assert_owned, @assert_noescape
                         (register_scoped! types, via the compiler's escape analysis), @assert_noalias
                         (_overlap between the written arguments and the read ones — the only

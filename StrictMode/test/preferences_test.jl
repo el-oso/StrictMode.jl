@@ -267,6 +267,9 @@ end
                     "['StrictMode']\ncheck_enabled = false\n",
                     "StrictMode.check_enabled = false\n",
                     "[StrictMode.check_enabled]\nx = 1\n",
+                    "StrictMode = {check_enabled = false}\n",
+                    "StrictMode = { banner = true, \"check_enabled\" = false } # c\n",
+                    "StrictMode = {banner = \"a, } b\", check_enabled = [1, 2]}\n",
                 )
                 @test found(text, prefs) == ["check_enabled ($prefs)"]
             end
@@ -274,15 +277,61 @@ end
                     "[deps]\n\n[preferences.\"StrictMode\"]\ncheck_enabled = false\n",
                     "[deps]\n\n[preferences]\nStrictMode.check_enabled = false\n",
                     "[deps]\n\n[ preferences . StrictMode ] # note\ncheck_enabled = false\n",
+                    "[deps]\n\n[preferences]\nStrictMode = {check_enabled = false}\n",
+                    "preferences = {Other = {x = 1}, StrictMode = {check_enabled = false}}\n[deps]\n",
                 )
                 @test found(text, proj) == ["check_enabled ($proj)"]
             end
             # Keys StrictMode reads, in the same spellings, and another package's table.
             @test isempty(found("StrictMode.checks_enabled = false\n[ StrictMode ] # c\nbanner = true\n[Other]\ncheck_enabled = 1\n", prefs))
             @test isempty(found("[preferences]\nStrictMode.banner = false\nOther.check_enabled = 1\n", proj))
+            @test isempty(found("StrictMode = {checks_enabled = false, banner = true}\nOther = {check_enabled = 1}\n", prefs))
+            @test isempty(found("[preferences]\nOther = {StrictMode = 1, check_enabled = 1}\n", proj))
             # The whole file is read, however long.
             @test found("[StrictMode]\n" * "# padding\n"^10_000 * "check_enabled = false\n", prefs) == ["check_enabled ($prefs)"]
         finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+end
+
+@testitem "unknown_preferences names a preference file it cannot read" begin
+    using StrictMode
+
+    # A file that cannot be read is named in a warning, once, and the other files are still
+    # searched: an empty list must not stand for "could not look". Permissions are what make a file
+    # unreadable here, and Windows does not deny reads through them.
+    Sys.iswindows() || mktempdir() do dir
+        oldproj, oldload = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH)
+        prefs = joinpath(dir, "LocalPreferences.toml")
+        try
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            proj = joinpath(dir, "Project.toml")
+            Base.set_active_project(proj)
+            write(proj, "[deps]\n\n[preferences.StrictMode]\nchecks_enable = false\n")
+            write(prefs, "[StrictMode]\nbaner = false\n")
+            chmod(prefs, 0o000)
+            # The fixture really is unreadable; as a superuser it would not be.
+            @test_throws SystemError read(prefs)
+            empty!(StrictMode._UNREADABLE_PREFERENCES)
+
+            out = joinpath(dir, "stderr.txt")
+            printed(f) = (open(io -> redirect_stderr(() -> (r = f(); Libc.flush_cstdio(); r), io), out, "w"), read(out, String))
+            (found, text) = printed(StrictMode.unknown_preferences)
+            @test found == ["checks_enable ($proj)"]
+            @test occursin("StrictMode: could not read the preference file $prefs", text)
+            # Once per file: a second search names it no more.
+            (found2, text2) = printed(StrictMode.unknown_preferences)
+            @test found2 == found
+            @test !occursin(prefs, text2)
+            # The load-time warning reaches the same search, and the text it prints holds no `%`.
+            @test !occursin('%', StrictMode._UNREADABLE_PREFERENCE_NOTE)
+        finally
+            chmod(prefs, 0o644)
+            empty!(StrictMode._UNREADABLE_PREFERENCES)
             Base.set_active_project(oldproj)
             empty!(Base.LOAD_PATH)
             append!(Base.LOAD_PATH, oldload)

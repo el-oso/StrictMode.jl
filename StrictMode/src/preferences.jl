@@ -230,7 +230,9 @@ const _KNOWN_PREFERENCES = ("checks_enabled", "banner", "__clear__")
 # A table header and a key are each read as a dotted path, with blanks and quotes dropped and a
 # comment cut off, and a key's path is the current table's followed by its own. So
 # `[ StrictMode ] # note`, `[preferences."StrictMode"]`, and `StrictMode.check_enabled` written as
-# a dotted key, all name StrictMode's table.
+# a dotted key, all name StrictMode's table. A value that opens an inline table, `{ a = 1, … }`, has
+# its keys read under the key it is assigned to, so `StrictMode = {check_enabled = false}` is found
+# too.
 function _unknown_preference_keys!(out::Vector{String}, f::String, table::String)
     isfile(f) || return out
     io = open(f)
@@ -264,17 +266,79 @@ function _unknown_preference_keys!(out::Vector{String}, f::String, table::String
         path = copy(current)
         isempty(path) || push!(path, UInt8('.'))
         append!(path, key)
-        name = _key_in_table(path, table)
-        isnothing(name) && continue
-        known = false
-        for k in _KNOWN_PREFERENCES
-            known |= _bytes_equal(name, 1, length(name), k)
+        _record_unknown!(out, path, table, f)
+        v = eq + 1
+        while v <= b && (buf[v] == UInt8(' ') || buf[v] == UInt8('\t'))
+            v += 1
         end
-        known && continue
-        entry = String(name) * " (" * f * ")"
-        any(==(entry), out) || push!(out, entry)
+        v <= b && buf[v] == UInt8('{') && _inline_table_keys!(out, buf, v + 1, b, path, table, f)
     end
     return out
+end
+
+# Push `name (f)` when the dotted `path` names a key of `table` that StrictMode does not read.
+function _record_unknown!(out::Vector{String}, path::Vector{UInt8}, table::String, f::String)
+    name = _key_in_table(path, table)
+    isnothing(name) && return out
+    for k in _KNOWN_PREFERENCES
+        _bytes_equal(name, 1, length(name), k) && return out
+    end
+    entry = String(name) * " (" * f * ")"
+    any(==(entry), out) || push!(out, entry)
+    return out
+end
+
+# The keys of an inline table, `{ a = 1, b = { c = 2 } }`, whose contents start at `buf[i]` and
+# which sits at the dotted path `prefix`; returns the index just past its closing `}`. TOML keeps an
+# inline table on one line, so the scan ends at `b`. A string value is stepped over whole, so a `,`
+# or `}` inside one does not end the entry.
+function _inline_table_keys!(
+        out::Vector{String}, buf::Vector{UInt8}, i::Int, b::Int, prefix::Vector{UInt8},
+        table::String, f::String
+    )
+    while i <= b
+        while i <= b && (buf[i] == UInt8(' ') || buf[i] == UInt8('\t') || buf[i] == UInt8(','))
+            i += 1
+        end
+        (i > b || buf[i] == UInt8('}')) && return i + 1
+        eq = i
+        while eq <= b && buf[eq] != UInt8('=') && buf[eq] != UInt8('}')
+            eq += 1
+        end
+        (eq > b || buf[eq] == UInt8('}')) && return eq + 1
+        path = copy(prefix)
+        push!(path, UInt8('.'))
+        append!(path, _toml_path(buf, i, eq - 1))
+        _record_unknown!(out, path, table, f)
+        i = eq + 1
+        while i <= b && (buf[i] == UInt8(' ') || buf[i] == UInt8('\t'))
+            i += 1
+        end
+        if i <= b && buf[i] == UInt8('{')
+            i = _inline_table_keys!(out, buf, i + 1, b, path, table, f)
+            continue
+        end
+        # Step over the value: a string whole, an array by its bracket depth.
+        depth = 0
+        while i <= b
+            c = buf[i]
+            if c == UInt8('"') || c == UInt8('\'')
+                i += 1
+                while i <= b && buf[i] != c
+                    c == UInt8('"') && buf[i] == UInt8('\\') && (i += 1)
+                    i += 1
+                end
+            elseif c == UInt8('[')
+                depth += 1
+            elseif c == UInt8(']')
+                depth -= 1
+            elseif depth == 0 && (c == UInt8(',') || c == UInt8('}'))
+                break
+            end
+            i += 1
+        end
+    end
+    return i
 end
 
 # The dotted path `buf[a:b]` spells, without its brackets, blanks and quotes, and ending at a
@@ -332,10 +396,29 @@ end
 function _preference_files!(out::Vector{String}, @nospecialize(p))
     p isa String || return out
     dir = isfile(p) ? _parent_dir(p) : p
-    _unknown_preference_keys!(out, joinpath(dir, "LocalPreferences.toml"), "StrictMode")
-    _unknown_preference_keys!(out, joinpath(dir, "JuliaLocalPreferences.toml"), "StrictMode")
-    _unknown_preference_keys!(out, joinpath(dir, "Project.toml"), "preferences.StrictMode")
-    _unknown_preference_keys!(out, joinpath(dir, "JuliaProject.toml"), "preferences.StrictMode")
+    _scan_preference_file!(out, joinpath(dir, "LocalPreferences.toml"), "StrictMode")
+    _scan_preference_file!(out, joinpath(dir, "JuliaLocalPreferences.toml"), "StrictMode")
+    _scan_preference_file!(out, joinpath(dir, "Project.toml"), "preferences.StrictMode")
+    _scan_preference_file!(out, joinpath(dir, "JuliaProject.toml"), "preferences.StrictMode")
+    return out
+end
+
+# The preference files that could not be read, each named in a warning the first time.
+const _UNREADABLE_PREFERENCES = String[]
+
+const _UNREADABLE_PREFERENCE_NOTE = "└ Its StrictMode keys, if it sets any, are not checked.\n"
+
+# One file's keys. A file that cannot be read is named in a warning, once per session, so that an
+# empty result never stands for a search that failed; the other files are still searched.
+function _scan_preference_file!(out::Vector{String}, f::String, table::String)
+    try
+        _unknown_preference_keys!(out, f, table)
+    catch
+        any(==(f), _UNREADABLE_PREFERENCES) && return out
+        push!(_UNREADABLE_PREFERENCES, f)
+        _eprint("┌ StrictMode: could not read the preference file " * _escape_percent(f) * "\n")
+        _eprint(_UNREADABLE_PREFERENCE_NOTE)
+    end
     return out
 end
 
@@ -371,9 +454,12 @@ Searched: `LocalPreferences.toml` (table `[StrictMode]`) and the project file (t
 `[preferences.StrictMode]`) of the active project, of every explicit path on `LOAD_PATH`, and of
 every shared environment `LOAD_PATH` names, such as `@v#.#`, which is where preferences go when no
 project is active. Any TOML spelling of the table counts: a comment after the header, blanks or
-quotes inside it, or a dotted key such as `StrictMode.check_enabled`.
+quotes inside it, a dotted key such as `StrictMode.check_enabled`, or an inline table such as
+`StrictMode = {check_enabled = false}`.
+
 StrictMode prints a warning at load for each key this returns, whatever the `banner` preference
-is set to. Anything unreadable counts as nothing found.
+is set to. A file that exists and cannot be read is named in a warning of its own, once per
+session, and the other files are still searched, so an empty result is never a search that failed.
 """
 function unknown_preferences()
     out = String[]
@@ -383,6 +469,9 @@ function unknown_preferences()
             _preference_files!(out, startswith(e, '@') ? _named_env(e) : e)
         end
     catch
+        # Past the files themselves, only the walk over `LOAD_PATH` and the depots is left here.
+        _eprint("┌ StrictMode: the search for preference files stopped early.\n" *
+            "└ The files it had not reached are not checked.\n")
     end
     return out
 end

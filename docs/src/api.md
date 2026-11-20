@@ -331,7 +331,8 @@ nothing about a tier its users can act on, so those sessions stay silent.
 StrictMode reads two preference keys, `checks_enabled` and `banner`. Preferences.jl ignores any
 other key without a word, so `check_enabled = false` leaves checks on. StrictMode names each such key
 in a warning at load, with the file it is in, and `unknown_preferences` returns the same list. The
-warning is given whatever `banner` is set to.
+warning is given whatever `banner` is set to. A preference file that exists but cannot be read is
+named in a warning of its own, once per session, rather than counted as setting nothing.
 
 ```@docs
 enable_checks!
