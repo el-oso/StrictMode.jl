@@ -229,3 +229,21 @@ end
     # A macro that performs its call raises the call's own error, so it gives no verdict to trust.
     @test_throws MethodError @assert_typestable A.bad(1)
 end
+
+@testitem "a signature that never returns is described as that, not only as throwing" begin
+    using StrictMode
+
+    # A worker loop infers `Union{}` as an error helper does: no path returns. It throws nothing.
+    feed_forever(ch::Channel{Int}) =
+        while true
+            put!(ch, 1)
+        end
+    f = only(findings(feed_forever, (Channel{Int},); guarantees = (:typestable,)))
+    @test f.code === :SM0208
+    @test f.status === :info
+    @test occursin("always throws or never returns", f.reason)
+    @test occursin("a loop that is meant to run until its task ends", f.suggestion)
+    # The advice for the other two readings is still there.
+    @test occursin("matches no method", f.suggestion)
+    @test occursin("never returns", StrictMode.explain(:SM0208))
+end

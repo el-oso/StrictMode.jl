@@ -55,11 +55,11 @@ function _always_throws(@nospecialize(f), @nospecialize(types::Tuple))
     return !isempty(rts) && all(T -> T === Union{}, rts)
 end
 
-const _ALWAYS_THROWS_WHY = "always throws: the inferred return type is `Union{}`, so nothing on a " *
-    "returning path was checked"
-const _ALWAYS_THROWS_FIX = "if this is not an error helper, a call in its body matches no method " *
-    "for these argument types, or the signature leaves out a required keyword argument; run the " *
-    "call to see which"
+const _ALWAYS_THROWS_WHY = "always throws or never returns: the inferred return type is `Union{}`, " *
+    "so nothing on a returning path was checked"
+const _ALWAYS_THROWS_FIX = "nothing is wrong if this is an error helper, or a loop that is meant to " *
+    "run until its task ends. Otherwise a call in its body matches no method for these argument " *
+    "types, or the signature leaves out a required keyword argument; run the call to see which"
 
 _always_throws_finding(x::StrictFinding, status::Symbol) = StrictFinding(
     x.mod, x.func, x.signature, x.guarantee, status, x.file, x.line,

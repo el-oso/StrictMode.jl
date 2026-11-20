@@ -41,9 +41,10 @@ A check that could not finish never passes. A scan that read only part of the co
 "not established". An analysis that errored reports the error as a failure. A scan that could not
 follow a callee reports that callee as undecided.
 
-A signature that always throws does not pass either. Its inferred return type is `Union{}`, so no
-path returns and there is nothing for a guarantee to check: that is an error helper, and it is also
-a kernel called with a wrong argument type or without a required keyword argument. Every guarantee
+A signature that always throws or never returns does not pass either. Its inferred return type is
+`Union{}`, so no path returns and there is nothing for a guarantee to check: that is an error
+helper, a worker loop that runs until its task ends, and it is also a kernel called with a wrong
+argument type or without a required keyword argument. Every guarantee
 reports SM0208 for it. In a sweep (`audit`, `test_compiled`, `test_registered`, `@strict_policy`)
 that is a note, because a module's error helpers are not defects. Where the signature was listed
 (`test_signatures`, a `@verify_strict` line, `@strict_function signatures = [...]`) it is a failure.
