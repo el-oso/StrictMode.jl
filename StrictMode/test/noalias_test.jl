@@ -69,6 +69,9 @@ end
 
     @test_throws "out of range" @assert_noalias mutates = (9,) swap2!(x, y)
     @test_throws "argument position" @assert_noalias mutates = (:first,) swap2!(x, y)
+    # An empty list names nothing written, which compares no pair.
+    @test_throws "names no argument" @assert_noalias mutates = () swap2!(x, x)
+    @test_throws "names no argument" @assert_noalias mutates = Int[] swap2!(x, x)
 
     # `mutates` names positional arguments, so a keyword call has nothing for it to name.
     @test_throws LoadError @eval @assert_noalias copyto!($x; dims = 1)

@@ -392,6 +392,12 @@ function _check_mutates(mutates, nargs::Int)
     applicable(iterate, mutates) || throw(
         ArgumentError("@assert_noalias: mutates must be a collection of argument positions, got $(typeof(mutates))")
     )
+    isempty(mutates) && throw(
+        ArgumentError(
+            "@assert_noalias: mutates names no argument, so the check would compare no pair and " *
+                "pass every call. Name the positions the call writes, or drop the assertion."
+        )
+    )
     for p in mutates
         p isa Integer || throw(
             ArgumentError("@assert_noalias: each mutates entry must be an argument position, got $(repr(p))")
@@ -689,8 +695,8 @@ engine to answer and no entry in [`StrictMode.guarantee_names`](@ref) — it can
 the one `Base.unalias` uses to decide whether to copy.
 
 Which arguments are written comes from the name — a trailing `!` means argument 1 — and anything
-else must say so with `mutates = (…)`. A call that gives neither is rejected rather than passed,
-since "nothing is written" would compare no pair and accept everything. So is a written position
+else must say so with `mutates = (…)`. A call that gives neither, or an empty `mutates`, is
+rejected rather than passed, since "nothing is written" would compare no pair and accept everything. So is a written position
 that holds no memory: `axpy!(a, x, y)` takes a scalar first, so the `!` default names nothing a
 kernel could write, and the call raises an `ArgumentError` asking for `mutates = (3,)`. The
 convention is not checked beyond that: `ldiv!(F, B)` writes its second argument, and the default

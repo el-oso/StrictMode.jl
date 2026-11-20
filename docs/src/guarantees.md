@@ -1318,7 +1318,7 @@ the arguments may share memory, and never raises.
 From the name: a trailing `!` means argument 1, Julia's convention. A number in that position is
 not taken for the written argument when the call also takes an array: `scale!(2.0, v)` and
 `scale!(big(2.0), v)` are both rejected until `mutates` names the position. Anything else must say so with
-`mutates = (…)`. A call that gives neither is **rejected**, not passed — "nothing is written" would
+`mutates = (…)`. A call that gives neither, or an empty `mutates`, is **rejected**, not passed — "nothing is written" would
 compare no pair and accept every call, and a check that cannot fail is worse than no check. Where
 the callee is written as a plain name the rejection happens at macro expansion, before the call
 runs.
