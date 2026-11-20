@@ -20,15 +20,20 @@
 Mark `x` as data from outside the program — read from a socket or a file, taken from `ARGS`, or
 handed over by a device.
 
-Nothing can be done with the wrapped value except pass it along or give it to a **trust boundary**:
-a function that validates it and returns a plain value, registered with [`trust_boundary!`](@ref).
-Ordinary methods do not match `Untrusted{T}`, so an accidental use raises a `MethodError` instead
-of quietly succeeding, and `u.x` throws. The one deliberate way out is [`unsafe_trust`](@ref).
+The wrapped value is meant to be passed along or given to a **trust boundary**: a function that
+validates it and returns a plain value, registered with [`trust_boundary!`](@ref). Methods written
+for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a `MethodError`
+instead of quietly succeeding, and `u.x` throws. The one deliberate way out is
+[`unsafe_trust`](@ref).
+
+Generic methods that accept any value still reach the payload: `reinterpret(UInt32, u)` copies the
+bytes of an `isbits` payload out, and `show`/`string` print it. Those reads happen inside Base, so
+neither dispatch nor [`@assert_trusted`](@ref) refuses them.
 
 Wrapping is free: `Untrusted{T}` has the same layout as `T` and allocates nothing. Wrapping twice
 returns the same value, so an edge that wraps defensively costs nothing.
 
-[`@assert_trusted`](@ref) fails on any function outside a boundary that reads the payload.
+[`@assert_trusted`](@ref) fails on any function outside a boundary that reads the payload itself.
 
 ```julia
 function parse_header(u::Untrusted{Vector{UInt8}})
@@ -372,7 +377,7 @@ call can do: `getfield` and `unsafe_trust` on it are reported as reads that cann
 and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
 name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the field, so it is
 reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
-from then on `p.x` on an untyped value is reported like the other two. Its other limits are missed violations: only compiled specializations are swept, and nothing verifies that a registered boundary really validates or
+from then on `p.x` on an untyped value is reported like the other two. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`reinterpret(UInt32, u)`, `show`) is not seen, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
