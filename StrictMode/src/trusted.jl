@@ -136,11 +136,11 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     ci = first(cts)[1]
     certain = Symbol[]
     erased = Symbol[]
-    # An object the body also reads ANOTHER field of is not an `Untrusted`, which has one. That is
+    # A value the body also reads ANOTHER field of is not an `Untrusted`, which has one. That is
     # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
     # loop over a loosely typed collection reads as a possible payload read.
-    other = _reads_another_field(ci)
-    for st in ci.code
+    other = _other_field_reads(ci)
+    for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
         T = _unopt_arg_type(ci, args[1])
@@ -148,22 +148,69 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         if T <: Untrusted
             push!(certain, nameof(callee))
         elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
-                !(args[1] in other)
+                !_same_value_has_another_field(ci, other, i, args[1]) &&
+                !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
         end
     end
     return (certain, erased)
 end
 
-# The operands a `getfield` reads a field from that `Untrusted` does not have.
-function _reads_another_field(ci)
-    out = Set{Any}()
-    for st in ci.code
+# Whether an operand is what `iterate` or `indexed_iterate` returned: a tuple of an element and
+# a state, never an `Untrusted`. Destructuring reads only field 1 of the last one, and inference
+# types it `Any` once enough packages have added methods to `indexed_iterate`.
+function _iteration_result(ci, @nospecialize(a))
+    a isa Core.SSAValue || return false
+    callee, _ = _call_callee_and_args(ci, ci.code[a.id])
+    return callee === Base.indexed_iterate || callee === Base.iterate
+end
+
+# Each `getfield` of a field `Untrusted` does not have, as statement index => operand.
+function _other_field_reads(ci)
+    out = Pair{Int, Any}[]
+    for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
         (callee === Core.getfield && length(args) >= 2) || continue
         fld = args[2]
         fld isa QuoteNode && (fld = fld.value)
-        ((fld isa Int && fld != 1) || (fld isa Symbol && fld !== _UNTRUSTED_FIELD)) && push!(out, args[1])
+        ((fld isa Int && fld != 1) || (fld isa Symbol && fld !== _UNTRUSTED_FIELD)) && push!(out, i => args[1])
+    end
+    return out
+end
+
+# Whether the operand read at statement `i` is the same VALUE as one a `getfield` reads another
+# field of. The same operand is the same value only along one path: with a branch between the two
+# statements they can sit on different arms of a type test, where the operand is an `Untrusted`
+# on one arm and something else on the other, and a variable assigned between them holds a
+# different value at each. A jump INTO the span is a path that skipped the first read, so the
+# span must hold no jump target either.
+function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand))
+    isempty(other) && return false
+    targets = _jump_targets(ci)
+    for (j, a) in other
+        a == operand || continue
+        lo, hi = minmax(i, j)
+        straight = !any(t -> lo < t <= hi, targets)
+        for k in lo:(hi - 1)
+            straight || break
+            st = ci.code[k]
+            if st isa Core.GotoNode || st isa Core.GotoIfNot || st isa Core.ReturnNode ||
+                    st isa Core.EnterNode || (st isa Expr && st.head === :(=) && st.args[1] == operand)
+                straight = false
+            end
+        end
+        straight && return true
+    end
+    return false
+end
+
+# The statements a jump can land on.
+function _jump_targets(ci)
+    out = Int[]
+    for st in ci.code
+        st isa Core.GotoNode && push!(out, st.label)
+        st isa Core.GotoIfNot && push!(out, st.dest)
+        st isa Core.EnterNode && push!(out, st.catch_dest)
     end
     return out
 end

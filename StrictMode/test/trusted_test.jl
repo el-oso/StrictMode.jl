@@ -211,3 +211,63 @@ end
     delete!(StrictMode._TRUST_BOUNDARIES, boundary)
     StrictMode.clear_cache!()
 end
+
+@testitem "a payload read on one path is not cleared by another field read on another" begin
+    using StrictMode
+
+    struct OtherPath
+        b::Int
+    end
+    const U8 = Untrusted{Vector{UInt8}}
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+
+    # The two reads are of the same variable on different paths: where the payload is read, the
+    # value is the `Untrusted`.
+    e7(x::Union{U8, OtherPath}) = x isa OtherPath ? getfield(x, :b) : length(getfield(x, :x))
+    function e8(x::Union{U8, OtherPath})
+        x isa OtherPath && return getfield(x, :b)
+        b = getfield(x, :x)
+        return length(b)
+    end
+    e1(x) = x isa OtherPath ? getfield(x, :b) : length(getfield(x, :x))
+    for (f, T) in ((e7, (Union{U8, OtherPath},)), (e8, (Union{U8, OtherPath},)), (e1, (Any,)))
+        r = status(f, T)
+        @test StrictMode._failed(r)
+        @test occursin("may read an `Untrusted` payload", r.reason)
+    end
+    # A variable assigned again between the two reads holds another value at the second.
+    function reassigned(x, y)
+        n = getfield(x, 2)
+        x = y
+        return n + length(getfield(x, 1))
+    end
+    @test StrictMode._failed(status(reassigned, (Any, Any)))
+    # A read inside a branch that falls through: the path that skips the branch reads the payload
+    # of a value nothing was learned about.
+    struct NoSuchField end
+    function falls_through(x)
+        n = 0
+        x isa OtherPath && (n = getfield(x, :b))
+        return n + length(getfield(x, :x))
+    end
+    @test StrictMode._failed(status(falls_through, (Any,)))
+    throws_first(x) = x isa NoSuchField ? getfield(x, :b) : length(getfield(x, :x))
+    @test StrictMode._failed(status(throws_first, (Any,)))
+
+    # Two fields of one value read on one path: that value has two fields, and `Untrusted` has one.
+    both(t) = getfield(t, 1) + getfield(t, 2)
+    @test status(both, (Any,)).status === :pass
+    destructure(t) = ((a, b) = t; a)
+    @test status(destructure, (Any,)).status === :pass
+    # Enough methods of `indexed_iterate` that inference types its result `Any`, as it does in a
+    # session with many packages loaded.
+    struct It1 end
+    struct It2 end
+    struct It3 end
+    struct It4 end
+    for T in (It1, It2, It3, It4)
+        @eval Base.indexed_iterate(x::$T, i::Int, state = 1) = (i, i + 1)
+    end
+    destructure_any(t) = ((a, b) = t; a + b)
+    @test status(destructure_any, (Any,)).status === :pass
+end
