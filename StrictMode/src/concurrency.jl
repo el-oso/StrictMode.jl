@@ -1329,6 +1329,9 @@ _conc_counts(groups) = string(
 # the plan.
 _only_global_atomics(vs::Vector{_ConcViol}) = all(v -> v.global_state && v.deliberate && v.certain, vs)
 
+# Whether the scan read an atomic write to the plan itself.
+_plan_atomics(vs::Vector{_ConcViol}) = any(v -> !v.global_state && v.deliberate && v.certain, vs)
+
 function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
@@ -1346,6 +1349,9 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
             _only_global_atomics(vs) ?
             "makes atomic writes to global state that every concurrent call shares; the plan " *
             "argument is not written. The writes cannot tear, and the state is still shared" :
+            _plan_atomics(vs) ?
+            "makes atomic writes to the plan argument — they cannot tear, and the plan is still " *
+            "shared mutable state" :
             "cannot establish that the plan argument is read-only — sharing it across concurrent " *
             "tasks is unproven, not disproven",
         " (", _conc_counts(groups), "):"
@@ -2153,10 +2159,13 @@ function _concurrency_safe_finding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
         at.file, at.line,
         (
-            certain ? "argument $self is written during the call (" :
+            any(v -> v.certain && !v.deliberate && !v.global_state, vs) ?
+                "argument $self is written during the call (" :
+                certain ? "global state every concurrent call shares is written during the call (" :
                 _only_global_atomics(vs) ?
                 "argument $self is not written; global state every concurrent call shares is " *
                 "written atomically (" :
+                _plan_atomics(vs) ? "argument $self is written atomically (" :
                 "cannot prove argument $self is read-only ("
         ) * _conc_counts(groups) * "): " * join(listed, "; "),
         _suggestion(:concurrency_safe), tier, _code(:concurrency_safe)

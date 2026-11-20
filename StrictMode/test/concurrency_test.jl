@@ -1691,3 +1691,27 @@ end
     @test isempty(StrictMode.threadid_state_findings(LockArg.per_thread, ()))
 end
 
+
+@testitem "the concurrency headline names what was written" begin
+    using StrictMode
+
+    module Headlines
+    const G = zeros(2)
+    f(p::Vector{Float64}) = (G[1] = p[1]; nothing)
+    mutable struct Q
+        @atomic n::Int
+    end
+    a(q::Q) = (@atomic q.n += 1; nothing)
+    end
+    H = Headlines
+    r = only(findings(H.f, (Vector{Float64},); guarantees = (:concurrency_safe,))).reason
+    @test !occursin("argument 1 is written", r)
+    @test occursin("global state every concurrent call shares is written", r)
+    fa = only(findings(H.a, (H.Q,); guarantees = (:concurrency_safe,)))
+    @test fa.status === :info
+    @test occursin("argument 1 is written atomically", fa.reason)
+    @test !occursin("cannot prove argument 1 is read-only", fa.reason)
+    @test_logs (:warn, r"makes atomic writes to the plan argument") match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
+    @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
+end
+

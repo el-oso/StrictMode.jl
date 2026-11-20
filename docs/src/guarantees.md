@@ -1450,7 +1450,8 @@ sharing it across concurrent tasks is unproven, not disproven". For a chain that
 raise `max_depth` or assert on the inner method.
 
 An atomic write, such as `@atomic plan.count += 1`, also warns. It cannot tear, but two calls that
-share the plan still both change it, and the scan cannot tell whether they are meant to.
+share the plan still both change it, and the scan cannot tell whether they are meant to. The warning
+says what was read: "makes atomic writes to the plan argument".
 
 ### Limits
 
