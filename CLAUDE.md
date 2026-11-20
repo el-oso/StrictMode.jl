@@ -374,7 +374,11 @@ StrictMode/src/
                         inline/dispatch/static-ownership suggestions), walks the module own
                         functions and then takes from the census each method the module, a
                         submodule or a loaded extension defines on a function the module does
-                        not own, sweeping that method only; an
+                        not own, sweeping that method only, and each callable object's method
+                        (not a capturing closure), whose specializations it hands on as
+                        (_callee(F), types): _Callable{F}() for a type with no instance. The census
+                        filters a callable with no instance by its type, and _decl_key keys on the
+                        callable's TYPE, so a declaration made on an instance stamps those rows; an
                         exemption of such a function excuses only the declaring module's methods
                         (_exempt_in, asked per method by _is_exempt(f, m)); _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function

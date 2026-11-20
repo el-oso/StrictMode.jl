@@ -213,6 +213,14 @@ extensions define on a function the module does not own, such as its `Base.getpr
 wrote is swept, not the function's other methods. `only` and `exempt` name such a method by
 the function's name, as they do the module's own.
 
+A callable object's method, `(r::Reader)(x)`, is swept too, once for each concrete type it compiled
+for: `Reader`, and `Boxed{Int}` and `Boxed{Float64}` separately for `(b::Boxed)(x)`. The sweep has
+no instance of the object, and needs none: it checks the signature `Tuple{Reader, typeof(x)}`, as
+[`findings`](@ref) does. Its findings, `only`, `exempt` and `@strict_exempt` all name it by its type,
+`Reader` or `Boxed`. An `only` or `exempt` that is a predicate function is not asked about a
+callable object with no instance, which stays in the sweep. A capturing closure is part of the
+function it is written in, and is not swept on its own.
+
 ## The coverage gate — default-deny
 
 The drivers above check what was *declared* (registry) or what *ran* (sweep) — neither notices a

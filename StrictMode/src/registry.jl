@@ -217,10 +217,12 @@ A package's declarations live in a `const` of the package itself, because a decl
 its precompile cannot be stored in StrictMode — StrictMode is loaded from its own cache by then, and
 the mutation does not survive the declaring package's next cached load.
 """
-# A declaration is looked up by the identity of its function and of its argument types. Hashing the
+# A declaration is looked up by the identity of its function's type and of its argument types: a
+# function's type has one instance, and a callable object is analyzed by its type, so a declaration
+# made on an instance answers for the sweep's row of that type. Hashing the
 # `(f, types)` tuple itself compiles a method of `hash` for every distinct tuple type, which is one
 # compilation per signature a module check looks up: 7.8 ms each, 0.6 s for a module of 80 methods.
-_decl_key(@nospecialize(f), @nospecialize(types)) = (objectid(f), objectid(Tuple(types)))
+_decl_key(@nospecialize(f), @nospecialize(types)) = (objectid(_ftype(f)), objectid(Tuple(types)))
 
 function _declaration_index(decls)
     index = Dict{Tuple{UInt, UInt}, Any}()
@@ -1220,16 +1222,16 @@ function module_methods(
             nothing
         end
         f = reason === :constructor ? F.parameters[1] : isdefined(F, :instance) ? F.instance : nothing
-        # A capturing closure has no instance. A filter by name still answers for it through its
-        # type; a filter that is the caller's own function expects a function, so it cannot, and the
-        # closure stays in the census.
-        isnothing(f) && _is_closure_type(F) && !(only isa Function) && !(exempt isa Function) &&
-            (f = F)
+        # A capturing closure or a callable object with fields has no instance. A filter by name, and
+        # an exemption, still answer for it through its type; a filter that is the caller's own
+        # function expects a function, so it is not asked, and the method stays in the census.
+        typed = isnothing(f) && F isa DataType
+        typed && (f = F)
         reason === :unreadable && !isnothing(onlypred) && return bump!(:filtered)
         if !isnothing(f)
-            ((!include_exempt && _is_exempt(f, m)) || (!isnothing(exemptpred) && exemptpred(f))) &&
-                return bump!(:exempt)
-            isnothing(onlypred) || onlypred(f) || return bump!(:filtered)
+            (!include_exempt && _is_exempt(f, m)) && return bump!(:exempt)
+            !isnothing(exemptpred) && !(typed && exempt isa Function) && exemptpred(f) && return bump!(:exempt)
+            isnothing(onlypred) || (typed && only isa Function) || onlypred(f) || return bump!(:filtered)
         end
         push!(out, m)
         return nothing
@@ -1270,17 +1272,15 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
     end
     for mth in first(module_methods(mod; only, exempt))
         F = _method_function(mth)
-        (F <: Function && isdefined(F, :instance)) || continue
-        f = F.instance
-        parentmodule(f) === mod && continue      # the module's own, walked above
+        isdefined(F, :instance) && F.instance isa Function && parentmodule(F.instance) === mod &&
+            continue      # the module's own, walked above
+        # A capturing closure is part of the function it is written in, and is not swept. A callable
+        # object is: each specialization names its concrete type, which is the callee.
+        _is_closure_type(F) && continue
         for mi in _specializations(mth)
-            tt = try
-                Tuple((mi.specTypes::DataType).parameters[2:end])
-            catch
-                continue
-            end
-            Base.isdispatchtuple(Tuple{tt...}) || continue
-            f!(f, tt)
+            sig = mi.specTypes
+            (sig isa DataType && Base.isdispatchtuple(sig)) || continue
+            f!(_callee(sig.parameters[1]), Tuple(sig.parameters[2:end]))
         end
     end
     return nothing
