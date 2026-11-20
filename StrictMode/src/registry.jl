@@ -1443,9 +1443,10 @@ const _REVISE_UNWATCH = Ref{Any}(nothing)
 """
     watch()
 
-Start the live re-checking loop: after each Revise edit, re-check the strict registry and print
-violations. Requires Revise — `using Revise` (which loads the StrictMode↔Revise extension) before
-calling. The human counterpart to [`audit`](@ref) (the agent path).
+Start the live re-checking loop: after each Revise edit, re-check every declaration in scope
+([`StrictMode.declarations`](@ref)) and print violations. Requires Revise — `using Revise` (which
+loads the StrictMode↔Revise extension) before calling. The human counterpart to [`audit`](@ref)
+(the agent path).
 """
 function watch()
     _REVISE_WATCH[] === nothing && return @info "StrictMode.watch() needs Revise: run `using Revise` first."

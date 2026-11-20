@@ -624,7 +624,7 @@ StrictMode/src/
 StrictMode/ext/
   StrictModeCthulhuExt.jl   — descend() fills _CTHULHU_DESCEND
   StrictModeCpuIdExt.jl     — CPU-specific _CACHE_BYTES override (weak dep, `using CpuId`)
-  StrictModeReviseExt.jl    — watch()/unwatch(): re-check the registry after each Revise edit and
+  StrictModeReviseExt.jl    — watch()/unwatch(): re-check declarations() after each Revise edit and
                               print what fails. It clears no cache; the caches follow an edit on
                               their own (see cache.jl)
   StrictModeMcaExt.jl       — llvm-mca CLI glue for mca_report (weak dep, `using LLVM_full_jll`,

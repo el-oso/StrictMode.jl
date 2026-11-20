@@ -1,4 +1,4 @@
-# Live human feedback: after each Revise edit, re-check the strict registry and print any
+# Live human feedback: after each Revise edit, re-check every declaration in scope and print any
 # violations to the REPL — the "compiler shouts as you code" loop. Loaded automatically when both
 # StrictMode and Revise are present. The agent-facing counterpart is `StrictMode.audit`.
 
@@ -12,7 +12,9 @@ const _KEY = Ref{Any}(nothing)
 # Runs after each revision (Revise invokes user callbacks with no arguments).
 function _on_revision()
     StrictMode.checks_enabled() || return nothing
-    isempty(StrictMode.registered_strict()) && return nothing
+    # `_findings_all` reads `declarations()`: this session's registry and each module's own store,
+    # which is where `@strict_function` writes.
+    isempty(StrictMode.declarations()) && return nothing
     fs = StrictMode._findings_all()
     failed = filter(StrictMode._failed, fs)
     isempty(failed) || StrictMode.format_findings(stdout, failed; format = :text)
