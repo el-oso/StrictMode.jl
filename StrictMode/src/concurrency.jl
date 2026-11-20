@@ -268,6 +268,9 @@ const _FCALL_ALIASES = Set{Symbol}(
     )
 )
 
+# Foreign functions returning a value stored in the table they are given as their first argument.
+const _FCALL_RETURNS_STORED = Set{Symbol}((:jl_eqtable_get, :jl_eqtable_pop))
+
 # Container-operand position (1-based among the call's DATA args, i.e. after the callee).
 const _PROJECT_OPS = Dict(
     :getfield => 1, :getproperty => 1, :memoryrefget => 1, :memoryrefnew => 1,
@@ -575,9 +578,14 @@ function _taint_scan_ci(
                 # `Threads.Atomic` is how it is written.
                 _fcall_name(st) in _FCALL_ALIASES && any(gtainted, fargs) && !(i in gset) &&
                     (push!(gset, i); changed = true)
+                fname = _fcall_name(st)
+                # An `IdDict` lookup returns a value its table holds: the plan's when the table is.
+                if fname in _FCALL_RETURNS_STORED && !isempty(fargs)
+                    _op_tainted(fargs[1], tset, targs) && settaint(_may_ref(types[i]))
+                    gtainted(fargs[1]) && _may_ref(types[i]) && !(i in gset) && (push!(gset, i); changed = true)
+                end
                 handed = Int[k for k in eachindex(fargs) if _op_tainted(fargs[k], tset, targs)]
                 isempty(handed) && continue
-                fname = _fcall_name(st)
                 if fname in _FCALL_ALIASES
                     settaint(true)
                     continue

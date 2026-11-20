@@ -1544,3 +1544,24 @@ end
     @test_throws StrictViolation @assert_concurrency_safe C.late!(C.P(Float64[], [1.0]))
 end
 
+
+@testitem "a value an IdDict held by the plan returns is the plan's" begin
+    using StrictMode
+
+    module IdDictPlan
+    struct P
+        cache::IdDict{Symbol, Vector{Float64}}
+    end
+    const SHARED = IdDict{Symbol, Vector{Float64}}(:a => [1.0])
+    w_get(p::P, x) = (get(p.cache, :a, x)[1] = 0.0; nothing)
+    w_idx(p::P) = (p.cache[:a][1] = 0.0; nothing)
+    r_idx(p::P) = p.cache[:a][1]
+    g_idx(p::P) = (SHARED[:a][1] = 0.0; nothing)
+    end
+    D = IdDictPlan
+    @test any(v -> v.certain && !v.global_state, StrictMode.concurrency_findings(D.w_get, (D.P, Vector{Float64})))
+    @test any(v -> v.certain && !v.global_state, StrictMode.concurrency_findings(D.w_idx, (D.P,)))
+    @test isempty(StrictMode.concurrency_findings(D.r_idx, (D.P,)))
+    @test any(v -> v.certain && v.global_state, StrictMode.concurrency_findings(D.g_idx, (D.P,)))
+end
+
