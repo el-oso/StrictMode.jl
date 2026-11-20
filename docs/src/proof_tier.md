@@ -142,6 +142,12 @@ and so does an exempt callee that was inlined, since its allocation then belongs
 own code. The exemption is matched on the method, so a function of the same name in another
 module excuses nothing.
 
+An exemption covers the exempt function's own code and what that calls. A function or closure the
+exempt function was handed is the caller's code: an allocation made while it runs is the caller's,
+and makes the result an ordinary failure. So `withbuf(b -> sum(zeros(n)) + b[1], n)` fails for an
+exempt `withbuf`, with or without `allow_exempt`, while the pool growth inside `withbuf` is still
+accounted for.
+
 Only an exemption declared in a module counts here, which is what `@strict_exempt` written in a
 package's source is. One declared with no module, from a session, covers by name in every module
 and names no method: its caller is an ordinary failure in the proof, with or without

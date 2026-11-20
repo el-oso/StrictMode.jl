@@ -429,24 +429,84 @@ _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : 
 # covers by name in every module and excuses no site here, though the scan still notes it. An exempt
 # callee that was inlined has no frame with a specialization of its own, so its site reads as the
 # caller's and the result is an ordinary failure.
+# A site reached through a function or closure the exempt function was handed is the caller's too
+# (`_runs_handed_in`).
 function _exempt_only(allocs)
     isempty(allocs) && return nothing
     by = Pair{String, String}[]
     for a in allocs
         hasproperty(a, :backtrace) || return nothing
         e = nothing
-        for fr in a.backtrace
+        for (k, fr) in enumerate(a.backtrace)
             fr isa Base.StackTraces.StackFrame || continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || continue
             e = StrictMode._mi_exemption(mi; declared_in_module = true)
-            isnothing(e) || break
+            isnothing(e) && continue
+            # The exemption covers the exempt function's own code and what that calls. A function
+            # or closure it was HANDED is the caller's code, and what that allocates is the
+            # caller's allocation, whichever frame ran it. An exempt frame further out may still
+            # account for the site, so the walk goes on.
+            _runs_handed_in(a.backtrace, k, mi) ? (e = nothing) : break
         end
         isnothing(e) && return nothing
         p = String(e.func) => e.reason
         p in by || push!(by, p)
     end
     return Tuple(by)
+end
+
+# Whether a frame between the allocation and the exempt frame at `k` runs a callable that the
+# exempt function received as an argument, directly or inside a struct. A frame that kept its
+# specialization is matched on the callable's type; an inlined one has only a name, and is
+# matched on the names of the callable's methods.
+function _runs_handed_in(bt, k::Int, mi::Core.MethodInstance)
+    k > 1 || return false
+    types = Any[]
+    ps = (mi.specTypes::DataType).parameters
+    for i in 2:length(ps)
+        _callable_types!(types, ps[i], 0)
+    end
+    isempty(types) && return false
+    names = Set{Symbol}()
+    for T in types
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+        ms isa Vector || continue
+        for match in ms
+            push!(names, match.method.name)
+        end
+        T <: Function && isdefined(T, :instance) && push!(names, nameof(T.instance))
+    end
+    for j in 1:(k - 1)
+        fr = bt[j]
+        fr isa Base.StackTraces.StackFrame || continue
+        inner = _frame_mi(fr)
+        if inner isa Core.MethodInstance
+            F = (inner.specTypes::DataType).parameters[1]
+            any(T -> T === F, types) && return true
+        elseif fr.func in names
+            return true
+        end
+    end
+    return false
+end
+
+# The callable types an argument of type `T` carries: a function, a closure, a callable struct, or
+# one of those held in a field.
+function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int)
+    T isa DataType || return out
+    if T <: Function
+        push!(out, T)
+    elseif isconcretetype(T) && !(T <: Union{Number, AbstractArray, AbstractString, Symbol, Type})
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, 1, Base.get_world_counter())
+        (ms isa Vector && !isempty(ms)) && push!(out, T)
+    end
+    if depth < 2 && isconcretetype(T) && !(T <: Union{AbstractArray, AbstractString, Number})
+        for F in fieldtypes(T)
+            _callable_types!(out, F, depth + 1)
+        end
+    end
+    return out
 end
 
 _through_barrier(@nospecialize(a)) = any(a.backtrace) do fr

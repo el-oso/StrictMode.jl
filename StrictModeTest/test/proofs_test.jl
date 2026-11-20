@@ -619,3 +619,47 @@ end
     @test_throws StrictViolation test_compiled(E; guarantees = (:noalloc,), only = [:typed_grows])
     @test test_compiled(E; guarantees = (:noalloc,), only = [:typed_grows], allow_exempt = true) isa Vector
 end
+
+@testitem "an exempt function does not excuse a callback it was handed" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ExemptCallback
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    # Exempt, and it runs whatever it is given.
+    @noinline withbuf(f::F, n) where {F} = f(grow!(n))
+    @strict_exempt :noalloc reason = "borrows the pool" withbuf
+    @noinline mk(n) = zeros(n)
+    cb(n::Int) = withbuf(b -> sum(mk(n)) + b[1], n)
+    cb_inline(n::Int) = withbuf(b -> sum(zeros(n)) + b[1], n)
+    named_cb(b) = sum(zeros(length(b))) + b[1]
+    cb_named(n::Int) = withbuf(named_cb, n)
+    # The callback allocates nothing of its own: every site is the exempt functions' own code.
+    cb_clean(n::Int) = withbuf(b -> b[1], n)
+    plain(n::Int) = (b = grow!(n); b[1])
+    end
+    E = ExemptCallback
+    E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_clean(3); E.plain(3)
+    proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
+
+    # An allocation made by the caller's own closure, run inside the exempt function, is the
+    # caller's: an ordinary failure, which no option accepts.
+    for f in (E.cb, E.cb_inline, E.cb_named)
+        r = proof(f; allow_exempt = true)
+        @test r.status === :fail
+        @test r.code !== :SM0018
+        @test isempty(r.exempt_by)
+    end
+    @test_throws StrictViolation @test_noalloc allow_exempt = true E.cb(3)
+
+    # What the exempt functions allocate themselves is still theirs.
+    @test proof(E.plain).code === :SM0018
+    @test proof(E.plain; allow_exempt = true).status === :info
+    clean = proof(E.cb_clean; allow_exempt = true)
+    @test clean.status === :info && clean.code === :SM0018
+end

@@ -609,7 +609,11 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         no gate in between (alloc_entry_report, proof_findings, proof_audit,
                         the Revise watcher); `allow_exempt = true` is threaded into
                         _proof_findings and makes it :info. divergence_report reads it beside the
-                        scan own exempt note as agreement. One site without an exempt frame, or an exempt
+                        scan own exempt note as agreement. A site is the exempt function's only
+                        if no frame between it and the allocation runs a callable the exempt
+                        function was HANDED (_runs_handed_in: matched on the argument's type for a
+                        frame with a specialization, on its method names for an inlined one);
+                        otherwise an exempt wrapper would launder its caller's closure. One site without an exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
                         is StrictMode._mi_exemption, on the method module and name, with
                         declared_in_module = true: an exemption declared with NO module covers
