@@ -1736,3 +1736,22 @@ end
     end
 end
 
+
+@testitem "a per-thread slot written through a pointer or C is threadid state" begin
+    using StrictMode
+
+    module TidPointer
+    const BUFS = [zeros(4) for _ in 1:Threads.maxthreadid()]
+    h(x) = (b = BUFS[Threads.threadid()]; yield(); GC.@preserve b unsafe_store!(pointer(b), x); nothing)
+    hm(x) = (b = BUFS[Threads.threadid()]; yield(); ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), b, 0, 32); nothing)
+    hr(x) = (b = BUFS[Threads.threadid()]; yield(); GC.@preserve b unsafe_load(pointer(b)))
+    end
+    T = TidPointer
+    for f in (T.h, T.hm)
+        vs = StrictMode.threadid_state_findings(f, (Float64,))
+        @test any(v -> v.certain && occursin("threadid", v.message), vs)
+    end
+    @test_throws StrictViolation @assert_no_threadid_state T.h(1.0)
+    # A read through the pointer writes nothing.
+    @test isempty(StrictMode.threadid_state_findings(T.hr, (Float64,)))
+end

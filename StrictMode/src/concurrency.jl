@@ -1550,6 +1550,20 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
             mark(s::BitSet, b) = (b && !(i in s)) ? (push!(s, i); changed = true) : nothing
             if _is_threadid_foreigncall(st)
                 mark(tid, true); continue
+            elseif Meta.isexpr(st, :foreigncall)
+                # A foreign function known to write its destination (`memset`, `memmove`, …) handed
+                # a pointer into a per-thread slot writes the slot.
+                fname = _fcall_name(st)
+                written = isnothing(fname) ? () : get(_FCALL_WRITES, fname, ())
+                if any(k -> 5 + k <= length(st.args) && _op_tainted(st.args[5 + k], tidref, ()), written)
+                    _record!(
+                        out, seen, String[],
+                        "writes mutable state indexed by `Threads.threadid()` (`$fname`) — unsafe under " *
+                            "task migration; index by a captured task-local id or a per-task buffer instead", fr;
+                        certain = true
+                    )
+                end
+                continue
             elseif st isa Core.PiNode
                 isdefined(st, :val) && _op_tainted(st.val, tid, ()) && mark(tid, true)
                 isdefined(st, :val) && _op_tainted(st.val, tidref, ()) && mark(tidref, true)
@@ -1598,10 +1612,17 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
                 # that gates. Only a result that can carry a reference propagates: an `Int` read out
                 # of a slot is a copy and can never be a store's container.
                 pos = _PROJECT_OPS[nm]
+                # A raw pointer read out of the slot (`ptr_or_offset`) is bits, yet a store through it
+                # writes the slot, so it propagates too.
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tidref, ())
                     T = (sts isa Vector && 1 <= i <= length(sts)) ? sts[i] : nothing
-                    _may_ref(T) && mark(tidref, true)
+                    (_may_ref(T) || _holds_ptr(Core.Compiler.widenconst(T))) && mark(tidref, true)
                 end
+                continue
+            elseif nm === :bitcast || nm === :add_ptr || nm === :sub_ptr
+                # `pointer(b)` and an offset from it: only the pointer operand carries the mark.
+                p = nm === :bitcast ? 2 : 1
+                p <= length(dataargs) && _op_tainted(dataargs[p], tidref, ()) && mark(tidref, true)
                 continue
             elseif haskey(_STORE_OPS, nm)
                 pos = _STORE_OPS[nm]
