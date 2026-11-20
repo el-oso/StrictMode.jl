@@ -533,6 +533,10 @@ function _taint_scan_ci(
                 argtypes = st.args[3]
                 nfargs = argtypes isa Core.SimpleVector ? length(argtypes) : length(st.args) - 5
                 fargs = @view st.args[6:min(lastindex(st.args), 5 + nfargs)]
+                # The address of a global is the global: `pointer_from_objref` of a constant
+                # `Threads.Atomic` is how it is written.
+                _fcall_name(st) in _FCALL_ALIASES && any(gtainted, fargs) && !(i in gset) &&
+                    (push!(gset, i); changed = true)
                 handed = Int[k for k in eachindex(fargs) if _op_tainted(fargs[k], tset, targs)]
                 isempty(handed) && continue
                 fname = _fcall_name(st)
@@ -634,7 +638,7 @@ function _taint_scan_ci(
                     src = dataargs[pos]
                     maybe(src) && (nm === :memoryrefnew || nm === :memoryref || _may_ref(types[i]) ||
                         _holds_ptr(Core.Compiler.widenconst(types[i]))) && setmaybe(i)
-                    if gtainted(src) && _may_ref(types[i]) && !_is_sync_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
+                    if gtainted(src) && _may_ref(types[i]) && !_is_lock_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
                         push!(gset, i); changed = true
                     end
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
@@ -700,10 +704,12 @@ function _taint_scan_ci(
             # to `add_ptr`, ending in a `pointerset`. Only the pointer operand carries the taint — an
             # offset read from the plan must not make a pointer into another array look like it.
             if nm === :bitcast && length(dataargs) == 2
+                gtainted(dataargs[2]) && !(i in gset) && (push!(gset, i); changed = true)
                 maybe(dataargs[2]) && setmaybe(i)
                 _op_tainted(dataargs[2], tset, targs) && settaint(true)
                 continue
             elseif (nm === :add_ptr || nm === :sub_ptr) && !isempty(dataargs)
+                gtainted(dataargs[1]) && !(i in gset) && (push!(gset, i); changed = true)
                 maybe(dataargs[1]) && setmaybe(i)
                 _op_tainted(dataargs[1], tset, targs) && settaint(true)
                 continue
@@ -715,6 +721,13 @@ function _taint_scan_ci(
             # Inline LLVM IR handed a pointer into the plan, which is how `Threads.Atomic` is
             # written before Julia 1.13. An atomic instruction is the same fact as the intrinsic
             # below. Any other store is not read, and is recorded as undecided.
+            if nm === :llvmcall && length(dataargs) >= 4 && any(gtainted, @view dataargs[4:end]) &&
+                    !any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
+                ir = _llvmcall_text(dataargs[1])
+                (occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)) &&
+                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true)
+                continue
+            end
             if nm === :llvmcall && length(dataargs) >= 4 &&
                     any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
                 ir = _llvmcall_text(dataargs[1])
@@ -736,6 +749,8 @@ function _taint_scan_ci(
                 continue
             end
             if nm !== nothing && nm in _ATOMIC_POINTER_WRITES && !isempty(dataargs)
+                gtainted(dataargs[1]) &&
+                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true)
                 _op_tainted(dataargs[1], tset, targs) && _record!(
                     out, seen, chain,
                     "stores into a buffer reachable from the plan (`$nm`) — a heap write the plan " *
@@ -880,9 +895,10 @@ function _is_mutable_global(@nospecialize(a))
         a
     end
     (v isa String || v isa Symbol || v isa Module || v isa Type || v isa Function) && return false
-    # A lock, an atomic, a condition, an event, a channel or a semaphore is how tasks synchronize: its
-    # internal writes are the synchronization, not shared data.
-    _is_sync_object(v) && return false
+    # A lock, a condition, an event, a channel or a semaphore is how tasks synchronize: its
+    # internal writes are the synchronization, not shared data. A `Threads.Atomic` is data that is
+    # written atomically, and stays, so a write to it is reported as an atomic write.
+    (_is_sync_object(v) && !(v isa Threads.Atomic)) && return false
     # Mutable state anywhere inside the value counts: an immutable struct or tuple holding a vector.
     return _holds_mutable(v)
 end
@@ -903,6 +919,10 @@ function _llvmcall_text(@nospecialize(a))
     a isa Tuple || return ""
     return join((String(x) for x in a if x isa AbstractString), "\n")
 end
+
+const _GLOBAL_ATOMIC_WRITE = "writes process-global state (an atomic write into a constant " *
+    "global `Threads.Atomic`) — the write is atomic, so it cannot tear, but every concurrent call " *
+    "shares the global"
 
 const _ATOMIC_POINTER_WRITES = (
     :atomic_pointerset, :atomic_pointerswap, :atomic_pointermodify, :atomic_pointerreplace,

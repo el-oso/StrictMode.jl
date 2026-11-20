@@ -1078,7 +1078,9 @@ end
     fails(f, T) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, T))
     @test fails(Rev.bumpn, (Rev.P1,))                                  # a plain modifyfield! is not atomic
     @test isempty(StrictMode.concurrency_findings(Rev.withlock, (Rev.Plan,)))
-    @test isempty(StrictMode.concurrency_findings(Rev.counted, (Rev.Plan,)))
+    # An atomic write to a global counter is reported, the deliberate way, and never fails.
+    @test all(v -> v.deliberate, StrictMode.concurrency_findings(Rev.counted, (Rev.Plan,)))
+    @test !fails(Rev.counted, (Rev.Plan,))
     @test !fails(Rev.fresh_out, (Rev.Plan,))                           # writes only its own fresh buffer
     @test fails(Rev.callable, (Rev.Plan,))                             # a callable struct is read too
     tid(f, T) = (vs = StrictMode.threadid_state_findings(f, T); isempty(vs) ? :pass : any(v -> v.certain, vs) ? :fail : :maybe)
@@ -1409,4 +1411,41 @@ end
     g = only(findings(undecided, (MPlan, Vector{Float64}); guarantees = (:concurrency_safe,)))
     @test g.status === :info
     @test occursin("[undecided 1]", g.reason) && !occursin("[write", g.reason)
+end
+
+@testitem "an atomic write to a global is reported as one to the plan is" begin
+    using StrictMode
+
+    module GlobalAtomics
+    const HITS = Threads.Atomic{Int}(0)
+    struct Stats
+        calls::Threads.Atomic{Int}
+        lk::ReentrantLock
+    end
+    const STATS = Stats(Threads.Atomic{Int}(0), ReentrantLock())
+    struct Plan
+        w::Vector{Float64}
+    end
+    add(p::Plan) = (Threads.atomic_add!(HITS, 1); p.w[1])
+    set(p::Plan) = (HITS[] = 3; p.w[1])
+    nested(p::Plan) = (Threads.atomic_add!(STATS.calls, 1); p.w[1])
+    read(p::Plan) = HITS[] + STATS.calls[] + p.w[1]
+    locked(p::Plan) = (lock(STATS.lk); x = p.w[1]; unlock(STATS.lk); x)
+    end
+    sig = (GlobalAtomics.Plan,)
+    for f in (GlobalAtomics.add, GlobalAtomics.set, GlobalAtomics.nested)
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate, vs)
+        @test any(v -> occursin("process-global state", v.message) && occursin("atomic", v.message), vs)
+    end
+    # Reading one, and taking a lock that sits beside one, write nothing.
+    @test isempty(StrictMode.concurrency_findings(GlobalAtomics.read, sig))
+    @test isempty(StrictMode.concurrency_findings(GlobalAtomics.locked, sig))
+
+    # It warns at a call site and is a note in a sweep: it never raises and never fails.
+    p = GlobalAtomics.Plan([1.0])
+    @test_logs (:warn, r"Atomic writes, which cannot tear \(1\)"s) match_mode = :any @assert_concurrency_safe GlobalAtomics.add(p)
+    GlobalAtomics.add(p)
+    @test only(findings(GlobalAtomics.add, sig; guarantees = (:concurrency_safe,))).status === :info
 end

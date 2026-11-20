@@ -270,7 +270,11 @@ StrictMode/src/
                         parameter and the seed): what `lock(plan.lk)` writes is the
                         synchronization. A Threads.Atomic DOES carry it, so atomic_add! and
                         `x[] = v` on one (the atomic_pointer intrinsics) are records with certain
-                        and deliberate both set, as an @atomic field write is. A Base callee
+                        and deliberate both set, as an @atomic field write is. A constant GLOBAL
+                        Threads.Atomic is treated the same (_is_mutable_global no longer skips
+                        it; the address of a global from jl_value_ptr carries `gset`): an
+                        atomic write to it is certain and deliberate, so it warns and never
+                        raises. A lock or channel global is still not data. A Base callee
                         entered for its result and NOT READ returns :maybe: the call is an
                         undecided record and the result goes into `mset`, through which a store is
                         an undecided record too, never a certain one (a fresh buffer from a deep

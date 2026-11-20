@@ -1413,7 +1413,9 @@ plan's memory or a copy, so `sort!(plan.buf)` and `get(plan.cache, k, x)[1] = v`
 A lock, a condition, an event, a channel or a semaphore held by the plan is not marked. What
 `lock(plan.lk)` writes inside the lock is the synchronization, not shared data. A `Threads.Atomic`
 is marked: `Threads.atomic_add!(plan.ctr, 1)` and `plan.ctr[] = v` are atomic writes to shared
-state, and warn as `@atomic plan.count += 1` does.
+state, and warn as `@atomic plan.count += 1` does. The same holds for a constant global
+`Threads.Atomic`: an atomic write to one is reported as an atomic write to process-global state,
+and warns.
 
 ### Throw or warn
 
