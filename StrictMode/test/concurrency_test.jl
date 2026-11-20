@@ -1627,3 +1627,29 @@ end
     @test isempty(StrictMode.concurrency_findings(L.load_str, (L.P,)))
 end
 
+
+@testitem "a constant global written through a pointer is process-global state" begin
+    using StrictMode
+
+    module GlobalPointer
+    const LOG = zeros(4)
+    struct Plan
+        buf::Vector{Float64}
+    end
+    g_copy(p::Plan) = (copyto!(LOG, p.buf); p.buf[1])
+    g_ptr(p::Plan) = (GC.@preserve LOG unsafe_store!(pointer(LOG), 1.0); p.buf[1])
+    g_set(p::Plan) = (ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), LOG, 0, 8); p.buf[1])
+    g_read(p::Plan) = (GC.@preserve LOG unsafe_load(pointer(LOG))) + p.buf[1]
+    g_from(p::Plan) = (copyto!(p.buf, LOG); nothing)
+    end
+    G = GlobalPointer
+    for f in (G.g_copy, G.g_ptr, G.g_set)
+        vs = StrictMode.concurrency_findings(f, (G.Plan,))
+        @test any(v -> v.certain && v.global_state && occursin("process-global state", v.message), vs)
+    end
+    # Reading the global through a pointer, or copying out of it, writes nothing shared.
+    @test isempty(StrictMode.concurrency_findings(G.g_read, (G.Plan,)))
+    @test !any(v -> v.global_state, StrictMode.concurrency_findings(G.g_from, (G.Plan,)))
+    @test_throws StrictViolation @assert_concurrency_safe G.g_ptr(G.Plan([1.0]))
+end
+

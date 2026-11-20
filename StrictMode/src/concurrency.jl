@@ -584,6 +584,15 @@ function _taint_scan_ci(
                     _op_tainted(fargs[1], tset, targs) && settaint(_may_ref(types[i]))
                     gtainted(fargs[1]) && _may_ref(types[i]) && !(i in gset) && (push!(gset, i); changed = true)
                 end
+                # A known write into a constant global, through its pointer: `copyto!(GLOBAL, x)`
+                # reaches its store through `memmove`.
+                gwritten = get(_FCALL_WRITES, fname, ())
+                any(k -> k in gwritten && gtainted(fargs[k]), eachindex(fargs)) && _record!(
+                    out, seen, chain,
+                    "writes process-global state (`$fname` into a mutable constant global) — every " *
+                        "concurrent call shares it; pass the buffer in, or own it per task",
+                    fr; certain = true, global_state = true
+                )
                 handed = Int[k for k in eachindex(fargs) if _op_tainted(fargs[k], tset, targs)]
                 isempty(handed) && continue
                 if fname in _FCALL_ALIASES
@@ -693,7 +702,10 @@ function _taint_scan_ci(
                         nm === :memoryrefnew || nm === :memoryref || _may_ref(types[i]) ||
                             _holds_ptr(Core.Compiler.widenconst(types[i]))
                     ) && setmaybe(i)
-                    if gtainted(src) && _may_ref(types[i]) && !_is_lock_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
+                    # A raw pointer read out of a global (`ptr_or_offset`) is bits, yet a store
+                    # through it writes the global.
+                    if gtainted(src) && (_may_ref(types[i]) || _holds_ptr(Core.Compiler.widenconst(types[i]))) &&
+                            !_is_lock_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
                         push!(gset, i); changed = true
                     end
                     # a memoryref is a *writable handle* into its buffer — always a live reference —
