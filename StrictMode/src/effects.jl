@@ -243,6 +243,12 @@ per-task state, and it belongs to the accessor, not to every kernel that reaches
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).
 
+A callable object is registered as its type, `register_alloc_barrier!(Table)`, and that covers a
+call of every `Table`: the scan reads the callee's type and has no value to tell one instance from
+another. Passing one instance, `register_alloc_barrier!(Table(4))`, raises for that reason, as does
+a closure that captures a variable. A function is the only instance of its type and is passed as
+itself. Registering a type does not cover its constructor.
+
 A registration made at a package's top level, while the package precompiles, is written into that
 package's cache, so it is in force again in every process that loads it. Only the package being
 precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
@@ -261,6 +267,16 @@ register_alloc_barrier!(_my_calibrator)
 ```
 """
 function register_alloc_barrier!(@nospecialize(f); mod::Module = _owner_module(f))
+    # A barrier is recognized by the type of the callee, which is all the scan has. One instance
+    # of a type with several would stand for all of them without saying so.
+    (f isa Type || isdefined(typeof(f), :instance)) || throw(
+        ArgumentError(
+            "register_alloc_barrier!: this is one instance of `$(_type_name(typeof(f)))`, and a " *
+                "barrier is matched on the callee's type, so it would cover every " *
+                "`$(_type_name(typeof(f)))`. Register the type, which says so: " *
+                "`register_alloc_barrier!($(_type_name(typeof(f))))`."
+        )
+    )
     push!(_ALLOC_BARRIERS, f)
     # The registry above lives in this session. A package that registers at its own precompile loses it
     # at the next load, so the registration is also kept in the package named by `mod`, which is
@@ -311,7 +327,12 @@ end
 # merely appears as an ordinary argument elsewhere (e.g. passed as a callback) — that distinction
 # matters here in a way it doesn't for the `Base` types below, since a registered function is an
 # arbitrary user function that could legitimately be passed around as a value.
-_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _barrier_functions())
+_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> _barrier_covers(f, p), _barrier_functions())
+
+# Whether a registration covers a callee of type `p`: a function covers its own type, and a
+# registered type covers every instance of it. `Type{T}`, the callee of a constructor call, is
+# not an instance of `T`.
+_barrier_covers(@nospecialize(f), @nospecialize(p)) = f isa Type ? (p isa Type && p <: f) : p === typeof(f)
 
 # `(::OncePerProcess)()` (and OncePerThread) are themselves `@inline`d away in Base —
 # the fast (already-initialized) path is inlined directly into the caller, so the only surviving
@@ -342,9 +363,9 @@ function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
     ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
     name = _demangle(mi.def.name)
     for f in bs
-        # A callable object is registered by value and has no name of its own; a keyword body
-        # is named after its type.
-        _callable_name(f) === name && any(p -> p === typeof(f), ps) && return true
+        # A callable object's type has no function name of its own; its keyword body is named
+        # after the type.
+        _callable_name(f) === name && any(p -> _barrier_covers(f, p), ps) && return true
     end
     return false
 end

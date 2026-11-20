@@ -116,7 +116,9 @@ struct Table
     n::Int
 end
 (t::Table)() = zeros(t.n)
-const CALLABLE_BARRIER = attempt(() -> StrictMode.register_alloc_barrier!(Table(4)))
+# A barrier is matched on the callee's type, so one instance is refused and the type is registered.
+const CALLABLE_BARRIER_INSTANCE = attempt(() -> StrictMode.register_alloc_barrier!(Table(4)))
+const CALLABLE_BARRIER = attempt(() -> StrictMode.register_alloc_barrier!(Table))
 end
 """
 
@@ -138,7 +140,7 @@ say("named_scoped", StrictMode._is_scoped_type(RegOwner.LentNamed))
 say("named_trust", StrictMode._is_trust_boundary(RegOwner.lent_reader_named))
 say("named_barrier", barrier(RegOwner.lent_table_named))
 say("callable_trust", RegDependent.CALLABLE_TRUST == "registered" && StrictMode._is_trust_boundary(RegDependent.Validator(3)) && !StrictMode._is_trust_boundary(RegDependent.Validator(4)))
-say("callable_barrier", RegDependent.CALLABLE_BARRIER == "registered" && barrier(RegDependent.Table(4)))
+say("callable_barrier", RegDependent.CALLABLE_BARRIER == "registered" && barrier(RegDependent.Table) && occursin("register_alloc_barrier!(Table)", RegDependent.CALLABLE_BARRIER_INSTANCE) && !barrier(RegDependent.Table(4)))
 say("lazy_owner_no_error", RegDependent.LAZY_OWNER == "registered" && RegDependent.LAZY_INIT == "registered")
 # Made in the dependent's precompile, so not in this process until the owner's code runs here.
 say("lazy_not_stored", !StrictMode._is_trust_boundary(RegOwner.lazy_reader) && !StrictMode._is_scoped_type(RegOwner.Lazy) && !barrier(RegOwner.lazy_table))

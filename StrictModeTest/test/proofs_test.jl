@@ -663,3 +663,25 @@ end
     clean = proof(E.cb_clean; allow_exempt = true)
     @test clean.status === :info && clean.code === :SM0018
 end
+
+@testitem "the proof honors a callable barrier registered as its type" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ProofCallableBarrier
+    struct Table
+        n::Int
+    end
+    @noinline (t::Table)() = zeros(t.n)
+    useany(t::Table) = t()[1]
+    end
+    P = ProofCallableBarrier
+    proof() = only(StrictModeTest.proof_findings(P.useany, (P.Table,); guarantees = (:noalloc,)))
+    @test StrictMode._failed(proof())
+    register_alloc_barrier!(P.Table)
+    @test !StrictMode._failed(proof())
+    delete!(StrictMode._ALLOC_BARRIERS, P.Table)
+    store = StrictMode._store_for(Base.moduleroot(parentmodule(P)), StrictMode._LOCAL_BARRIERS)
+    isnothing(store) || filter!(g -> g !== P.Table, store)
+    StrictMode._BARRIER_GEN[] += 1
+    StrictMode.clear_cache!()
+end

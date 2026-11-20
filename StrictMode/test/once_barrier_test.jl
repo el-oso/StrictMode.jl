@@ -217,3 +217,57 @@ end
     @test isempty(d)
     @test !any(l -> startswith(l, "proof:alloc-sites="), d.proof_signals)
 end
+
+@testitem "a callable object is a barrier by its type, and registered as the type" begin
+    using StrictMode
+
+    module CallableBarrier
+    struct Table
+        n::Int
+    end
+    @noinline (t::Table)() = zeros(t.n)
+    @noinline (t::Table)(k::Int; scale::Int = 1) = zeros(t.n * k * scale)
+    use4() = Table(4)()[1]
+    use5() = Table(5)()[1]
+    useany(t::Table) = t()[1]
+    usekw(t::Table) = t(2; scale = 3)[1]
+    @noinline singleton() = zeros(3)
+    usesingleton() = singleton()[1]
+    end
+    C = CallableBarrier
+    status(f, T = ()) = only(findings(f, T; guarantees = (:noalloc,))).status
+
+    # The scan sees the callee's type and no value, so one instance cannot be registered apart
+    # from the others. Asking for that is refused, and the message says what can be registered.
+    @test_throws "a barrier is matched on the callee's type, so it would cover every `Table`" register_alloc_barrier!(C.Table(4))
+    @test_throws "register_alloc_barrier!(Table)" register_alloc_barrier!(C.Table(4))
+    captured = let n = 3
+        () -> zeros(n)
+    end
+    @test_throws "would cover every" register_alloc_barrier!(captured)
+    @test isempty(filter(g -> g isa C.Table, StrictMode._barrier_functions()))
+    @test StrictMode._failed(only(findings(C.use4, (); guarantees = (:noalloc,))))
+
+    # The type is every instance, and says so at the call.
+    @test isnothing(register_alloc_barrier!(C.Table))
+    @test status(C.use4) !== :fail
+    @test status(C.use5) !== :fail
+    @test status(C.useany, (C.Table,)) !== :fail
+    @test status(C.usekw, (C.Table,)) !== :fail
+    # Building one is not calling one.
+    build(n) = CallableBarrier.Table(n)
+    @test status(build, (Int,)) === :pass
+
+    # A function is its own type's one instance.
+    @test StrictMode._failed(only(findings(C.usesingleton, (); guarantees = (:noalloc,))))
+    @test isnothing(register_alloc_barrier!(C.singleton))
+    @test status(C.usesingleton) !== :fail
+
+    for f in (C.Table, C.singleton)
+        delete!(StrictMode._ALLOC_BARRIERS, f)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(C)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== f, store)
+    end
+    StrictMode._BARRIER_GEN[] += 1
+    StrictMode.clear_cache!()
+end

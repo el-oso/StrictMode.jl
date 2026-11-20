@@ -362,6 +362,10 @@ use one of those two `Base` types (this includes `Base.OncePerTask`, which is **
 auto-recognized — its implementation has no detectable non-inlined callee boundary; wrap it in your
 own function and register that instead).
 
+A callable object is registered as its type, `register_alloc_barrier!(Table)`, which covers a call
+of every `Table`. One instance, `register_alloc_barrier!(Table(4))`, is refused: the scan reads the
+type of the callee and cannot tell one instance from another.
+
 ```@docs
 register_alloc_barrier!
 ```

@@ -119,7 +119,7 @@ end
     StrictMode.clear_cache!()
 end
 
-@testitem "a callable object is registered by value" begin
+@testitem "a callable trust boundary is registered by value, a callable barrier by type" begin
     using StrictMode
 
     struct MinLength
@@ -141,21 +141,21 @@ end
         n::Int
     end
     (t::Tabulate)() = zeros(t.n)
-    @test isnothing(StrictMode.register_alloc_barrier!(Tabulate(4)))
-    @test any(g -> g === Tabulate(4), StrictMode._barrier_functions())
+    @test isnothing(StrictMode.register_alloc_barrier!(Tabulate))
+    @test any(g -> g === Tabulate, StrictMode._barrier_functions())
     # A scan that meets a keyword body compares it with every registered barrier by name, and
     # an object has none of its own.
     kwuser(x; scale = 2.0) = scale * x
     kwcaller(x) = kwuser(x; scale = 3.0)
     @test only(findings(kwcaller, (Float64,); guarantees = (:noalloc,))).status === :pass
-    @test StrictMode._callable_name(Tabulate(4)) === :Tabulate
+    @test StrictMode._callable_name(Tabulate) === :Tabulate
     # The registration is taken back from the session and from the store a session write makes.
-    delete!(StrictMode._ALLOC_BARRIERS, Tabulate(4))
+    delete!(StrictMode._ALLOC_BARRIERS, Tabulate)
     store = StrictMode._store_for(Base.moduleroot(parentmodule(Tabulate)), StrictMode._LOCAL_BARRIERS)
-    isnothing(store) || filter!(g -> g !== Tabulate(4), store)
+    isnothing(store) || filter!(g -> g !== Tabulate, store)
     StrictMode._BARRIER_GEN[] += 1
     StrictMode.clear_cache!()
-    @test !any(g -> g === Tabulate(4), StrictMode._barrier_functions())
+    @test !any(g -> g === Tabulate, StrictMode._barrier_functions())
 end
 
 @testitem "a payload read into a local is a read" begin

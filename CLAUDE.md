@@ -881,8 +881,12 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   lies in that package's directory, read from the frame's file because an inlined frame keeps no
   method): a table a package registers on first use, first used by a dependent's precompile
   workload, must not break that precompile.
-  `jl_generating_output() == 1` alone does not say whose code is running. A callable object is
-  registered by value and belongs to the module of its type (`_owner_module`).
+  `jl_generating_output() == 1` alone does not say whose code is running. A callable object
+  belongs to the module of its type (`_owner_module`). A TRUST BOUNDARY is registered by value
+  (`findings(f, types)` has the value). An ALLOC BARRIER is registered as its TYPE and covers every
+  instance (`_barrier_covers`: `p <: T`, which `Type{T}`, a constructor call, is not): the scan
+  meets it as the callee type of an :invoke and has no value, so `register_alloc_barrier!` RAISES
+  on an instance of a non-singleton type rather than silently excuse the others.
   `test/consumer/dependents.jl` builds three packages and pins each case from their caches.
 - **Certainty decides throw-vs-warn, and it can be per FINDING, not only per guarantee.** StrictMode
   throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
@@ -940,7 +944,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F67 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F68 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,
