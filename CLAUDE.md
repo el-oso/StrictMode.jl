@@ -603,10 +603,13 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         registry and passes), then announces the proof tier.
   src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _exempt_only (a call
                         whose EVERY allocation site has a frame whose method is exempt from
-                        :noalloc is its own result: :info, SM0018, with StrictFinding.exempt_by
-                        listing each exempt function and its reason. NEVER a pass — the gates
-                        turn it into :fail through StrictMode._gate_exempt_only unless given
-                        `allow_exempt = true`. One site without an exempt frame, or an exempt
+                        :noalloc is its own result: SM0018, with StrictFinding.exempt_by listing
+                        each exempt function and its reason. Its status is :fail FROM THE PROOF,
+                        so every reader of _failed/nfailures/status sees it as not passed with
+                        no gate in between (alloc_entry_report, proof_findings, proof_audit,
+                        the Revise watcher); `allow_exempt = true` is threaded into
+                        _proof_findings and makes it :info. divergence_report reads it beside the
+                        scan own exempt note as agreement. One site without an exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
                         is StrictMode._mi_exemption, on the method module and name, with
                         declared_in_module = true: an exemption declared with NO module covers

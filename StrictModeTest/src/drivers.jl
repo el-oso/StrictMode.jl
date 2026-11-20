@@ -31,16 +31,15 @@ function _gate(items, kind::Symbol, target::AbstractString; allow_exempt::Bool =
     # can never outlive the gate that asked for it.
     fs = try
         _trim_batch!(_trim_sigs(items))
-        StrictMode._map_findings(_proof_findings, items)
+        # An exempt-only result is a failure from the proof unless this gate's caller accepted
+        # the exemptions.
+        StrictMode._map_findings((f, types, gs) -> _proof_findings(f, types, gs; allow_exempt), items)
     finally
         empty!(_TRIM_BATCH)
     end
     # A listed signature is one its author expects to return; in a sweep, a signature that always
     # throws is an error helper and stays a note.
     kind === :test_signatures && (fs = StrictMode._gate_always_throws(fs))
-    # A call that allocates only inside exempt functions is a note from the proof and a failure
-    # at a gate, unless the gate's caller accepted the exemptions.
-    fs = StrictMode._gate_exempt_only(fs, allow_exempt)
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -66,9 +65,10 @@ test_signatures([
 ```
 
 A signature that allocates only inside functions exempted from `:noalloc` is not a pass: the proof
-reports it as an SM0018 note that lists the exempt functions and their reasons, and this gate, like
-`test_compiled`, `test_registered` and `@test_noalloc`, fails it. `allow_exempt = true` accepts the
-exemptions for this gate, which then passes it when nothing else allocates.
+reports it as a failure with code SM0018 that lists the exempt functions and their reasons, and this
+gate, like `test_compiled`, `test_registered` and `@test_noalloc`, fails on it. `allow_exempt = true`
+accepts the exemptions for this gate: the result is then a note, and the gate passes when nothing
+else allocates.
 Only an exemption declared in the function's own module counts; a session-wide one, which covers by
 name, leaves its caller an ordinary failure.
 """
@@ -675,14 +675,14 @@ end
 _kw_entries(@nospecialize(f)) =
     collect(methods(Core.kwcall, Tuple{Any, Core.Typeof(f), Vararg{Any}}))
 
-function _positional_entry(@nospecialize(f), sig)
+function _positional_entry(@nospecialize(f), sig; allow_exempt::Bool = false)
     Base.isdispatchtuple(sig) || return AllocEntry(
         sig, :positional, :unproven,
         "the signature names no concrete argument types — prove it at the types a caller uses " *
             "with `test_signatures([(f, (T1, T2, …))])` or `@test_noalloc f(args…)`"
     )
     fs = try
-        _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,))
+        _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,); allow_exempt)
     catch e
         return AllocEntry(
             sig, :positional, :unproven, "the proof could not run: " * sprint(showerror, e)
@@ -717,10 +717,10 @@ r = StrictModeTest.alloc_entry_report(gemm!)
 filter(e -> e.status === :unproven, r.entries)
 ```
 """
-function alloc_entry_report(@nospecialize(f))
+function alloc_entry_report(@nospecialize(f); allow_exempt::Bool = false)
     entries = AllocEntry[]
     for m in methods(f)
-        push!(entries, _positional_entry(f, m.sig))
+        push!(entries, _positional_entry(f, m.sig; allow_exempt))
     end
     for m in _kw_entries(f)
         push!(entries, _keyword_entry(m.sig))

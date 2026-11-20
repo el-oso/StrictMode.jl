@@ -28,7 +28,7 @@ guesses that nothing gates on, and `:proof` is `StrictModeTest`'s AllocCheck/JET
 its drivers do gate. A saved `:jsonlines` file read by another process, or by another session, has
 no other way to tell a guess from a proof.
 
-`exempt_by` is empty except on the allocation proof's SM0018 note: a call whose every allocation
+`exempt_by` is empty except on the allocation proof's SM0018 result: a call whose every allocation
 lies inside a function exempted from `:noalloc` by a declaration made in that function's
 module (`@strict_exempt` in its source). An exemption declared with no module does not count. It lists each such function with the `reason` its
 exemption gave, as `"name" => "reason"`, so the reader of a result sees what was excused and why

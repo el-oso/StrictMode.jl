@@ -117,7 +117,7 @@ Each finding is one object (here pretty-printed):
 }
 ```
 
-`exempt_by` is empty except on the allocation proof's SM0018 note, where it lists the functions
+`exempt_by` is empty except on the allocation proof's SM0018 result, where it lists the functions
 exempt from `:noalloc` by a declaration in their own module that account for every allocation, as `{"function": …, "reason": …}`.
 
 `guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |

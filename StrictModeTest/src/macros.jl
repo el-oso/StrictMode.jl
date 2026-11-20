@@ -13,8 +13,7 @@ function _test_guarantee(
         kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple);
         allow_exempt::Bool = false
     )
-    fs = StrictMode._gate_always_throws(_proof_findings(f, types, guarantees))
-    fs = StrictMode._gate_exempt_only(fs, allow_exempt)
+    fs = StrictMode._gate_always_throws(_proof_findings(f, types, guarantees; allow_exempt))
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return nothing
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -53,9 +52,10 @@ as is a call whose only allocation is a recognized one-time-init barrier
 (see [`set_ignore_barrier!`](@ref)).
 
 A call that allocates only inside functions exempted from `:noalloc` with `@strict_exempt`, in the
-module that defines them, is not a pass. It fails, with code SM0018, and the message lists each exempt function with the reason its
-exemption gave. `allow_exempt = true` accepts those exemptions for this check: the call then
-passes if nothing else allocates, and still fails if one site is its own.
+module that defines them, is not a pass. It fails, with code SM0018, and the message lists each
+exempt function with the reason its exemption gave. `allow_exempt = true` accepts those exemptions
+for this check: the call then passes if nothing else allocates, and still fails if one site is its
+own.
 An exemption declared with no module (a session-wide one, by name) counts for none of this: its
 caller fails as any allocating call does.
 

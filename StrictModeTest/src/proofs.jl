@@ -407,8 +407,8 @@ end
 # `Condition` and `Threads.Event`; finalizers are code registered elsewhere, and they run at other GC
 # points too. A Base slow path that allocates for its own sake (a contended lock) is still judged.
 # An `@strict_exempt` callee is NOT dropped here: `@test_noalloc` proves no allocation on any path.
-# A call whose every site is inside one is reported as that (`_exempt_only`, SM0018), which a
-# gate fails unless its caller passes `allow_exempt = true`; a pool that grows on first use is
+# A call whose every site is inside one is reported as that (`_exempt_only`, SM0018), which is a
+# failure unless the caller passes `allow_exempt = true`; a pool that grows on first use is
 # gated on what it does once warm by `@test_steady_state`.
 function _not_own_excused(@nospecialize(f), allocs)
     fin(a) = a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
@@ -1148,10 +1148,19 @@ One [`StrictMode.StrictFinding`](@ref) per requested guarantee, computed with th
 than StrictMode's value-free scan. `f` is never called. This is the data half of the gating API;
 `test_signatures`/`test_compiled`/`test_registered` add the raise.
 """
-proof_findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:typestable, :noalloc)) =
-    _proof_findings(f, types, guarantees)
+proof_findings(
+    @nospecialize(f), @nospecialize(types::Tuple);
+    guarantees = (:typestable, :noalloc), allow_exempt::Bool = false
+) = _proof_findings(f, types, guarantees; allow_exempt)
 
-function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
+# What a caller is told to do about an exempt-only result.
+const _EXEMPT_ONLY_FIX = "every allocation is inside a function exempted from :noalloc. Accept " *
+    "the exemptions listed for this check with `allow_exempt = true`, or remove the " *
+    "allocation or the exemption"
+
+function _proof_findings(
+        @nospecialize(f), @nospecialize(types::Tuple), guarantees; allow_exempt::Bool = false
+    )
     fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
     target = fn * sg
     # AllocCheck runs at most once per signature even when both allocation guarantees are asked
@@ -1193,16 +1202,17 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
                     )
                 elseif !isnothing(_exempt_only(allocs))
                     # Every site lies inside a function exempt from `:noalloc`. That is not a
-                    # proof of no allocation, so it is a note with its own code and never a pass:
-                    # a gate fails it unless its caller accepted the exemptions.
+                    # proof of no allocation, so it is a FAILURE with its own code: counted by
+                    # `nfailures`, failed by every gate, not a pass to any reader of the status.
+                    # A caller that accepts the exemptions by name gets the note in its place.
                     by = _exempt_only(allocs)
                     push!(
                         out, StrictMode.StrictFinding(
-                            md, fn, sg, g, :info, file, line,
+                            md, fn, sg, g, allow_exempt ? :info : :fail, file, line,
                             "allocates only inside " * (length(by) == 1 ? "a function" : "functions") *
                                 " exempt from :noalloc ($(length(allocs)) site(s)): " *
                                 join(("`" * n * "`" * (isempty(r) ? "" : " (" * r * ")") for (n, r) in by), ", "),
-                            "", :proof, :SM0018, "", by
+                            allow_exempt ? "" : _EXEMPT_ONLY_FIX, :proof, :SM0018, "", by
                         )
                     )
                 else

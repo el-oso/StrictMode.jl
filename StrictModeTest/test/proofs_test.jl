@@ -481,13 +481,13 @@ end
     proof(f) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,)))
 
     r = proof(E.only_grows)
-    @test r.status === :info
+    @test r.status === :fail
     @test r.code === :SM0018
     @test r.exempt_by == ("grow!" => "pool grows to a high-water mark",)
     @test occursin("allocates only inside", r.reason) && occursin("`grow!`", r.reason)
-    @test !StrictMode._failed(r)
+    @test StrictMode._failed(r)
     two = proof(E.two_exempt)
-    @test two.status === :info
+    @test two.status === :fail && two.code === :SM0018
     @test Set(first.(two.exempt_by)) == Set(["grow!", "table!"])
     @test ("table!" => "index table built once per size") in two.exempt_by
 
@@ -550,7 +550,7 @@ end
     # The same exemption declared in the module names the method, and counts.
     StrictMode._exempt!(:sgrow!, SessionExempt; guarantees = (:noalloc,), reason = "declared in the module")
     m = only(StrictModeTest.proof_findings(SessionExempt.only_grows, (Int,); guarantees = (:noalloc,)))
-    @test m.status === :info && m.code === :SM0018
+    @test m.status === :fail && m.code === :SM0018
     @test m.exempt_by == ("sgrow!" => "declared in the module",)
 
     # `@strict_exempt` written in a module's source is that form.
@@ -566,6 +566,56 @@ end
     end
     MacroExempt.only_grows(4)
     w = only(StrictModeTest.proof_findings(MacroExempt.only_grows, (Int,); guarantees = (:noalloc,)))
-    @test w.status === :info && w.code === :SM0018
+    @test w.status === :fail && w.code === :SM0018
     @test w.exempt_by == ("mgrow!" => "written in the source",)
+end
+
+@testitem "an exempt-only result is not a pass to any reader" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ExemptReaders
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    typed_grows(n::Int) = (b = grow!(n); b[1])
+    end
+    E = ExemptReaders
+    E.typed_grows(4)
+    sig = (Int,)
+
+    # The data API: counted as a failure, with the code and the exempt functions kept.
+    fs = StrictModeTest.proof_findings(E.typed_grows, sig; guarantees = (:noalloc,))
+    r = only(fs)
+    @test StrictMode._failed(r)
+    @test nfailures(fs) == 1
+    @test r.code === :SM0018
+    @test r.exempt_by == ("grow!" => "pool",)
+    @test occursin("allow_exempt = true", r.suggestion)
+    # Accepted by name, it is a note, and still not a pass.
+    ok = only(StrictModeTest.proof_findings(E.typed_grows, sig; guarantees = (:noalloc,), allow_exempt = true))
+    @test ok.status === :info && ok.code === :SM0018 && ok.exempt_by == r.exempt_by
+    @test nfailures([ok]) == 0
+
+    # Every entry point of the function: the positional one is not proven clean.
+    entry = only(e for e in StrictModeTest.alloc_entry_report(E.typed_grows).entries if e.kind === :positional)
+    @test entry.status === :fail
+    @test occursin("exempt from :noalloc", entry.reason)
+    accepted = only(e for e in StrictModeTest.alloc_entry_report(E.typed_grows; allow_exempt = true).entries if e.kind === :positional)
+    @test accepted.status === :pass
+
+    # The two engines say the same thing about this call, each in its own words: the scan notes the
+    # exempt callee and the proof reports the exempt-only result. That is not a disagreement, and it
+    # is not "the proof passes" either.
+    d = divergence_report(E.typed_grows, sig; guarantees = (:noalloc,))
+    @test isempty(d)
+    @test !StrictMode._failed(only(StrictMode.findings(E.typed_grows, sig; guarantees = (:noalloc,))))
+
+    # A sweep that reports, and one that gates.
+    @test nfailures(StrictModeTest.proof_findings(E; guarantees = (:noalloc,), only = [:typed_grows])) == 1
+    @test_throws StrictViolation test_compiled(E; guarantees = (:noalloc,), only = [:typed_grows])
+    @test test_compiled(E; guarantees = (:noalloc,), only = [:typed_grows], allow_exempt = true) isa Vector
 end

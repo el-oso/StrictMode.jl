@@ -149,6 +149,13 @@ function divergence_report(
     # what this function is for. What matters here is whether the engine flagged the call at all.
     fmap = Dict(x.guarantee => StrictMode._failed(x) for x in ff)
     lmap = Dict(x.guarantee => StrictMode._failed(x) for x in fl)
+    # A call that allocates only inside exempt functions gets a note from the scan and the
+    # exempt-only failure (SM0018) from the proof. Both name the same exempt callee, so that is the
+    # two engines agreeing, in their own words.
+    if any(x -> x.guarantee === :noalloc && x.code === :SM0018, fl) &&
+            !isnothing(StrictMode._alloc_signals(f, types).exempt) && !get(fmap, :noalloc, true)
+        lmap[:noalloc] = false
+    end
     diverged = Tuple{Symbol, Bool, Bool}[]
     for g in guarantees
         a = get(fmap, g, false)
