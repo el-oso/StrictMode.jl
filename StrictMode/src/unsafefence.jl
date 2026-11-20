@@ -25,8 +25,10 @@ const _UNSAFE_LIBC = Base.IdSet{Any}(
 )
 
 # The construct names that are not the name of a function: a `ccall` statement, an `@cfunction`,
-# `@inbounds`, and a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`).
-const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr)
+# `@inbounds`, a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`), and a
+# global of a module read by a name that is a run-time value (`getglobal(Base, nm)`), which may be
+# any function the module holds.
+const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr, :dynamic_global)
 
 # The builtins that take a bounds-check flag as their last argument. A literal `false` there reads
 # or writes without the check, as `@inbounds` does.
@@ -91,29 +93,59 @@ function _check_allow(allow)
     return allowed
 end
 
-# The function a lowered call names, resolved without inference: a `GlobalRef`, a constant, or
+# The function a lowered call names, resolved without inference: a `GlobalRef`, a constant,
 # `M.name` on a module, which lowers to `getproperty(M, :name)` (or is written `getfield(M, :name)`)
-# in a statement of its own.
+# in a statement of its own, or a local that is assigned once and holds one of those.
 function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
     depth > 8 && return nothing
     a isa GlobalRef && return isdefined(a.mod, a.name) ? getglobal(a.mod, a.name) : nothing
     a isa QuoteNode && return a.value
-    # `M.name` written where a value is stored (`f = Base.unsafe_load`) is the call itself, with
-    # no statement of its own.
-    Meta.isexpr(a, :call) && return _lowered_global_read(code, a, depth)
-    if a isa Core.SSAValue
-        s = code[a.id]
-        v = _lowered_global_read(code, s, depth)
-        isnothing(v) || return v
-        # `Ptr{T}` is `Core.apply_type(Ptr, T)` in a statement of its own. The type it names is
-        # the one being parameterized, which is all a caller needs to know it is a pointer type.
-        if Meta.isexpr(s, :call) && length(s.args) >= 2 &&
-                _lowered_callee(code, s.args[1], depth + 1) === Core.apply_type
-            return _lowered_callee(code, s.args[2], depth + 1)
-        end
-        return _lowered_callee(code, s, depth + 1)
+    if a isa Core.SlotNumber
+        # `B = Base; B.unsafe_load(p)` and `T = Ptr{Float64}; T(a)`. A local assigned more than
+        # once holds no one value, and each of its assignments is judged where it is written.
+        rhs = _single_assignment(code, a)
+        return rhs === nothing ? a : _lowered_callee(code, rhs, depth + 1)
     end
+    if Meta.isexpr(a, :call)
+        # `M.name` written where a value is stored (`f = Base.unsafe_load`) is the call itself,
+        # with no statement of its own.
+        v = _lowered_global_read(code, a, depth)
+        isnothing(v) || return v
+        # `Ptr{T}` is `Core.apply_type(Ptr, T)`. The type it names is the one being
+        # parameterized, which is all a caller needs to know it is a pointer type.
+        if length(a.args) >= 2 && _lowered_callee(code, a.args[1], depth + 1) === Core.apply_type
+            return _lowered_callee(code, a.args[2], depth + 1)
+        end
+        return nothing
+    end
+    a isa Core.SSAValue && return _lowered_callee(code, code[a.id], depth + 1)
     return a isa Expr ? nothing : a
+end
+
+# The right-hand side of the one assignment to a local, or `nothing` when there is none or
+# several.
+function _single_assignment(code::Vector{Any}, slot::Core.SlotNumber)
+    rhs = nothing
+    for st in code
+        (Meta.isexpr(st, :(=)) && st.args[1] == slot) || continue
+        isnothing(rhs) || return nothing
+        rhs = st.args[2]
+    end
+    return rhs
+end
+
+# Whether a statement reads a global of a module by a name that is not written in the code. Which
+# function that is cannot be read from the method, so it cannot be cleared either. `getglobal`
+# reads nothing but a module; `getproperty` and `getfield` count only when their first operand
+# is one, since on any other value they read a field.
+function _dynamic_global_read(code::Vector{Any}, @nospecialize(s))
+    (Meta.isexpr(s, :call) && length(s.args) >= 3) || return false
+    reader = _lowered_callee(code, s.args[1], 1)
+    reader in (getproperty, getfield, getglobal) || return false
+    nm = s.args[3]
+    (nm isa QuoteNode || nm isa Symbol) && return false
+    (nm isa Core.SSAValue && code[nm.id] isa QuoteNode) && return false
+    return reader === getglobal || _lowered_callee(code, s.args[2], 1) isa Module
 end
 
 # The value `M.name` reads: `getproperty(M, :name)`, `getfield(M, :name)` or `getglobal(M, :name)`
@@ -132,6 +164,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
     # mean the same thing about this method.
     any(fl -> !iszero(fl & _IR_FLAG_INBOUNDS), ci.ssaflags) && push!(out, :inbounds)
     note(@nospecialize(v)) = (nm = _unsafe_function(v); isnothing(nm) || push!(out, nm); nothing)
+    dynamic(@nospecialize(s)) = _dynamic_global_read(ci.code, s)
     # A value a statement can hold by name: lowering gives a global its own statement, so the
     # name is judged where it is USED. A use as a callee, an argument, a stored local or a
     # returned value hands the function on; a comparison (`f === unsafe_load`) does not.
@@ -157,6 +190,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
             continue
         end
         (st.head === :call && !isempty(st.args)) || continue
+        dynamic(st) && push!(out, :dynamic_global)
         callee = resolve(st.args[1])
         # Comparing a value with an unsafe function hands the function to nothing.
         (callee === (===) || callee === (!==) || callee === (==) || callee === (!=) || callee === isequal) && continue
@@ -240,11 +274,16 @@ uses any of these.
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
 | a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)` | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
+| a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
 
 A function counts wherever the method names it, not only where it calls it: `map(unsafe_load, ps)`,
 `unsafe_load.(ps)`, `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own = false)` and
 `f = unsafe_load; f(p)` are all reported as `unsafe_load` or `unsafe_wrap`. The name may be
-qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. Comparing a value with
+qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. A module or a
+pointer type kept in a local that is assigned once is followed: `B = Base; B.unsafe_load(p)` and
+`T = Ptr{Float64}; T(addr)` are reported. A lookup whose name is not written in the code,
+`getglobal(Base, nm)`, cannot be resolved to a function, so it is reported as `dynamic_global`
+instead of passing. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
 function named `free` is not `Libc.free`. Taking a `Ptr` argument, or naming the type, builds no
 pointer and is not reported.

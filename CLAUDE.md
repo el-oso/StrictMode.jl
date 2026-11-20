@@ -537,6 +537,11 @@ StrictMode/src/
                         statement of its own, which _lowered_callee resolves to the type being
                         parameterized), and so is convert to one, whatever is converted, since
                         lowered code carries no types — a Ptr argument or annotation is not; a
+                        local assigned ONCE is followed to its value (_single_assignment:
+                        `B = Base; B.unsafe_load(p)`, `T = Ptr{Float64}; T(a)`); a module global
+                        read by a run-time name cannot be resolved and is reported as
+                        :dynamic_global (_dynamic_global_read: getglobal always, getproperty and
+                        getfield only when the first operand resolves to a Module); a
                         name read through a module (`f = Base.unsafe_load`, getglobal(Base, …)) is
                         resolved by _lowered_global_read, as a statement or as a stored value; :cfunction is a
                         statement head; a memoryref builtin or getfield with a literal `false`

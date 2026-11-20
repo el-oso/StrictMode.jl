@@ -279,3 +279,43 @@ end
     @test_throws "`allow` names `pointr`" unsafe_report(FenceSpellings; allow = (:pointr,))
     @test_throws "not a construct this scan reports" unsafe_report(FenceSpellings; allow = (:inbound,))
 end
+
+@testitem "unsafe_report follows a module or a pointer type kept in a local" begin
+    using StrictMode
+
+    module FenceLocals
+    module_local(p) = (B = Base; B.unsafe_load(p))
+    module_then_function(p) = (B = Base; f = B.unsafe_load; f(p))
+    type_local(a) = (T = Ptr{Float64}; T(a))
+    type_local_convert(a) = (T = Ptr{Float64}; convert(T, a))
+    # The name is a value of the call, so which function this reads is decided at run time.
+    by_name(p, nm) = getglobal(Base, nm)(p)
+    by_name_qualified(p, nm) = getproperty(Base, nm)(p)
+    by_name_local(p, nm) = (B = Base; getfield(B, nm)(p))
+    end
+    found(nm) = only(f for f in unsafe_report(FenceLocals) if f.func == String(nm)).reason
+    @test occursin("unsafe_load", found(:module_local))
+    @test occursin("unsafe_load", found(:module_then_function))
+    @test occursin("Ptr", found(:type_local))
+    @test occursin("Ptr", found(:type_local_convert))
+    # Not resolved, and said so: a method that passes this scan calls nothing unsafe by name.
+    for nm in (:by_name, :by_name_qualified, :by_name_local)
+        @test occursin("dynamic_global", found(nm))
+    end
+    @test length(unsafe_report(FenceLocals)) == 7
+    @test length(unsafe_report(FenceLocals; allow = (:dynamic_global,))) == 4
+
+    module FenceLocalsClean
+    struct S
+        x::Int
+    end
+    module_local(v) = (B = Base; B.sum(v))
+    type_local(a) = (T = Vector{Float64}; T(a))
+    # A field chosen at run time is a field of a value, not a global of a module.
+    field_by_name(s, nm) = getfield(s, nm)
+    property_by_name(s, nm) = getproperty(s, nm)
+    # A variable assigned twice is not followed to either value; neither names anything unsafe.
+    twice(v, c) = (f = sum; c && (f = prod); f(v))
+    end
+    @test isempty(unsafe_report(FenceLocalsClean))
+end
