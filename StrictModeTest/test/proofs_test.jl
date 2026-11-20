@@ -655,7 +655,11 @@ end
     @strict_exempt :noalloc reason = "vec" withbufs
     const FS = [b -> sum(zeros(length(b))) + b[1]]
     cb_vec(n::Int) = withbufs(FS, n)
-    @noinline withhooks(hooks::Vector{Function}, n::Int) = (b = grow!(n); for h in hooks; h(b); end; b[1])
+    @noinline withhooks(hooks::Vector{Function}, n::Int) = (
+        b = grow!(n); for h in hooks
+            h(b)
+        end; b[1]
+    )
     @strict_exempt :noalloc reason = "runs hooks" withhooks
     const HOOKS = Function[b -> sum(zeros(length(b)))]
     cb_hooks(n::Int) = withhooks(HOOKS, n)
@@ -714,6 +718,43 @@ end
     isnothing(store) || filter!(g -> g !== P.Table, store)
     StrictMode._BARRIER_GEN[] += 1
     StrictMode.clear_cache!()
+end
+
+@testitem "a barrier excuses a helper it calls from several sites, unless the call reaches it too" begin
+    using StrictMode, StrictModeTest, Test
+
+    # A function called from more than one place is compiled once, and AllocCheck ends the backtrace
+    # of its sites at a frame named "multiple call sites": the barrier is not in it.
+    module MultiSite
+    @noinline helper(n::Int; k::Int = 1) = (w = zeros(n + k); w[1] + length(w))
+    @noinline sized(n::Int) = helper(n) + helper(n; k = 3)
+    @noinline regrow!(n::Int) = sized(n)
+    @noinline mid(n::Int) = helper(n; k = 5)
+    only_barrier(n::Int) = regrow!(n) + 1
+    also_direct(n::Int) = regrow!(n) + mid(n)
+    end
+    M = MultiSite
+    M.only_barrier(3); M.also_direct(3)
+    register_alloc_barrier!(M.regrow!)
+    try
+        proof(f) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,)))
+        # Both calls reach the proof's barrier filter rather than the unfiltered proof.
+        for f in (M.only_barrier, M.also_direct)
+            sig = StrictMode._alloc_signals(f, (Int,))
+            @test sig.barrier && !sig.alloc
+        end
+        raw = StrictModeTest._raw_allocs(M.only_barrier, (Int,))
+        @test any(a -> any(fr -> fr.func === Symbol("multiple call sites"), a.backtrace), raw)
+        @test !StrictMode._failed(proof(M.only_barrier))
+        # `mid` reaches the helper without crossing the barrier, so its sites are the call's own.
+        @test StrictMode._failed(proof(M.also_direct))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, M.regrow!)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(M)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== M.regrow!, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
 end
 
 @testitem "proof_audit and proof_findings(mod) accept exemptions with allow_exempt" begin

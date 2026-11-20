@@ -382,9 +382,10 @@ end
 # accounts for are dropped. A site is the barrier's when its backtrace passes through the barrier's
 # own frame, or when no frame of it lies outside Base and Core: AllocCheck merges the lock and task
 # internals of a once-guard into "multiple call sites" with no caller left to name (24 of 52 sites on
-# a `OncePerProcess` calibrator), and those are the guard's. Every other site stands, so a buffer
-# grown later through the barrier's accessor is still reported where it grows: excusing the whole call
-# on the barrier signal hid exactly that, because the scan it fell back on stops two calls deep.
+# a `OncePerProcess` calibrator), and those are the guard's. A site is the barrier's too when its
+# function is reached only through a barrier (`_only_through_barrier`). Every other site stands, so a
+# buffer grown later through the barrier's accessor is still reported where it grows; the value-free
+# scan stops two calls deep and cannot see it.
 # A call whose scan already finds allocation, boxing or an abstract-eltype container gets the
 # unfiltered proof, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
@@ -393,6 +394,10 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     sig = StrictMode._alloc_signals(f, types)
     (sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)) || return (allocs, false)
     kept = filter(a -> !_through_barrier(a) && _has_user_frame(a), allocs)
+    if !isempty(kept)
+        inside = _only_through_barrier(StrictMode._sigtype(f, types))
+        isnothing(inside) || filter!(a -> !(_site_mi(a) in inside), kept)
+    end
     excused = length(allocs) - length(kept)
     if excused > 0
         name = something(_barrier_frame_name(allocs), :barrier)
@@ -536,6 +541,79 @@ end
 _through_barrier(@nospecialize(a)) = any(a.backtrace) do fr
     mi = _frame_mi(fr)
     mi isa Core.MethodInstance && StrictMode._mi_is_barrier(mi)
+end
+
+# The specialization compiled around an allocation site: its first frame that was not inlined.
+function _site_mi(@nospecialize(a))
+    for fr in a.backtrace
+        mi = _frame_mi(fr)
+        mi isa Core.MethodInstance && return mi
+    end
+    return nothing
+end
+
+# Most bodies `_invoke_reach` reads before it gives up.
+const _BARRIER_WALK_MAX = 4096
+
+# The specializations the call `sig` reaches only by entering a barrier: reached from a barrier, and
+# not from the call along any path that avoids one. A function called from several places is
+# compiled once, and AllocCheck ends the backtrace of its sites at a frame named "multiple call
+# sites", so the backtrace cannot say whether the barrier is on every path to it; this call graph
+# can. `nothing` when the graph outside the barriers could not be read in full, since an edge the
+# walk did not see may reach any site.
+function _only_through_barrier(@nospecialize(sig))
+    root = StrictMode._sig_instance(sig, Base.get_world_counter())
+    root isa Core.MethodInstance || return nothing
+    outside, barriers, complete = _invoke_reach(Core.MethodInstance[root], true)
+    (complete && !isempty(barriers)) || return nothing
+    inside, _, _ = _invoke_reach(collect(barriers), false)
+    return Base.IdSet{Core.MethodInstance}(mi for mi in inside if !(mi in outside))
+end
+
+# The specializations reached from `roots` along the `:invoke` edges of their optimized bodies,
+# which are the static calls AllocCheck compiles and follows. AllocCheck compiles the specialization
+# for the inferred types where Julia invokes the compilation signature (`_native_dispatches`); where
+# the two differ, the site's specialization is not in the walk and the site is kept. A call left to
+# run-time dispatch is not such an edge: AllocCheck reports the dispatch itself and compiles nothing
+# behind it. With `stop`, a barrier is recorded rather than entered. Returns `(reached, barriers, complete)`;
+# `complete` is false when a body could not be read, when a call could still be compiled statically
+# without an `:invoke` (`Core.invoke` and its kin, a `@cfunction`, an opaque closure), or when the
+# walk reached `_BARRIER_WALK_MAX` bodies.
+function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool)
+    reached = Base.IdSet{Core.MethodInstance}(roots)
+    barriers = Base.IdSet{Core.MethodInstance}()
+    queue = copy(roots)
+    complete = true
+    while !isempty(queue)
+        length(reached) > _BARRIER_WALK_MAX && return (reached, barriers, false)
+        ci = StrictMode._typed_body(pop!(queue).specTypes)
+        if !(ci isa Core.CodeInfo)
+            complete = false
+            continue
+        end
+        for st in ci.code
+            st isa Expr || continue
+            if st.head === :invoke || st.head === :invoke_modify
+                callee = StrictMode._invoke_mi(st.args[1])
+                if isnothing(callee)
+                    complete = false
+                elseif !(callee in reached || callee in barriers)
+                    if stop && StrictMode._mi_is_barrier(callee)
+                        push!(barriers, callee)
+                    else
+                        push!(reached, callee)
+                        push!(queue, callee)
+                    end
+                end
+            elseif st.head === :call
+                v = StrictMode._sw_callee_value(st.args[1])
+                v isa Core.Builtin && nameof(v) in StrictMode._SW_DYNAMIC_BUILTINS && (complete = false)
+            elseif st.head in (:cfunction, :new_opaque_closure)
+                complete = false
+            end
+        end
+    end
+    return (reached, barriers, complete)
 end
 
 _has_user_frame(@nospecialize(a)) = any(a.backtrace) do fr
