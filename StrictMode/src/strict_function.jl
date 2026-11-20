@@ -556,8 +556,12 @@ include("b.jl")
 end
 ```
 
-Every definition the module made is checked, **including those in `include`d files** — the check
-reads the module's methods, not the text of its body. A method whose own signature is not concrete
+Every definition the module has made **by that line** is checked, including those in `include`d
+files: the check reads the module's methods, not the text of its body, and it runs where the macro
+is written. A method defined below the line is not read. A policy that finds nothing to check
+raises an `ArgumentError` for that reason: written first in a module it would load cleanly over
+methods it never looked at. Place it at the end of the module, or wrap the module with
+`@strict module`. A method whose own signature is not concrete
 cannot be checked at load (a generic declaration infers to `Any`); declare its instantiations with
 [`@strict_function`](@ref)'s `signatures = [...]`, or gate on them from the test environment with
 `StrictModeTest.test_coverage`.
@@ -600,7 +604,8 @@ macro strict_policy(args...)
         $(check) && $(_auto_check_module)(
             @__MODULE__, _gs,
             $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line));
-            only = $(esc(get(opts, :only, nothing))), exempt = $(esc(get(opts, :exempt, ())))
+            only = $(esc(get(opts, :only, nothing))), exempt = $(esc(get(opts, :exempt, ()))),
+            require_methods = true
         )
         _gs
     end

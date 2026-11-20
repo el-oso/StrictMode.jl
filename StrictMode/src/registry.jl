@@ -789,16 +789,36 @@ end
 # later version errors on. Callers with no policy of their own resolve it here, a world later.
 function _auto_check_module(
         mod::Module, policy = module_policy(mod), source::AbstractString = "";
-        only = nothing, exempt = ()
+        only = nothing, exempt = (), require_methods::Bool = false
     )
     CHECKS_ENABLED || return nothing
-    fs = _map_findings(_scan_findings, _module_load_items(mod, policy; only, exempt))
+    # A `@strict_policy` line checks the methods defined above it. With none there, a filter has
+    # nothing to match yet, so this is asked before the names are.
+    require_methods && isempty(first(module_methods(mod; include_exempt = true))) &&
+        throw(ArgumentError(_policy_checked_nothing(mod, 0)))
+    items = _module_load_items(mod, policy; only, exempt)
+    require_methods && isempty(items) && throw(
+        ArgumentError(_policy_checked_nothing(mod, length(first(module_methods(mod; only, exempt)))))
+    )
+    fs = _map_findings(_scan_findings, items)
     # The policy is the requirement here, so its line is what a reader needs; a signature with its
     # own declaration keeps that one, which `_map_findings` has already stamped.
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
     _report_at_load(fs, :strict_module, string(nameof(mod)))
     _release_after_load_check()
     return nothing
+end
+
+# A policy line that read no method. Loading on would look like a module that satisfies its
+# policy, with everything defined below the line unread.
+function _policy_checked_nothing(mod::Module, defined::Int)
+    what = defined == 0 ? "no method is defined above this line in `$(nameof(mod))`" :
+        "$defined method(s) are defined above this line in `$(nameof(mod))`, and none has a " *
+        "concrete signature to check (declare the instantiations with `@strict_function " *
+        "signatures = [...]`)"
+    return "@strict_policy checked nothing: $what. A policy checks the methods defined above " *
+        "it, so place `@strict_policy` at the end of the module, or use `@strict module`. To " *
+        "record a policy without checking, write `check = false`."
 end
 
 # Split on `_guarantee_gates`: a check that observes compiled output throws, an inference warns.

@@ -49,6 +49,10 @@ reports SM0208 for it. In a sweep (`audit`, `test_compiled`, `test_registered`, 
 that is a note, because a module's error helpers are not defects. Where the signature was listed
 (`test_signatures`, a `@verify_strict` line, `@strict_function signatures = [...]`) it is a failure.
 
+A module policy is a sweep with a position. `@strict_policy` checks only the methods defined above
+it, and raises when there are none to check, so it is written at the end of the module
+([Automating](automating.md)).
+
 Whether a failure throws or warns depends on how sure the check is. A check that observes what it
 reports throws: it read compiled output, the type the compiler assigned, or a store in the IR. A
 check that infers something it cannot see, such as the allocation scan, warns, and the proof in

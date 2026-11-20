@@ -102,3 +102,34 @@ end
     @test_throws "no method matches" Core.eval(Module(:_DeclTypo), typo)
     StrictMode.clear_declarations!()
 end
+
+@testitem "@strict_policy raises when it has nothing to check at its line" begin
+    using StrictMode
+
+    load(src) = Core.eval(@__MODULE__, Meta.parse(src))
+    unstable = "later(x::Int) = x > 0 ? 1 : \"s\""
+
+    # A policy checks the methods defined ABOVE it. Written first, it finds none, and loading on
+    # would read as a module that satisfies its policy: the unstable method below is never read.
+    @test_throws "@strict_policy checked nothing: no method is defined above this line in `PolFirst`" load("module PolFirst; using StrictMode; @strict_policy :typestable; $unstable; end")
+    @test_throws "place `@strict_policy` at the end of the module, or use `@strict module`" load("module PolFirstB; using StrictMode; @strict_policy :typestable; $unstable; end")
+    # The same with a filter: there is nothing above it for the name to match yet.
+    @test_throws "no method is defined above this line in `PolFirstOnly`" load("module PolFirstOnly; using StrictMode; @strict_policy :typestable only = (:later,); $unstable; end")
+    @test_throws "no method is defined above this line" load("module PolFirstExempt; using StrictMode; @strict_policy :typestable exempt = (:later,); $unstable; end")
+
+    # Written last, it reads the method.
+    @test_throws StrictMode.StrictViolation load("module PolLast; using StrictMode; $unstable; @strict_policy :typestable; end")
+    @test_throws StrictMode.StrictViolation load("module PolLastOnly; using StrictMode; $unstable; @strict_policy :typestable only = (:later,); end")
+    @test load("module PolLastClean; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable; end") isa Module
+
+    # A policy that does check something still rejects a name that matches nothing.
+    @test_throws "`only` names `latr`, which matches no function" load("module PolTypo; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable only = (:latr,); end")
+
+    # Methods above it, none of them with a concrete signature to check.
+    @test_throws "@strict_policy checked nothing: 1 method(s) are defined above this line in `PolGeneric`, and none has a concrete signature" load("module PolGeneric; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    @test_throws "check = false" load("module PolGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+
+    # `check = false` records the policy and checks nothing, by request.
+    @test load("module PolRecorded; using StrictMode; @strict_policy :typestable check = false only = (:later,); $unstable; end") isa Module
+    @test StrictMode.module_policy(PolRecorded) == (:typestable,)
+end

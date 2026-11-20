@@ -74,6 +74,12 @@ end
 It reads the module's methods rather than rewriting its body, which is why definitions inside an
 `include`d file are covered.
 
+A policy checks only the methods defined above it: the check runs at the line where the macro is
+written, and a method defined below is not read. That is why it goes last. A policy that finds
+nothing to check at its line raises, since written first it would load cleanly over a module it
+never looked at. `@strict module … end` wraps the whole module and has no such position, and
+`check = false` records a policy without checking.
+
 ### Declaring a narrower set, rather than excusing a guarantee
 
 An exemption is for a method that sits under a policy claiming something it cannot deliver. When

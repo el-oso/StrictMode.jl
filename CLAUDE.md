@@ -279,7 +279,11 @@ StrictMode/src/
                         body moves to a hidden `#f#inner`, the wrapper infers its return type via
                         promote_op so a stable specialization folds the branch away entirely),
                         @strict_exempt (a definition, a name, a `begin … end` block, or an
-                        `include` whose definitions are found by diffing the census), @strict_policy
+                        `include` whose definitions are found by diffing the census), @strict_policy. A
+                        @strict_policy line checks only the methods defined ABOVE it and RAISES
+                        when it has none to check (`require_methods` in _auto_check_module: no
+                        method above it, or none with a concrete signature): written first it
+                        loaded cleanly over a module it never read. `check = false` does not raise
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
                         StrictMode performance guarantees. A @verify_strict line is an
                         example call or a SIGNATURE line, `f(::T1, ::T2; k::K)`: _signature_parts
