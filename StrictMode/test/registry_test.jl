@@ -338,3 +338,38 @@ end
     @test !NamedLikeInit.__init__(NamedLikeInit.Builder())
     @test !StrictMode._called_from_init()
 end
+
+@testitem "a module sweep covers the methods it adds to another module's function" begin
+    using StrictMode
+
+    module ForeignMethods
+    using StrictMode
+    struct MyT
+        v::Int
+    end
+    # A method of `Base.getproperty`, written here. It reads the payload outside any boundary.
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    struct Grows
+        n::Int
+    end
+    Base.collect(g::Grows) = zeros(g.n)
+    own(x::Int) = x + 1
+    end
+    F = ForeignMethods
+    u = Untrusted(F.MyT(7))
+    u.x; collect(F.Grows(3)); F.own(1)
+
+    swept(; kw...) = audit(F; sweep = true, dispatch_suggest = false, kw...)
+    fs = swept(; guarantees = (:trusted,))
+    read = only(f for f in fs if f.func == "getproperty")
+    @test StrictMode._failed(read)
+    @test occursin("reads an `Untrusted` payload", read.reason)
+    @test any(f -> f.func == "own" && f.status === :pass, fs)
+    # Only the method written here: `getproperty` has many others, and they are Base's.
+    @test count(f -> f.func == "getproperty", fs) == 1
+    @test any(f -> f.func == "collect" && f.guarantee === :noalloc && f.status !== :pass, swept(; guarantees = (:noalloc,)))
+    # The filters name it as they name the module's own functions.
+    @test !any(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), exempt = (:getproperty,)))
+    @test all(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), only = (:getproperty,)))
+    Base.delete_method(which(getproperty, (Untrusted{F.MyT}, Symbol)))
+end

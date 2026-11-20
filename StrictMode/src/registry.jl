@@ -1216,7 +1216,11 @@ function module_methods(mod::Module; only = nothing, exempt = (), include_exempt
 end
 
 # Shared module-sweep core: every `(f, tt)` pair — a concrete dispatch-tuple specialization `mod`
-# has actually compiled — across its own functions matching `only`/`exempt`. The compiled sweep,
+# has actually compiled — across its own functions matching `only`/`exempt`, and across the
+# methods it adds to a function another module owns (`Base.getproperty`, `Base.size`), which are
+# often a package's hottest code and which no walk over the module's names meets. Those come from
+# the census, `module_methods`, and only the method written here is swept, not the function's
+# others. The compiled sweep,
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
 function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
@@ -1239,6 +1243,22 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
                 Base.isdispatchtuple(Tuple{tt...}) || continue
                 f!(f, tt)
             end
+        end
+    end
+    for mth in first(module_methods(mod; only, exempt))
+        mth.module === mod || continue
+        F = _method_function(mth)
+        (F <: Function && isdefined(F, :instance)) || continue
+        f = F.instance
+        parentmodule(f) === mod && continue      # the module's own, walked above
+        for mi in _specializations(mth)
+            tt = try
+                Tuple((mi.specTypes::DataType).parameters[2:end])
+            catch
+                continue
+            end
+            Base.isdispatchtuple(Tuple{tt...}) || continue
+            f!(f, tt)
         end
     end
     return nothing

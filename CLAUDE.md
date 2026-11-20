@@ -332,7 +332,11 @@ StrictMode/src/
                         reporting drivers _findings_all/_findings_compiled are here too;
                         StrictModeTest's test_registered/test_compiled reuse the same item lists.
                         module_methods is the CENSUS (Base.visit(Core.methodtable) filtered by
-                        module, so a method on a FOREIGN function counts); _coverage_all_findings
+                        module, so a method on a FOREIGN function counts); _module_specializations,
+                        the one enumerator behind every compiled sweep (audit sweep, test_compiled,
+                        inline/dispatch/static-ownership suggestions), walks the module own
+                        functions and then takes from the census each method the module defines
+                        on a function ANOTHER module owns, sweeping that method only; _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function
                         form; _is_parametric_def keeps a `where` definition out of the registry.
                         _STORES/_store_for memoize each module's store so a reader never touches a
@@ -953,7 +957,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F69 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F70 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

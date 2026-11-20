@@ -261,3 +261,20 @@ end
     @test any(x -> x.func == "need" && x.code === :SM0208, swept)
     @test_throws MethodError @test_noalloc A.bad(1)
 end
+
+@testitem "test_compiled covers a method added to another module's function" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ForeignGate
+    using StrictMode
+    struct MyT
+        v::Int
+    end
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    own(x::Int) = x + 1
+    end
+    Untrusted(ForeignGate.MyT(7)).x; ForeignGate.own(1)
+    @test_throws "getproperty" test_compiled(ForeignGate; guarantees = (:trusted,))
+    @test test_compiled(ForeignGate; guarantees = (:trusted,), exempt = (:getproperty,)) isa Vector
+    Base.delete_method(which(getproperty, (Untrusted{ForeignGate.MyT}, Symbol)))
+end
