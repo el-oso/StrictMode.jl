@@ -550,9 +550,15 @@ function _barrier_frame_name(allocs)
         mi = _frame_mi(fr)
         (mi isa Core.MethodInstance && mi.def isa Method && StrictMode._mi_is_barrier(mi)) || continue
         ps = mi.specTypes.parameters
-        # A registered barrier is named by its function; a Base once-guard by its type, since its
-        # frame is a generated init closure.
+        # A registered barrier is named by its function, or by its type for a callable object; a
+        # Base once-guard by its type, since its frame is a generated init closure. A keyword call
+        # reaches the registered callable through `Core.kwcall` or its keyword body, which carry it
+        # past parameter 1.
         StrictMode._is_registered_callee(ps[1]) && return StrictMode._demangle(mi.def.name)
+        for f in StrictMode._barrier_functions()
+            any(p -> StrictMode._barrier_covers(f, p), ps) &&
+                return StrictMode._demangle(StrictMode._callable_name(f))
+        end
         return nameof(Base.unwrap_unionall(ps[2]))
     end
     return nothing

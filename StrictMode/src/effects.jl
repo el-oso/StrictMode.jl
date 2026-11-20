@@ -370,19 +370,14 @@ function _kwbody_self(mi::Core.MethodInstance)
 end
 
 # A registered function called with keywords is reached through two more methods: `Core.kwcall`, which
-# carries the function at parameter 3, and the keyword-sorted body `#f#N`, which carries it after the
-# keyword values. Both are the barrier: the allocation is the registered function's own.
+# carries the function at parameter 3, and the keyword body, which carries it after the keyword
+# values (`_kwbody_self`). Both are the barrier: the allocation is the registered function's own.
 function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
     bs = _barrier_functions()
     (isempty(bs) || !(mi.def isa Method)) && return false
     ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
-    name = _demangle(mi.def.name)
-    for f in bs
-        # A callable object's type has no function name of its own; its keyword body is named
-        # after the type.
-        _callable_name(f) === name && any(p -> _barrier_covers(f, p), ps) && return true
-    end
-    return false
+    self = _kwbody_self(mi)
+    return !isnothing(self) && _is_registered_callee(self)
 end
 
 function _mi_is_barrier(mi::Core.MethodInstance)
