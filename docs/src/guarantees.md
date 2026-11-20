@@ -1148,7 +1148,9 @@ frame = Untrusted(read(sock, n))
 ```
 
 That changes its type, so nothing written for `Vector{UInt8}` accepts it. `sum(frame)` and
-`frame[1]` are `MethodError`s; `frame.x` throws. You can pass it around, and that is all.
+`frame[1]` are `MethodError`s; `frame.x` and `reinterpret(T, frame)` throw. Printing it shows
+`Untrusted{Vector{UInt8}}(<redacted>)`, so a log line does not carry the payload. You can pass it
+around, and that is all.
 Wrapping costs nothing — same layout as the payload, no allocation — and the type is still there
 in a shipped build.
 
@@ -1193,7 +1195,9 @@ Two limits, both real.
 **The type does most of the work on its own.** An `Untrusted{T}` matches no method written for
 `T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
-that.
+that. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs. Base methods
+written for every value still read the fields: `dump(frame)` prints the payload, and `==`,
+`isequal` and `hash` compare and hash it — `Untrusted(1) == Untrusted(1)` is `true`.
 
 **Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header`
 really checks what it read, or that it copied instead of handing back the caller's buffer. Both

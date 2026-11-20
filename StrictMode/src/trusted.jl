@@ -23,12 +23,13 @@ handed over by a device.
 The wrapped value is meant to be passed along or given to a **trust boundary**: a function that
 validates it and returns a plain value, registered with [`trust_boundary!`](@ref). Methods written
 for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a `MethodError`
-instead of quietly succeeding, and `u.x` throws. The one deliberate way out is
-[`unsafe_trust`](@ref).
+instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. The one deliberate way out
+is [`unsafe_trust`](@ref).
 
-Generic methods that accept any value still reach the payload: `reinterpret(UInt32, u)` copies the
-bytes of an `isbits` payload out, and `show`/`string` print it. Those reads happen inside Base, so
-neither dispatch nor [`@assert_trusted`](@ref) refuses them.
+`show`, `print`, `string` and `repr` print the type and `<redacted>` in place of the payload, so a
+log line cannot leak it. `dump(u)`, `==`, `isequal` and `hash` are Base's defaults, which read the
+fields directly: `dump` prints the payload, `Untrusted(1) == Untrusted(1)` is `true`, and the hash
+of an `isbits` payload depends on its value.
 
 Wrapping is free: `Untrusted{T}` has the same layout as `T` and allocates nothing. Wrapping twice
 returns the same value, so an edge that wraps defensively costs nothing.
@@ -50,10 +51,19 @@ end
 
 Untrusted(u::Untrusted) = u
 
-Base.getproperty(::Untrusted, name::Symbol) = error(
-    "`Untrusted` data has no readable fields (tried `.$name`). Validate it in a function " *
+_untrusted_read_error(tried::String) = error(
+    "`Untrusted` data has no readable fields (tried `$tried`). Validate it in a function " *
         "registered with `trust_boundary!`, which reads the payload with `unsafe_trust`."
 )
+
+Base.getproperty(::Untrusted, name::Symbol) = _untrusted_read_error(".$name")
+
+# Base's generic `reinterpret(T, x)` copies the bits of any `isbits` value, so without this method it
+# would hand out an `isbits` payload. Base's other `reinterpret` methods take an array or a float.
+Base.reinterpret(::Type, ::Untrusted) = _untrusted_read_error("reinterpret")
+
+# Printing is how a payload reaches a log, so the type is shown and the payload is not.
+Base.show(io::IO, u::Untrusted) = print(io, typeof(u), "(<redacted>)")
 
 """
     unsafe_trust(u::Untrusted)
@@ -133,6 +143,9 @@ end
 # it at check time is more use than a runtime error in whatever session first hits that branch.
 const _DEREF_FUNCS = (Core.getfield, Base.getproperty, unsafe_trust)
 
+# Whether a value is typed as an `Untrusted`. `Union{}` is a subtype of every type and types no value.
+_is_untrusted_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Untrusted
+
 # Callee names of the payload reads in `f`'s OWN body — empty when there are none, and `nothing`
 # when the typed IR could not be obtained, which a caller must not read as "no sites".
 # `Untrusted` carries one field, so a read of it is `unsafe_trust`, the field's name, or the index
@@ -193,6 +206,11 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         # `Untrusted`. Comparing a value with it applies it to nothing.
         if !(callee in (===, !==, ==, !=, isequal)) && any(a -> _unopt_callee(ci, a) === unsafe_trust, args)
             push!(certain, nameof(unsafe_trust))
+        end
+        # `reinterpret(T, u)` raises at run time, like `u.x`; reporting it here says so before then.
+        if callee === reinterpret && any(a -> _is_untrusted_type(_unopt_arg_type(ci, a)), args)
+            push!(certain, :reinterpret)
+            continue
         end
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
         T = _unopt_arg_type(ci, args[1])
@@ -377,8 +395,8 @@ end
 Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f` is not registered
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
-The read is any call to `getfield`, `getproperty`, or [`unsafe_trust`](@ref) on an argument
-that inference types as `<:Untrusted`, directly or through `invoke`, and `unsafe_trust` handed to
+The read is any call to `getfield`, `getproperty`, `reinterpret` or [`unsafe_trust`](@ref) on an
+argument that inference types as `<:Untrusted`, directly or through `invoke`, and `unsafe_trust` handed to
 another call as a value (`map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`). Registering `f` with [`trust_boundary!`](@ref) permits all of
 them in that one method. A function with keywords keeps its code in a body function of its own; the
 positional and `Core.kwcall` methods are judged by that body, and a registered boundary's body is
@@ -393,7 +411,7 @@ name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the
 reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
 from then on `p.x`, `p.v` or a property of any name read from an untyped value is reported like
 the other two, since that method returns what it chooses whatever the name. A method for the form
-with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`reinterpret(UInt32, u)`, `show`) is not seen, and nothing verifies that a registered boundary really validates or
+with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`dump`, `==`, `hash`) is not seen, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to

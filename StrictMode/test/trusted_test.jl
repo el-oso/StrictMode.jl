@@ -457,3 +457,37 @@ end
     # A module whose boundary takes keywords loads under a policy.
     @test Core.eval(@__MODULE__, Meta.parse("module KwBoundaryPolicy; using StrictMode; const U8 = Untrusted{Vector{UInt8}}; parsekw(u::U8; strict::Bool = true) = length(unsafe_trust(u)); trust_boundary!(parsekw); @strict_policy :trusted; end")) isa Module
 end
+
+@testitem "reinterpret and printing do not reach the payload" begin
+    using StrictMode
+    u = Untrusted(UInt32(0xdeadbeef))
+    v = Untrusted(UInt8[0x42, 0x43])
+
+    # `reinterpret` raises as a field read does, naming the call that was tried.
+    @test_throws "`Untrusted` data has no readable fields (tried `reinterpret`)" reinterpret(UInt32, u)
+    @test_throws "trust_boundary!" reinterpret(Float32, u)
+    @test_throws "`Untrusted` data has no readable fields (tried `.x`)" u.x
+    @test reinterpret(Float32, 0x3f800000) === 1.0f0
+
+    # Printing names the type and hides the payload, however it is asked for.
+    for s in (repr(u), string(u), sprint(print, u), sprint(show, u), repr(MIME"text/plain"(), u))
+        @test occursin("Untrusted{UInt32}", s)
+        @test occursin("redacted", s)
+        @test !occursin("deadbeef", s) && !occursin(string(0xdeadbeef), s)
+    end
+    for s in (repr(v), string(v), repr(MIME"text/plain"(), v), sprint(show, [v]))
+        @test occursin("redacted", s)
+        @test !occursin("0x42", s) && !occursin("66", s)
+    end
+
+    # The scan reports a `reinterpret` of an `Untrusted` as the payload read it attempts.
+    fr(u::Untrusted{UInt32}) = reinterpret(UInt32, u) + 1
+    fi = only(findings(fr, (Untrusted{UInt32},); guarantees = (:trusted,)))
+    @test StrictMode._failed(fi)
+    @test occursin("outside a trust boundary (reinterpret)", fi.reason)
+    @test_throws "(tried `reinterpret`)" fr(u)              # and the call itself raises
+    # A `reinterpret` of a plain value in the same function reads no payload.
+    clean(u::Untrusted{UInt32}, x::Float32) = (u, reinterpret(UInt32, x))
+    fc = only(findings(clean, (Untrusted{UInt32}, Float32); guarantees = (:trusted,)))
+    @test !StrictMode._failed(fc)
+end

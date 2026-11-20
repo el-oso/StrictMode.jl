@@ -230,6 +230,9 @@ StrictMode/src/
                         with no checker at all; the scan covers what the language cannot, reading
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller.
+                        `reinterpret(T, u)` raises like `u.x` (Base's generic reinterpret copies an
+                        isbits payload) and the scan reports it; `show` prints `<redacted>`. dump,
+                        ==, isequal and hash are Base's defaults and still read the payload.
                         A keyword function is judged by its body (_keyword_body: Base.bodyfunction,
                         accepted only when it carries the `#f#N` name of the method's function),
                         followed from the positional and kwcall methods, and a registered
