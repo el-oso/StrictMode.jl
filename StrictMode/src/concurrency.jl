@@ -12,7 +12,8 @@ Raised when a scan or a report cannot read the code it describes: `concurrency_f
 `threadid_state_findings` and `pool_balance_report` when there is no typed IR for the signature;
 `kernel_report`, `spill_report`, `register_report`, `scalar_fp_loops`, `mca_report` and
 `inline_suggestions` when there is no compiled body to read (a signature that is not concrete, or
-one no method matches); `effects` when no method matches. Each would otherwise return an empty
+one no method matches), and `spill_report` also on an architecture whose vector register names it
+does not know; `effects` when no method matches. Each would otherwise return an empty
 result, a zero count or a clean report: "could not check" and "is fine" would render identically,
 on guarantees that GATE (see `_guarantee_gates` in report.jl). Returning `_ConcViol[]` here is the
 vacuous-green shape this package exists to remove.

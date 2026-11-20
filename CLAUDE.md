@@ -208,7 +208,10 @@ StrictMode/src/
                         scalar_fp_loops) read their text through _report_text, which RAISES
                         _UnanalyzableSignature on an empty one (a signature that is not concrete,
                         or a printer that raised): a report of zeros reads as a clean kernel. The
-                        guarantees do not go through it — they turn an empty text into :fail
+                        guarantees do not go through it — they turn an empty text into :fail.
+                        Spills are counted only where _vec_reg_re knows the vector register
+                        names (x86, AArch64); elsewhere _spill_arch_unread makes spill_report
+                        raise and :no_spill unevaluated
   static_ownership.jl — static_ownership_suggestions (module-sweep static-ownership advisory)
   dispatch.jl         — _instability_cause (which declaration made a body unstable: a non-const
                         global, an abstract field, an abstract container eltype, reflection, or more
@@ -1006,9 +1009,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 - `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly.
 - `ignore_throw() = true` is the default and lives in StrictMode (`effects.jl`) — throw-path allocations don't count, and BOTH tiers honor it, so the scan and AllocCheck answer the same question.
 - **A compiled-output guarantee reads compiled output or fails.** `_llvm_ir`/`_native_asm` return
-  `""` when the printer raises AND for a signature that is not concrete: `code_llvm` prints a
-  run-time-dispatch fallback for it (437 characters for `sum(::AbstractVector{Float64})`, no loop, no
-  spill), which every loop and register check read as clean. `:vectorized`, `:no_scalar_loops`,
+  `""` when the printer raises AND for a signature that is not concrete: `code_llvm` prints the
+  method compiled for the abstract types, not the code a concrete call runs (for
+  `sum(::AbstractVector{Float64})`, one run-time dispatch and no loop or spill), which every loop and
+  register check would read as clean. `:vectorized`, `:no_scalar_loops`,
   `:no_spill` and `:inlined` turn an empty text (or `nothing` from `_inlined_survives`) into
   `_unevaluated`, in `_compiled_output_finding` and in the `@assert_*` macros alike. The public
   reports (`spill_report`, `scalar_fp_loops`, `kernel_report`, `register_report`) raise
