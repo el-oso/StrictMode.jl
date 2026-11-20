@@ -674,7 +674,14 @@ function _taint_scan_ci(
                         ), fr; certain = true, deliberate = atomic
                     )
                 end
-                continue
+                # An out-of-line method under a store's name (`@noinline Base.setindex!(w::W, …)`)
+                # on a wrapper built around a plan value writes wherever its body writes, so it is
+                # followed with the wrapper's field map like any other callee.
+                (
+                    isinvoke && 1 <= pos <= length(dataargs) &&
+                        !_op_tainted(dataargs[pos], tset, targs) &&
+                        !isnothing(_direct_fields(dataargs[pos], cset, cflds, cargs))
+                ) || continue
             end
 
             # projection: derive a (maybe-shared) reference

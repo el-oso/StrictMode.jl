@@ -1565,3 +1565,30 @@ end
     @test any(v -> v.certain && v.global_state, StrictMode.concurrency_findings(D.g_idx, (D.P,)))
 end
 
+
+@testitem "an out-of-line setindex! on a wrapper of a plan buffer is followed" begin
+    using StrictMode
+
+    module StoreWrapper
+    struct W
+        data::Vector{Float64}
+    end
+    @noinline Base.setindex!(w::W, v, i::Int) = (w.data[i] = v; w)
+    struct Own
+        data::Vector{Float64}
+        own::Vector{Float64}
+    end
+    @noinline Base.setindex!(w::Own, v, i::Int) = (w.own[i] = v; w)
+    struct P
+        buf::Vector{Float64}
+    end
+    f(p::P) = (w = W(p.buf); w[1] = 0.0; nothing)
+    g(p::P) = (w = Own(p.buf, zeros(2)); w[1] = 0.0; nothing)
+    end
+    S = StoreWrapper
+    vs = StrictMode.concurrency_findings(S.f, (S.P,))
+    @test any(v -> v.certain && occursin("setindex!", v.message), vs)
+    # The same call writing the wrapper's own fresh field is the method's own business.
+    @test isempty(StrictMode.concurrency_findings(S.g, (S.P,)))
+end
+
