@@ -311,3 +311,30 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "only a module's own initializer counts as running in __init__" begin
+    using StrictMode
+
+    # The loader calls this one: the zero-argument `__init__` of the module that defines it.
+    module RealInit
+    using StrictMode
+    const SEEN = Ref(false)
+    __init__() = (SEEN[] = StrictMode._called_from_init(); nothing)
+    end
+    @test RealInit.SEEN[]
+
+    # A function that merely has the name is not an initializer.
+    module NamedLikeInit
+    using StrictMode
+    function outer()
+        __init__() = StrictMode._called_from_init()
+        return __init__()
+    end
+    struct Builder end
+    __init__(b::Builder) = StrictMode._called_from_init()
+    __init__() = nothing
+    end
+    @test !NamedLikeInit.outer()
+    @test !NamedLikeInit.__init__(NamedLikeInit.Builder())
+    @test !StrictMode._called_from_init()
+end

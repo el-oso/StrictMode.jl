@@ -873,9 +873,14 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   precompiled has an open module. A store that was already there belongs to a package loaded
   from its own cache, and pushing onto it is silent loss, so that case RAISES and asks for
   `mod = @__MODULE__` (`_registration_lost`), as does a module that cannot take the constant at
-  all. The one exception is a call with an `__init__` frame on its stack (`_called_from_init`):
-  a dependency's `__init__` runs while its dependent precompiles, with the dependency's module
-  closed, and it runs again at every load, so it is a session registration and never raises.
+  all. Two exceptions, both a session registration that never raises. A call from a module's own
+  initializer (`_called_from_init`: the zero-argument `__init__` of the module that defines it, not
+  any frame of that name): a dependency's `__init__` runs while its dependent precompiles, with
+  the dependency's module closed, and it runs again at every load. And a call made by the OWNING
+  package's own code (`_registered_by_owner`: the first stack frame outside StrictMode and Base
+  lies in that package's directory, read from the frame's file because an inlined frame keeps no
+  method): a table a package registers on first use, first used by a dependent's precompile
+  workload, must not break that precompile.
   `jl_generating_output() == 1` alone does not say whose code is running. A callable object is
   registered by value and belongs to the module of its type (`_owner_module`).
   `test/consumer/dependents.jl` builds three packages and pins each case from their caches.
@@ -935,7 +940,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F53 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F67 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

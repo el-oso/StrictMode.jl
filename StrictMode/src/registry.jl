@@ -111,13 +111,48 @@ function _persist_registration!(@nospecialize(x), mod::Module, name::Symbol, cal
     catch
         false
     end
-    kept || _registration_lost(mod, call)
+    # A package's own code registering its own function while ANOTHER package precompiles (a
+    # table registered on first use, first used by a dependent's precompile workload) runs again
+    # in every process that calls it. The session's set is the whole registration, as it is for
+    # an `__init__`, and nothing of the dependent's is lost.
+    (kept || _registered_by_owner(mod)) || _registration_lost(mod, call)
     return nothing
 end
 
+# The method a stack frame runs, or `nothing` for a frame that has none of its own (top-level
+# code, or a call that was inlined).
+function _frame_method(fr::Base.StackTraces.StackFrame)
+    li = fr.linfo
+    li isa Core.CodeInstance && (li = li.def)
+    li isa Core.MethodInstance && (li = li.def)
+    return li isa Method ? li : nothing
+end
+
+# Whether a module's initializer is running: the zero-argument `__init__` of the module that
+# defines it, which is what the loader calls. Another function of that name is not one.
 function _called_from_init()
     for fr in stacktrace()
-        fr.func === :__init__ && return true
+        fr.func === :__init__ || continue
+        m = _frame_method(fr)
+        (m isa Method && _is_module_init(m)) && return true
+    end
+    return false
+end
+
+_is_module_init(m::Method) = m.nargs == 1 && isdefined(m.module, :__init__) &&
+    m.sig === Tuple{typeof(getglobal(m.module, :__init__))}
+
+# Whether the code that called the registration function belongs to the package that owns `mod`:
+# the first frame outside StrictMode and Base lies in that package's directory. Read from the
+# frame's file, which an inlined frame keeps and a method lookup does not.
+function _registered_by_owner(mod::Module)
+    dir = pkgdir(Base.moduleroot(mod))
+    isnothing(dir) && return false
+    for fr in stacktrace()
+        file = String(fr.file)
+        # Base's own frames carry a relative path.
+        (isabspath(file) && !startswith(file, @__DIR__)) || continue
+        return startswith(file, joinpath(dir, ""))
     end
     return false
 end

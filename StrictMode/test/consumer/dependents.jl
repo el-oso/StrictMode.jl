@@ -1,6 +1,7 @@
 # Three packages, one depending on the other two, built in a scratch directory and loaded from their
 # caches, for the registrations a single package cannot exercise: one made in an `__init__`, one
-# of a function or type another package owns, and one of a callable object.
+# of a function or type another package owns, one of a callable object, and one a package makes of
+# its own function when a dependent first calls it.
 #
 #     julia dependents.jl WORKDIR STRICTMODE_DIR
 #
@@ -38,6 +39,20 @@ lent_reader(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
 lent_reader_named(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
 @noinline lent_table() = zeros(4)
 @noinline lent_table_named() = zeros(4)
+
+# Registered by this package's own code when it is first called. A dependent's precompile
+# workload can be the first caller, in a process where this package came from its cache.
+struct Lazy
+    p::Ptr{Cvoid}
+end
+lazy_reader(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
+@noinline lazy_table() = zeros(4)
+function lazy_setup!()
+    StrictMode.register_scoped!(Lazy)
+    StrictMode.trust_boundary!(lazy_reader)
+    StrictMode.register_alloc_barrier!(lazy_table)
+    return nothing
+end
 end
 """
 
@@ -53,6 +68,8 @@ end
 init_reader(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
 const INIT_TABLE = Ref{Vector{Float64}}()
 @noinline init_table() = (isassigned(INIT_TABLE) || (INIT_TABLE[] = zeros(4)); INIT_TABLE[])
+lazy_reader(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u))
+lazy_setup!() = (StrictMode.trust_boundary!(lazy_reader); nothing)
 function __init__()
     StrictMode.register_scoped!(InitHandle)
     StrictMode.trust_boundary!(init_reader)
@@ -78,6 +95,11 @@ end
 const UNNAMED_SCOPED = attempt(() -> StrictMode.register_scoped!(RegOwner.Lent))
 const UNNAMED_TRUST = attempt(() -> StrictMode.trust_boundary!(RegOwner.lent_reader))
 const UNNAMED_BARRIER = attempt(() -> StrictMode.register_alloc_barrier!(RegOwner.lent_table))
+
+# RegOwner registering its own, called from here while this package precompiles: in force for
+# the process, and no error. The same call from RegInit, which holds no store at all.
+const LAZY_OWNER = attempt(RegOwner.lazy_setup!)
+const LAZY_INIT = attempt(RegInit.lazy_setup!)
 
 # The same, naming this package: stored here.
 StrictMode.register_scoped!(RegOwner.LentNamed; mod = @__MODULE__)
@@ -117,6 +139,11 @@ say("named_trust", StrictMode._is_trust_boundary(RegOwner.lent_reader_named))
 say("named_barrier", barrier(RegOwner.lent_table_named))
 say("callable_trust", RegDependent.CALLABLE_TRUST == "registered" && StrictMode._is_trust_boundary(RegDependent.Validator(3)) && !StrictMode._is_trust_boundary(RegDependent.Validator(4)))
 say("callable_barrier", RegDependent.CALLABLE_BARRIER == "registered" && barrier(RegDependent.Table(4)))
+say("lazy_owner_no_error", RegDependent.LAZY_OWNER == "registered" && RegDependent.LAZY_INIT == "registered")
+# Made in the dependent's precompile, so not in this process until the owner's code runs here.
+say("lazy_not_stored", !StrictMode._is_trust_boundary(RegOwner.lazy_reader) && !StrictMode._is_scoped_type(RegOwner.Lazy) && !barrier(RegOwner.lazy_table))
+RegOwner.lazy_setup!()
+say("lazy_in_session", StrictMode._is_trust_boundary(RegOwner.lazy_reader) && StrictMode._is_scoped_type(RegOwner.Lazy) && barrier(RegOwner.lazy_table))
 """
 
 mkpath(WORK)
