@@ -103,3 +103,30 @@ end
     @test any(x -> x.guarantee === :inline_suggestion && occursin("leaf", x.reason), fs)
     @test nfailures(fs) == 0                          # info findings never fail the audit
 end
+
+@testitem "inline_suggestions raises on a signature it could not read" begin
+    using StrictMode
+    caller(x::Int) = x + 1
+    # No suggestions and "could not read the body" must not render alike.
+    @test_throws StrictMode._UnanalyzableSignature inline_suggestions(sum, (Int, Int, Int))
+    @test_throws "no method matches" inline_suggestions(sum, (Int, Int, Int))
+    @test_throws "not concrete" inline_suggestions(caller, (Integer,))
+    @test inline_suggestions(caller, (Int,)) isa Vector{StrictFinding}
+
+    # In a module sweep the unreadable specialization is recorded, not dropped.
+    module UnreadableGen
+    const N = Ref(0)
+    @generated function gen(x)
+        N[] += 1
+        N[] > 1 && error("generator ran again")
+        return :(x + 1)
+    end
+    end
+    UnreadableGen.gen(1)
+    fs = inline_suggestions(UnreadableGen)
+    f = only(fs)
+    @test f.status === :info
+    @test f.func == "gen"
+    @test occursin("could not", f.reason)
+    @test nfailures(fs) == 0
+end

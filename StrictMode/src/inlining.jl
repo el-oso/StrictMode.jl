@@ -153,14 +153,17 @@ end
 # Base call is usually intentional. The user's own kernels (the actionable ones) live elsewhere.
 _is_base_core(m::Module) = (r = Base.moduleroot(m); r === Base || r === Core)
 
-# Walk `f`'s optimized IR; aggregate every non-inlined callee by Method.
+# Walk `f`'s optimized IR; aggregate every non-inlined callee by Method. A body that cannot be read
+# raises: an empty list would read as "nothing to suggest".
 function _noninlined_callees(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) ||
+        throw(_UnanalyzableSignature(:inline_suggestions, f, types, _output_unread(f, types)))
     cts = try
         _code_typed(f, types; optimize = true)
-    catch
-        return _NonInlinedCallee[]
+    catch err
+        throw(_UnanalyzableSignature(:inline_suggestions, f, types, sprint(showerror, err)))
     end
-    isempty(cts) && return _NonInlinedCallee[]
+    isempty(cts) && throw(_UnanalyzableSignature(:inline_suggestions, f, types, _NO_BODY_WHY))
     code = first(cts).first.code
     spans = _loop_spans(code)
     acc = Dict{Method, _NonInlinedCallee}()
@@ -213,6 +216,10 @@ column loop ran ~0.7× until marked `@inline`). `only_flagged = true` keeps just
 defaults to it to stay quiet); the single-function form shows all by default. Base/Core callees are
 skipped unless `include_base = true`.
 
+The `(f, types)` form raises `_UnanalyzableSignature` when it cannot read the body: a signature that
+is not concrete, one no method matches, or a generator that raised. The `Module` form records such
+a specialization as an `:info` finding saying the suggestions could not be computed.
+
 These findings are **never failures** — [`nfailures`](@ref) ignores them, so they never break a gate.
 Inlining is a heuristic: a tiny callee LLVM still inlines despite a Julia-IR `:invoke` is a false positive,
 so treat a suggestion as a prompt to *benchmark*, not a verdict.
@@ -248,6 +255,7 @@ function inline_suggestions(
             append!(out, inline_suggestions(f, tt; include_base, only_flagged))
         catch err
             err isa StrictViolation && rethrow()
+            push!(out, _advisory_error(f, tt, err))
         end
     end
     return out
