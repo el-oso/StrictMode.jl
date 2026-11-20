@@ -745,7 +745,9 @@ function _taint_scan_ci(
                             else
                                 _operand_type(src, types)
                             end
-                            idx = _proj_field_index(dataargs, pos, srcT)
+                            # Only a field read names a field: the constant in `w[2]` is an index
+                            # into whatever `getindex` reads, not field 2 of `w`.
+                            idx = nm in (:getfield, :getproperty) ? _proj_field_index(dataargs, pos, srcT) : nothing
                             (isnothing(idx) || idx in flds) && settaint(isref)
                         end
                     end

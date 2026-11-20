@@ -1715,3 +1715,24 @@ end
     @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
 end
 
+
+@testitem "a constant index into a wrapper is an element, not a field" begin
+    using StrictMode
+
+    module ConstIndex
+    struct P
+        bufs::Vector{Vector{Float64}}
+    end
+    struct Wr
+        v::Vector{Vector{Float64}}
+    end
+    @noinline Base.getindex(w::Wr, i::Int) = w.v[i]
+    f1(p::P) = (w = Wr(p.bufs); w[1][1] = 0.0; nothing)
+    f2(p::P) = (w = Wr(p.bufs); w[2][1] = 0.0; nothing)
+    end
+    C = ConstIndex
+    for f in (C.f1, C.f2)
+        @test any(v -> v.certain, StrictMode.concurrency_findings(f, (C.P,)))
+    end
+end
+
