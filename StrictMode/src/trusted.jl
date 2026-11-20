@@ -152,11 +152,12 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         T isa Type || continue
         if T <: Untrusted
             push!(certain, nameof(callee))
-        # StrictMode's `getproperty` raises on an `Untrusted` whatever the name, so on a value
-        # whose type is not known `p.x` reads no payload: it is a field of something else, or an
-        # error. That holds only while that method is the one an `Untrusted` reaches.
+            # StrictMode's two-argument `getproperty` raises on an `Untrusted` whatever the name, so on
+            # a value whose type is not known `p.x` reads no payload: it is a field of something else,
+            # or an error. That holds only while that method is the one an `Untrusted` reaches. The
+            # three-argument form, `getproperty(p, :x, order)`, is Base's, and reads the field.
         elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
-                (callee !== Base.getproperty || overridden) &&
+                (callee !== Base.getproperty || length(args) != 2 || overridden) &&
                 !_same_value_has_another_field(ci, other, i, args[1]) &&
                 !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
@@ -307,7 +308,8 @@ typed IR, with no execution, backend, or timing — and it **gates**, because it
 type inference has already fixed rather than guessing at a cost. A value inference could not type is handled by what the
 call can do: `getfield` and `unsafe_trust` on it are reported as reads that cannot be ruled out,
 and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
-name. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
+name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the field, so it is
+reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
 from then on `p.x` on an untyped value is reported like the other two. Its other limits are missed violations: only compiled specializations are swept, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 

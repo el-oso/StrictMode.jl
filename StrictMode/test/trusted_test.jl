@@ -357,3 +357,16 @@ end
     @test !StrictMode._untrusted_getproperty_overridden()
     @test Base.invokelatest(status, O.norm1).status === :pass
 end
+
+@testitem "getproperty with a memory order on an untyped value may read the payload" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    @test getproperty(Untrusted(UInt8[1, 2]), :x, :not_atomic) == UInt8[1, 2]
+    ordered(v::Vector{Any}) = getproperty(v[1], :x, :not_atomic)
+    r = status(ordered, (Vector{Any},))
+    @test StrictMode._failed(r)
+    @test occursin("may read an `Untrusted` payload", r.reason)
+    plain(v::Vector{Any}) = getproperty(v[1], :x)
+    @test status(plain, (Vector{Any},)).status === :pass
+end
