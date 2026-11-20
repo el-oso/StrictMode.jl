@@ -148,8 +148,8 @@ end
 _reach_follows(mi::Core.MethodInstance) =
     !_sw_is_base(mi.def.module) || _reach_carries_user(mi.specTypes)
 
-# Whether a signature has an argument typed abstractly (`Any`, `AbstractVector{Float64}`, a
-# `Vararg`), so that a value of a type defined outside Base may arrive there at run time and the
+# Whether a signature has an argument typed abstractly (`Any`, `AbstractVector{Float64}`,
+# `Vararg{Any}`), so that a value of a type defined outside Base may arrive there at run time and the
 # Base method run that type's methods. Such a Base callee is not entered, so the walk counts it as
 # a call site it could not read. A `Type{T}` and a union of concrete types are closed. Only the top
 # level is judged: a concrete Base container of abstract elements (`Vector{Any}`) is closed.
@@ -158,8 +158,17 @@ function _reach_open(@nospecialize(sig))
     sig isa DataType || return true
     return any(_reach_open_arg, sig.parameters)
 end
+# The types an `:invoke` passes, read at the call site. The method instance can be wider than
+# these: a `@nospecialize` method compiles once for `Vararg{Any}` whatever the caller passes.
+function _reach_invoke_types(ci::Core.CodeInfo, @nospecialize(sig), st::Expr, mi::Core.MethodInstance)
+    return try
+        Tuple{(_reach_argtype(ci, sig, a) for a in st.args[2:end])...}
+    catch
+        mi.specTypes
+    end
+end
 function _reach_open_arg(@nospecialize(T))
-    T isa Core.TypeofVararg && return true
+    T isa Core.TypeofVararg && return !isdefined(T, :T) || _reach_open_arg(T.T)
     T isa Union && return _reach_open_arg(T.a) || _reach_open_arg(T.b)
     T isa DataType || return T !== Union{}
     return !(isconcretetype(T) || T <: Type)
@@ -221,7 +230,7 @@ function _reach_scan!(
             if key in stop
             elseif _reach_follows(mi)
                 push!(queue, (mi.specTypes, depth))
-            elseif _reach_open(mi.specTypes)
+            elseif _reach_open(_reach_invoke_types(ci, sig, st, mi))
                 r.dynamic += 1
             end
         elseif st.head === :call

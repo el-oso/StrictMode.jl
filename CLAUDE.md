@@ -666,9 +666,12 @@ StrictMode/src/
                         outside Base (_reach_carries_user: a handed closure, or a user array whose
                         getindex `sum` calls); one on concrete Base types is neither entered nor
                         counted. One with an ABSTRACT argument type (_reach_open: Any,
-                        AbstractVector{Float64}, Vararg; top level only, so Vector{Any} is closed)
-                        is not entered but counts as dynamic, whether reached by :invoke, an
-                        enumerated dispatch or an unenumerable one: a user value may arrive there.
+                        AbstractVector{Float64}, Vararg{Any}; top level only, so Vector{Any} is
+                        closed) is not entered but counts as dynamic, whether reached by :invoke,
+                        an enumerated dispatch or an unenumerable one: a user value may arrive
+                        there. An :invoke is judged by its CALL-SITE argument types, since a
+                        @nospecialize method instance (print_to_string, Vararg{Any}) is wider than
+                        what an error-message interpolation of an Int passes.
                         So a route that computes with fetch(t) (inferred Any) is incomplete. A run-time dispatch is followed
                         when it matches at most _REACH_MAX_METHODS methods. `stop` cuts a hub (a pool
                         dispatcher reaches every job).

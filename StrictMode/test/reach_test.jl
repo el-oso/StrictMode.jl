@@ -204,4 +204,13 @@ end
     @test StrictMode._reach_open(Tuple{typeof(sum), AbstractVector{Float64}})
     @test StrictMode._reach_open(Tuple{typeof(+), Any, Float64})
     @test StrictMode._reach_open(Tuple{typeof(print), Vararg{Any}})
+    @test !StrictMode._reach_open(Tuple{typeof(Base._string), String, Vararg{String}})
+
+    # An :invoke is judged by the types at the call site, not by the method instance, which a
+    # `@nospecialize` widens: interpolating an `Int` into an error message stays in Base, and
+    # interpolating an `Any` does not.
+    chk(x::Int) = x > 0 ? x : throw(ArgumentError("bad $x"))
+    @test StrictMode.complete(StrictMode.reach_report(chk, (Int,)))
+    s2(r::Base.RefValue{Any}) = string("a", r[])
+    @test !StrictMode.complete(StrictMode.reach_report(s2, (Base.RefValue{Any},)))
 end
