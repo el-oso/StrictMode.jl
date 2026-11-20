@@ -182,8 +182,12 @@ _proof_analyzer(allow_exempt::Bool) =
         -> Vector{StrictFinding}
 
 [`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, and the same
-`Vector{StrictFinding}` back, and it likewise **never throws and never sets an exit status**. The
-only difference is the engine — AllocCheck, JET and TrimCheck instead of the value-free scan.
+`Vector{StrictFinding}` back, and it likewise **never throws on a violation and never sets an exit
+status**. The only difference is the engine — AllocCheck, JET and TrimCheck instead of the
+value-free scan. An argument that names nothing raises an `ArgumentError`, as in `audit`: an
+unknown guarantee, a `target` that is neither `:registered` nor a module, an invalid `require`,
+`format`/`io`, and an `only` or `exempt` entry that matches no function with a method in the
+module.
 
 That is the whole point of it existing. `audit`'s allocation verdicts are structural guesses, which
 is fine for discovery but means an agent cannot tell a real regression from noise; the `test_*`
