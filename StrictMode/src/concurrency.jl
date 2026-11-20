@@ -1298,9 +1298,10 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
         )
     )
     _may_ref(types[self_arg]) || return out
-    # A lock or a channel is written by every task that uses it; that is what it is for.
-    _is_lock_type(types[self_arg]) && return out
-    targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
+    # A lock or a channel is written by every task that uses it; that is what it is for. It is not
+    # seeded, and the scan still runs for the writes to constant globals the body makes.
+    targs = _is_lock_type(types[self_arg]) ? Set{Int}() :
+        Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
     _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Any}(), out, Set{String}())
     return out
 end
@@ -1865,7 +1866,8 @@ function _callee_writes_arg(mi::Core.MethodInstance, k::Int)
     catch
         return false
     end
-    return any(v -> v.certain, vs)
+    # A write to a constant global is not a write to argument `k`.
+    return any(v -> v.certain && !v.global_state, vs)
 end
 
 # Whether the callee `mi` returns its argument `k`, or a reference projected out of it, so that the

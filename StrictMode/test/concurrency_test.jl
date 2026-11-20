@@ -1671,3 +1671,23 @@ end
     @test f.status === :info
 end
 
+
+@testitem "a lock as the shared argument still has its global writes read" begin
+    using StrictMode
+
+    module LockArg
+    const LOG = zeros(4)
+    record!(lk::ReentrantLock, x::Float64) = (lock(lk); LOG[1] = x; unlock(lk); nothing)
+    const LKS = [ReentrantLock() for _ in 1:Threads.maxthreadid()]
+    @noinline note(lk::ReentrantLock) = (LOG[2] = 1.0; nothing)
+    per_thread() = (lk = LKS[Threads.threadid()]; note(lk); yield(); lk)
+    end
+    vs = StrictMode.concurrency_findings(LockArg.record!, (ReentrantLock, Float64))
+    @test any(v -> v.certain && v.global_state, vs)
+    @test_throws StrictViolation @assert_concurrency_safe LockArg.record!(ReentrantLock(), 1.0)
+    # The lock itself is still not a write.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+    # A helper handed a per-thread lock that writes a global writes the global, not the lock.
+    @test isempty(StrictMode.threadid_state_findings(LockArg.per_thread, ()))
+end
+
