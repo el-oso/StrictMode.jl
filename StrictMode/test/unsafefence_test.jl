@@ -425,3 +425,25 @@ end
     @test all(f -> StrictMode._failed(f) && occursin("`eval`", f.reason), fs)
     @test isempty(unsafe_report(FenceEval; allow = (:eval,)))
 end
+
+@testitem "unsafe_report sees an unsafe function held by a callable constant" begin
+    using StrictMode
+
+    module FenceWrapped
+    const LOAD1 = Base.Fix2(unsafe_load, 1)
+    get1(p) = LOAD1(p)
+    const RELEASE = identity ∘ Libc.free
+    release(p) = RELEASE(p)
+    end
+    found(nm) = only(f for f in unsafe_report(FenceWrapped) if f.func == String(nm)).reason
+    @test occursin("`unsafe_load`", found(:get1))
+    @test occursin("`free`", found(:release))
+
+    module FenceWrappedClean
+    const ADD1 = Base.Fix2(+, 1)
+    inc(x) = ADD1(x)
+    const ABSSUM = sum ∘ abs
+    total(x) = ABSSUM(x)
+    end
+    @test isempty(unsafe_report(FenceWrappedClean))
+end

@@ -61,16 +61,26 @@ _is_unsafe_name(nm::Symbol) = nm in _UNSAFE_NAMES || startswith(String(nm), "uns
 # Asked of every operand, not only of the callee: `map(unsafe_load, ps)`, `unsafe_load.(ps)`,
 # `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own)` and `f = unsafe_load` all name the
 # function as an argument of some other call, or as a value.
-function _unsafe_function(@nospecialize(v))
+#
+# A callable object holding a function, such as `const LOAD1 = Base.Fix2(unsafe_load, 1)` or
+# `identity ∘ Libc.free`, names the functions it holds: calling it calls them.
+function _unsafe_function(@nospecialize(v), depth::Int = 0)
     (v isa Function || v isa Core.IntrinsicFunction) || return nothing
     _is_eval(v) && return :eval
     v in _UNSAFE_LIBC && return nameof(v)::Symbol   # by identity, so before the name test
     nm = try
         nameof(v)
     catch
-        return nothing
+        nothing
     end
-    return (nm isa Symbol && _is_unsafe_name(nm)) ? nm : nothing
+    (nm isa Symbol && _is_unsafe_name(nm)) && return nm
+    depth < 4 || return nothing
+    for i in 1:nfields(v)
+        isdefined(v, i) || continue
+        inner = _unsafe_function(getfield(v, i), depth + 1)
+        isnothing(inner) || return inner
+    end
+    return nothing
 end
 
 _is_ptr_type(@nospecialize(v)) = v isa Type && v <: Ptr && v !== Union{}
@@ -357,7 +367,8 @@ own are read like every other method.
 A function counts wherever the method names it, not only where it calls it: `map(unsafe_load, ps)`,
 `unsafe_load.(ps)`, `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own = false)` and
 `f = unsafe_load; f(p)` are all reported as `unsafe_load` or `unsafe_wrap`. The name may be
-qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. A pointer type
+qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too, and so does a
+callable constant holding it, `const LOAD1 = Base.Fix2(unsafe_load, 1); LOAD1(p)`. A pointer type
 kept in a local that is assigned once is followed, `T = Ptr{Float64}; T(addr)`, and so is a module
 kept in a local to every module it is assigned, typed or not: `B = Base; B.unsafe_load(p)` and
 `M = Core; c && (M = Base); M.unsafe_load(p)` are reported. A lookup whose name is not written in the code,
