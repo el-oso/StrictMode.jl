@@ -821,7 +821,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   the census's: demangled, so a keyword body and a closure answer to the function that wrote
   them); a `stop` entry raises in `reach_report` when the walk never met it AND no reached body names
   it before optimization (`_reach_named_unoptimized`: a call the optimizer folded away leaves no
-  statement and no inlining edge, and a `stop` list must not depend on that), and in
+  statement and no inlining edge, and a `stop` list must not depend on that; a function
+  HANDED to any callee, Base included, counts as named and its methods are read, via
+  `_reach_handed!`, which is what finds a hub called from a closure, a `do` block, a generator, a
+  broadcast, a keyword call or a splat), and in
   `route_parity` only when NEITHER route met it. A preference key StrictMode does not read WARNS at load
   (`_warn_unknown_preferences`, called from `__init__`, so it scans the preference files by bytes
   and is pinned trim-clean in `StrictModeTest/test/trim_test.jl`); it is NOT gated on the

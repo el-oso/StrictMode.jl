@@ -276,7 +276,10 @@ _stop_unmet(caller::String, target, unmet) =
 
 # Which of `keys` some body reachable from `sig` calls by name, read from typed IR BEFORE
 # optimization, where every call the source wrote is still a statement. Callees outside Base are
-# followed, at the argument types inference gave the call.
+# followed, at the argument types inference gave the call. A function handed to any callee, Base's
+# included, is one the call may run: it counts as named, and its methods are read too. That
+# covers a closure, a `do` block, a generator, a broadcast, a keyword call and a splat, none of
+# which calls the function in a statement of the body that wrote it.
 const _REACH_NAMED_BODIES = 512
 function _reach_named_unoptimized(@nospecialize(sig), keys::Set{Tuple{Module, Symbol}})
     found = Set{Tuple{Module, Symbol}}()
@@ -295,6 +298,11 @@ function _reach_named_unoptimized(@nospecialize(sig), keys::Set{Tuple{Module, Sy
             for st in ci.code
                 Meta.isexpr(st, :(=)) && (st = st.args[2])
                 callee, args = _call_callee_and_args(ci, st)
+                if Meta.isexpr(st, :call) || Meta.isexpr(st, :new)
+                    for a in st.args
+                        _reach_handed!(found, queue, keys, _unopt_arg_type(ci, a), 0)
+                    end
+                end
                 (isnothing(callee) || callee isa Core.Builtin || callee isa Core.IntrinsicFunction) && continue
                 key = try
                     _reach_key(callee)
@@ -310,6 +318,25 @@ function _reach_named_unoptimized(@nospecialize(sig), keys::Set{Tuple{Module, Sy
         end
     end
     return found
+end
+
+# The functions defined outside Base that a value of type `T` is or carries: itself, or a type
+# parameter of a closure, a `Generator`, a `Broadcasted` or a tuple. Each is recorded when `keys`
+# names it, and queued to be read at any arguments.
+function _reach_handed!(found, queue::Vector{Any}, keys, @nospecialize(T), depth::Int)
+    T = Base.unwrap_unionall(T)
+    (T isa DataType && depth <= 3) || return nothing
+    if T <: Function && !_sw_is_base(parentmodule(T))
+        if isdefined(T, :instance)
+            key = _reach_key(T.instance)
+            key in keys && push!(found, key)
+        end
+        push!(queue, Tuple{T, Vararg{Any}})
+    end
+    for P in T.parameters
+        P isa Type && _reach_handed!(found, queue, keys, P, depth + 1)
+    end
+    return nothing
 end
 
 # The report, and the `stop` entries the walk never met.

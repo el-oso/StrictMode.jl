@@ -141,3 +141,34 @@ end
     @test StrictMode.route_parity(entry => sig, direct => sig; stop = (hub,)) isa StrictMode.RouteParity
     @test_throws "route_parity: `stop` names `other`, which neither" StrictMode.route_parity(entry => sig, direct => sig; stop = (other,))
 end
+
+@testitem "a stop entry is found through a closure or a function Base is handed" begin
+    using StrictMode
+
+    hub_fold(x) = 3
+    hub_kw(x; k = 1) = 3
+    hub_two(x, y) = 3
+    never(x) = x
+    fold_closure(xs) = sum(x -> hub_fold(x), xs)
+    fold_do(xs) = map(xs) do x
+        hub_fold(x)
+    end
+    fold_generator(xs) = sum(hub_fold(x) for x in xs)
+    fold_comprehension(xs) = [hub_fold(x) for x in xs]
+    fold_broadcast(xs) = hub_fold.(xs)
+    fold_passed(xs) = sum(hub_fold, xs)
+    fold_keyword(xs) = hub_kw(xs; k = 2)
+    fold_splat(t) = hub_two(t...)
+    fold_nested(xs) = sum(x -> sum(y -> hub_fold(y), x), xs)
+    for (f, T, hub) in (
+            (fold_closure, (Vector{Int},), hub_fold), (fold_do, (Vector{Int},), hub_fold),
+            (fold_generator, (Vector{Int},), hub_fold), (fold_comprehension, (Vector{Int},), hub_fold),
+            (fold_broadcast, (Vector{Int},), hub_fold), (fold_passed, (Vector{Int},), hub_fold),
+            (fold_keyword, (Vector{Int},), hub_kw), (fold_splat, (Tuple{Int, Int},), hub_two),
+            (fold_nested, (Vector{Vector{Int}},), hub_fold),
+        )
+        @test StrictMode.reach_report(f, T; stop = (hub,)) isa StrictMode.ReachReport
+        # A name the call does not use is still refused.
+        @test_throws "`stop` names `never`" StrictMode.reach_report(f, T; stop = (hub, never))
+    end
+end
