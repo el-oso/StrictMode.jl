@@ -179,6 +179,20 @@ end
     @test_logs (:warn, r"argument 1 \(written\) and argument 2 \(a buffer held in a field of argument 1"s) match_mode = :any (@assert_noalias from_fact!(F, F.factors))
     @test_logs (@assert_noalias ldiv!(F, [1.0, 2.0]))
 
+    # A closure is a struct whose fields are what it captured, and is read the same way. It is
+    # still not something a kernel writes.
+    struct FnHolder{G}
+        g::G
+    end
+    ignore_ws!(dst, ws) = dst
+    let w = [1.0, 2.0, 3.0]
+        rev = i -> w[4 - i]
+        @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias mutates = (2,) map!(rev, w, 1:3))
+        @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias ignore_ws!(w, FnHolder(rev)))
+        @test_logs (@assert_noalias mutates = (2,) map!(rev, zeros(3), 1:3))
+        @test_throws "holds no memory to write" @assert_noalias map!(rev, w, w)
+    end
+
     # Disjoint views of one parent are still told apart, and distinct arrays still cost nothing.
     M = zeros(4, 4)
     @test (@assert_noalias copyto!(view(M, :, 1), view(M, :, 2))) == zeros(4)

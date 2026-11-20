@@ -420,6 +420,10 @@ const _NOALIAS_NO_BANG = "does not end in `!`, so which arguments it writes is n
 @inline _holds_memory(x) = isbits(x) ? _carries_pointer(typeof(x)) :
     !(x isa Union{Type, Module, Function, Symbol, AbstractString, Nothing, Missing})
 
+# Whether a value can reach memory another argument writes. A closure is not written, but it reads
+# what it captured, so it is read through its fields as any struct is.
+@inline _reads_memory(x) = _holds_memory(x) || (x isa Function && !isbits(x))
+
 # Whether a plain-data type has a `Ptr` in it. Decided from the type, so it folds away for the
 # arguments of a call.
 Base.@assume_effects :foldable function _carries_pointer(@nospecialize(T::Type), depth::Int = 0)
@@ -496,7 +500,7 @@ function _collect_memory!(r::_Reached, @nospecialize(x), depth::Int)
         x == C_NULL || push!(r.ptrs, UInt(x))
         return nothing
     end
-    _holds_memory(x) || return nothing
+    _reads_memory(x) || return nothing
     data = 0
     if x isa AbstractArray
         if !isbits(x) && _declares_ids(x)
@@ -572,7 +576,7 @@ end
         Base.mightalias(a, b) && return :arrays
         (!isbits(a) && !isbits(b) && _declares_ids(a) && _declares_ids(b)) && return :none
     end
-    (_holds_memory(a) && _holds_memory(b)) || return :none
+    (_reads_memory(a) && _reads_memory(b)) || return :none
     return _deep_overlap(a, b)
 end
 
@@ -704,7 +708,7 @@ still compares argument 1 against the rest, which for a two-argument call is the
 
 An argument is compared by the memory it reaches. Two arrays are compared with `Base.mightalias`.
 An array type that defines no `Base.dataids` method (a wrapper struct around a `Vector`) and an
-argument that is not an array (a workspace struct, a factorization) are read through their fields,
+argument that is not an array (a workspace struct, a factorization, a closure) are read through their fields,
 three levels down, and the arrays found there are compared the same way, so disjoint views inside
 two wrappers do not overlap. A raw pointer (an array type built on a `Ptr`, a `BigInt`) counts
 only where it equals another pointer or the start of an array; an address inside another array

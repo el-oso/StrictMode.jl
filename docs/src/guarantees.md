@@ -1298,7 +1298,7 @@ them.
 `Base.mightalias` reads `Base.dataids`, which an array type has to define. A wrapper struct around
 a `Vector` that defines none answers with its own identity, and never matches the vector it holds.
 So an array type without a `dataids` method, and an argument that is not an array at all (a
-workspace struct, a factorization), is read through its fields, three levels down, and compared by
+workspace struct, a factorization, a closure), is read through its fields, three levels down, and compared by
 the buffers found there.
 
 An array type built on a pointer (a plain-data struct with one `Ptr{T}` field for its `T` elements)
