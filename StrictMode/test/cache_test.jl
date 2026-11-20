@@ -126,7 +126,7 @@ end
     StrictMode.clear_cache!()
     verdict() = only(findings(ld_leak, (Ptr{Cvoid},); guarantees = (:noescape,)))
     @test !StrictMode._failed(verdict())
-    mktempdir() do dir
+    ldstore = mktempdir() do dir
         mkpath(joinpath(dir, "LdStore", "src"))
         write(
             joinpath(dir, "LdStore", "src", "LdStore.jl"),
@@ -142,4 +142,9 @@ end
         end
     end
     @test StrictMode._failed(Base.@invokelatest verdict())
+    # A loaded package cannot be unloaded, and its store stays in every later reader's union: empty
+    # it, and the memoized union read from it, so later items see the session's registrations only.
+    empty!(getfield(ldstore, StrictMode._LOCAL_SCOPED))
+    empty!(StrictMode._REGISTRATION_MEMO)
+    @test !StrictMode._is_scoped_type(LdHandle)
 end
