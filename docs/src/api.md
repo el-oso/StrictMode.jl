@@ -192,6 +192,13 @@ routes, when one of them calls a shared core with its defaults. `reach_report` l
 a call reaches after optimization, `@assert_reaches` checks one named target, and `route_parity`
 compares two entries and names what only one of them reaches.
 
+The walk does not enter Base. A Base call on concrete Base types stays in Base and costs nothing;
+one with an argument typed abstractly (`Any`, `AbstractVector{Float64}`) may run a user type's
+methods at run time, so it is counted as unread and the graph is not complete. `fetch(t)` returns
+`Any`, so a route that fetches a task and computes with the result is incomplete: there
+`` warns about an absent target instead of throwing, and `route_parity` reports
+`:incomplete` rather than `:agree`.
+
 ```@docs
 @assert_reaches
 reach_report

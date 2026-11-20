@@ -664,8 +664,12 @@ StrictMode/src/
                         positional method are one function. Reuses spinwait.jl's task-closure
                         reading. A Base callee is entered when its signature names a type defined
                         outside Base (_reach_carries_user: a handed closure, or a user array whose
-                        getindex `sum` calls); one typed only by Base types, abstract ones
-                        included, is neither entered nor counted. A run-time dispatch is followed
+                        getindex `sum` calls); one on concrete Base types is neither entered nor
+                        counted. One with an ABSTRACT argument type (_reach_open: Any,
+                        AbstractVector{Float64}, Vararg; top level only, so Vector{Any} is closed)
+                        is not entered but counts as dynamic, whether reached by :invoke, an
+                        enumerated dispatch or an unenumerable one: a user value may arrive there.
+                        So a route that computes with fetch(t) (inferred Any) is incomplete. A run-time dispatch is followed
                         when it matches at most _REACH_MAX_METHODS methods. `stop` cuts a hub (a pool
                         dispatcher reaches every job).
                         unread/dynamic are counted, RouteParity's status is :agree only for two

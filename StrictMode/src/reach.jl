@@ -16,9 +16,9 @@
 # Functions are identified by `(module, name)` with the keyword-sorter mangling removed, so a
 # keyword method, its body function and its positional method count as one function.
 #
-# Whatever could not be read is counted: a signature with no typed IR, and a call site whose callee
-# is not known. A reach with a positive count is a lower bound, and nothing here presents it as
-# the whole graph.
+# Whatever could not be read is counted: a signature with no typed IR, a call site whose callee
+# is not known, and a Base call on an abstract argument type, whose method may run user code.
+# A reach with a positive count is a lower bound, and nothing here presents it as the whole graph.
 
 """
     StrictMode.ReachedFunction
@@ -40,8 +40,8 @@ Base.show(io::IO, f::ReachedFunction) = print(io, f.mod, ".", f.name)
 
 What [`reach_report`](@ref StrictMode.reach_report) read: the `functions` reached, nearest first,
 from `bodies` method bodies. `unread` counts signatures whose typed IR could not be read and
-`dynamic` the call sites whose callee is unknown or matches too many methods to enumerate. When
-either is positive the list is a lower bound.
+`dynamic` the call sites whose callee is unknown, matches too many methods to enumerate, or is a
+Base method called on an abstract argument type. When either is positive the list is a lower bound.
 """
 struct ReachReport
     target::String
@@ -131,7 +131,7 @@ end
 # Whether a Base method called with these types can run code outside Base: the signature names a
 # type defined outside Base, at any parameter depth — a user function it was handed, or an argument
 # whose methods it may call (`getindex` from `sum`, `show` from `string`). An argument typed only as
-# an abstract Base type (`Any`, `AbstractVector`) is not counted.
+# an abstract Base type (`Any`, `AbstractVector`) does not name one; `_reach_open` judges those.
 function _reach_carries_user(@nospecialize(T), depth::Int = 0)
     depth > 8 && return true
     T = Base.unwrap_unionall(T)
@@ -147,6 +147,23 @@ end
 # A callee outside Base is entered, and one in Base whenever it can run code outside it.
 _reach_follows(mi::Core.MethodInstance) =
     !_sw_is_base(mi.def.module) || _reach_carries_user(mi.specTypes)
+
+# Whether a signature has an argument typed abstractly (`Any`, `AbstractVector{Float64}`, a
+# `Vararg`), so that a value of a type defined outside Base may arrive there at run time and the
+# Base method run that type's methods. Such a Base callee is not entered, so the walk counts it as
+# a call site it could not read. A `Type{T}` and a union of concrete types are closed. Only the top
+# level is judged: a concrete Base container of abstract elements (`Vector{Any}`) is closed.
+function _reach_open(@nospecialize(sig))
+    sig = Base.unwrap_unionall(sig)
+    sig isa DataType || return true
+    return any(_reach_open_arg, sig.parameters)
+end
+function _reach_open_arg(@nospecialize(T))
+    T isa Core.TypeofVararg && return true
+    T isa Union && return _reach_open_arg(T.a) || _reach_open_arg(T.b)
+    T isa DataType || return T !== Union{}
+    return !(isconcretetype(T) || T <: Type)
+end
 
 # A call left to run-time dispatch on a known function. The function is reached whatever method
 # runs; the methods are followed only when the argument types narrow them to a few.
@@ -165,17 +182,23 @@ function _reach_dispatch!(
     ms = isnothing(tt) ? nothing :
         Base._methods_by_ftype(tt, _REACH_MAX_METHODS, Base.get_world_counter())
     if !(ms isa Vector) || isempty(ms)
-        # A Base function called on Base's own types stays in Base, which the walk does not enter
-        # either way, so nothing of the route is lost behind it.
-        stays_in_base = !isnothing(tt) && _sw_is_base(key[1]) && !_reach_carries_user(tt)
+        # A Base function called on concrete Base types stays in Base, which the walk does not
+        # enter either way, so nothing of the route is lost behind it.
+        stays_in_base = !isnothing(tt) && _sw_is_base(key[1]) && !_reach_carries_user(tt) &&
+            !_reach_open(tt)
         stays_in_base || (r.dynamic += 1)
         return nothing
     end
+    open = false
     for match in ms
         m = match.method
-        (!_sw_is_base(m.module) || _reach_carries_user(match.spec_types)) &&
+        if !_sw_is_base(m.module) || _reach_carries_user(match.spec_types)
             push!(queue, (match.spec_types, depth))
+        else
+            open |= _reach_open(match.spec_types)
+        end
     end
+    open && (r.dynamic += 1)
     return nothing
 end
 
@@ -195,7 +218,12 @@ function _reach_scan!(
             end
             key = _reach_key(mi.def)
             _reach_record!(r, key, depth, false)
-            key in stop || !_reach_follows(mi) || push!(queue, (mi.specTypes, depth))
+            if key in stop
+            elseif _reach_follows(mi)
+                push!(queue, (mi.specTypes, depth))
+            elseif _reach_open(mi.specTypes)
+                r.dynamic += 1
+            end
         elseif st.head === :call
             v = _sw_callee_value(st.args[1])
             if v isa Core.IntrinsicFunction || v isa Core.Builtin
@@ -269,9 +297,12 @@ from one that chooses a route first.
   A hub the source calls and the optimizer folded away is named, and does not raise.
 
 A callee in Base is entered only when its argument types name a type defined outside Base: a
-closure passed to `foreach`, or a user array whose `getindex` a `sum` calls. A Base call whose
-arguments are typed only by Base types, abstract ones such as `Any` included, is neither entered
-nor counted.
+closure passed to `foreach`, or a user array whose `getindex` a `sum` calls. A Base call on
+concrete Base types is neither entered nor counted. A Base call with an argument typed abstractly
+(`Any`, `AbstractVector{Float64}`) is not entered either, but a value of a user type may arrive
+there at run time, so it is counted in `dynamic`. That includes the value of `fetch(t)`, which is
+`Any`: a route that fetches a task and computes with the result is not complete. Only the top
+level of an argument type is judged, so a `Vector{Any}` argument is concrete and not counted.
 
 `unread` and `dynamic` on the report count what could not be read, and the list is a lower bound
 when either is positive. For a keyword call, pass `Core.kwcall` and its signature:
@@ -457,7 +488,9 @@ Check that the function `g` is in the call graph of `f(args...)` after optimizat
 entry really takes the route through `g`.
 
 It throws when `g` is absent and the whole graph was read, and warns when `g` is absent but part
-of the graph could not be read, since the target may sit behind that part. See
+of the graph could not be read, since the target may sit behind that part. A call into Base on an
+abstract argument type, such as arithmetic on the result of `fetch`, leaves the graph incomplete,
+so on such a route an absent target warns. See
 [`StrictMode.reach_report`](@ref) for how the graph is read, and
 [`StrictMode.route_parity`](@ref) to compare two entries without naming a target.
 

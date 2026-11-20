@@ -33,7 +33,10 @@ end
     # The entry that chooses a route reaches every branch, including the callee of a spawned task.
     rn = StrictMode.reach_report(R.native, V; mod = R)
     @test names(rn) == Set([:core, :choose, :tune, :serial, :threaded, :strassen, :deep])
-    @test StrictMode.complete(rn)
+    # `fetch` returns `Any`, and the `+` it feeds runs whatever method the task's value has, so the
+    # graph is incomplete.
+    @test rn.dynamic > 0
+    @test !StrictMode.complete(rn)
     @test StrictMode.reaches(rn, R.threaded)
 
     # The entry that takes the defaults reaches the core and the one branch the defaults leave.
@@ -112,6 +115,8 @@ end
     # The target may sit behind the call the scan could not name, so this one is reported.
     r = Ref{Any}(R.hidden)
     @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches R.viaref(r, 1) R.hidden
+    # A route that fetches a task is incomplete, so an absent target warns there too.
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches R.native(x) R.hidden
 
     @test StrictMode._code(:reaches) === :SM0015
 end
@@ -156,4 +161,47 @@ end
     @test viaref(Ref{AbstractLazy}(Lazy([1.0]))) == 2.0
     rd = StrictMode.reach_report(viaref, (Base.RefValue{AbstractLazy},))
     @test StrictMode.reaches(rd, hot) || !StrictMode.complete(rd)
+end
+
+@testitem "a Base call on abstract argument types is counted as unread" begin
+    using StrictMode
+    # User code runs behind each of these Base calls at run time, through a value whose type the
+    # signature leaves abstract. The walk does not enter Base, so it counts the call instead.
+    @noinline hot(x) = 2x
+    struct L <: AbstractVector{Float64}
+        v::Vector{Float64}
+    end
+    Base.size(l::L) = size(l.v)
+    Base.getindex(l::L, i::Int) = hot(l.v[i])
+    struct N
+        v::Float64
+    end
+    Base.:+(a::N, b::Float64) = hot(a.v) + b
+    viaabs(r::Base.RefValue{AbstractVector{Float64}}) = sum(r[])
+    viafetch(x::Float64) = (t = Threads.@spawn N(x); fetch(t) + x)
+    viaany(r::Base.RefValue{Any}, x::Float64) = r[] + x
+    @test viaabs(Ref{AbstractVector{Float64}}(L([1.0]))) == 2.0
+    @test viafetch(1.0) == 3.0
+    @test viaany(Ref{Any}(N(1.0)), 1.0) == 3.0
+    for (f, T) in ((viaabs, (Base.RefValue{AbstractVector{Float64}},)), (viafetch, (Float64,)),
+                   (viaany, (Base.RefValue{Any}, Float64)))
+        r = StrictMode.reach_report(f, T)
+        @test !StrictMode.reaches(r, hot)
+        @test r.dynamic > 0
+        @test !StrictMode.complete(r)
+    end
+    # The target may sit behind the abstract call, so its absence warns rather than throws.
+    a = Ref{AbstractVector{Float64}}(L([1.0]))
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches viaabs(a) hot
+
+    # A Base function on concrete Base types stays in Base and is not counted.
+    conc(x::Vector{Float64}) = sum(x)
+    rc = StrictMode.reach_report(conc, (Vector{Float64},))
+    @test StrictMode.complete(rc)
+    @test_throws StrictViolation @assert_reaches conc([1.0]) hot
+    @test !StrictMode._reach_open(Tuple{typeof(sum), Vector{Float64}})
+    @test !StrictMode._reach_open(Tuple{typeof(convert), Type{Int}, Union{Nothing, Int}})
+    @test StrictMode._reach_open(Tuple{typeof(sum), AbstractVector{Float64}})
+    @test StrictMode._reach_open(Tuple{typeof(+), Any, Float64})
+    @test StrictMode._reach_open(Tuple{typeof(print), Vararg{Any}})
 end
