@@ -186,3 +186,59 @@ end
     V = SubArray{Float64, 1, Matrix{Float64}, Tuple{Base.Slice{Base.OneTo{Int}}, Int}, true}
     @test all(f -> f.status === :pass, findings(vcheck, (V, V); guarantees = (:noalloc,)))
 end
+
+@testitem "@assert_noalias does not reject or fail what it can compare" begin
+    using StrictMode
+
+    y = collect(1.0:6.0)
+    z = zeros(6)
+
+    # A plain-data array backed by a pointer holds memory, though it is isbits.
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    GC.@preserve y z begin
+        pv = PtrVec(pointer(z), 6)
+        @test (@assert_noalias copyto!(pv, y)) === pv
+        @test z == y
+        # The same address is the same memory, and is found.
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), y)
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), PtrVec(pointer(y), 3))
+        # An address inside another array cannot be told from one outside it without knowing how
+        # the type uses its pointer, so it is not reported.
+        @test (@assert_noalias copyto!(PtrVec(pointer(y, 4), 3), view(y, 1:3))) isa PtrVec
+    end
+
+    # A `BigInt` is a number that holds memory.
+    bx, by = big(2)^80, big(3)^80
+    @test (@assert_noalias Base.GMP.MPZ.add!(bx, by)) == big(2)^80 + big(3)^80
+    @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias Base.GMP.MPZ.add!(bx, bx))
+    # A plain number still holds none.
+    setfirst!(a, v) = (v[1] = a; v)
+    @test_throws "holds no memory to write" @assert_noalias setfirst!(2.0, y)
+
+    # Views inside a wrapper with no `dataids` method are compared as the views are: disjoint
+    # ranges of one parent do not overlap, and overlapping ones do.
+    struct WV{A <: AbstractVector{Float64}} <: AbstractVector{Float64}
+        data::A
+    end
+    Base.size(w::WV) = size(w.data)
+    Base.getindex(w::WV, i::Int) = w.data[i]
+    Base.setindex!(w::WV, v, i::Int) = (w.data[i] = v)
+    @test (@assert_noalias copyto!(WV(view(y, 1:3)), WV(view(y, 4:6)))) isa WV
+    @test (@assert_noalias copyto!(WV(view(y, 1:3)), view(y, 4:6))) isa WV
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(view(y, 1:3)), WV(view(y, 3:5)))
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(view(y, 1:3)), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(WV(y)), WV(y))
+    # A workspace holding a disjoint view of the written array shares none of it.
+    struct ViewSpace
+        v::SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int}}, true}
+    end
+    from_vs!(dst, ws) = (dst .= ws.v; dst)
+    @test_logs (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 4:6))))
+    @test_logs (:warn, r"buffer held in a field"s) match_mode = :any (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 2:4))))
+end

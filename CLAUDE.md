@@ -57,11 +57,19 @@ StrictMode/src/
                         answered by Base.mightalias alone, allocation-free, which is what keeps
                         disjoint views of one parent apart. An array type with NO dataids method
                         (_declares_ids: the fallback answers with the wrapper own objectid) and a
-                        non-array struct are read through their fields by _collect_ids!, which
-                        allocates. An overlap between two arrays GATES; one found only in a field
+                        non-array struct are read through their fields by _collect_memory!, which
+                        allocates and gathers the DECLARED ARRAYS found there plus the raw
+                        pointers. The arrays are asked of Base.mightalias pairwise, so disjoint
+                        views inside two wrappers do not overlap; comparing their dataids would
+                        find the shared parent and raise. A pointer is evidence only when it
+                        equals another pointer or the start of an array: an address INSIDE
+                        another array is undecided and not reported, since what a pointer-backed
+                        type reaches is not known. Arrays held as elements (`[y, z]`, a Dict)
+                        are not followed. An overlap between two arrays GATES; one found only in a field
                         of a non-array argument warns (gates = gates && arrays in _noalias_fail).
                         A written position that holds no memory (_holds_memory: the scalar in
-                        axpy!(a, x, y), the function in map!(f, dest, src)) raises an ArgumentError
+                        axpy!(a, x, y), the function in map!(f, dest, src); a plain-data value
+                        with a Ptr in it and a BigInt DO hold memory) raises an ArgumentError
                         — the `!` default would otherwise compare nothing and pass)
   typestability.jl    — @assert_typestable, _typestable_check_expr/_typestable_fast
   inlining.jl         — @assert_inlined, inline_suggestions (module-sweep advisory).

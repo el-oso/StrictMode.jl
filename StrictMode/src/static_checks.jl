@@ -407,10 +407,23 @@ const _NOALIAS_NO_BANG = "does not end in `!`, so which arguments it writes is n
     "them — `mutates = (1,)` — or drop the assertion. Defaulting to \"nothing is written\" would " *
     "compare no pair and pass every call."
 
-# Whether a value can be written through at all. A number, a function, a type or a string holds
-# no memory a kernel could write, so naming one as the written argument compares nothing.
-@inline _holds_memory(x) =
-    !isbits(x) && !(x isa Union{Type, Module, Function, Symbol, AbstractString, Number, Nothing, Missing})
+# Whether a value can be written through at all. A plain number, a function, a type or a string
+# holds no memory a kernel could write, so naming one as the written argument compares nothing.
+# A plain-data value that carries a pointer does (an array type built on a `Ptr`), and so does a
+# number that is not plain data (`BigInt`, `BigFloat`).
+@inline _holds_memory(x) = isbits(x) ? _carries_pointer(typeof(x)) :
+    !(x isa Union{Type, Module, Function, Symbol, AbstractString, Nothing, Missing})
+
+# Whether a plain-data type has a `Ptr` in it. Decided from the type, so it folds away for the
+# arguments of a call.
+Base.@assume_effects :foldable function _carries_pointer(@nospecialize(T::Type), depth::Int = 0)
+    T <: Ptr && return true
+    (T isa DataType && depth < 4) || return false
+    for F in fieldtypes(T)
+        _carries_pointer(F, depth + 1) && return true
+    end
+    return false
+end
 
 # Base's own array types define `dataids`, the protocol `Base.mightalias` reads. An array type that
 # does not is answered by the fallback, the object's own identity, which never matches the buffer
@@ -424,27 +437,42 @@ end
 
 const _ALIAS_FIELD_DEPTH = 3
 
-# The memory `x` can reach, as `Base.dataids` names it: an array that declares its ids is taken at
-# its word, and anything else (a wrapper array with no `dataids` method, a workspace struct, a
-# factorization) is read through its fields.
-function _collect_ids!(out::Vector{UInt}, @nospecialize(x), depth::Int)
-    _holds_memory(x) || return out
-    if x isa AbstractArray && _declares_ids(x)
-        append!(out, Base.dataids(x))
-        return out
+# The memory `x` can reach: the arrays that declare their ids, which are taken at their word, and
+# the raw pointers. Anything else (a wrapper array with no `dataids` method, a workspace struct, a
+# factorization, a plain-data array built on a pointer) is read through its fields.
+function _collect_memory!(arrays::Vector{Any}, ptrs::Vector{UInt}, @nospecialize(x), depth::Int)
+    if x isa Ptr
+        x == C_NULL || push!(ptrs, UInt(x))
+        return nothing
     end
-    depth <= 0 && return out
+    _holds_memory(x) || return nothing
+    if x isa AbstractArray && !isbits(x) && _declares_ids(x)
+        push!(arrays, x)
+        return nothing
+    end
+    depth <= 0 && return nothing
     for i in 1:nfields(x)
-        isdefined(x, i) && _collect_ids!(out, getfield(x, i), depth - 1)
+        isdefined(x, i) && _collect_memory!(arrays, ptrs, getfield(x, i), depth - 1)
     end
-    return out
+    return nothing
 end
 
+# Whether the memory two arguments reach overlaps, by the evidence there is. Two arrays found
+# inside them are asked of `Base.mightalias`, exactly as two plain arguments are, so disjoint views
+# of one parent inside two wrappers do not overlap. A raw pointer is evidence only when it equals
+# another pointer or the start of an array: where a pointer-backed type reaches from there is not
+# known, so an address inside another array is undecided and is not reported.
 @noinline function _deep_overlap(@nospecialize(a), @nospecialize(b))
-    ia = _collect_ids!(UInt[], a, _ALIAS_FIELD_DEPTH)
-    isempty(ia) && return :none
-    ib = _collect_ids!(UInt[], b, _ALIAS_FIELD_DEPTH)
-    isdisjoint(ia, ib) && return :none
+    aa, pa = Any[], UInt[]
+    _collect_memory!(aa, pa, a, _ALIAS_FIELD_DEPTH)
+    (isempty(aa) && isempty(pa)) && return :none
+    ab, pb = Any[], UInt[]
+    _collect_memory!(ab, pb, b, _ALIAS_FIELD_DEPTH)
+    found = any(x -> any(y -> Base.mightalias(x, y), ab), aa) ||
+        !isdisjoint(pa, pb) ||
+        any(x -> any(p -> p in Base.dataids(x), pb), aa) ||
+        any(y -> any(p -> p in Base.dataids(y), pa), ab)
+    found || return :none
     return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
 end
 
@@ -555,7 +583,11 @@ still compares argument 1 against the rest, which for a two-argument call is the
 An argument is compared by the memory it reaches. Two arrays are compared with `Base.mightalias`.
 An array type that defines no `Base.dataids` method (a wrapper struct around a `Vector`) and an
 argument that is not an array (a workspace struct, a factorization) are read through their fields,
-three levels down. An overlap between two arrays raises. An overlap with a buffer held in a field
+three levels down, and the arrays found there are compared the same way, so disjoint views inside
+two wrappers do not overlap. A raw pointer (an array type built on a `Ptr`, a `BigInt`) counts
+only where it equals another pointer or the start of an array; an address inside another array
+is undecided and is not reported. Arrays held as ELEMENTS, as in `[y, z]` or a `Dict`, are not
+followed. An overlap between two arrays raises. An overlap with a buffer held in a field
 of a non-array argument warns: the memory is shared, but nothing says the kernel reads that field.
 
 ```julia
