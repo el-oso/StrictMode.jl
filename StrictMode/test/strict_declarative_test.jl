@@ -152,6 +152,8 @@ end
     @test_throws "no method is defined above this line in `AccNothing`" load("module AccNothing; using StrictMode; @strict_policy :typestable; g(x::Int) = x; end")
     @test_throws "1 method(s) are defined above this line in `AccGeneric`, and none is checked or accounted for" load("module AccGeneric; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
     @test_throws "`@strict_function signatures = [...]`" load("module AccGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    # An exemption from none of the policy's guarantees does not account for the method.
+    @test_throws "none is checked or accounted for" load("module AccOther; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
     # A filter that leaves only an undeclared generic method checks nothing.
     @test_throws "none is checked or accounted for" load("module AccOnly; using StrictMode; ok(x::Int) = x; gen(x::AbstractVector) = sum(x); @strict_policy :typestable only = (:gen,); end")
     # A struct beside an undeclared generic method: the constructor is accounted for, and the

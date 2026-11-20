@@ -831,7 +831,7 @@ function _auto_check_module(
     end
     items = _module_load_items(mod, policy; only, exempt)
     if require_methods && isempty(items)
-        unaccounted = _policy_unaccounted(mod; only, exempt)
+        unaccounted = _policy_unaccounted(mod, policy; only, exempt)
         isnothing(unaccounted) || throw(ArgumentError(_policy_checked_nothing(mod, unaccounted)))
     end
     fs = _map_findings(_scan_findings, items)
@@ -845,11 +845,11 @@ end
 
 # For a policy line that had no concrete method to check: `nothing` when some method above it is
 # accounted for anyway, else how many methods it left unread. Accounted for means the policy has
-# an answer for the method without checking it here: it is exempt (by `@strict_exempt` or by this
-# line's own `exempt`), its instantiations are declared with `@strict_function signatures = [...]`,
-# or it is a macro, a constructor or a callable object's method, none of which the policy judges.
-# Only generic methods nobody declared are left unread.
-function _policy_unaccounted(mod::Module; only = nothing, exempt = ())
+# an answer for the method without checking it here: it is exempt (by `@strict_exempt` from a
+# guarantee in `policy`, or by this line's own `exempt`), its instantiations are declared with
+# `@strict_function signatures = [...]`, or it is a macro, a constructor or a callable object's
+# method, none of which the policy judges. Only generic methods nobody declared are left unread.
+function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
     ms, skipped = module_methods(mod; only, exempt)
     (get(skipped, :exempt, 0) > 0 || get(skipped, :constructor, 0) > 0) && return nothing
     decls = keys(declarations())
@@ -858,7 +858,7 @@ function _policy_unaccounted(mod::Module; only = nothing, exempt = ())
         startswith(String(m.name), "@") && return nothing
         ft = _method_function(m)
         (ft isa DataType && isdefined(ft, :instance)) || return nothing   # a callable object's
-        _is_exempt(ft.instance, nothing, nothing) && return nothing
+        any(g -> _is_exempt(ft.instance, nothing, g), policy) && return nothing
     end
     return length(ms)
 end
