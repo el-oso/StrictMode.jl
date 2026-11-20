@@ -259,10 +259,19 @@ StrictMode/src/
                         _FCALL_ALIASES, whose RESULT is the argument's memory (jl_ptr_to_array_1d
                         behind unsafe_wrap). Only the declared arguments are read, never the GC
                         roots after them. Every BLAS/LAPACK routine is unnamed, so a plan matrix
-                        passed to dgemv reports. (3) A lock, condition, atomic, event, channel or
-                        semaphore carries NO taint (_is_sync_type at a projection, a PiNode, a
-                        callee parameter and the seed): what `lock(plan.lk)` writes is the
-                        synchronization. _recurse_closure_body returns before the depth check for a
+                        passed to dgemv reports. (3) A lock, condition, event, channel or semaphore
+                        carries NO taint (_is_lock_type at a projection, a PiNode, a callee
+                        parameter and the seed): what `lock(plan.lk)` writes is the
+                        synchronization. A Threads.Atomic DOES carry it, so atomic_add! and
+                        `x[] = v` on one (the atomic_pointer intrinsics) are records with certain
+                        and deliberate both set, as an @atomic field write is. A Base callee
+                        entered for its result and NOT READ returns :maybe: the call is an
+                        undecided record and the result goes into `mset`, through which a store is
+                        an undecided record too, never a certain one (a fresh buffer from a deep
+                        `lu` must not raise). The memo keeps each result with its depth and
+                        whether the walk was cut beneath it; a cut result answers only a visit at
+                        least as deep. A builtin held as the callee VALUE is as read-only as one
+                        named through a binding. _recurse_closure_body returns before the depth check for a
                         struct with no call method outside Base — it is data, with no body to read
   strict_function.jl  — @strict_function (load-time enforcement; `signatures = [...]` verifies
                         concrete instantiations a generic declaration cannot name, since such a

@@ -1303,3 +1303,65 @@ end
     @test_logs (:warn, r"cannot establish that the plan argument is read-only.*foreign function"s) match_mode = :any @assert_concurrency_safe w_axpy(p, x)
     @test (@assert_concurrency_safe r_copyfrom(p, x)) === nothing
 end
+
+@testitem "atomic writes agree, builtins are not dispatch, and an unread result is undecided" begin
+    using StrictMode
+
+    mutable struct CPlan
+        ctr::Threads.Atomic{Int}
+        @atomic n::Int
+        buf::Vector{Float64}
+        d::Dict{Symbol, Vector{Float64}}
+        sd::Dict{String, Int}
+        name::String
+    end
+    sig = (CPlan, Vector{Float64})
+    records(f; kw...) = StrictMode.concurrency_findings(f, sig; kw...)
+
+    # Three spellings of an atomic write to the plan. Each cannot tear and each is still shared
+    # state, so each is reported the deliberate way: named, and not a failure.
+    a_field(p, x) = (@atomic p.n += 1; nothing)
+    a_add(p, x) = (Threads.atomic_add!(p.ctr, 1); nothing)
+    a_set(p, x) = (p.ctr[] = 3; nothing)
+    for f in (a_field, a_add, a_set)
+        vs = records(f)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate, vs)
+        @test any(v -> occursin("ATOMIC", v.message), vs)
+    end
+    a_read(p, x) = p.ctr[] + (@atomic p.n)
+    @test isempty(records(a_read))
+    # A lock is still not shared data.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+
+    # A builtin cannot dispatch, however the call to it is spelled in the IR, and a table a copy
+    # builds for itself is not the plan.
+    r_haskey(p, x) = haskey(p.sd, p.name)
+    r_parse(p, x) = parse(Int, p.name)
+    r_print(p, x) = (io = IOBuffer(); print(io, p.name); position(io))
+    r_deepcopy(p, x) = sum(deepcopy(p.buf))
+    for f in (r_haskey, r_parse, r_print, r_deepcopy)
+        vs = records(f)
+        @test !any(v -> occursin("`sizeof`", v.message), vs)
+        @test !any(v -> occursin("jl_eqtable_put", v.message), vs)
+    end
+    @test isempty(records(r_haskey))
+    # `deepcopy` dispatches at run time inside Base, which stays undecided; it is not a write.
+    @test !any(v -> v.certain, records(r_deepcopy))
+
+    # A Base callee whose result may be the plan's memory, past the depth the walk reads. Its
+    # result is undecided: the call is recorded, and so is a store through what it returned.
+    # Neither is a write the scan read.
+    w_get(p, x) = (get(p.d, :a, x)[1] = 0.0; nothing)
+    @test any(v -> v.certain, records(w_get))                # read at the default depth
+    shallow = records(w_get; max_depth = -StrictMode._BASE_EXTRA_DEPTH)
+    @test !isempty(shallow)
+    @test !any(v -> v.certain, shallow)
+    @test any(v -> occursin("`get`", v.message) && occursin("may be the plan's memory", v.message), shallow)
+    @test any(v -> occursin("stores into a value", v.message), shallow)
+    r_get(p, x) = (x[1] = get(p.d, :a, x)[1]; nothing)
+    shallow_read = records(r_get; max_depth = -StrictMode._BASE_EXTRA_DEPTH)
+    @test !any(v -> v.certain, shallow_read)
+    @test !any(v -> occursin("stores into a value", v.message), shallow_read)
+    @test isempty(records(r_get))
+end

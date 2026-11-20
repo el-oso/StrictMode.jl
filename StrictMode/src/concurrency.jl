@@ -76,8 +76,14 @@ end
 #     of those is a write the scan read. A plan pointer handed to any other foreign function —
 #     every BLAS and LAPACK routine among them — is a record that reports and does not raise.
 #     `_FCALL_ALIASES` names the ones whose result is the same memory under another type.
-#   * A LOCK, a condition, an atomic, an event, a channel or a semaphore read out of the plan
-#     carries no taint: what `lock(plan.lk)` writes is the synchronization.
+#   * A LOCK, a condition, an event, a channel or a semaphore read out of the plan carries no
+#     taint: what `lock(plan.lk)` writes is the synchronization. A `Threads.Atomic` does carry
+#     it: `Threads.atomic_add!(plan.ctr, 1)` and `plan.ctr[] = v` are atomic writes to shared
+#     state, reported as an `@atomic` field write is, read and deliberate.
+#   * A Base callee entered for what it RETURNS and not read (past its depth, or no typed IR) is
+#     recorded as undecided, and its result is marked as possibly the plan's (`mset`). A store
+#     through such a value is a record the scan could not rule out, never a write it read; the
+#     value is not followed into a callee.
 #
 # WHAT IT CANNOT CATCH (honest limits — PureFFT's runtime concurrency test is the load-bearing
 # backstop; this static proof is complementary):
@@ -90,7 +96,8 @@ end
 #   * Recursion is depth-bounded (`max_depth`, default 4); beyond it a still-tainted call is
 #     flagged conservatively rather than followed. A Base callee past its own bound is flagged
 #     only when its name ends in `!`.
-#   * `llvmcall` stores are not modelled.
+#   * An `llvmcall` is read only for whether its IR holds an atomic instruction or a store; a
+#     plain store through a plan pointer there is undecided.
 #   * A callee returning a struct BUILT AROUND a plan value (a wrapper, not a projection) returns
 #     no taint, and neither does a callee the walk did not read or a dynamic call.
 
@@ -248,7 +255,7 @@ const _FCALL_WRITES = Dict{Symbol, Tuple{Vararg{Int}}}(
     :memcmp => (), :memchr => (), :strlen => (), :memhash => (), :memhash_seed => (),
     :memhash32_seed => (), :jl_object_id => (), :jl_egal => (), :jl_types_equal => (),
     :jl_genericmemory_copy_slice => (), :jl_genericmemory_copy => (), :jl_array_copy => (),
-    :jl_pchar_to_string => (), :jl_symbol_n => (), :jl_eqtable_get => (),
+    :jl_pchar_to_string => (), :jl_symbol_n => (), :jl_eqtable_get => (), :jl_eqtable_put => (1,), :jl_eqtable_pop => (1,),
     :jl_eqtable_nextind => (), :jl_string_ptr => (), :jl_gc_add_finalizer_th => (),
     :jl_stored_inline => (), :jl_array_isassigned => (),
 )
@@ -296,11 +303,16 @@ const _NEVER_READONLY = Set{Symbol}(
 )
 
 function _is_readonly_builtin(@nospecialize(callee))
-    callee isa GlobalRef || return false
-    isconst(callee.mod, callee.name) || return false
-    v = try
-        getglobal(callee.mod, callee.name)
-    catch
+    # Optimized IR names a builtin through a binding or holds the builtin itself as the callee.
+    v = if callee isa Core.Builtin || callee isa Core.IntrinsicFunction
+        callee
+    elseif callee isa GlobalRef && isconst(callee.mod, callee.name)
+        try
+            getglobal(callee.mod, callee.name)
+        catch
+            return false
+        end
+    else
         return false
     end
     (v isa Core.Builtin || v isa Core.IntrinsicFunction) || return false
@@ -397,7 +409,7 @@ end
 # the method may RETURN a plan-reachable reference (so the caller can keep tainting).
 function _taint_scan_ci(
         ci, targs::Set{Int}, chain::Vector{String}, fr::_Frame, depth::Int, max_depth::Int,
-        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String};
+        memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String};
         cargs::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(),
     )
     code = ci.code
@@ -419,6 +431,12 @@ function _taint_scan_ci(
     einset(@nospecialize(a)) = a isa Core.SSAValue && a.id in eset
     setelem(j) = (j in eset) ? false : (push!(eset, j); changed = true; true)
     returns_tainted = false
+    # Values a Base callee the walk did not read may have returned from the plan. Undecided, so a
+    # store through one is recorded as a site the scan could not rule out, never as a write it
+    # read, and such a value is not followed into a callee.
+    mset = BitSet()
+    maybe(@nospecialize(a)) = a isa Core.SSAValue && a.id in mset
+    setmaybe(j) = (j in mset || j in tset) ? false : (push!(mset, j); changed = true; true)
     # Values reachable from a mutable constant global. Every caller shares it, so a store into one
     # is shared state whatever argument the check was told is shared.
     gset = BitSet()
@@ -432,13 +450,15 @@ function _taint_scan_ci(
             settaint(b) = (b && !(i in tset)) ? (push!(tset, i); changed = true; true) : false
 
             if st isa Core.PiNode
+                isdefined(st, :val) && maybe(st.val) && setmaybe(i)
                 isdefined(st, :val) && einset(st.val) && setelem(i)
                 isdefined(st, :val) && gtainted(st.val) && !(i in gset) && (push!(gset, i); changed = true)
                 # A value narrowed to a lock or a condition is a synchronization object from here on.
                 isdefined(st, :val) && _op_tainted(st.val, tset, targs) &&
-                    settaint(!_is_sync_type(Core.Compiler.widenconst(types[i])))
+                    settaint(!_is_lock_type(Core.Compiler.widenconst(types[i])))
                 continue
             elseif st isa Core.PhiNode || st isa Core.PhiCNode
+                any(k -> isassigned(st.values, k) && maybe(st.values[k]), eachindex(st.values)) && setmaybe(i)
                 st isa Core.PhiNode && any(k -> isassigned(st.values, k) && einset(st.values[k]), eachindex(st.values)) && setelem(i)
                 _any_phi_tainted(st, tset, targs) && settaint(true)
                 continue
@@ -585,6 +605,13 @@ function _taint_scan_ci(
                         fr; certain = true, deliberate = gatomic
                     )
                 end
+                if 1 <= pos <= length(dataargs) && maybe(dataargs[pos]) && !_op_tainted(dataargs[pos], tset, targs)
+                    _record!(
+                        out, seen, chain,
+                        "stores into a value (`$nm`) that a Base callee the scan did not read may " *
+                            "have returned from the plan — not read, so not established", fr
+                    )
+                end
                 if 1 <= pos <= length(dataargs) && _op_tainted(dataargs[pos], tset, targs)
                     atomic = _is_atomic_store(st, nm, dataargs)
                     _record!(
@@ -605,6 +632,8 @@ function _taint_scan_ci(
                 pos = _PROJECT_OPS[nm]
                 if 1 <= pos <= length(dataargs)
                     src = dataargs[pos]
+                    maybe(src) && (nm === :memoryrefnew || nm === :memoryref || _may_ref(types[i]) ||
+                        _holds_ptr(Core.Compiler.widenconst(types[i]))) && setmaybe(i)
                     if gtainted(src) && _may_ref(types[i]) && !_is_sync_type(Core.Compiler.widenconst(types[i])) && !(i in gset)
                         push!(gset, i); changed = true
                     end
@@ -625,7 +654,7 @@ function _taint_scan_ci(
                     # A lock, a condition or a channel read out of the plan is how the tasks
                     # sharing it synchronize, and what `lock` writes inside it is the
                     # synchronization, not shared data.
-                    isref = isref && !_is_sync_type(Core.Compiler.widenconst(types[i]))
+                    isref = isref && !_is_lock_type(Core.Compiler.widenconst(types[i]))
                     if _op_tainted(src, tset, targs)
                         settaint(isref)
                     else
@@ -661,6 +690,7 @@ function _taint_scan_ci(
 
             # value-carrying op (tuple/ifelse): result may carry the reference forward
             if nm !== nothing && nm in _CARRY_OPS
+                any(maybe, dataargs) && setmaybe(i)
                 any(a -> _op_tainted(a, tset, targs), dataargs) && settaint(true)
                 continue
             end
@@ -670,10 +700,49 @@ function _taint_scan_ci(
             # to `add_ptr`, ending in a `pointerset`. Only the pointer operand carries the taint — an
             # offset read from the plan must not make a pointer into another array look like it.
             if nm === :bitcast && length(dataargs) == 2
+                maybe(dataargs[2]) && setmaybe(i)
                 _op_tainted(dataargs[2], tset, targs) && settaint(true)
                 continue
             elseif (nm === :add_ptr || nm === :sub_ptr) && !isempty(dataargs)
+                maybe(dataargs[1]) && setmaybe(i)
                 _op_tainted(dataargs[1], tset, targs) && settaint(true)
+                continue
+            end
+
+            # An atomic write through a pointer into the plan: what `Threads.atomic_add!` and
+            # `x[] = v` on a `Threads.Atomic` become. It is the same fact as an `@atomic` field
+            # write and is reported the same way: read, and deliberate.
+            # Inline LLVM IR handed a pointer into the plan, which is how `Threads.Atomic` is
+            # written before Julia 1.13. An atomic instruction is the same fact as the intrinsic
+            # below. Any other store is not read, and is recorded as undecided.
+            if nm === :llvmcall && length(dataargs) >= 4 &&
+                    any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
+                ir = _llvmcall_text(dataargs[1])
+                if occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)
+                    _record!(
+                        out, seen, chain,
+                        "stores into a buffer reachable from the plan (an atomic instruction in " *
+                            "`llvmcall`) — a heap write the plan can observe — the write is ATOMIC, " *
+                            "so it cannot tear, but the plan is still shared mutable state and " *
+                            "atomicity does not make sharing safe", fr; certain = true, deliberate = true
+                    )
+                elseif occursin("store", ir)
+                    _record!(
+                        out, seen, chain,
+                        "hands a plan-reachable pointer to inline LLVM IR that stores (`llvmcall`) " *
+                            "— StrictMode does not read it (flagged conservatively)", fr
+                    )
+                end
+                continue
+            end
+            if nm !== nothing && nm in _ATOMIC_POINTER_WRITES && !isempty(dataargs)
+                _op_tainted(dataargs[1], tset, targs) && _record!(
+                    out, seen, chain,
+                    "stores into a buffer reachable from the plan (`$nm`) — a heap write the plan " *
+                        "can observe — the write is ATOMIC, so it cannot tear, but the plan is still " *
+                        "shared mutable state and atomicity does not make sharing safe", fr;
+                    certain = true, deliberate = true
+                )
                 continue
             end
 
@@ -684,7 +753,7 @@ function _taint_scan_ci(
                 mi0 = _invoke_mi(st.args[1])
                 if !isnothing(mi0) && mi0.specTypes isa DataType
                     ps = mi0.specTypes.parameters
-                    filter!(k -> !(k + 1 <= length(ps) && _is_sync_type(ps[k + 1])), tainted_pos)
+                    filter!(k -> !(k + 1 <= length(ps) && _is_lock_type(ps[k + 1])), tainted_pos)
                 end
             end
             # Container arguments travel too, with their field map: the writes that matter often
@@ -702,7 +771,7 @@ function _taint_scan_ci(
                 m = mi === nothing ? nothing : mi.def
                 if m isa Method && !_is_base_core(m.module)
                     rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen; cpos)
-                    settaint(rt && _may_ref(types[i]))
+                    settaint(rt === true && _may_ref(types[i]))
                 elseif nm !== nothing && nm in _BASE_MUTATORS && _mutator_dest(nm) in tainted_pos
                     _record!(
                         out, seen, chain,
@@ -721,7 +790,8 @@ function _taint_scan_ci(
                             mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen;
                             cpos, base = true, bang
                         )
-                        settaint(rt && _may_ref(types[i]))
+                        settaint(rt === true && _may_ref(types[i]))
+                        rt === :maybe && _may_alias_result(types[i]) && setmaybe(i)
                     end
                 end
                 continue
@@ -821,6 +891,23 @@ _is_sync_object(@nospecialize(v)) =
     v isa Base.AbstractLock || v isa Threads.Atomic || v isa Base.GenericCondition ||
     v isa Base.Event || v isa Channel || v isa Base.Semaphore
 
+# The synchronization types a plan may hold without their writes counting as writes to the plan:
+# a lock, a condition, an event, a channel, a semaphore. A `Threads.Atomic` is not one of them.
+# Writing it is an atomic write to shared state, reported as an `@atomic` field write is.
+_is_lock_type(@nospecialize(T)) = _is_sync_type(T) && !(T <: Threads.Atomic)
+
+# The IR an `llvmcall` carries: a string, or a `(module IR, entry name)` tuple.
+function _llvmcall_text(@nospecialize(a))
+    a isa QuoteNode && (a = a.value)
+    a isa AbstractString && return String(a)
+    a isa Tuple || return ""
+    return join((String(x) for x in a if x isa AbstractString), "\n")
+end
+
+const _ATOMIC_POINTER_WRITES = (
+    :atomic_pointerset, :atomic_pointerswap, :atomic_pointermodify, :atomic_pointerreplace,
+)
+
 # A type whose objects are how tasks synchronize; a value of it read out of a global is not shared data.
 _is_sync_type(@nospecialize(T)) = T isa Type && (T <: Base.AbstractLock || T <: Threads.Atomic ||
     T <: Base.GenericCondition || T <: Base.Event || T <: Channel || T <: Base.Semaphore)
@@ -830,7 +917,7 @@ _is_sync_type(@nospecialize(T)) = T isa Type && (T <: Base.AbstractLock || T <: 
 # buffer captured beside them stays the closure's own. A struct with no call method has no body to read.
 function _recurse_closure_body(
         @nospecialize(T), fields::Set{Int}, chain::Vector{String}, depth::Int, max_depth::Int,
-        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
+        memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame,
     )
     T = Core.Compiler.widenconst(T)
     # A closure, or any struct with a call method of its own: both are functions that carry state.
@@ -889,7 +976,7 @@ end
 # than skipped: a task body that could not be read is not a task body that writes nothing.
 function _recurse_task_body(
         @nospecialize(T), chain::Vector{String}, depth::Int, max_depth::Int,
-        memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame;
+        memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String}, caller::_Frame;
         fields::Union{Nothing, Set{Int}} = nothing,
     )
     held = "spawns a task holding a plan-reachable value"
@@ -944,7 +1031,7 @@ end
 
 function _recurse(
         mi::Core.MethodInstance, m::Method, tainted_pos::Vector{Int}, chain::Vector{String},
-        depth::Int, max_depth::Int, memo::Dict{Any, Bool}, out::Vector{_ConcViol}, seen::Set{String};
+        depth::Int, max_depth::Int, memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String};
         cpos::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(), base::Bool = false, bang::Bool = false,
     )
     # Canonical, and comparable: sorting the pairs directly falls through to comparing the `Set`
@@ -952,7 +1039,13 @@ function _recurse(
     # package: every `cholesky!` signature came back unanalyzable with a `MethodError` from the
     # memo key rather than from anything about the method.
     key = (mi, sort(tainted_pos), [k => sort!(collect(v)) for (k, v) in sort!(collect(cpos); by = first)])
-    haskey(memo, key) && return memo[key]
+    # A result is kept with the depth it was computed at and whether the walk was cut short
+    # somewhere beneath it. One that was cut answers only a visit at least as deep: a shallower
+    # visit reads further and may find what the deeper one could not.
+    kept = get(memo, key, nothing)
+    if kept isa Tuple
+        (!kept[3] || depth >= kept[2]) && return kept[1]
+    end
     label = string(_demangle(m.name))
     # A Base callee that is not read is reported only when its name declares a write. Base's
     # other functions do not write their arguments, and a record for each one the walk stopped
@@ -964,10 +1057,11 @@ function _recurse(
             "hands a plan-reachable value to `$label` at recursion depth $depth (≥ max_depth=$max_depth) — " *
                 "not read, so not established; pass a larger `max_depth` to check it", _Frame(label, string(m.file), Int(m.line))
         )
-        memo[key] = false
-        return false
+        memo[:cut] = get(memo, :cut, 0) + 1
+        return quiet ? _unread_result(label, "past the depth the walk reads", m, chain, out, seen) : false
     end
-    memo[key] = false   # cycle guard: assume non-tainting return until proven
+    cut0 = get(memo, :cut, 0)
+    memo[key] = (false, depth, false)   # cycle guard: assume non-tainting return until proven
     ci = base ? _mi_codeinfo_by_type(mi) : _mi_codeinfo(mi)
     if ci === nothing
         # The callee holds a plan-reachable value and nothing says what it does with it.
@@ -976,7 +1070,8 @@ function _recurse(
             "hands a plan-reachable value to `$label`, whose typed IR could not be read — " *
                 "not read, so not established", _Frame(label, string(m.file), Int(m.line))
         )
-        return false
+        delete!(memo, key)
+        return quiet ? _unread_result(label, "its typed IR could not be read", m, chain, out, seen) : false
     end
     # user param k (1-based) ↔ Core.Argument(k+1)
     callee_targs = Set{Int}(p + 1 for p in tainted_pos)
@@ -986,8 +1081,20 @@ function _recurse(
         ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen;
         cargs = callee_cargs
     )
-    memo[key] = rt
+    memo[key] = (rt, depth, get(memo, :cut, 0) != cut0)
     return rt
+end
+
+# A Base callee that was entered because what it returns can be a reference into an argument,
+# and was not read. Whether its result is the plan's memory is not known, so the call is recorded
+# as undecided and the result is marked as possibly the plan's.
+function _unread_result(label::String, why::String, m::Method, chain::Vector{String}, out::Vector{_ConcViol}, seen::Set{String})
+    _record!(
+        out, seen, chain,
+        "hands a plan-reachable value to `$label`, whose result may be the plan's memory — " *
+            "not read ($why), so not established", _Frame(label, string(m.file), Int(m.line))
+    )
+    return :maybe
 end
 
 # ── entry point ─────────────────────────────────────────────────────────────────────────────
@@ -1039,9 +1146,9 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     )
     _may_ref(types[self_arg]) || return out
     # A lock or a channel is written by every task that uses it; that is what it is for.
-    _is_sync_type(types[self_arg]) && return out
+    _is_lock_type(types[self_arg]) && return out
     targs = Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
-    _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Bool}(), out, Set{String}())
+    _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Any}(), out, Set{String}())
     return out
 end
 
@@ -1101,8 +1208,9 @@ and `get(plan.cache, k, x)[1] = v` are writes and `copyto!(out, plan.buf)` is no
 A foreign call follows Go's rule for cgo: a C function is assumed to write through every pointer it
 is given. `memmove`, `memcpy` and `memset` are known to write their destination, so a plan buffer
 there is a write the scan read; a plan pointer handed to any other foreign function, a BLAS routine
-included, is reported as one the scan could not rule out. A lock, condition, atomic or channel held
-by the plan is not shared data: locking it is not a write to the plan.
+included, is reported as one the scan could not rule out. A lock, condition or channel held by the
+plan is not shared data: locking it is not a write to the plan. A `Threads.Atomic` held by the plan
+is: writing it is reported as an `@atomic` field write is, as an atomic write that warns.
 
 **Failing and warning are different outcomes here, and which one you get follows how sure the scan
 is.** A write it READ — a store whose container is plan-reachable, a hand-off to a known Base

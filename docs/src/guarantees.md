@@ -1401,8 +1401,10 @@ A Base function that was not inlined is read the same way when its name ends in 
 plan's memory or a copy, so `sort!(plan.buf)` and `get(plan.cache, k, x)[1] = v` are writes, and
 `copyto!(out, plan.buf)`, `mul!(out, plan.A, x)` and `sort!(copy(plan.buf))` are not.
 
-A lock, a condition, an atomic, an event, a channel or a semaphore held by the plan is not marked.
-What `lock(plan.lk)` writes inside the lock is the synchronization, not shared data.
+A lock, a condition, an event, a channel or a semaphore held by the plan is not marked. What
+`lock(plan.lk)` writes inside the lock is the synchronization, not shared data. A `Threads.Atomic`
+is marked: `Threads.atomic_add!(plan.ctr, 1)` and `plan.ctr[] = v` are atomic writes to shared
+state, and warn as `@atomic plan.count += 1` does.
 
 ### Throw or warn
 
