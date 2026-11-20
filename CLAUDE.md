@@ -312,10 +312,10 @@ StrictMode/src/
                         synchronization. A Threads.Atomic DOES carry it, so atomic_add! and
                         `x[] = v` on one (the atomic_pointer intrinsics) are records with certain
                         and deliberate both set, as an @atomic field write is. A constant GLOBAL
-                        Threads.Atomic is treated the same (_is_mutable_global no longer skips
-                        it; the address of a global from jl_value_ptr carries `gset`): an
+                        Threads.Atomic is treated the same (_is_mutable_global counts it as
+                        mutable; the address of a global from jl_value_ptr carries `gset`): an
                         atomic write to it is certain and deliberate, so it warns and never
-                        raises. A lock or channel global is still not data. Global taint
+                        raises. A lock or channel global is not data. Global taint
                         crosses an :invoke like plan taint (`gpos` → `gargs` in _recurse, in the
                         memo key): a helper handed the global is read, silently when it cannot
                         be. _ConcViol.global_state marks a record about a global, and when every
@@ -1011,8 +1011,8 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   spill), which every loop and register check read as clean. `:vectorized`, `:no_scalar_loops`,
   `:no_spill` and `:inlined` turn an empty text (or `nothing` from `_inlined_survives`) into
   `_unevaluated`, in `_compiled_output_finding` and in the `@assert_*` macros alike. The public
-  reports (`spill_report`, `scalar_fp_loops`, `kernel_report`, `register_report`) still return
-  their empty value for it. The same rule elsewhere: `_unsafe_constructs` returns `nothing` for a
+  reports (`spill_report`, `scalar_fp_loops`, `kernel_report`, `register_report`) raise
+  `_UnanalyzableSignature` for it, through `_report_text`. The same rule elsewhere: `_unsafe_constructs` returns `nothing` for a
   method it could not read and `unsafe_report` fails it (SM0203); the concurrency scan records a
   plan value handed to a callee whose typed IR it cannot read (a callable struct with fields).
 - `kernel_report` and `@assert_vectorized` work from `InteractiveUtils.code_llvm` — no backend needed. `_CACHE_BYTES` is a tunable `Ref` for cache-residency annotation thresholds.
