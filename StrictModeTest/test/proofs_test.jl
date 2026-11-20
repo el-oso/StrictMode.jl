@@ -685,3 +685,27 @@ end
     StrictMode._BARRIER_GEN[] += 1
     StrictMode.clear_cache!()
 end
+
+@testitem "a declared signature keeps the exempt functions its result names" begin
+    using StrictMode, StrictModeTest, Test
+
+    module DeclaredExempt
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    @strict_function guarantees = (:noalloc,) use(n::Int) = (b = grow!(n); b[1])
+    end
+    D = DeclaredExempt
+    D.use(4)
+    fs = test_signatures([(D.use, (Int,))]; guarantees = (:noalloc,), allow_exempt = true)
+    r = only(fs)
+    @test r.code === :SM0018 && r.policy != ""
+    @test r.exempt_by == ("grow!" => "pool",)
+    @test occursin("exempt by", sprint(io -> StrictMode.format_findings(io, fs; format = :text)))
+    r = only(test_registered(; guarantees = (:noalloc,), modules = [D], allow_exempt = true))
+    @test r.exempt_by == ("grow!" => "pool",)
+end

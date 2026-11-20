@@ -596,12 +596,7 @@ function _with_policy(fs, decls, @nospecialize(f), @nospecialize(types))
     (isempty(fs) || isempty(decls)) && return fs
     meta = get(decls, _decl_key(f, types), nothing)
     (isnothing(meta) || meta.source == "") && return fs
-    return [
-        StrictFinding(
-            x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason,
-            x.suggestion, x.tier, x.code, meta.source
-        ) for x in fs
-    ]
+    return [_restamp(x, meta.source) for x in fs]
 end
 
 # `(guarantees still to check, :info findings for the exempted ones)`.
