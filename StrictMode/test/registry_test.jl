@@ -370,7 +370,9 @@ end
     @test any(f -> f.func == "collect" && f.guarantee === :noalloc && f.status !== :pass, swept(; guarantees = (:noalloc,)))
     # The filters name it as they name the module's own functions.
     @test !any(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), exempt = (:getproperty,)))
-    @test all(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), only = (:getproperty,)))
+    scoped = swept(; guarantees = (:trusted,), only = (:getproperty,))
+    @test !isempty(scoped)
+    @test all(f -> f.func == "getproperty", scoped)
     Base.delete_method(which(getproperty, (Untrusted{F.MyT}, Symbol)))
 end
 
