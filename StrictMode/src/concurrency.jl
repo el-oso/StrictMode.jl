@@ -96,8 +96,8 @@ end
 #   * Recursion is depth-bounded (`max_depth`, default 4); beyond it a still-tainted call is
 #     flagged conservatively rather than followed. A Base callee past its own bound is flagged
 #     only when its name ends in `!`.
-#   * An `llvmcall` is read only for whether its IR holds an atomic instruction or a store; a
-#     plain store through a plan pointer there is undecided.
+#   * An `llvmcall` is read only for which instructions its IR holds: an atomic write is read,
+#     and a plain store, a call or IR the code does not state is undecided whatever it writes.
 #   * A callee returning a struct BUILT AROUND a plan value (a wrapper, not a projection) returns
 #     no taint, and neither does a callee the walk did not read or a dynamic call.
 
@@ -773,34 +773,39 @@ function _taint_scan_ci(
             # An atomic write through a pointer into the plan: what `Threads.atomic_add!` and
             # `x[] = v` on a `Threads.Atomic` become. It is the same fact as an `@atomic` field
             # write and is reported the same way: read, and deliberate.
-            # Inline LLVM IR handed a pointer into the plan, which is how `Threads.Atomic` is
-            # written before Julia 1.13. An atomic instruction is the same fact as the intrinsic
-            # below. Any other store is not read, and is recorded as undecided.
+            # Inline LLVM IR handed a pointer into the plan or into a constant global, which is how
+            # `Threads.Atomic` is written before Julia 1.13. An atomic instruction is the same fact
+            # as the intrinsic below. Any other instruction that can write — a store, a call (an
+            # intrinsic such as `llvm.memset` is one) — is not read, and neither is IR whose text
+            # the code does not state: both are recorded as undecided. IR that can only read
+            # records nothing.
             if nm === :llvmcall && length(dataargs) >= 4 && any(gtainted, @view dataargs[4:end]) &&
                     !any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
-                ir = _llvmcall_text(dataargs[1])
-                (occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)) &&
-                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true, global_state = true)
+                atomic, other = _llvmcall_writes(_llvmcall_text(dataargs[1], code))
+                atomic && _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true, global_state = true)
+                other && _record!(
+                    out, seen, chain,
+                    "hands a pointer into a mutable constant global to inline LLVM IR (`llvmcall`) " *
+                        "that may write through it — StrictMode does not read it (flagged conservatively)",
+                    fr; global_state = true
+                )
                 continue
             end
             if nm === :llvmcall && length(dataargs) >= 4 &&
                     any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
-                ir = _llvmcall_text(dataargs[1])
-                if occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)
-                    _record!(
-                        out, seen, chain,
-                        "stores into a buffer reachable from the plan (an atomic instruction in " *
-                            "`llvmcall`) — a heap write the plan can observe — the write is ATOMIC, " *
-                            "so it cannot tear, but the plan is still shared mutable state and " *
-                            "atomicity does not make sharing safe", fr; certain = true, deliberate = true
-                    )
-                elseif occursin("store", ir)
-                    _record!(
-                        out, seen, chain,
-                        "hands a plan-reachable pointer to inline LLVM IR that stores (`llvmcall`) " *
-                            "— StrictMode does not read it (flagged conservatively)", fr
-                    )
-                end
+                atomic, other = _llvmcall_writes(_llvmcall_text(dataargs[1], code))
+                atomic && _record!(
+                    out, seen, chain,
+                    "stores into a buffer reachable from the plan (an atomic instruction in " *
+                        "`llvmcall`) — a heap write the plan can observe — the write is ATOMIC, " *
+                        "so it cannot tear, but the plan is still shared mutable state and " *
+                        "atomicity does not make sharing safe", fr; certain = true, deliberate = true
+                )
+                other && _record!(
+                    out, seen, chain,
+                    "hands a plan-reachable pointer to inline LLVM IR (`llvmcall`) that may write " *
+                        "through it — StrictMode does not read it (flagged conservatively)", fr
+                )
                 continue
             end
             if nm !== nothing && nm in _ATOMIC_POINTER_WRITES && !isempty(dataargs)
@@ -1003,12 +1008,27 @@ _is_sync_object(@nospecialize(v)) =
 # Writing it is an atomic write to shared state, reported as an `@atomic` field write is.
 _is_lock_type(@nospecialize(T)) = _is_sync_type(T) && !(T <: Threads.Atomic)
 
-# The IR an `llvmcall` carries: a string, or a `(module IR, entry name)` tuple.
-function _llvmcall_text(@nospecialize(a))
+# The IR an `llvmcall` carries: a string, or a `(module IR, entry name)` tuple, given as a constant
+# or built by a `tuple` statement in `code`. `nothing` when the code does not state it.
+function _llvmcall_text(@nospecialize(a), code)
+    if a isa Core.SSAValue
+        s = 1 <= a.id <= length(code) ? code[a.id] : nothing
+        (Meta.isexpr(s, :call) && _callee_name(s.args[1]) === :tuple) || return nothing
+        a = Tuple(x isa QuoteNode ? x.value : x for x in @view s.args[2:end])
+    end
     a isa QuoteNode && (a = a.value)
     a isa AbstractString && return String(a)
-    a isa Tuple || return ""
-    return join((String(x) for x in a if x isa AbstractString), "\n")
+    (a isa Tuple && all(x -> x isa AbstractString, a)) || return nothing
+    return join(a, "\n")
+end
+
+# Whether inline LLVM IR writes atomically, and whether it may write any other way: a plain store, or
+# a call, which covers intrinsics such as `llvm.memset`. IR whose text is unknown may do anything.
+function _llvmcall_writes(ir::Union{Nothing, String})
+    isnothing(ir) && return (false, true)
+    atomic = occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)
+    other = occursin(r"\bstore\b(?!\s+atomic)", ir) || occursin(r"\b(call|invoke)\b", ir)
+    return (atomic, other)
 end
 
 const _GLOBAL_ATOMIC_WRITE = "writes process-global state (an atomic write into a constant " *

@@ -1592,3 +1592,38 @@ end
     @test isempty(StrictMode.concurrency_findings(S.g, (S.P,)))
 end
 
+
+@testitem "inline LLVM IR handed a plan pointer is cleared only when it cannot write" begin
+    using StrictMode
+
+    module LlvmPlan
+    struct P
+        buf::Vector{Float64}
+    end
+    memset_str!(p::P) = (GC.@preserve p Base.llvmcall("call void @llvm.memset.p0.i64(ptr %0, i8 0, i64 8, i1 false)\nret void", Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    memset_mod!(p::P) = (GC.@preserve p Base.llvmcall(("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\ndefine void @e(ptr %p) {\n call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n ret void\n}", "e"), Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    store_mod!(p::P) = (GC.@preserve p Base.llvmcall(("define void @e(ptr %p) {\n store double 0.0, ptr %p\n ret void\n}", "e"), Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    load_str(p::P) = GC.@preserve p Base.llvmcall("%v = load double, ptr %0\nret double %v", Float64, Tuple{Ptr{Float64}}, pointer(p.buf))
+    mutable struct Box
+        x::Float64
+    end
+    const GBOX = Box(1.0)
+    gstore(p::P) = (GC.@preserve GBOX Base.llvmcall("store double 0.0, ptr %0\nret void", Cvoid, Tuple{Ptr{Cvoid}}, pointer_from_objref(GBOX)); p.buf[1])
+    end
+    L = LlvmPlan
+    p = L.P([5.0])
+    L.memset_str!(p)
+    @test p.buf[1] == 0.0
+    for f in (L.memset_str!, L.memset_mod!, L.store_mod!)
+        vs = StrictMode.concurrency_findings(f, (L.P,))
+        @test !isempty(vs)
+        @test all(v -> !v.certain, vs)
+    end
+    # The same through a pointer into a constant global is undecided process-global state.
+    vs = StrictMode.concurrency_findings(L.gstore, (L.P,))
+    @test !isempty(vs)
+    @test all(v -> v.global_state && !v.certain, vs)
+    # IR that only loads writes nothing.
+    @test isempty(StrictMode.concurrency_findings(L.load_str, (L.P,)))
+end
+
