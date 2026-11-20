@@ -329,11 +329,14 @@ end
     status(f) = only(findings(f, (Symbol,); guarantees = (:trusted,)))
 
     # StrictMode's own method is the only one for an `Untrusted`, and it raises: `p.x` on an
-    # untyped value reads no payload.
+    # untyped value reads no payload. Both callers are compiled first, so each verdict cached below
+    # holds a compiled instance to watch, and the method defined later caps neither instance.
+    @test O.norm1(:a) == 1.0
+    @test_throws "payload" O.erased_caller(:u)
+    @test !isempty(StrictMode._watch_instances(O.norm1, (Symbol,)))
     @test !StrictMode._untrusted_getproperty_overridden()
     @test status(O.norm1).status === :pass
     @test status(O.erased_caller).status === :pass
-    @test_throws "payload" O.erased_caller(:u)
 
     # A package gives its own wrapped type a `getproperty` that returns the payload. From then on
     # `p.x` on an untyped value can read one, and the verdicts above, which were cached, no longer hold.

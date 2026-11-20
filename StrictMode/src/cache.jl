@@ -25,13 +25,18 @@ const _CACHE_MISSES = Ref(0)
 # STRICTLY MORE than a shallower one. Omitting it hands back the shallow verdict to a caller who
 # asked to look deeper — staleness that can only ever lose findings, which is the direction that
 # goes quiet. (`_SIGNAL_MEMO` in effects.jl already keys on depth; this is the outer layer.)
+#
+# Whether a package overrides `getproperty` on an `Untrusted` is part of it too, for `:trusted`. An
+# untyped `p.x` is a dynamic call, and the compiler records no edge for one, so defining that method
+# caps no instance the entry watches.
 function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     m = try
         which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[])
+    overridden = :trusted in guarantees ? _untrusted_getproperty_overridden() : nothing
+    return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
 end
 
 # What a cached verdict depends on, beyond its key: the compiled code the analysis read. A verdict

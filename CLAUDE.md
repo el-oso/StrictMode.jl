@@ -244,9 +244,9 @@ StrictMode/src/
                         reported while StrictMode's own method, which raises whatever the name,
                         is the only one an Untrusted reaches; once a package defines a more
                         specific getproperty for one (_untrusted_getproperty_overridden, asked
-                        of the method table at each scan, so no cache keeps the old answer:
-                        the findings cache is keyed on the world and _BODY_MEMO holds IR, not
-                        verdicts) untyped `p.x` is an erased read like the others; erased getfield and unsafe_trust are
+                        of the method table at each scan; for :trusted the findings cache
+                        key carries its answer, since the compiler records no edge from an
+                        untyped `p.x` to the new method, and _BODY_MEMO holds IR, not verdicts) untyped `p.x` is an erased read like the others; erased getfield and unsafe_trust are
                         reported, and getproperty on a value typed <:Untrusted is certain. The three-argument
                         getproperty(p, :x, order) is Base's and reads the field, so an erased one
                         is reported like getfield
@@ -408,7 +408,8 @@ StrictMode/src/
   codes.jl            — the diagnostic codes: _CODES keyed on (guarantee, cause) — NEVER on the
                         reason text, which is assembled per call site — plus explain(code)/codes().
                         A published code is permanent; a retired kind leaves a gap
-  cache.jl            — (method, world, signature, guarantees) → findings cache. Each entry also
+  cache.jl            — (method, world, signature, guarantees, depth, and for :trusted whether
+                        getproperty on an Untrusted is overridden) → findings cache. Each entry also
                         holds the CodeInstances its verdict was read from (_watch_instances): the
                         key cannot see an edit to a CALLEE, but Julia caps those instances'
                         max_world when one changes, so a stale entry is dropped on lookup. A
