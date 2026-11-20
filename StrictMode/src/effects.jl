@@ -253,7 +253,8 @@ A registration made at a package's top level, while the package precompiles, is 
 package's cache, so it is in force again in every process that loads it. Only the package being
 precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
 registering a function another package owns needs `mod = @__MODULE__` and raises without it:
-the registration would hold for that precompile and be gone afterwards. A call made from an
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
 `__init__` runs again at every load, so it registers for the session and stores nothing. So does a
 call made by the owning package's own code while another package precompiles, such as a
 registration on first use that a dependent's precompile workload triggers. In a
@@ -277,10 +278,10 @@ function register_alloc_barrier!(@nospecialize(f); mod::Module = _owner_module(f
                 "`register_alloc_barrier!($(_type_name(typeof(f))))`."
         )
     )
-    push!(_ALLOC_BARRIERS, f)
-    # The registry above lives in this session. A package that registers at its own precompile loses it
-    # at the next load, so the registration is also kept in the package named by `mod`, which is
+    # `_ALLOC_BARRIERS` lives in this session. A package that registers at its own precompile loses
+    # it at the next load, so the registration is also kept in the package named by `mod`, which is
     # serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
     if ccall(:jl_generating_output, Cint, ()) == 1
         _persist_registration!(f, mod, _LOCAL_BARRIERS, "register_alloc_barrier!($(_func_name(f)))")
     else
@@ -292,6 +293,7 @@ function register_alloc_barrier!(@nospecialize(f); mod::Module = _owner_module(f
         catch
         end
     end
+    push!(_ALLOC_BARRIERS, f)
     _BARRIER_GEN[] += 1
     clear_cache!()
     return nothing
@@ -1670,7 +1672,8 @@ A registration made at a package's top level, while the package precompiles, is 
 package's cache, so it is in force again in every process that loads it. Only the package being
 precompiled is written, and `mod` names it. It defaults to the module that owns `T`, so
 registering a type another package owns needs `mod = @__MODULE__` and raises without it:
-the registration would hold for that precompile and be gone afterwards. A call made from an
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
 `__init__` runs again at every load, so it registers for the session and stores nothing. So does a
 call made by the owning package's own code while another package precompiles, such as a
 registration on first use that a dependent's precompile workload triggers. In a
@@ -1679,10 +1682,11 @@ session the registration lasts for the session.
 See also [`@assert_noescape`](@ref), [`register_alloc_barrier!`](@ref).
 """
 function register_scoped!(@nospecialize(T::Type); mod::Module = _owner_module(T))
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
+    _keep_registration!(T, mod, _LOCAL_SCOPED, "register_scoped!($T)")
     @lock _SCOPED_LOCK begin
         any(S -> S === T, _SCOPED_TYPES) || push!(_SCOPED_TYPES, T)
     end
-    _keep_registration!(T, mod, _LOCAL_SCOPED, "register_scoped!($T)")
     clear_cache!()
     return T
 end

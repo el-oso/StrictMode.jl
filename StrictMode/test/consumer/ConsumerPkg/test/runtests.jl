@@ -93,6 +93,7 @@ end
     for name in (
             "loaded_from_cache", "top_level_own", "init_scoped", "init_trust", "init_barrier",
             "unnamed_scoped_refused", "unnamed_trust_refused", "unnamed_barrier_refused",
+            "unnamed_refused_at_precompile",
             "named_scoped", "named_trust", "named_barrier", "callable_trust", "callable_barrier",
             "lazy_owner_no_error", "lazy_not_stored", "lazy_in_session",
         )

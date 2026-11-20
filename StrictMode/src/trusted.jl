@@ -84,7 +84,8 @@ A registration made at a package's top level, while the package precompiles, is 
 package's cache, so it is in force again in every process that loads it. Only the package being
 precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
 registering a function another package owns needs `mod = @__MODULE__` and raises without it:
-the registration would hold for that precompile and be gone afterwards. A call made from an
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
 `__init__` runs again at every load, so it registers for the session and stores nothing. So does a
 call made by the owning package's own code while another package precompiles, such as a
 registration on first use that a dependent's precompile workload triggers. In a
@@ -93,8 +94,9 @@ session the registration lasts for the session.
 Clears the findings cache, since a registration changes `:trusted` results.
 """
 function trust_boundary!(@nospecialize(f); mod::Module = _owner_module(f))
-    push!(_TRUST_BOUNDARIES, f)
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
     _keep_registration!(f, mod, _LOCAL_TRUST, "trust_boundary!($(_func_name(f)))")
+    push!(_TRUST_BOUNDARIES, f)
     # A `:trusted` verdict depends on this set, and the findings cache does not key on it.
     clear_cache!()
     return f

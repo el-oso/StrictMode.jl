@@ -95,6 +95,10 @@ end
 const UNNAMED_SCOPED = attempt(() -> StrictMode.register_scoped!(RegOwner.Lent))
 const UNNAMED_TRUST = attempt(() -> StrictMode.trust_boundary!(RegOwner.lent_reader))
 const UNNAMED_BARRIER = attempt(() -> StrictMode.register_alloc_barrier!(RegOwner.lent_table))
+# A refused registration registers nothing, in this precompile either.
+const UNNAMED_IN_FORCE_HERE = StrictMode._is_scoped_type(RegOwner.Lent) ||
+    StrictMode._is_trust_boundary(RegOwner.lent_reader) ||
+    any(g -> g === RegOwner.lent_table, StrictMode._barrier_functions())
 
 # RegOwner registering its own, called from here while this package precompiles: in force for
 # the process, and no error. The same call from RegInit, which holds no store at all.
@@ -136,6 +140,7 @@ refused(s) = occursin("mod = @__MODULE__", s)
 say("unnamed_scoped_refused", refused(RegDependent.UNNAMED_SCOPED) && !StrictMode._is_scoped_type(RegOwner.Lent))
 say("unnamed_trust_refused", refused(RegDependent.UNNAMED_TRUST) && !StrictMode._is_trust_boundary(RegOwner.lent_reader))
 say("unnamed_barrier_refused", refused(RegDependent.UNNAMED_BARRIER) && !barrier(RegOwner.lent_table))
+say("unnamed_refused_at_precompile", !RegDependent.UNNAMED_IN_FORCE_HERE)
 say("named_scoped", StrictMode._is_scoped_type(RegOwner.LentNamed))
 say("named_trust", StrictMode._is_trust_boundary(RegOwner.lent_reader_named))
 say("named_barrier", barrier(RegOwner.lent_table_named))
