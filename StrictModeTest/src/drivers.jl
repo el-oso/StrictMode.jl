@@ -33,7 +33,7 @@ function _gate(items, kind::Symbol, target::AbstractString; allow_exempt::Bool =
         _trim_batch!(_trim_sigs(items))
         # An exempt-only result is a failure from the proof unless this gate's caller accepted
         # the exemptions.
-        StrictMode._map_findings((f, types, gs) -> _proof_findings(f, types, gs; allow_exempt), items)
+        StrictMode._map_findings(_proof_analyzer(allow_exempt), items)
     finally
         empty!(_TRIM_BATCH)
     end
@@ -47,7 +47,8 @@ function _gate(items, kind::Symbol, target::AbstractString; allow_exempt::Bool =
 end
 
 """
-    test_signatures(pairs; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+    test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 Prove `guarantees` for an explicit list of `(f, types)` pairs, and throw a
 `StrictMode.StrictViolation` collecting every failure. Returns the findings when all pass.
@@ -80,7 +81,8 @@ function test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exem
 end
 
 """
-    test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+                  allow_exempt = false)
         -> Vector{StrictFinding}
 
 Prove `guarantees` for every concrete method instance `mod`'s functions have **actually compiled**
@@ -107,7 +109,8 @@ function test_compiled(
 end
 
 """
-    test_registered(; guarantees = nothing, modules = nothing) -> Vector{StrictFinding}
+    test_registered(; guarantees = nothing, modules = nothing, allow_exempt = false)
+        -> Vector{StrictFinding}
 
 Re-prove every signature in StrictMode's mark-once registry — everything `@strict_function`,
 `@strict module`, or `register_strict!` declared — and throw a `StrictMode.StrictViolation`
@@ -145,7 +148,8 @@ function test_registered(; guarantees = nothing, modules = nothing, allow_exempt
 end
 
 """
-    proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+                   allow_exempt = false)
         -> Vector{StrictFinding}
 
 Every concrete method instance `mod`'s functions have **actually compiled**, proved and returned as
@@ -156,13 +160,25 @@ Reach for it when you want the proofs but not the raise: `test_compiled` returns
 when everything passes and throws a `StrictViolation` carrying a formatted string otherwise, so it
 cannot hand you structured findings for a package that is currently failing — which is exactly when
 an agent wants them.
+
+A signature that allocates only inside functions exempted from `:noalloc` is a failure with code
+SM0018, as in every gate; `allow_exempt = true` accepts those exemptions, and the result is then a
+note (`:info`, same code, same `exempt_by`).
 """
-proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ()) =
-    StrictMode._findings_compiled(_proof_findings, mod; guarantees, only, exempt)
+proof_findings(
+    mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+    allow_exempt::Bool = false
+) = StrictMode._findings_compiled(_proof_analyzer(allow_exempt), mod; guarantees, only, exempt)
+
+# `_proof_findings` as the `analyze(f, types, guarantees)` callable the shared drivers take, with
+# the caller's acceptance of exempt-only results applied to every signature they reach.
+_proof_analyzer(allow_exempt::Bool) =
+    (f, types, gs) -> _proof_findings(f, types, gs; allow_exempt)
 
 """
     proof_audit(target = :registered; guarantees = nothing, sweep = false,
-                require = nothing, only = nothing, exempt = ()) -> Vector{StrictFinding}
+                require = nothing, only = nothing, exempt = (), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 [`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, and the same
 `Vector{StrictFinding}` back, and it likewise **never throws and never sets an exit status**. The
@@ -181,9 +197,13 @@ using MyPkg, StrictMode, StrictModeTest
 fs = proof_audit(MyPkg; sweep = true, exempt = r"^_plan")
 nfailures(fs)        # proved failures, not guesses
 ```
+
+A signature that allocates only inside functions exempted from `:noalloc` is a failure with code
+SM0018; `allow_exempt = true` accepts those exemptions for every signature the audit proves, and the
+result is then a note (`:info`, same code, same `exempt_by`).
 """
-proof_audit(target = :registered; kwargs...) =
-    StrictMode._audit(_proof_findings, "proof_audit", target; kwargs...)
+proof_audit(target = :registered; allow_exempt::Bool = false, kwargs...) =
+    StrictMode._audit(_proof_analyzer(allow_exempt), "proof_audit", target; kwargs...)
 
 """
     test_coverage(mod::Module; require = :all, only = nothing, exempt = ())

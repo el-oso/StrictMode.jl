@@ -686,6 +686,51 @@ end
     StrictMode.clear_cache!()
 end
 
+@testitem "proof_audit and proof_findings(mod) accept exemptions with allow_exempt" begin
+    using StrictMode, StrictModeTest, Test
+
+    module AuditExempt
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    @noinline setup(n::Int) = zeros(n)
+    @strict_function guarantees = (:noalloc,) use(n::Int) = (b = grow!(n); b[1])
+    end
+    A = AuditExempt
+    A.use(4)
+    register_alloc_barrier!(A.setup)
+    try
+        row(fs) = only(filter(f -> f.mod === :AuditExempt && f.guarantee === :noalloc, fs))
+        r = row(proof_audit(:registered; allow_exempt = true))
+        @test r.status === :info && r.code === :SM0018
+        @test r.exempt_by == ("grow!" => "pool",)
+        r = row(proof_audit(:registered))
+        @test StrictMode._failed(r) && r.code === :SM0018
+        @test r.exempt_by == ("grow!" => "pool",)
+
+        # The declared scope and the sweep both list `use`.
+        rs = filter(
+            f -> f.guarantee === :noalloc,
+            proof_audit(A; sweep = true, guarantees = (:noalloc,), only = [:use], allow_exempt = true)
+        )
+        @test length(rs) == 2
+        @test all(r -> r.status === :info && r.exempt_by == ("grow!" => "pool",), rs)
+        r = only(StrictModeTest.proof_findings(A; guarantees = (:noalloc,), only = [:use], allow_exempt = true))
+        @test r.status === :info && r.code === :SM0018 && r.exempt_by == ("grow!" => "pool",)
+        @test StrictMode._failed(only(StrictModeTest.proof_findings(A; guarantees = (:noalloc,), only = [:use])))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, A.setup)
+        store = StrictMode._store_for(Base.moduleroot(A), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== A.setup, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end
+
 @testitem "a declared signature keeps the exempt functions its result names" begin
     using StrictMode, StrictModeTest, Test
 

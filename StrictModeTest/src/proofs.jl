@@ -1202,7 +1202,8 @@ end
 # ── the proof engine ─────────────────────────────────────────────────────────────────────────────
 
 """
-    StrictModeTest.proof_findings(f, types; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+    StrictModeTest.proof_findings(f, types; guarantees = (:typestable, :noalloc), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 One [`StrictMode.StrictFinding`](@ref) per requested guarantee, computed with the proofs rather
 than StrictMode's value-free scan. `f` is never called. This is the data half of the gating API;

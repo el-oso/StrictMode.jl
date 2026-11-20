@@ -135,9 +135,9 @@ dropped. A call whose every allocation lies inside such functions gets a result 
 proof: a failure with code SM0018 and an `exempt_by` field listing each exempt function with the
 `reason` its exemption gave. It is a failure to every reader: `nfailures` counts it, `@test_noalloc`,
 `test_signatures`, `test_compiled` and `test_registered` fail on it, and `alloc_entry_report` lists
-the entry as failing. `allow_exempt = true`, on any of those and on `proof_findings`, accepts the
-exemptions for that check; the result is then a note (`:info`, same code), which is still not a
-pass. One allocation outside an exempt function makes it an ordinary failure either way,
+the entry as failing. `allow_exempt = true`, on any of those and on `proof_findings` (signature or
+module) and `proof_audit`, accepts the exemptions for that check; the result is then a note
+(`:info`, same code, same `exempt_by`), which is still not a pass. One allocation outside an exempt function makes it an ordinary failure either way,
 and so does an exempt callee that was inlined, since its allocation then belongs to the caller's
 own code. The exemption is matched on the method, so a function of the same name in another
 module excuses nothing.
