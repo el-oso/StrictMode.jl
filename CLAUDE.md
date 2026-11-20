@@ -767,8 +767,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   matches no function with a method in the module raises in `_check_name_filters`, which
   `module_methods`, `_module_specializations` and `_coverage_findings` call first (the names are
   the census's: demangled, so a keyword body and a closure answer to the function that wrote
-  them); a `stop` entry the reach walk never met raises in `reach_report`, and in `route_parity`
-  only when NEITHER route met it. A preference key StrictMode does not read WARNS at load
+  them); a `stop` entry raises in `reach_report` when the walk never met it AND no reached body names
+  it before optimization (`_reach_named_unoptimized`: a call the optimizer folded away leaves no
+  statement and no inlining edge, and a `stop` list must not depend on that), and in
+  `route_parity` only when NEITHER route met it. A preference key StrictMode does not read WARNS at load
   (`_warn_unknown_preferences`, called from `__init__`, so it scans the preference files by bytes
   and is pinned trim-clean in `StrictModeTest/test/trim_test.jl`); it is NOT gated on the
   `banner` preference, which hides the tier banner alone: a misspelled `banner` is what the

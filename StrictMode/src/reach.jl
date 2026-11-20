@@ -244,6 +244,8 @@ from one that chooses a route first.
   other packages; this filters what is listed.
 - `stop` names functions that are recorded but not entered. A thread pool's dispatcher reaches
   every job the package can submit, so naming it keeps the list about the route.
+  An entry the call does not name anywhere it reaches raises an `ArgumentError`: it cut nothing.
+  A hub the source calls and the optimizer folded away is named, and does not raise.
 
 A callee in Base is entered only when it was handed a function from outside Base, such as a
 closure passed to `foreach`.
@@ -272,6 +274,44 @@ _stop_unmet(caller::String, target, unmet) =
     "$caller: `stop` names " * join(("`$(g)`" for g in unmet), ", ") * ", which $target does not " *
     "reach, so nothing was cut there. Check the name, or drop the entry."
 
+# Which of `keys` some body reachable from `sig` calls by name, read from typed IR BEFORE
+# optimization, where every call the source wrote is still a statement. Callees outside Base are
+# followed, at the argument types inference gave the call.
+const _REACH_NAMED_BODIES = 512
+function _reach_named_unoptimized(@nospecialize(sig), keys::Set{Tuple{Module, Symbol}})
+    found = Set{Tuple{Module, Symbol}}()
+    seen = Set{Any}()
+    queue = Any[sig]
+    while !isempty(queue) && length(seen) < _REACH_NAMED_BODIES && length(found) < length(keys)
+        s = popfirst!(queue)
+        s in seen && continue
+        push!(seen, s)
+        cts = try
+            _code_typed_by_type(s; optimize = false)
+        catch
+            continue
+        end
+        for (ci, _) in cts
+            for st in ci.code
+                Meta.isexpr(st, :(=)) && (st = st.args[2])
+                callee, args = _call_callee_and_args(ci, st)
+                (isnothing(callee) || callee isa Core.Builtin || callee isa Core.IntrinsicFunction) && continue
+                key = try
+                    _reach_key(callee)
+                catch
+                    continue
+                end
+                key in keys && push!(found, key)
+                _sw_is_base(key[1]) && continue
+                ats = Any[_unopt_arg_type(ci, a) for a in args]
+                all(T -> T isa Type, ats) || continue
+                push!(queue, Tuple{Core.Typeof(callee), ats...})
+            end
+        end
+    end
+    return found
+end
+
 # The report, and the `stop` entries the walk never met.
 function _reach_report(
         @nospecialize(f), @nospecialize(types::Tuple); mod::Union{Nothing, Module} = nothing,
@@ -287,6 +327,14 @@ function _reach_report(
     stopkeys = Set{Tuple{Module, Symbol}}(_reach_key(g) for g in stop)
     r = _reach(Base.signature_type(f, types), stopkeys)
     unmet = Any[g for g in stop if !haskey(r.found, _reach_key(g))]
+    # A hub the walk did not meet may still be one the code calls: a call the optimizer folded
+    # away leaves no statement and no inlining edge. Whether that happened depends on the
+    # compiler, and a `stop` list must not. So an entry is unmet only when no body the call
+    # reaches names it before optimization.
+    if !isempty(unmet)
+        named = _reach_named_unoptimized(Base.signature_type(f, types), Set{Tuple{Module, Symbol}}(_reach_key(g) for g in unmet))
+        filter!(g -> !(_reach_key(g) in named), unmet)
+    end
     fs = collect(values(r.found))
     isnothing(mod) || filter!(x -> _reach_in_module(x.mod, mod), fs)
     sort!(fs; by = x -> (x.depth, string(x.mod), string(x.name)))

@@ -126,6 +126,15 @@ end
     @test StrictMode.reaches(StrictMode.reach_report(entry, sig; stop = (hub,)), hub)
     @test !StrictMode.reaches(StrictMode.reach_report(entry, sig; stop = (hub,)), leaf)
     @test_throws "reach_report: `stop` names `other`, which entry(Int64) does not reach" StrictMode.reach_report(entry, sig; stop = (other,))
+    # A hub the source calls and the optimizer folded away is still a hub the caller named
+    # rightly: whether the call survived is not something a `stop` list should depend on.
+    hub_const(x) = 3
+    entry_folded(x) = hub_const(x) + x
+    @test StrictMode.reach_report(entry_folded, sig; stop = (hub_const,)) isa StrictMode.ReachReport
+    @noinline deep_const(x) = hub_const(x) + 1
+    entry_deep(x) = deep_const(x) + x
+    @test StrictMode.reach_report(entry_deep, sig; stop = (hub_const,)) isa StrictMode.ReachReport
+    @test_throws "`stop` names `other`" StrictMode.reach_report(entry_folded, sig; stop = (hub_const, other))
     @test_throws "nothing was cut there" StrictMode.reach_report(entry, sig; stop = (hub, other))
     # Two routes: a hub only one of them reaches is the difference being reported.
     direct(x) = leaf(x)
