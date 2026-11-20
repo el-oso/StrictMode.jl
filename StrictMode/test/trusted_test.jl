@@ -408,3 +408,31 @@ end
     invoked_clean(x::Vector{UInt8}) = invoke(length, Tuple{AbstractVector}, x)
     @test status(invoked_clean, (Vector{UInt8},)).status === :pass
 end
+
+@testitem "a keyword function is judged by its body, and a boundary's body is the boundary" begin
+    using StrictMode
+
+    const U8 = Untrusted{Vector{UInt8}}
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    peek(u::U8; n::Int = 1) = unsafe_trust(u)[n]
+    for (f, T) in ((peek, (U8,)), (Core.kwcall, (NamedTuple{(:n,), Tuple{Int}}, typeof(peek), U8)))
+        r = status(f, T)
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    u = Untrusted(UInt8[7])
+    @test_throws StrictViolation @assert_trusted peek(u)
+    @test_throws StrictViolation @assert_trusted peek(u; n = 1)
+
+    parsekw(u::U8; strict::Bool = true) = length(unsafe_trust(u))
+    StrictMode.trust_boundary!(parsekw)
+    body = Base.bodyfunction(only(methods(parsekw)))
+    @test status(body, (Bool, typeof(parsekw), U8)).status === :pass
+    @test status(parsekw, (U8,)).status === :pass
+    @test (@assert_trusted parsekw(u; strict = false)) == 1
+    delete!(StrictMode._TRUST_BOUNDARIES, parsekw)
+    StrictMode.clear_cache!()
+
+    # A module whose boundary takes keywords loads under a policy.
+    @test Core.eval(@__MODULE__, Meta.parse("module KwBoundaryPolicy; using StrictMode; const U8 = Untrusted{Vector{UInt8}}; parsekw(u::U8; strict::Bool = true) = length(unsafe_trust(u)); trust_boundary!(parsekw); @strict_policy :trusted; end")) isa Module
+end

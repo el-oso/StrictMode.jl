@@ -220,6 +220,10 @@ StrictMode/src/
                         with no checker at all; the scan covers what the language cannot, reading
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller.
+                        A keyword function is judged by its body (_keyword_body: Base.bodyfunction,
+                        accepted only when it carries the `#f#N` name of the method's function),
+                        followed from the positional and kwcall methods, and a registered
+                        boundary's body is the boundary (_is_trust_boundary).
                         trust_boundary! calls clear_cache!, like every registration a verdict
                         depends on (register_scoped!, register_alloc_barrier!, _exempt!). A
                         read whose result is STORED is the right-hand side of an assignment in

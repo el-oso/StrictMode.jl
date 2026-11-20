@@ -65,9 +65,29 @@ check fails on the call site.
 const _TRUST_BOUNDARIES = Base.IdSet{Any}()
 const _LOCAL_TRUST = :__strict_trust_boundaries__
 
-# Every boundary in scope: this session's, and each loaded package's own.
-_is_trust_boundary(@nospecialize(f)) =
-    f in _TRUST_BOUNDARIES || any(g -> g === f, _registrations(_TRUST_BOUNDARIES, _LOCAL_TRUST))
+# Every boundary in scope: this session's, and each loaded package's own. A boundary that takes
+# keywords keeps its code in a body function of its own, `#f#N`, which is the boundary too.
+function _is_trust_boundary(@nospecialize(f))
+    f in _TRUST_BOUNDARIES && return true
+    bs = _registrations(_TRUST_BOUNDARIES, _LOCAL_TRUST)
+    any(g -> g === f, bs) && return true
+    (f isa Function && startswith(String(nameof(f)), "#")) || return false
+    return any(g -> any(m -> _keyword_body(m) === f, methods(g)), bs)
+end
+
+# The body function a keyword method forwards to, or `nothing` for a method without keywords.
+# `Base.bodyfunction` returns the last function a method calls whatever it is, so its answer counts
+# only when it carries the keyword-body name, `#f#N`, of this method's function.
+function _keyword_body(m::Method)
+    b = try
+        Base.bodyfunction(m)
+    catch
+        nothing
+    end
+    b isa Function || return nothing
+    mt = match(r"^#(.+)#\d+$", String(nameof(b)))
+    return (!isnothing(mt) && mt.captures[1] == String(m.name)) ? b : nothing
+end
 
 """
     trust_boundary!(f) -> f
@@ -78,7 +98,8 @@ Register `f` as a validating crossing: the one place [`@assert_trusted`](@ref) p
 `f` is expected to validate what it reads, and to **copy** anything it hands back — the caller
 still holds the original buffer and can write to it afterwards, which is why the kernel's
 `copy_from_user` copies rather than aliasing. Neither property is checked; registering `f` asserts
-both.
+both. When `f` takes keywords, the body function its keyword methods forward to (`#f#N`) is
+the boundary too.
 
 A registration made at a package's top level, while the package precompiles, is written into that
 package's cache, so it is in force again in every process that loads it. Only the package being
@@ -145,11 +166,22 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     # loop over a loosely typed collection reads as a possible payload read.
     other = _other_field_reads(ci)
     overridden = _untrusted_getproperty_overridden()
+    # A keyword function's positional and `Core.kwcall` methods only forward to its body function,
+    # where the code the caller wrote is; that body is read as part of `f`'s own.
+    m = ci.parent isa Core.MethodInstance ? ci.parent.def : nothing
+    body = m isa Method ? _keyword_body(m) : nothing
     for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
         # `invoke(f, T, args...)` calls `f` on `args`, whichever method `T` selects.
         if callee === Core.invoke && length(args) >= 2
             callee, args = _unopt_callee(ci, args[1]), args[3:end]
+        end
+        if !isnothing(body) && callee === body
+            sub = _untrusted_deref_sites(body, Tuple(_unopt_arg_type(ci, a) for a in args))
+            isnothing(sub) && return nothing
+            append!(certain, sub[1])
+            append!(erased, sub[2])
+            continue
         end
         # The escape hatch handed to another call — `map(unsafe_trust, us)`, `unsafe_trust.(us)`,
         # `u |> unsafe_trust` — reads a payload wherever it is applied: its one method takes an
@@ -329,7 +361,9 @@ as a trust boundary. Passing a wrapped value along is always fine; only reading 
 The read is any call to `getfield`, `getproperty`, or [`unsafe_trust`](@ref) on an argument
 that inference types as `<:Untrusted`, directly or through `invoke`, and `unsafe_trust` handed to
 another call as a value (`map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`). Registering `f` with [`trust_boundary!`](@ref) permits all of
-them in that one method.
+them in that one method. A function with keywords keeps its code in a body function of its own; the
+positional and `Core.kwcall` methods are judged by that body, and a registered boundary's body is
+the boundary.
 
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized
 typed IR, with no execution, backend, or timing — and it **gates**, because it observes a call on a
