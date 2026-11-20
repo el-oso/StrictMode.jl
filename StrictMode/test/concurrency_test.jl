@@ -1544,7 +1544,6 @@ end
     @test_throws StrictViolation @assert_concurrency_safe C.late!(C.P(Float64[], [1.0]))
 end
 
-
 @testitem "a value an IdDict held by the plan returns is the plan's" begin
     using StrictMode
 
@@ -1564,7 +1563,6 @@ end
     @test isempty(StrictMode.concurrency_findings(D.r_idx, (D.P,)))
     @test any(v -> v.certain && v.global_state, StrictMode.concurrency_findings(D.g_idx, (D.P,)))
 end
-
 
 @testitem "an out-of-line setindex! on a wrapper of a plan buffer is followed" begin
     using StrictMode
@@ -1591,7 +1589,6 @@ end
     # The same call writing the wrapper's own fresh field is the method's own business.
     @test isempty(StrictMode.concurrency_findings(S.g, (S.P,)))
 end
-
 
 @testitem "inline LLVM IR handed a plan pointer is cleared only when it cannot write" begin
     using StrictMode
@@ -1627,7 +1624,6 @@ end
     @test isempty(StrictMode.concurrency_findings(L.load_str, (L.P,)))
 end
 
-
 @testitem "a constant global written through a pointer is process-global state" begin
     using StrictMode
 
@@ -1653,7 +1649,6 @@ end
     @test_throws StrictViolation @assert_concurrency_safe G.g_ptr(G.Plan([1.0]))
 end
 
-
 @testitem "a `!` name does not excuse a write to a global in a sweep" begin
     using StrictMode
 
@@ -1670,7 +1665,6 @@ end
     f = only(findings(B.own!, (Vector{Float64},); guarantees = (:concurrency_safe,)))
     @test f.status === :info
 end
-
 
 @testitem "a lock as the shared argument still has its global writes read" begin
     using StrictMode
@@ -1690,7 +1684,6 @@ end
     # A helper handed a per-thread lock that writes a global writes the global, not the lock.
     @test isempty(StrictMode.threadid_state_findings(LockArg.per_thread, ()))
 end
-
 
 @testitem "the concurrency headline names what was written" begin
     using StrictMode
@@ -1715,7 +1708,6 @@ end
     @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
 end
 
-
 @testitem "a constant index into a wrapper is an element, not a field" begin
     using StrictMode
 
@@ -1735,7 +1727,6 @@ end
         @test any(v -> v.certain, StrictMode.concurrency_findings(f, (C.P,)))
     end
 end
-
 
 @testitem "a per-thread slot written through a pointer or C is threadid state" begin
     using StrictMode
