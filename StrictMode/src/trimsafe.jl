@@ -40,7 +40,7 @@ function _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple))
         push!(issues, "dynamic dispatch (result inferred as `Any`): " * TypeContracts._trim_truncate(string(st)))
     end
     unique!(issues)
-    entry = string(nameof(f), _sig_string(types))
+    entry = string(_func_name(f), _sig_string(types))
     return TypeContracts.TrimReport(entry, issues, isempty(issues))
 end
 

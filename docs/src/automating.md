@@ -39,6 +39,11 @@ findings(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))   # all :pass
 Nothing actually runs here; the analysis works purely from the types. That means it is happy even
 with calls you wouldn't want to execute for real — a `10000×10000` signature costs nothing.
 
+`findings` also takes the whole signature as one tuple type, `Tuple{F, argtypes...}`, where `F` is
+the type of the callable. That form needs no instance, which is how a callable object's method is
+checked from its type alone: for `(r::Reader)(x::Int)`, `findings(Tuple{Reader, Int})` reads what
+`findings(Reader(1), (Int,))` reads, and both name the finding `Reader`.
+
 `findings` never throws: it is the data half of the API, and the caller decides what a finding is
 worth. To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
 `test_signatures` takes the same list, runs AllocCheck and JET instead of the value-free scan, and

@@ -20,20 +20,22 @@ function _sig_string(@nospecialize(types::Tuple))
     @lock _SIGNAL_MEMO_LOCK (_SIG_STRING_MEMO[key] = (world, s))
     return s
 end
+# A callable object is named by its type, as `only` and `exempt` match it: printing the value would
+# show its fields.
 _func_name(@nospecialize(f)) = try
-    string(nameof(f))
+    string(f isa Function || f isa Type ? nameof(f) : nameof(_ftype(f)))
 catch
     string(f)
 end
 _mod_sym(@nospecialize(f)) = try
-    nameof(parentmodule(f))
+    nameof(parentmodule(f isa Function || f isa Type || f isa Module ? f : _ftype(f)))
 catch
     :Main
 end
 # The module that wrote the method `f` reaches for `types`. A finding is named after it: a method a
 # package defines on `Base.getproperty` is the package's code, not Base's.
 _mod_sym(@nospecialize(f), @nospecialize(types)) = try
-    nameof(which(f, Tuple(types)).module)
+    nameof(_which(f, Tuple(types)).module)
 catch
     _mod_sym(f)
 end
@@ -86,7 +88,7 @@ _gate_always_throws(fs::Vector{StrictFinding}) = StrictFinding[
 # The method's source location for a signature, or `("", 0)` when it cannot be resolved.
 function _method_loc(@nospecialize(f), @nospecialize(types::Tuple))
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
@@ -283,6 +285,21 @@ function findings(
     return copy(fs)
 end
 
+"""
+    findings(sig::Type{<:Tuple}; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+
+The same analysis for a signature type `Tuple{F, types...}`, where `F` is the type of the callable.
+This form needs no instance of `F`, so it reaches a callable object's method — `(r::Reader)(x)` — from
+its type alone: `findings(Tuple{Reader, Int})` reads what `findings(Reader(1), (Int,))` reads. A
+callable object is named by its type in the findings.
+"""
+function findings(@nospecialize(sig::Type{<:Tuple}); guarantees = (:typestable, :noalloc))
+    (sig isa DataType && !isempty(sig.parameters)) || throw(
+        ArgumentError("findings: `$sig` is not a signature `Tuple{F, argtypes...}` without free type parameters")
+    )
+    return findings(_callee(sig.parameters[1]), Tuple(sig.parameters[2:end]); guarantees)
+end
+
 function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     n = _window_open()
     try
@@ -391,7 +408,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try
-                which(f, types)
+                _which(f, types)
             catch
                 nothing
             end

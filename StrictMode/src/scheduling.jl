@@ -85,8 +85,8 @@ function _forwarded_call(@nospecialize(f), @nospecialize(types::Tuple))
     fsig = _forwarded_sig(sig)
     fsig === sig && return (f, types)
     ft = fsig.parameters[1]
-    (ft isa DataType && isdefined(ft, :instance)) || return (f, types)
-    return (ft.instance, Tuple(fsig.parameters[2:end]))
+    ft isa DataType || return (f, types)
+    return (_callee(ft), Tuple(fsig.parameters[2:end]))
 end
 
 _forwarded_types(@nospecialize(f), @nospecialize(types::Tuple)) = last(_forwarded_call(f, types))
@@ -317,12 +317,38 @@ _output_unread(@nospecialize(f), @nospecialize(types::Tuple)) =
     "the signature is not concrete, so it names no compiled body to read; give the argument " *
     "types a call would have"
 
+# `code_llvm` (`native = false`) or `code_native` for a signature, with the keywords `_llvm_ir` and
+# `_native_asm` pass. Julia 1.12's printers take a function value only, so there this is their body
+# with the method instance found by the signature.
+@static if VERSION >= v"1.13.0-"
+    _print_code_by_type(io::IO, @nospecialize(tt), native::Bool) = native ?
+        InteractiveUtils.code_native(io, tt; debuginfo = :none) :
+        InteractiveUtils.code_llvm(io, tt; debuginfo = :none, optimize = true)
+else
+    function _print_code_by_type(io::IO, @nospecialize(tt), native::Bool)
+        world = Base.get_world_counter()
+        mi = Base.specialize_method(Base._which(tt; world))
+        src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
+        src isa Core.CodeInfo || error("failed to infer source for $mi")
+        params = Base.CodegenParams(;
+            debug_info_kind = Cint(0), debug_info_level = Cint(2), safepoint_on_entry = false, gcstack_arg = false
+        )
+        IU = InteractiveUtils
+        print(
+            io, native ? IU._dump_function_native_assembly(mi, src, false, :intel, :none, false, false, params) :
+                IU._dump_function_llvm(mi, src, false, true, false, true, :none, params)
+        )
+        return nothing
+    end
+end
+
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
     _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
+        f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), false) :
+            InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
     catch
         return ""
     end
@@ -334,7 +360,8 @@ function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        InteractiveUtils.code_native(io, f, types; debuginfo = :none)
+        f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), true) :
+            InteractiveUtils.code_native(io, f, types; debuginfo = :none)
     catch
         return ""
     end

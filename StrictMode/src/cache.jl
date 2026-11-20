@@ -29,15 +29,19 @@ const _CACHE_MISSES = Ref(0)
 # Whether a package overrides `getproperty` on an `Untrusted` is part of it too, for `:trusted`. An
 # untyped `p.x` is a dynamic call, and the compiler records no edge for one, so defining that method
 # caps no instance the entry watches.
+#
+# The callable's type is part of it as well: one method serves every instantiation of a parametric
+# callable (`(b::Boxed)(x)` for `Boxed{Int}` and `Boxed{Float64}`) and every type a constructor method
+# covers, and those are different signatures with different verdicts.
 function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
     overridden = :trusted in guarantees ?
         (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3)) : nothing
-    return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
+    return (objectid(m), objectid(_ftype(f)), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
 end
 
 # What a cached verdict depends on, beyond its key: the compiled code the analysis read. A verdict
@@ -55,14 +59,14 @@ end
 function _watch_instances(@nospecialize(f), @nospecialize(types::Tuple))
     out = Core.CodeInstance[]
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         return out
     end
     # Only the instance compiled for THIS signature. A method's other specializations are other
     # verdicts, and one of them going stale says nothing about this one — watching them all turned
     # a 14 ms warm re-audit into 489 ms by invalidating entries that were still good.
-    want = Tuple{typeof(f), types...}
+    want = _sigtype(f, types)
     for mi in Base.specializations(m)
         isnothing(mi) && continue
         mi isa Core.MethodInstance || continue

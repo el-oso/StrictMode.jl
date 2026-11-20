@@ -1291,7 +1291,7 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     )
     ci = cts[1].first
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
@@ -1546,7 +1546,7 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
     code = ci.code
     sts = ci.ssavaluetypes
     m = try
-        which(f, types)
+        _which(f, types)
     catch nothing end
     fr = _Frame(
         _func_name(f) * _sig_string(types),

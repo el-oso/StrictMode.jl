@@ -128,7 +128,7 @@ function _static_ownership_finding(@nospecialize(f), @nospecialize(types::Tuple)
     interprocedural = isempty(sites) && _interprocedural_typekey_lookup(f, types, code)
     (isempty(sites) && !interprocedural) && return StrictFinding(md, fn, sg, :static_ownership, :pass, "", 0, "", "")
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end

@@ -505,7 +505,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
         isnothing(topci) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
         _scan_ci(topci, sig, depth, seen, mode, true)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
@@ -1784,7 +1784,7 @@ end
 function _noescape_finding(
         @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
     )
-    r = _escaping_scoped(Tuple{typeof(f), types...})
+    r = _escaping_scoped(_sigtype(f, types))
     reason = !isempty(r.escaped) ?
         "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
         " — it is returned, stored, or captured, or handed to a function this analysis " *
@@ -2035,7 +2035,12 @@ function _return_types(@nospecialize(f), @nospecialize(types))
     n = _window_open()
     interp = _ScanInterpreter()
     try
-        return Base.return_types(f, types; interp)
+        f isa _Callable || return Base.return_types(f, types; interp)
+        # `Base.return_types`, read by the signature.
+        tt = _sigtype(f, types)
+        matches = Base.invoke_interp_compiler(interp, :_findall_matches, interp, tt)
+        matches === nothing && Base.raise_match_failure(:return_types, tt)
+        return Any[something(Base.invoke_interp_compiler(interp, :typeinf_type, interp, m::Core.MethodMatch), Any) for m in matches.matches]
     finally
         _keep_sources(interp)
         _window_close(n)
@@ -2046,7 +2051,12 @@ function _infer_effects(@nospecialize(f), @nospecialize(types))
     n = _window_open()
     interp = _ScanInterpreter()
     try
-        return Base.infer_effects(f, types; interp)
+        f isa _Callable || return Base.infer_effects(f, types; interp)
+        # `Base.infer_effects`, read by the signature.
+        tt = _sigtype(f, types)
+        effects = Base.invoke_interp_compiler(interp, :_infer_effects, interp, tt, true)
+        effects === nothing && Base.raise_match_failure(:infer_effects, tt)
+        return effects
     finally
         _keep_sources(interp)
         _window_close(n)
@@ -2073,13 +2083,33 @@ end
 # checked at its own precompile keeps those methods in its image: one per checked signature for each
 # of `signature_type`, `to_tuple_type` and `code_typed`, a few thousand on a package with a few
 # hundred checked kernels.
-_sigtype(@nospecialize(f), @nospecialize(types)) = Core.apply_type(Tuple, Core.Typeof(f), types...)
+_sigtype(@nospecialize(f), @nospecialize(types)) = Core.apply_type(Tuple, _ftype(f), types...)
+
+# A callable object known by its type alone. A compiled specialization of a callable struct's
+# method names the struct's type and holds no instance of it, and every analysis here reads the
+# signature only, so `_Callable{F}()` stands for an instance of `F` wherever the engine takes a
+# function. Base's `(f, types)` reflection reads the type of the value it is handed, so the readers
+# below reach Base by the signature for it.
+struct _Callable{F} end
+
+# The callee for a function type: its singleton instance when it has one, `_Callable{F}()` otherwise.
+_callee(@nospecialize(F)) = (F isa DataType && isdefined(F, :instance)) ? F.instance : _Callable{F}()
+
+# The type a call to `f` dispatches on.
+_ftype(@nospecialize(f)) = f isa _Callable ? typeof(f).parameters[1] : Core.Typeof(f)
+
+# `which(f, types)`, where `types` is a tuple of types or a tuple type.
+function _which(@nospecialize(f), @nospecialize(types))
+    f isa _Callable || return which(f, types)
+    ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
+    return which(_sigtype(f, ps))
+end
 
 function _code_typed(
         @nospecialize(f), @nospecialize(types); optimize::Bool = true, debuginfo::Symbol = :default
     )
     ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
-    return _code_typed_by_type(Core.apply_type(Tuple, Core.Typeof(f), ps...); optimize, debuginfo)
+    return _code_typed_by_type(Core.apply_type(Tuple, _ftype(f), ps...); optimize, debuginfo)
 end
 
 function _code_typed_by_type(@nospecialize(sig); optimize::Bool = true, debuginfo::Symbol = :default)

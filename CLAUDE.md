@@ -417,7 +417,13 @@ StrictMode/src/
                         defect, issue #36. The callers that LIST a signature turn the note into
                         a failure: test_signatures, @test_*, a @verify_strict line, and
                         @strict_function signatures = [...]. test_compiled, test_registered,
-                        audit, @strict_policy and a @strict_function on a definition keep the note
+                        audit, @strict_policy and a @strict_function on a definition keep the note.
+                        findings(sig::Type{<:Tuple}) takes Tuple{F, argtypes...} for a callable
+                        object known by its type alone: the engine holds _Callable{F}() (effects.jl)
+                        as the callee, and every reader of f goes through _ftype/_sigtype/_which,
+                        _return_types/_infer_effects and _print_code_by_type (scheduling.jl), which
+                        reach Base by the signature for it. _func_name names a callable by its type
+                        (the cache key carries that type too: one method serves every Boxed{T})
   findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, `code`, and
                         `policy`: the macro line that required the guarantee),
                         format_findings,
@@ -426,7 +432,7 @@ StrictMode/src/
   codes.jl            — the diagnostic codes: _CODES keyed on (guarantee, cause) — NEVER on the
                         reason text, which is assembled per call site — plus explain(code)/codes().
                         A published code is permanent; a retired kind leaves a gap
-  cache.jl            — (method, world, signature, guarantees, depth, and for :trusted whether
+  cache.jl            — (method, callable type, world, signature, guarantees, depth, and for :trusted whether
                         getproperty on an Untrusted is overridden) → findings cache. Each entry also
                         holds the CodeInstances its verdict was read from (_watch_instances): the
                         key cannot see an edit to a CALLEE, but Julia caps those instances'

@@ -354,7 +354,7 @@ function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn,
         return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature"; tier)
     certain, erased = sites
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end

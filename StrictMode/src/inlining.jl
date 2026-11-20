@@ -17,6 +17,9 @@
 # inlined. Building the closure through this specialized helper restores the `:invoke`.
 _inline_wrapper(f::F) where {F} = (args...) -> f(args...)
 
+# The wrapper for a callable known by its type: the callable is its first argument.
+_call_through(c::C, args::Vararg{Any, N}) where {C, N} = c(args...)
+
 const _INLINED_UNREAD = "whether the call is inlined could not be read: the signature is not " *
     "concrete, no single method matches it, or the calling wrapper has no typed body"
 
@@ -30,18 +33,18 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     _has_compiled_body(f, types) || return nothing
     local m
     try
-        m = which(f, types)
+        m = _which(f, types)
     catch
         return nothing
     end
     fm = try
-        which(_forwarded_call(f, types)...)
+        _which(_forwarded_call(f, types)...)
     catch
         m
     end
-    owner = f === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : Core.Typeof(f)
-    wrapper = _inline_wrapper(f)
-    cts = _code_typed(wrapper, types; optimize = true)
+    owner = f === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : _ftype(f)
+    cts = f isa _Callable ? _code_typed(_call_through, (_ftype(f), types...); optimize = true) :
+        _code_typed(_inline_wrapper(f), types; optimize = true)
     isempty(cts) && return nothing
     for stmt in first(cts).first.code
         if Meta.isexpr(stmt, :invoke)
@@ -63,7 +66,7 @@ function _assert_inlined(target, @nospecialize(f), @nospecialize(types::Tuple))
     if survives
         _fail(
             :inlined, target,
-            "call to `$(which(f, types).name)` was not inlined — it survives as an `:invoke` at " *
+            "call to `$(_which(f, types).name)` was not inlined — it survives as an `:invoke` at " *
                 "the call site (inlining is a heuristic; this may be expected)."
         )
     end

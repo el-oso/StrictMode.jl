@@ -352,7 +352,7 @@ end
 
 function _site(@nospecialize(f), @nospecialize(types), callee, detail)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
@@ -510,7 +510,7 @@ function dispatch_suggestions(@nospecialize(f), @nospecialize(types::Tuple))
     (isempty(dyn) && isempty(cl)) && return out
     md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end

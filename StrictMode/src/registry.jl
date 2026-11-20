@@ -498,7 +498,7 @@ function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f
     isnothing(mod) && return true
     root = mod
     owner = try
-        parentmodule(f isa Type ? f : Core.Typeof(f))
+        parentmodule(f isa Type ? f : _ftype(f))
     catch
         nothing
     end
@@ -513,7 +513,7 @@ function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f
         return !isempty(ms) && all(m -> m.module === root, ms)
     end
     m = try
-        which(f, Tuple{types...})
+        _which(f, Tuple{types...})
     catch
         nothing
     end
@@ -1037,7 +1037,7 @@ end
 _callable_name(@nospecialize(f)) = f isa Function ? nameof(f) :
     _is_closure_type(f) ? _closure_owner(f) :
     f isa Type ? _type_name(f) :                        # a constructor answers to its type's name
-    nameof(Core.Typeof(f))
+    nameof(_ftype(f))
 
 _type_name(T::Type) = (U = Base.unwrap_unionall(T); U isa DataType ? nameof(U) : Symbol(string(T)))
 

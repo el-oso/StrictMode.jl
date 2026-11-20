@@ -292,7 +292,7 @@ function _assert_noescape(
         target, @nospecialize(f), @nospecialize(types::Tuple);
         gates::Bool = _guarantee_gates(:noescape)
     )
-    r = _escaping_scoped(Tuple{typeof(f), types...})
+    r = _escaping_scoped(_sigtype(f, types))
     if !isempty(r.escaped)
         _fail(
             :noescape, target,
