@@ -1236,10 +1236,11 @@ function module_methods(
 end
 
 # Shared module-sweep core: every `(f, tt)` pair — a concrete dispatch-tuple specialization `mod`
-# has actually compiled — across its own functions matching `only`/`exempt`, and across the
-# methods it adds to a function another module owns (`Base.getproperty`, `Base.size`), which are
-# often a package's hottest code and which no walk over the module's names meets. Those come from
-# the census, `module_methods`, and only the method written here is swept, not the function's
+# has actually compiled — across its own functions matching `only`/`exempt`, and across every other
+# method the census, `module_methods`, counts as the package's: a method `mod`, a submodule or a
+# loaded extension defines on a function `mod` does not own (`Base.getproperty`, `Base.size`, or a
+# submodule's own function). Methods on foreign functions are often a package's hottest code, and
+# no walk over the module's names meets them. Only the census method is swept, not the function's
 # others. The compiled sweep,
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
@@ -1266,7 +1267,6 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
         end
     end
     for mth in first(module_methods(mod; only, exempt))
-        mth.module === mod || continue
         F = _method_function(mth)
         (F <: Function && isdefined(F, :instance)) || continue
         f = F.instance

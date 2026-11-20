@@ -89,8 +89,9 @@ Prove `guarantees` for every concrete method instance `mod`'s functions have **a
 (during your tests, a run, or the precompile workload), and throw a `StrictMode.StrictViolation`
 collecting every failure.
 
-That includes the methods `mod` defines on a function another module owns (`Base.getproperty`,
-`Base.size`): the method written in `mod` is swept, and the function's other methods are not.
+That includes the methods `mod`, its submodules and its loaded extensions define on a function
+`mod` does not own (`Base.getproperty`, `Base.size`, or a submodule's own function): the method
+written in the package is swept, and the function's other methods are not.
 
 No annotation needed, but coverage is whatever executed, and a module that mixes hot and cold
 (plan-time) helpers will be noisy — cold helpers that legitimately allocate show up too. Scope it

@@ -373,3 +373,30 @@ end
     @test all(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), only = (:getproperty,)))
     Base.delete_method(which(getproperty, (Untrusted{F.MyT}, Symbol)))
 end
+
+@testitem "a module sweep covers the methods its submodules define" begin
+    using StrictMode
+
+    module NestedForeign
+    using StrictMode
+    module Sub
+    using StrictMode
+    struct MyT
+        v::Int
+    end
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    end
+    own(x::Int) = x + 1
+    end
+    N = NestedForeign
+    Untrusted(N.Sub.MyT(1)).x; N.own(1)
+
+    # The census counts the submodule's method as the package's, so the sweep reads it.
+    @test any(m -> m.name === :getproperty, first(StrictMode.module_methods(N)))
+    fs = audit(N; sweep = true, guarantees = (:trusted,), dispatch_suggest = false)
+    rs = [f for f in fs if f.func == "getproperty"]
+    @test length(rs) == 1
+    @test StrictMode._failed(only(rs))
+    @test any(f -> f.func == "own" && f.status === :pass, fs)
+    Base.delete_method(which(getproperty, (Untrusted{N.Sub.MyT}, Symbol)))
+end

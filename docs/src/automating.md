@@ -198,9 +198,10 @@ test_compiled(MyPkg; guarantees = (:noalloc, :noboxing))          # prove and ga
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
 best-effort and defensive. In return, it needs no marks at all.
 
-The sweep covers the module's own functions and the methods it defines on a function another
-module owns, such as its `Base.getproperty`, `Base.size` or `Base.:*` methods. Only the method the
-module wrote is swept, not the function's other methods. `only` and `exempt` name such a method by
+The sweep covers the module's own functions and the methods it, its submodules and its loaded
+extensions define on a function the module does not own, such as its `Base.getproperty`,
+`Base.size` or `Base.:*` methods, or a submodule's own function. Only the method the package
+wrote is swept, not the function's other methods. `only` and `exempt` name such a method by
 the function's name, as they do the module's own.
 
 ## The coverage gate — default-deny
