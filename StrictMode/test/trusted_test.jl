@@ -157,3 +157,57 @@ end
     StrictMode.clear_cache!()
     @test !any(g -> g === Tabulate(4), StrictMode._barrier_functions())
 end
+
+@testitem "a payload read into a local is a read" begin
+    using StrictMode
+
+    sig = (Untrusted{Vector{UInt8}},)
+    status(f, s = sig) = only(findings(f, s; guarantees = (:trusted,)))
+
+    # The read stored in a local, which is how most code is written.
+    stored(u::Untrusted{Vector{UInt8}}) = (b = unsafe_trust(u); length(b))
+    stored_field(u::Untrusted{Vector{UInt8}}) = (b = getfield(u, :x); length(b))
+    function stored_block(u::Untrusted{Vector{UInt8}})
+        b = unsafe_trust(u)
+        n = 0
+        for x in b
+            n += x
+        end
+        return n
+    end
+    # The wrapped value itself passed through a local, then read.
+    renamed(u::Untrusted{Vector{UInt8}}) = (v = u; length(unsafe_trust(v)))
+    renamed_stored(u::Untrusted{Vector{UInt8}}) = (v = u; b = unsafe_trust(v); length(b))
+    reassigned(u::Untrusted{Vector{UInt8}}, w::Untrusted{Vector{UInt8}}) = (v = u; v = w; b = unsafe_trust(v); length(b))
+    for f in (stored, stored_field, stored_block, renamed, renamed_stored)
+        x = status(f)
+        @test StrictMode._failed(x)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", x.reason)
+    end
+    @test StrictMode._failed(status(reassigned, (Untrusted{Vector{UInt8}}, Untrusted{Vector{UInt8}})))
+    u = Untrusted(UInt8[1, 2])
+    @test_throws "reads an `Untrusted` payload outside a trust boundary" @assert_trusted stored(u)
+
+    # A boundary that stores the payload in a local is still the boundary, and a function that
+    # stores the WRAPPED value in a local reads nothing.
+    boundary(u::Untrusted{Vector{UInt8}}) = (b = unsafe_trust(u); length(b) >= 2 ? Int(b[1]) : 0)
+    StrictMode.trust_boundary!(boundary)
+    @test status(boundary).status === :pass
+    @test (@assert_trusted boundary(u)) == 1
+    carries(u::Untrusted{Vector{UInt8}}) = (v = u; boundary(v))
+    keeps(u::Untrusted{Vector{UInt8}}) = (v = u; w = v; w)
+    @test status(carries).status === :pass
+    @test status(keeps).status === :pass
+    # A loop over a loosely typed collection reads fields 1 and 2 of what `iterate` returned,
+    # which an `Untrusted`, with its one field, cannot be.
+    struct LooseBag
+        v::AbstractVector
+    end
+    loose_sum(l::LooseBag) = (s = 0.0; for a in l.v; s += a; end; s)
+    @test status(loose_sum, (LooseBag,)).status === :pass
+    # A lone read of the first field of an untyped value is still one that cannot be ruled out.
+    first_field(v::Vector{Any}) = (x = getfield(v[1], 1); x)
+    @test StrictMode._failed(status(first_field, (Vector{Any},)))
+    delete!(StrictMode._TRUST_BOUNDARIES, boundary)
+    StrictMode.clear_cache!()
+end

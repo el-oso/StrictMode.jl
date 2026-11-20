@@ -100,6 +100,10 @@ function _unopt_callee(ci, @nospecialize(a))
 end
 
 function _call_callee_and_args(ci, st)
+    # Unoptimized IR keeps a local as a slot, and a call whose result is stored in one is the
+    # right-hand side of an assignment: `b = unsafe_trust(u)` is `_3 = (%1)(_2)`. Read as a
+    # statement that is no call, it hid every read whose result was given a name.
+    Meta.isexpr(st, :(=)) && (st = st.args[2])
     Meta.isexpr(st, :call) && return _unopt_callee(ci, st.args[1]), st.args[2:end]
     # `:invoke_modify` carries an `:invoke`'s layout and is what the atomic read-modify-write forms
     # lower to, so a scan that omits it reads `@atomic x.f += v` as no call at all.

@@ -207,7 +207,13 @@ StrictMode/src/
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller.
                         trust_boundary! calls clear_cache!, like every registration a verdict
-                        depends on (register_scoped!, register_alloc_barrier!, _exempt!)
+                        depends on (register_scoped!, register_alloc_barrier!, _exempt!). A
+                        read whose result is STORED is the right-hand side of an assignment in
+                        unoptimized IR (`_3 = (%1)(_2)`), which _call_callee_and_args unwraps;
+                        read as a non-call it passed `b = unsafe_trust(u)`. An erased read of
+                        field 1 is dropped when the same operand also has another field read
+                        (_reads_another_field): that is a `for` loop taking element and state
+                        from what iterate returned, not an Untrusted, which has one field
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves

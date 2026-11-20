@@ -136,6 +136,10 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     ci = first(cts)[1]
     certain = Symbol[]
     erased = Symbol[]
+    # An object the body also reads ANOTHER field of is not an `Untrusted`, which has one. That is
+    # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
+    # loop over a loosely typed collection reads as a possible payload read.
+    other = _reads_another_field(ci)
     for st in ci.code
         callee, args = _call_callee_and_args(ci, st)
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
@@ -143,11 +147,25 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         T isa Type || continue
         if T <: Untrusted
             push!(certain, nameof(callee))
-        elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args)
+        elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
+                !(args[1] in other)
             push!(erased, nameof(callee))
         end
     end
     return (certain, erased)
+end
+
+# The operands a `getfield` reads a field from that `Untrusted` does not have.
+function _reads_another_field(ci)
+    out = Set{Any}()
+    for st in ci.code
+        callee, args = _call_callee_and_args(ci, st)
+        (callee === Core.getfield && length(args) >= 2) || continue
+        fld = args[2]
+        fld isa QuoteNode && (fld = fld.value)
+        ((fld isa Int && fld != 1) || (fld isa Symbol && fld !== _UNTRUSTED_FIELD)) && push!(out, args[1])
+    end
+    return out
 end
 
 function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
