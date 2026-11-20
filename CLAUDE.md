@@ -222,8 +222,12 @@ StrictMode/src/
                         and no reassignment between the two statements, so a read on the other
                         arm of a type test clears nothing), and when the operand is what
                         iterate/indexed_iterate returned. An erased `getproperty` is NOT
-                        reported: Base.getproperty on an Untrusted raises whatever the name, so
-                        untyped `p.x` reads no payload; erased getfield and unsafe_trust are
+                        reported while StrictMode's own method, which raises whatever the name,
+                        is the only one an Untrusted reaches; once a package defines a more
+                        specific getproperty for one (_untrusted_getproperty_overridden, asked
+                        of the method table at each scan, so no cache keeps the old answer:
+                        the findings cache is keyed on the world and _BODY_MEMO holds IR, not
+                        verdicts) untyped `p.x` is an erased read like the others; erased getfield and unsafe_trust are
                         reported, and getproperty on a value typed <:Untrusted is certain
   concurrency.jl      — @assert_concurrency_safe, @assert_no_threadid_state, pool_balance_report.
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no

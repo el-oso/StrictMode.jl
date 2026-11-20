@@ -309,3 +309,51 @@ end
     # A module of such methods loads under a policy.
     @test Core.eval(@__MODULE__, Meta.parse("module UntypedPolicy; using StrictMode; struct Pt; x::Float64; end; const D = Dict{Symbol, Any}(:a => Pt(1.0)); norm1(k::Symbol) = (p = D[k]; abs(p.x)); @strict_policy :trusted; end")) isa Module
 end
+
+@testitem "an untyped field read is reported once a package reads the payload through getproperty" begin
+    using StrictMode
+
+    module OverrideCallers
+    using StrictMode
+    struct Pt
+        x::Float64
+    end
+    struct MyT
+        v::Int
+    end
+    const D = Dict{Symbol, Any}(:a => Pt(1.0), :u => Untrusted(MyT(7)))
+    norm1(k::Symbol) = (p = D[k]; abs(p.x))
+    erased_caller(k::Symbol) = (p = D[k]; p.x)
+    end
+    O = OverrideCallers
+    status(f) = only(findings(f, (Symbol,); guarantees = (:trusted,)))
+
+    # StrictMode's own method is the only one for an `Untrusted`, and it raises: `p.x` on an
+    # untyped value reads no payload.
+    @test !StrictMode._untrusted_getproperty_overridden()
+    @test status(O.norm1).status === :pass
+    @test status(O.erased_caller).status === :pass
+    @test_throws "payload" O.erased_caller(:u)
+
+    # A package gives its own wrapped type a `getproperty` that returns the payload. From then on
+    # `p.x` on an untyped value can read one, and the verdicts above, which were cached, no longer hold.
+    Core.eval(O, :(Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)))
+    @test StrictMode._untrusted_getproperty_overridden()
+    @test Base.invokelatest(O.erased_caller, :u) === O.MyT(7)
+    for f in (O.norm1, O.erased_caller)
+        r = Base.invokelatest(status, f)
+        @test StrictMode._failed(r)
+        @test occursin("may read an `Untrusted` payload", r.reason)
+    end
+    # At a call site it warns and does not raise: the scan did not see a read on a value typed
+    # `Untrusted`, only one it cannot rule out.
+    @test_logs (:warn, r"may read an `Untrusted` payload"s) match_mode = :any Base.invokelatest(() -> @assert_trusted O.erased_caller(:u))
+    # The method that does the reading is a read on a typed value, and raises.
+    u = Untrusted(O.MyT(7))
+    @test_throws StrictViolation Base.invokelatest(() -> @assert_trusted getproperty(u, :x))
+
+    # Taken back, the first answer returns.
+    Base.delete_method(which(getproperty, (Untrusted{O.MyT}, Symbol)))
+    @test !StrictMode._untrusted_getproperty_overridden()
+    @test Base.invokelatest(status, O.norm1).status === :pass
+end

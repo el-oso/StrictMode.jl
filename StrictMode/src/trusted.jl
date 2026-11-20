@@ -142,6 +142,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
     # loop over a loosely typed collection reads as a possible payload read.
     other = _other_field_reads(ci)
+    overridden = _untrusted_getproperty_overridden()
     for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
@@ -149,10 +150,11 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         T isa Type || continue
         if T <: Untrusted
             push!(certain, nameof(callee))
-        # `getproperty` raises on an `Untrusted` whatever the name, so on a value whose type is
-        # not known it reads no payload: `p.x` there is a field of something else, or an error.
+        # StrictMode's `getproperty` raises on an `Untrusted` whatever the name, so on a value
+        # whose type is not known `p.x` reads no payload: it is a field of something else, or an
+        # error. That holds only while that method is the one an `Untrusted` reaches.
         elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args) &&
-                callee !== Base.getproperty &&
+                (callee !== Base.getproperty || overridden) &&
                 !_same_value_has_another_field(ci, other, i, args[1]) &&
                 !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
@@ -168,6 +170,15 @@ function _iteration_result(ci, @nospecialize(a))
     a isa Core.SSAValue || return false
     callee, _ = _call_callee_and_args(ci, ci.code[a.id])
     return callee === Base.indexed_iterate || callee === Base.iterate
+end
+
+# Whether some `Untrusted` reaches a `getproperty` method other than StrictMode's own: a package
+# that gave its wrapped type a method returning the payload. Read from the method table as it is
+# now, so the answer changes when such a method is defined or deleted.
+function _untrusted_getproperty_overridden()
+    ms = Base._methods_by_ftype(Tuple{typeof(getproperty), Untrusted, Symbol}, -1, Base.get_world_counter())
+    ms isa Vector || return true
+    return any(match -> Base.moduleroot(match.method.module) !== @__MODULE__, ms)
 end
 
 # Each `getfield` of a field `Untrusted` does not have, as statement index => operand.
@@ -294,7 +305,8 @@ typed IR, with no execution, backend, or timing — and it **gates**, because it
 type inference has already fixed rather than guessing at a cost. A value inference could not type is handled by what the
 call can do: `getfield` and `unsafe_trust` on it are reported as reads that cannot be ruled out,
 and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
-name. Its other limits are missed violations: only compiled specializations are swept, and nothing verifies that a registered boundary really validates or
+name. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
+from then on `p.x` on an untyped value is reported like the other two. Its other limits are missed violations: only compiled specializations are swept, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
