@@ -80,13 +80,17 @@ still holds the original buffer and can write to it afterwards, which is why the
 `copy_from_user` copies rather than aliasing. Neither property is checked; registering `f` asserts
 both.
 
-The registration is kept in the package that owns `f` as well as in this session, so one made at
-a package's top level is still in force when the package is loaded from its precompile cache.
-`mod` names that package; pass `mod = @__MODULE__` to register a function another package owns.
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
+registering a function another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. In a
+session the registration lasts for the session.
 
 Clears the findings cache, since a registration changes `:trusted` results.
 """
-function trust_boundary!(@nospecialize(f); mod::Module = parentmodule(f))
+function trust_boundary!(@nospecialize(f); mod::Module = _owner_module(f))
     push!(_TRUST_BOUNDARIES, f)
     _keep_registration!(f, mod, _LOCAL_TRUST, "trust_boundary!($(_func_name(f)))")
     # A `:trusted` verdict depends on this set, and the findings cache does not key on it.

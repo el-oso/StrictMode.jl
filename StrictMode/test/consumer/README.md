@@ -32,7 +32,11 @@ What it pins:
    and an allocation barrier registered at the top level of `src/` are in force in the test process,
    where this session registered nothing. Without that, `:trusted` fails on the boundary itself and
    `:noescape` passes every signature with nothing checked. A type or function another package owns is refused
-   unless the call names this package with `mod = @__MODULE__`.
+. The cases one package cannot show. `dependents.jl` generates three packages in a scratch directory
+   and loads them from their caches: a registration made in a dependency's `__init__` (which also
+   runs while its dependent precompiles, and must not raise there), a function or type of another
+   package registered at top level (refused without `mod = @__MODULE__`, including when its owner
+   already holds a store of that kind), and a callable object.
 
 ## Two builds
 

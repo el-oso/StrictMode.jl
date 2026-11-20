@@ -789,11 +789,18 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   this: after a cached load `:trusted` failed on the registered boundary itself and `:noescape`
   passed with no type registered. The first two write the constant ONLY while a package image is
   being generated (`_keep_registration!`): in a session the session's set is the registration, and
-  a test that empties it to take a registration back must not find it again in `Main`. A store
-  that cannot be written during a precompile (the function or type belongs to another, closed,
-  package) RAISES from all three and asks for `mod = @__MODULE__` (`_registration_lost`);
-  registering for the precompile only is the failure being prevented. `test/consumer` pins all
-  three, with and without `mod`.
+  a test that empties it to take a registration back must not find it again in `Main`. During a
+  precompile `_persist_registration!` decides, the same for all three: only a store THIS PROCESS
+  CREATED (`_STORES_CREATED`) is written with the image, because only the package being
+  precompiled has an open module. A store that was already there belongs to a package loaded
+  from its own cache, and pushing onto it is silent loss, so that case RAISES and asks for
+  `mod = @__MODULE__` (`_registration_lost`), as does a module that cannot take the constant at
+  all. The one exception is a call with an `__init__` frame on its stack (`_called_from_init`):
+  a dependency's `__init__` runs while its dependent precompiles, with the dependency's module
+  closed, and it runs again at every load, so it is a session registration and never raises.
+  `jl_generating_output() == 1` alone does not say whose code is running. A callable object is
+  registered by value and belongs to the module of its type (`_owner_module`).
+  `test/consumer/dependents.jl` builds three packages and pins each case from their caches.
 - **Certainty decides throw-vs-warn, and it can be per FINDING, not only per guarantee.** StrictMode
   throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
   by definition, because AllocCheck/JET/TrimCheck are full machinery rather than a scan. `_fail`

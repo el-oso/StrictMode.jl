@@ -118,3 +118,42 @@ end
     delete!(StrictMode._TRUST_BOUNDARIES, late_boundary)
     StrictMode.clear_cache!()
 end
+
+@testitem "a callable object is registered by value" begin
+    using StrictMode
+
+    struct MinLength
+        min::Int
+    end
+    (v::MinLength)(u::Untrusted{Vector{UInt8}}) = length(unsafe_trust(u)) >= v.min
+    sig = (Untrusted{Vector{UInt8}},)
+    MinLength(3)(Untrusted(UInt8[1, 2, 3]))
+
+    @test StrictMode._failed(only(findings(MinLength(3), sig; guarantees = (:trusted,))))
+    # The object has no module of its own to ask for; it belongs to the module of its type.
+    @test StrictMode._owner_module(MinLength(3)) === parentmodule(MinLength)
+    @test StrictMode.trust_boundary!(MinLength(3)) === MinLength(3)
+    @test only(findings(MinLength(3), sig; guarantees = (:trusted,))).status === :pass
+    delete!(StrictMode._TRUST_BOUNDARIES, MinLength(3))
+    StrictMode.clear_cache!()
+
+    struct Tabulate
+        n::Int
+    end
+    (t::Tabulate)() = zeros(t.n)
+    @test isnothing(StrictMode.register_alloc_barrier!(Tabulate(4)))
+    @test any(g -> g === Tabulate(4), StrictMode._barrier_functions())
+    # A scan that meets a keyword body compares it with every registered barrier by name, and
+    # an object has none of its own.
+    kwuser(x; scale = 2.0) = scale * x
+    kwcaller(x) = kwuser(x; scale = 3.0)
+    @test only(findings(kwcaller, (Float64,); guarantees = (:noalloc,))).status === :pass
+    @test StrictMode._callable_name(Tabulate(4)) === :Tabulate
+    # The registration is taken back from the session and from the store a session write makes.
+    delete!(StrictMode._ALLOC_BARRIERS, Tabulate(4))
+    store = StrictMode._store_for(Base.moduleroot(parentmodule(Tabulate)), StrictMode._LOCAL_BARRIERS)
+    isnothing(store) || filter!(g -> g !== Tabulate(4), store)
+    StrictMode._BARRIER_GEN[] += 1
+    StrictMode.clear_cache!()
+    @test !any(g -> g === Tabulate(4), StrictMode._barrier_functions())
+end

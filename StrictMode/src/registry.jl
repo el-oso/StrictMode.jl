@@ -54,8 +54,14 @@ function _local_store!(mod::Module, name::Symbol, empty)
     store = empty
     Core.eval(root, :(const $name = $store))
     _STORES[(root, name)] = store
+    push!(_STORES_CREATED, store)
     return store
 end
+
+# The stores this process created. While a package image is being written these are the ones that
+# are written with it: a store that was already there belongs to a package loaded from its own
+# cache, and what is pushed onto it now is in no image.
+const _STORES_CREATED = Base.IdSet{Any}()
 
 # Every module that may hold a store: the loaded packages, plus `Main` for a REPL session, which is
 # not one of them.
@@ -82,26 +88,52 @@ function _keep_registration!(@nospecialize(x), mod::Module, name::Symbol, call::
     # registration, and a constant added to a loaded module would outlive a caller that empties
     # that set to take a registration back.
     ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
-    stored = try
-        store = _local_store!(mod, name, Any[])
-        any(y -> y === x, store) || push!(store, x)
-        true
-    catch
-        false
-    end
-    stored || _registration_lost(mod, call)
+    _persist_registration!(x, mod, name, call)
     return nothing
 end
 
-# A registration that is in force for the precompile and gone at every load after it is the
-# failure the package-local stores exist to prevent, so a module that cannot take the constant
-# while a package image is being written is an error.
+# Put `x` where it is written into the image of the package being precompiled, or raise. A
+# registration that is in force for the precompile and gone at every load after it is the failure
+# the package-local stores exist to prevent.
+function _persist_registration!(@nospecialize(x), mod::Module, name::Symbol, call::AbstractString)
+    # A dependency's `__init__` also runs while another package precompiles. That call is made
+    # again in every process that loads the dependency, so the session's set is the whole
+    # registration and there is nothing to store.
+    _called_from_init() && return nothing
+    kept = try
+        store = _local_store!(mod, name, Any[])
+        if store in _STORES_CREATED
+            any(y -> y === x, store) || push!(store, x)
+            true
+        else
+            false
+        end
+    catch
+        false
+    end
+    kept || _registration_lost(mod, call)
+    return nothing
+end
+
+function _called_from_init()
+    for fr in stacktrace()
+        fr.func === :__init__ && return true
+    end
+    return false
+end
+
+# The module that owns what is being registered: a function's or a type's own, and for a callable
+# object the module of its type.
+_owner_module(@nospecialize(x)) =
+    (x isa Function || x isa Type || x isa Module) ? parentmodule(x) : parentmodule(typeof(x))
+
+# Only the package being precompiled is written, so only its module can take the registration.
 _registration_lost(mod::Module, call::AbstractString) = throw(
     ArgumentError(
-        "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`, " *
-            "which is closed while another package precompiles, so it would be lost when " *
-            "that package is next loaded from its cache. Name the package making it: " *
-            "`$call` with `mod = @__MODULE__`."
+        "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`. " *
+            "Only the package being precompiled is written to its cache, and that module " *
+            "belongs to another one, so the registration would be lost when this package is " *
+            "next loaded. Name the package making it: `$call` with `mod = @__MODULE__`."
     )
 )
 

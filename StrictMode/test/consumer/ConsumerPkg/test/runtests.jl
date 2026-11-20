@@ -72,3 +72,29 @@ end
     @test any(g -> g === Base.Libc.gethostname, StrictMode._barrier_functions())
     @test !any(g -> g === Base.Libc.getpid, StrictMode._barrier_functions())
 end
+
+@testset "registrations across packages" begin
+    # A registration made in a dependency's `__init__`, one of a type or function another package
+    # owns, and one of a callable object. `dependents.jl` builds the packages in a scratch
+    # directory and reports what a process that loads them from their caches finds.
+    script = joinpath(@__DIR__, "..", "..", "dependents.jl")
+    out = mktempdir() do dir
+        cmd = `$(Base.julia_cmd()) --startup-file=no $script $dir $(pkgdir(StrictMode))`
+        # The child resolves its own environments, so it must not inherit this sandbox's.
+        cmd = addenv(cmd, "JULIA_LOAD_PATH" => nothing, "JULIA_PROJECT" => nothing)
+        read(ignorestatus(cmd), String)
+    end
+    facts = Dict{String, String}()
+    for line in split(out, '\n')
+        parts = split(line, " = "; limit = 2)
+        length(parts) == 2 && (facts[parts[1]] = parts[2])
+    end
+    @test !haskey(facts, "first_load")
+    for name in (
+            "loaded_from_cache", "top_level_own", "init_scoped", "init_trust", "init_barrier",
+            "unnamed_scoped_refused", "unnamed_trust_refused", "unnamed_barrier_refused",
+            "named_scoped", "named_trust", "named_barrier", "callable_trust", "callable_barrier",
+        )
+        @test get(facts, name, "missing") == "true"
+    end
+end

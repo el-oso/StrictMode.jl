@@ -233,11 +233,13 @@ per-task state, and it belongs to the accessor, not to every kernel that reaches
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).
 
-The registration is kept in the package that owns `f` as well as in this session, so one made at
-a package's top level is still in force when the package is loaded from its precompile cache.
-`mod` names that package; pass `mod = @__MODULE__` to register a function another package owns.
-Without it such a call raises while a package precompiles, since the registration would hold for
-that precompile and be gone afterwards.
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
+registering a function another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. In a
+session the registration lasts for the session.
 
 ```julia
 @noinline function _my_calibrator()
@@ -246,22 +248,22 @@ end
 register_alloc_barrier!(_my_calibrator)
 ```
 """
-function register_alloc_barrier!(@nospecialize(f); mod::Module = parentmodule(f))
+function register_alloc_barrier!(@nospecialize(f); mod::Module = _owner_module(f))
     push!(_ALLOC_BARRIERS, f)
     # The registry above lives in this session. A package that registers at its own precompile loses it
-    # at the next load, so the registration is also kept in the package that owns the function, which
-    # is serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
-    stored = try
-        store = _local_store!(mod, _LOCAL_BARRIERS, Any[])
-        any(g -> g === f, store) || push!(store, f)
-        true
-    catch
-        false
+    # at the next load, so the registration is also kept in the package named by `mod`, which is
+    # serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
+    if ccall(:jl_generating_output, Cint, ()) == 1
+        _persist_registration!(f, mod, _LOCAL_BARRIERS, "register_alloc_barrier!($(_func_name(f)))")
+    else
+        # A module that is closed to writes keeps the session registration only, which is all a
+        # session needs.
+        try
+            store = _local_store!(mod, _LOCAL_BARRIERS, Any[])
+            any(g -> g === f, store) || push!(store, f)
+        catch
+        end
     end
-    # A module that is closed to writes keeps the session registration only, which is all a
-    # session needs. While a package image is being written it is the registration being lost.
-    (stored || ccall(:jl_generating_output, Cint, ()) != 1) ||
-        _registration_lost(mod, "register_alloc_barrier!($(_func_name(f)))")
     _BARRIER_GEN[] += 1
     clear_cache!()
     return nothing
@@ -328,7 +330,9 @@ function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
     ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
     name = _demangle(mi.def.name)
     for f in bs
-        nameof(f) === name && any(p -> p === typeof(f), ps) && return true
+        # A callable object is registered by value and has no name of its own; a keyword body
+        # is named after its type.
+        _callable_name(f) === name && any(p -> p === typeof(f), ps) && return true
     end
     return false
 end
@@ -1620,13 +1624,17 @@ visible. The two cover different halves and neither subsumes the other.
 Registration is by type because the analysis runs on IR after inlining, where a small accessor has
 been inlined into its caller and the callee boundary no longer exists. The type does.
 
-The registration is kept in the package that owns `T` as well as in this session, so one made at
-a package's top level is still in force when the package is loaded from its precompile cache.
-`mod` names that package; pass `mod = @__MODULE__` to register a type another package owns.
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `T`, so
+registering a type another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. In a
+session the registration lasts for the session.
 
 See also [`@assert_noescape`](@ref), [`register_alloc_barrier!`](@ref).
 """
-function register_scoped!(@nospecialize(T::Type); mod::Module = parentmodule(T))
+function register_scoped!(@nospecialize(T::Type); mod::Module = _owner_module(T))
     @lock _SCOPED_LOCK begin
         any(S -> S === T, _SCOPED_TYPES) || push!(_SCOPED_TYPES, T)
     end
