@@ -9,9 +9,14 @@
 # compiled has no instance to watch, and neither has a verdict that read the body of a task the
 # method spawns (that code holds no edge to what the task calls), so such an entry answers only in
 # the world it was made in.
+#
+# A registration a verdict reads (a scoped type, a trust boundary, a barrier, an exemption) is also
+# read from the stores of the loaded packages, and loading a package that holds one calls no
+# registration function to clear the cache. So an entry also records how many packages were loaded.
 
-# The findings, the `CodeInstance`s they were read from (see `_watch_instances`), and the world.
-const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}, UInt}}()
+# The findings, the `CodeInstance`s they were read from (see `_watch_instances`), the world, and
+# the number of loaded packages.
+const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}, UInt, Int}}()
 const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
@@ -65,10 +70,14 @@ end
 
 _instances_valid(cis) = all(ci -> ci.max_world == typemax(UInt), cis)
 
-# Whether a cache entry made in `world` with `watched` still answers. With nothing to watch, any
-# definition since may be an edit to a callee, so only the same world does.
-_entry_valid(watched, world::UInt) =
-    isempty(watched) ? world == Base.get_world_counter() : _instances_valid(watched)
+# Packages are never unloaded, so a count that moved means a package was loaded since.
+_loaded_count() = length(Base.loaded_modules)
+
+# Whether a cache entry made in `world` with `watched`, while `loaded` packages were loaded, still
+# answers. With nothing to watch, any definition since may be an edit to a callee, so only the same
+# world does. A package loaded since may hold a registration the verdict did not read.
+_entry_valid(watched, world::UInt, loaded::Int) = loaded == _loaded_count() &&
+    (isempty(watched) ? world == Base.get_world_counter() : _instances_valid(watched))
 
 # What the scan keeps is worth keeping in a session, where the next check reuses it, and not at a
 # precompile, where nothing asks again and a process that is about to write a package image holds

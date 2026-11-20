@@ -112,3 +112,34 @@ end
     Base.@invokelatest tk_run([1])
     @test StrictMode._failed(Base.@invokelatest verdict())
 end
+
+@testitem "a cached verdict follows a registration a loaded package holds" begin
+    using StrictMode
+    # A package that holds a scoped-type store registers nothing when it loads: the store is read
+    # from its module. Loading it changes `:noescape` verdicts without a registration call.
+    mutable struct LdHandle
+        p::Ptr{Cvoid}
+    end
+    const LD_KEPT = Ref{Any}(nothing)
+    ld_leak(p::Ptr{Cvoid}) = (LD_KEPT[] = LdHandle(p); nothing)
+    ld_leak(C_NULL)
+    StrictMode.clear_cache!()
+    verdict() = only(findings(ld_leak, (Ptr{Cvoid},); guarantees = (:noescape,)))
+    @test !StrictMode._failed(verdict())
+    mktempdir() do dir
+        mkpath(joinpath(dir, "LdStore", "src"))
+        write(
+            joinpath(dir, "LdStore", "src", "LdStore.jl"),
+            "__precompile__(false)\nmodule LdStore\nconst $(StrictMode._LOCAL_SCOPED) = Any[$(repr(LdHandle))]\nend\n"
+        )
+        oldload = copy(Base.LOAD_PATH)
+        try
+            push!(Base.LOAD_PATH, dir)
+            Base.require(Main, :LdStore)
+        finally
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+    @test StrictMode._failed(Base.@invokelatest verdict())
+end

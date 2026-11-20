@@ -228,10 +228,10 @@ function findings(
     if !isnothing(key)
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)
         if !isnothing(cached)
-            fs, watched, world = cached
+            fs, watched, world, loaded = cached
             # The key cannot see an edit to a CALLEE; the compiled code the verdict was read from
             # can. A hit whose instances have been invalidated is dropped rather than handed back.
-            if _entry_valid(watched, world)
+            if _entry_valid(watched, world, loaded)
                 @lock _CACHE_LOCK (_CACHE_HITS[] += 1)
                 return copy(fs)
             end
@@ -239,13 +239,14 @@ function findings(
         end
     end
     world = Base.get_world_counter()
+    loaded = _loaded_count()
     tasks = _TASK_BODY_READS[]
     fs = _findings_uncached(f, types, guarantees)
     if !isnothing(key)
         # A verdict that read a task body has nothing to watch for an edit there (`_TASK_BODY_READS`).
         watched = _TASK_BODY_READS[] == tasks ? _watch_instances(f, types) : Core.CodeInstance[]
         @lock _CACHE_LOCK begin
-            _CACHE[key] = (fs, watched, world)
+            _CACHE[key] = (fs, watched, world, loaded)
             _CACHE_MISSES[] += 1
         end
     end

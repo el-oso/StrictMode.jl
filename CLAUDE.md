@@ -388,8 +388,11 @@ StrictMode/src/
                         method with no compiled code has nothing to watch, nor has a verdict that
                         read a spawned task's body (_TASK_BODY_READS in concurrency.jl moved while
                         it was made: no edge leads from the spawner to what the task calls), so
-                        such an entry answers only in the world it was made in (_entry_valid). The
-                        memos under it that outlive a world (_BODY_MEMO, _ESCAPE_MEMO in effects.jl; _SITES_MEMO in
+                        such an entry answers only in the world it was made in (_entry_valid). An
+                        entry also records length(Base.loaded_modules) and misses once it moves: a
+                        package loaded since may hold a store (scoped type, boundary, barrier,
+                        exemption) that no registration call announced. The memos under it that
+                        outlive a world (_BODY_MEMO, _ESCAPE_MEMO in effects.jl; _SITES_MEMO in
                         StrictModeTest) carry a _ReadStamp and answer through _read_holds: the
                         compiler's record of the specialization must still be valid AND the
                         signature must still dispatch to that specialization. The second is not
