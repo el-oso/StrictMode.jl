@@ -794,12 +794,16 @@ function _auto_check_module(
     CHECKS_ENABLED || return nothing
     # A `@strict_policy` line checks the methods defined above it. With none there, a filter has
     # nothing to match yet, so this is asked before the names are.
-    require_methods && isempty(first(module_methods(mod; include_exempt = true))) &&
-        throw(ArgumentError(_policy_checked_nothing(mod, 0)))
+    if require_methods
+        ms, skipped = module_methods(mod; include_exempt = true)
+        (isempty(ms) && iszero(sum(values(skipped); init = 0))) &&
+            throw(ArgumentError(_policy_checked_nothing(mod, 0)))
+    end
     items = _module_load_items(mod, policy; only, exempt)
-    require_methods && isempty(items) && throw(
-        ArgumentError(_policy_checked_nothing(mod, length(first(module_methods(mod; only, exempt)))))
-    )
+    if require_methods && isempty(items)
+        unaccounted = _policy_unaccounted(mod; only, exempt)
+        isnothing(unaccounted) || throw(ArgumentError(_policy_checked_nothing(mod, unaccounted)))
+    end
     fs = _map_findings(_scan_findings, items)
     # The policy is the requirement here, so its line is what a reader needs; a signature with its
     # own declaration keeps that one, which `_map_findings` has already stamped.
@@ -809,13 +813,33 @@ function _auto_check_module(
     return nothing
 end
 
+# For a policy line that had no concrete method to check: `nothing` when some method above it is
+# accounted for anyway, else how many methods it left unread. Accounted for means the policy has
+# an answer for the method without checking it here: it is exempt (by `@strict_exempt` or by this
+# line's own `exempt`), its instantiations are declared with `@strict_function signatures = [...]`,
+# or it is a macro, a constructor or a callable object's method, none of which the policy judges.
+# Only generic methods nobody declared are left unread.
+function _policy_unaccounted(mod::Module; only = nothing, exempt = ())
+    ms, skipped = module_methods(mod; only, exempt)
+    (get(skipped, :exempt, 0) > 0 || get(skipped, :constructor, 0) > 0) && return nothing
+    decls = keys(declarations())
+    for m in ms
+        _method_declared(m, decls) && return nothing
+        startswith(String(m.name), "@") && return nothing
+        ft = _method_function(m)
+        (ft isa DataType && isdefined(ft, :instance)) || return nothing   # a callable object's
+        _is_exempt(ft.instance, nothing, nothing) && return nothing
+    end
+    return length(ms)
+end
+
 # A policy line that read no method. Loading on would look like a module that satisfies its
 # policy, with everything defined below the line unread.
 function _policy_checked_nothing(mod::Module, defined::Int)
     what = defined == 0 ? "no method is defined above this line in `$(nameof(mod))`" :
-        "$defined method(s) are defined above this line in `$(nameof(mod))`, and none has a " *
-        "concrete signature to check (declare the instantiations with `@strict_function " *
-        "signatures = [...]`)"
+        "$defined method(s) are defined above this line in `$(nameof(mod))`, and none is checked " *
+        "or accounted for: none has a concrete signature, an exemption, or instantiations " *
+        "declared with `@strict_function signatures = [...]`"
     return "@strict_policy checked nothing: $what. A policy checks the methods defined above " *
         "it, so place `@strict_policy` at the end of the module, or use `@strict module`. To " *
         "record a policy without checking, write `check = false`."

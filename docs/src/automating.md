@@ -75,9 +75,11 @@ It reads the module's methods rather than rewriting its body, which is why defin
 `include`d file are covered.
 
 A policy checks only the methods defined above it: the check runs at the line where the macro is
-written, and a method defined below is not read. That is why it goes last. A policy that finds
-nothing to check at its line raises, since written first it would load cleanly over a module it
-never looked at. `@strict module … end` wraps the whole module and has no such position, and
+written, and a method defined below is not read. That is why it goes last. A policy raises when no method above its line is checked or accounted for: nothing is defined
+above it, or only generic methods that nobody declared. Written first, it would otherwise load
+cleanly over a module it never looked at. A method is accounted for when it is exempt, when its
+instantiations are declared with `@strict_function signatures = [...]`, or when it is a
+constructor, a macro or a callable object's method. `@strict module … end` wraps the whole module and has no such position, and
 `check = false` records a policy without checking.
 
 ### Declaring a narrower set, rather than excusing a guarantee

@@ -291,9 +291,12 @@ StrictMode/src/
                         @strict_exempt (a definition, a name, a `begin … end` block, or an
                         `include` whose definitions are found by diffing the census), @strict_policy. A
                         @strict_policy line checks only the methods defined ABOVE it and RAISES
-                        when it has none to check (`require_methods` in _auto_check_module: no
-                        method above it, or none with a concrete signature): written first it
-                        loaded cleanly over a module it never read. `check = false` does not raise
+                        when none above it is checked OR ACCOUNTED FOR (`require_methods` in
+                        _auto_check_module, _policy_unaccounted: nothing above it, or only
+                        undeclared generic methods; an exempt method, one declared with
+                        `signatures = [...]`, a constructor, a macro and a callable object's
+                        method are all accounted for): written first it would load cleanly
+                        over a module it never read. `check = false` does not raise
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
                         StrictMode performance guarantees. A @verify_strict line is an
                         example call or a SIGNATURE line, `f(::T1, ::T2; k::K)`: _signature_parts
