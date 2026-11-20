@@ -140,6 +140,11 @@ and so does an exempt callee that was inlined, since its allocation then belongs
 own code. The exemption is matched on the method, so a function of the same name in another
 module excuses nothing.
 
+Only an exemption declared in a module counts here, which is what `@strict_exempt` written in a
+package's source is. One declared with no module, from a session, covers by name in every module
+and names no method: its caller is an ordinary failure in the proof, with or without
+`allow_exempt`. The reporting scan still notes such a caller as reaching an exempt function.
+
 ```@docs
 ignore_barrier
 set_ignore_barrier!

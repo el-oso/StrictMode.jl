@@ -522,3 +522,50 @@ end
     @test proof(E.clean).status === :pass
     @test occursin("exempt", StrictMode.explain(:SM0018))
 end
+
+@testitem "a session-wide exemption excuses no proof site" begin
+    using StrictMode, StrictModeTest, Test
+
+    module SessionExempt
+    const POOL = Ref(Float64[])
+    @noinline function sgrow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    only_grows(n::Int) = (b = sgrow!(n); b[1])
+    end
+    # Declared with no module: it covers by name, in every module, so it does not name a method.
+    StrictMode._exempt!(:sgrow!; guarantees = (:noalloc,), reason = "session-wide")
+    SessionExempt.only_grows(4)
+
+    r = only(StrictModeTest.proof_findings(SessionExempt.only_grows, (Int,); guarantees = (:noalloc,)))
+    @test r.status === :fail
+    @test r.code !== :SM0018
+    @test isempty(r.exempt_by)
+    @test_throws StrictViolation @test_noalloc allow_exempt = true SessionExempt.only_grows(4)
+    @test_throws StrictViolation test_signatures([(SessionExempt.only_grows, (Int,))]; guarantees = (:noalloc,), allow_exempt = true)
+    # The scan's own note is as it was: the session-wide exemption still excuses the callee there.
+    @test only(StrictMode.findings(SessionExempt.only_grows, (Int,); guarantees = (:noalloc,))).status === :info
+
+    # The same exemption declared in the module names the method, and counts.
+    StrictMode._exempt!(:sgrow!, SessionExempt; guarantees = (:noalloc,), reason = "declared in the module")
+    m = only(StrictModeTest.proof_findings(SessionExempt.only_grows, (Int,); guarantees = (:noalloc,)))
+    @test m.status === :info && m.code === :SM0018
+    @test m.exempt_by == ("sgrow!" => "declared in the module",)
+
+    # `@strict_exempt` written in a module's source is that form.
+    module MacroExempt
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function mgrow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "written in the source" mgrow!
+    only_grows(n::Int) = (b = mgrow!(n); b[1])
+    end
+    MacroExempt.only_grows(4)
+    w = only(StrictModeTest.proof_findings(MacroExempt.only_grows, (Int,); guarantees = (:noalloc,)))
+    @test w.status === :info && w.code === :SM0018
+    @test w.exempt_by == ("mgrow!" => "written in the source",)
+end

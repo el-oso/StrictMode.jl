@@ -608,7 +608,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         turn it into :fail through StrictMode._gate_exempt_only unless given
                         `allow_exempt = true`. One site without an exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
-                        is StrictMode._mi_exemption, on the method module and name), _opt_reports (JET,
+                        is StrictMode._mi_exemption, on the method module and name, with
+                        declared_in_module = true: an exemption declared with NO module covers
+                        by name everywhere, names no method, and excuses no proof site, though
+                        the scan still notes it), _opt_reports (JET,
                         wrapped in AnalysisError). _is_boxing drops a DynamicDispatch that is a C
                         VARARGS call (_c_varargs_call): AllocCheck lists a `ccall` with a required-
                         argument count as a dispatch to an unknown target, and Base.trypoptask holds

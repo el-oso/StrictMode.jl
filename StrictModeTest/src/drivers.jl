@@ -69,6 +69,8 @@ A signature that allocates only inside functions exempted from `:noalloc` is not
 reports it as an SM0018 note that lists the exempt functions and their reasons, and this gate, like
 `test_compiled`, `test_registered` and `@test_noalloc`, fails it. `allow_exempt = true` accepts the
 exemptions for this gate, which then passes it when nothing else allocates.
+Only an exemption declared in the function's own module counts; a session-wide one, which covers by
+name, leaves its caller an ordinary failure.
 """
 function test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exempt::Bool = false)
     # A name no guarantee has is a mistake in the call, not a failing signature.

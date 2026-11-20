@@ -424,7 +424,9 @@ _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : 
 # The exempt functions that account for every allocation site, each with the reason its exemption
 # gave, or `nothing` when one site has no exempt frame. A site is an exempt function's when its
 # backtrace passes through a frame whose METHOD an exemption covers for `:noalloc`: matched on the
-# method's module and name, so a function of the same name elsewhere excuses nothing. An exempt
+# method's module and name, so a function of the same name elsewhere excuses nothing. Only an
+# exemption declared in a module names a method. One declared with no module, from a session,
+# covers by name in every module and excuses no site here, though the scan still notes it. An exempt
 # callee that was inlined has no frame with a specialization of its own, so its site reads as the
 # caller's and the result is an ordinary failure.
 function _exempt_only(allocs)
@@ -437,7 +439,7 @@ function _exempt_only(allocs)
             fr isa Base.StackTraces.StackFrame || continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || continue
-            e = StrictMode._mi_exemption(mi)
+            e = StrictMode._mi_exemption(mi; declared_in_module = true)
             isnothing(e) || break
         end
         isnothing(e) && return nothing

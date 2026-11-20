@@ -230,6 +230,8 @@ the call, then check that a second identical call allocates nothing
 allocations are inside such exempt functions as its own result, SM0018, listing each exempt
 function with its reason. That is not a pass: `@test_noalloc` and the `test_*` gates fail it unless
 they are given `allow_exempt = true`, and a caller with one allocation of its own fails either way.
+The exemption has to be declared in the module that defines the function, as `@strict_exempt` in
+its source is: one declared with no module covers by name and excuses nothing in the proof.
 
 **A barrier excuses allocation, and nothing else.** Every other guarantee still reads `f` itself: a
 dictionary lookup or a boxed value inside `f` is reported when `f` is checked, once. A caller whose
@@ -1529,9 +1531,11 @@ _mi_exempt_name(mi::Core.MethodInstance) =
     (e = _mi_exemption(mi); isnothing(e) ? nothing : _demangle(mi.def.name))
 
 # The exemption that covers `:noalloc` for the method `mi` is a specialization of, at the types
-# it is called with. Matched on the method's own module as well as its name: a function of the
-# same name elsewhere is another function.
-function _mi_exemption(mi::Core.MethodInstance)
+# it is called with. One declared in a module is matched on that module as well as the name: a
+# function of the same name elsewhere is another function. One declared with no module, from a
+# session, covers by name wherever the function lives, and `declared_in_module = true` leaves
+# those out, for a caller that needs the exemption to name a method.
+function _mi_exemption(mi::Core.MethodInstance; declared_in_module::Bool = false)
     mi.def isa Method || return nothing
     es = _noalloc_exemptions()
     isempty(es) && return nothing
@@ -1540,6 +1544,7 @@ function _mi_exemption(mi::Core.MethodInstance)
     types = length(ps) > 1 ? Tuple(ps[2:end]) : ()
     root = Base.moduleroot(mi.def.module)
     for (mod, e) in es
+        (declared_in_module && isnothing(e.mod) && isnothing(mod)) && continue
         # The declaring module when recorded, else the package root of the store it came from.
         if !isnothing(e.mod)
             mi.def.module === e.mod || continue

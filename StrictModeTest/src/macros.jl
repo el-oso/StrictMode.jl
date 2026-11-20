@@ -52,10 +52,12 @@ Allocations on never-taken throw branches are ignored by default — see [`Stric
 as is a call whose only allocation is a recognized one-time-init barrier
 (see [`set_ignore_barrier!`](@ref)).
 
-A call that allocates only inside functions exempted from `:noalloc` with `@strict_exempt` is not
-a pass. It fails, with code SM0018, and the message lists each exempt function with the reason its
+A call that allocates only inside functions exempted from `:noalloc` with `@strict_exempt`, in the
+module that defines them, is not a pass. It fails, with code SM0018, and the message lists each exempt function with the reason its
 exemption gave. `allow_exempt = true` accepts those exemptions for this check: the call then
 passes if nothing else allocates, and still fails if one site is its own.
+An exemption declared with no module (a session-wide one, by name) counts for none of this: its
+caller fails as any allocating call does.
 
 ```julia
 @test_noalloc dot3(a, b)              # ok
