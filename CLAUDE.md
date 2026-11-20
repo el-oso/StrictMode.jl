@@ -593,6 +593,9 @@ StrictMode/src/
                         _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
                         @propagate_inbounds method is clean and the caller that wrote @inbounds
                         carries the finding. Gating form: StrictModeTest.test_no_unsafe
+                        A Ptr TYPE counts as `:Ptr` only where a call applies it — the function
+                        operand of a fixed list (_PTR_APPLIERS: map, broadcasted, foreach, sum, …),
+                        the right of |>, any operand of ∘ — never where it is merely named
                         It reads the census's constructors, closures and unnamed callables too
                         (module_methods' `keep`): the census skips them because no declaration
                         names them, which says nothing about their code.

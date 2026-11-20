@@ -85,6 +85,27 @@ end
 
 _is_ptr_type(@nospecialize(v)) = v isa Type && v <: Ptr && v !== Union{}
 
+# The higher-order functions that call the function in their first operand. A pointer type there is
+# applied to each element, so `map(Ptr{T}, addrs)` builds pointers as `Ptr{T}(addr)` does. `|>`
+# applies its second operand, and `∘` and `ComposedFunction` every one.
+const _PTR_APPLIERS = (
+    map, map!, broadcast, broadcast!, Base.broadcasted, foreach, mapreduce, mapfoldl, mapfoldr,
+    filter, filter!, any, all, sum, count, findall, Iterators.map, Base.Fix1, Base.Fix2,
+)
+
+# Whether a call hands a pointer type to a function that applies it. A keyword call,
+# `Core.kwcall(kws, f, args...)`, is judged as the call to `f`.
+function _ptr_applied(@nospecialize(callee), args::Vector{Any}, resolve)
+    ops = args[2:end]
+    if callee === Core.kwcall && length(ops) >= 2
+        callee, ops = resolve(ops[2]), ops[3:end]
+    end
+    fs = callee === (|>) ? ops[2:end] :
+        (callee === (∘) || callee === ComposedFunction) ? ops :
+        any(g -> g === callee, _PTR_APPLIERS) ? ops[1:min(1, end)] : Any[]
+    return any(a -> _is_ptr_type(resolve(a)), fs)
+end
+
 # `allow` names constructs by bare `Symbol`, but a reader looks for the macro they wrote.
 _render_construct(nm::Symbol) =
     nm === :inbounds ? "`@inbounds`" : nm === :cfunction ? "`@cfunction`" : "`" * String(nm) * "`"
@@ -266,6 +287,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         for a in st.args
             named(a) && noteval(a)
         end
+        _ptr_applied(callee, st.args, resolve) && push!(out, :Ptr)
         isnothing(callee) && continue
         if _is_ptr_type(callee)
             push!(out, :Ptr)
@@ -359,7 +381,7 @@ own are read like every other method.
 | `pointer`, `pointer_from_objref`, and any function whose name begins with `unsafe_` | its name |
 | the pointer intrinsics `pointerref`, `pointerset`, `atomic_pointer…`, and `llvmcall`, `cglobal` | its name |
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
-| a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)` | `:Ptr` |
+| a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, or `Ptr{T}` handed to a function that applies it | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 | a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
 | code evaluated at run time: `eval`, `@eval`, `Core.eval`, `include_string`, `include`, whether called or passed on | `:eval` |
@@ -375,8 +397,13 @@ kept in a local to every module it is assigned, typed or not: `B = Base; B.unsaf
 `getglobal(Base, nm)`, cannot be resolved to a function, so it is reported as `dynamic_global`
 instead of passing. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
-function named `free` is not `Libc.free`. Taking a `Ptr` argument, or naming the type, builds no
-pointer and is not reported.
+function named `free` is not `Libc.free`. A pointer type is reported where a call applies it to
+each element: as the function operand of `map`, `map!`, `broadcast`, `broadcast!`,
+`Base.broadcasted` (so `Ptr{T}.(addrs)`), `foreach`, `mapreduce`, `mapfoldl`, `mapfoldr`, `filter`,
+`filter!`, `any`, `all`, `sum`, `count`, `findall`, `Iterators.map`, `Base.Fix1` and `Base.Fix2`,
+as the right operand of `|>`, and as any operand of `∘` or `ComposedFunction`, including through a
+keyword call. Taking a `Ptr` argument, or naming the type anywhere else (`Ptr{T}[]`,
+`isa(x, Ptr{T})`, `Vector{Ptr{T}}`, `Ref{Ptr{Cvoid}}`), builds no pointer and is not reported.
 A conversion to a pointer type is reported whatever is converted: the scan reads lowered code,
 which carries no types, so `convert(Ptr{Cvoid}, p)` on a pointer reads like one on an address.
 

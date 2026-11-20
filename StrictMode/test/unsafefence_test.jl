@@ -447,3 +447,59 @@ end
     end
     @test isempty(unsafe_report(FenceWrappedClean))
 end
+
+@testitem "unsafe_report sees a pointer type handed to a higher-order function" begin
+    using StrictMode
+
+    # Each method builds pointers from integers by handing `Ptr{T}` to a call that applies it.
+    module FencePtrApplied
+    mapped(xs) = map(Ptr{Float64}, xs)
+    mapped_into(ys, xs) = map!(Ptr{Float64}, ys, xs)
+    dotted(xs) = Ptr{Float64}.(xs)
+    broadcast_call(xs) = broadcast(Ptr{Float64}, xs)
+    broadcast_into(ys, xs) = broadcast!(Ptr{Float64}, ys, xs)
+    broadcasted_lazy(xs) = Base.broadcasted(Ptr{Float64}, xs)
+    each(xs) = foreach(Ptr{Float64}, xs)
+    piped(x) = x |> Ptr{Float64}
+    composed(x) = (identity ∘ Ptr{Float64})(x)
+    composed_type(x) = ComposedFunction(identity, Ptr{Float64})(x)
+    fixed1(x) = Base.Fix1(Ptr{Float64}, x)
+    fixed2(x) = Base.Fix2(Ptr{Float64}, x)
+    reduced(xs) = mapreduce(Ptr{Float64}, (a, b) -> b, xs)
+    reduced_kw(xs) = mapreduce(Ptr{Float64}, (a, b) -> b, xs; init = C_NULL)
+    folded_left(xs) = mapfoldl(Ptr{Float64}, (a, b) -> b, xs)
+    folded_right(xs) = mapfoldr(Ptr{Float64}, (a, b) -> b, xs)
+    filtered(xs) = filter(Ptr{Float64}, xs)
+    filtered_into(xs) = filter!(Ptr{Float64}, xs)
+    any_of(xs) = any(Ptr{Float64}, xs)
+    all_of(xs) = all(Ptr{Float64}, xs)
+    summed(xs) = sum(Ptr{Float64}, xs)
+    counted(xs) = count(Ptr{Float64}, xs)
+    found(xs) = findall(Ptr{Float64}, xs)
+    lazy(xs) = Iterators.map(Ptr{Float64}, xs)
+    end
+    fs = unsafe_report(FencePtrApplied)
+    reported = Set(f.func for f in fs)
+    for nm in names(FencePtrApplied; all = true)
+        s = String(nm)
+        (isdefined(FencePtrApplied, nm) && getglobal(FencePtrApplied, nm) isa Function &&
+            !startswith(s, "#") && s != "eval" && s != "include") || continue
+        @test s in reported
+    end
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+    @test isempty(unsafe_report(FencePtrApplied; allow = (:Ptr,)))
+
+    # Naming the pointer type builds no pointer, whatever call the name is handed to.
+    module FencePtrNamed
+    ptr_typed(v) = Ptr{Float64}[]
+    is_ptr(x) = isa(x, Ptr{Float64})
+    ptr_vector() = Vector{Ptr{Float64}}(undef, 2)
+    ref_ptr() = Ref{Ptr{Cvoid}}(C_NULL)
+    eltyped(xs) = map(x -> x isa Ptr{Float64}, xs)
+    mapped_clean(xs) = map(abs, xs)
+    piped_clean(x) = x |> abs
+    counted_types(ts) = count(==(Ptr{Float64}), ts)
+    collected(ps) = map(identity, Ptr{Float64}[])
+    end
+    @test isempty(unsafe_report(FencePtrNamed))
+end
