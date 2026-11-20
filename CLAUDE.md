@@ -304,7 +304,10 @@ StrictMode/src/
                         session's; module_policy/_set_module_policy! back @strict_policy, and
                         _auto_check_module checks _module_load_items — the module's METHODS, so an
                         include'd definition is covered where a body rewrite could not see it
-  audit.jl            — audit (the reporting entry point; no exit status, never throws, and no
+  audit.jl            — audit (the reporting entry point; no exit status, never throws on a
+                        VIOLATION — it raises on an invalid argument: an unknown guarantee, a
+                        target that is neither :registered nor a Module, an `only` or `exempt`
+                        entry that matches no function — and no
                         rendering: it returns the findings and format_findings renders them).
                         audit_changed diffs a run against the previous one — _LAST_AUDIT in this
                         session, or a Serialization baseline FILE another session can read
@@ -852,9 +855,9 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   consumer's precompile is issue #18, and it made checks-on unusable in PureBLAS. The proofs in
   `StrictModeTest` gate unconditionally — that is what that package is.
 - **A signature that always throws is not a pass.** Its inferred return is `Union{}`, and with the
-  throw paths set aside nothing is left for a guarantee to read, so every one of them used to pass:
-  `bad(x::Int) = x + "a"` and a call that leaves out a required keyword argument passed
-  `test_signatures` for `(:typestable, :noalloc, :noboxing, :trim_compatible)`. The verdict is the
+  throw paths set aside nothing is left for a guarantee to read: `bad(x::Int) = x + "a"`, a call
+  that leaves out a required keyword argument, and a loop that never returns all have nothing on
+  a returning path for `(:typestable, :noalloc, :noboxing, :trim_compatible)` to check. The verdict is the
   SM0208 note, `:info` in a sweep and `:fail` where the signature was listed (see check.jl in the
   map). An `@assert_*` or `@test_*` macro performs its call, so there the call's own error is raised
   and no verdict is given.

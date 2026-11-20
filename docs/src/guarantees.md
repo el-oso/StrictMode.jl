@@ -1715,7 +1715,8 @@ split their own signals the same way.
 [`audit`](@ref) with nothing written at the call site; the four that are not need actual argument
 values, or an optional dependency, or a set of effects only the caller can name.
 
-**[`audit`](@ref) is the second step, not the first.** It never throws and returns no exit status, so
+**[`audit`](@ref) is the second step, not the first.** It never throws on a violation (an invalid
+argument, such as an unknown guarantee or an `only` entry that matches no function, does raise) and returns no exit status, so
 it is not a gate — it is what you run *after* a warning or a failing test, to see the whole picture
 around the one site that complained. The gate is the `@assert_` at the call site, or a
 `StrictModeTest` driver in your suite; `audit` is how you work out what to change. That is also why

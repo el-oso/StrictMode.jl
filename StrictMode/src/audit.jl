@@ -1,6 +1,8 @@
 # Agentic feedback: a one-shot, structured counterpart to the Revise loop. An AI coding agent (or a
 # human at a prompt) runs `audit`, reads the machine-readable findings, and drives an
-# edit→check→fix loop. It reports; it never throws, and it never sets an exit status. Its verdicts
+# edit→check→fix loop. It reports; it never throws on a violation, and it never sets an exit status.
+# An invalid argument raises: an unknown guarantee, a target that is neither `:registered` nor a
+# module, an `only` or `exempt` entry that matches no function. Its verdicts
 # come from the value-free engine, whose allocation findings are structural guesses — a tool that
 # reports is allowed to be wrong, a tool that gates is not. `StrictModeTest`'s `test_*` drivers gate.
 
@@ -85,6 +87,11 @@ and costs 17.8% of the sweep — one extra typed-IR read per specialization. Pas
 `static_ownership_suggest = true` additionally runs [`static_ownership_suggestions`](@ref):
 informational "consider static ownership" findings (`guarantee = :static_ownership`,
 `status = :info`) for type/symbol-keyed registry lookups. Also never a failure.
+
+A violation is a finding, never an exception. An argument that names nothing is an exception: an
+unknown guarantee, a `target` that is neither `:registered` nor a module, and an `only` or
+`exempt` entry that matches no function with a method in the module each raise an
+`ArgumentError`, since the sweep they describe would check nothing and return a clean result.
 
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
