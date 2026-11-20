@@ -181,6 +181,9 @@ StrictMode/src/
                         effect_holds wrap Base.infer_effects, and effect_holds covers all NINE
                         Effects fields, so a field Julia adds cannot stay unaskable through
                         @assert_effects (a test compares the predicate set against fieldnames).
+                        effects RAISES on a signature with no typed body, and @assert_effects
+                        fails on it: infer_effects over zero matches reports every effect but
+                        nothrow.
                         Every one is a PROOF: false means the compiler could not establish the
                         property, NOT that it fails — :noub is false for a non-const global read
                         and for a dynamic call, neither of which is undefined behavior (measured),

@@ -676,3 +676,15 @@ end
     @test own(OwnedShared.y).status === :pass
     @test length(StrictMode._OWNED_NODE_MEMO) <= n + 2
 end
+
+@testitem "effects of a signature no method matches are not read as holding" begin
+    using StrictMode
+    g(x::Float64) = x + 1
+    # The compiler answers a signature with no match with every effect but :nothrow.
+    @test_throws StrictMode._UnanalyzableSignature StrictMode.effects(g, (Int,))
+    @test_throws "no typed body" StrictMode.effects(g, (Int,))
+    @test_throws StrictViolation @assert_effects g(1.0) (:effect_free, :terminates, :consistent) types = (Int,)
+    @test_throws "no typed body" @assert_effects g(1.0) (:effect_free,) types = (Int,)
+    @test StrictMode.effect_holds(StrictMode.effects(g, (Float64,)), :effect_free)
+    @test (@assert_effects g(1.0) (:effect_free,)) === 2.0
+end

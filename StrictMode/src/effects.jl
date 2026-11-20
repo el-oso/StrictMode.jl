@@ -1589,8 +1589,16 @@ end
 The compiler's inferred effects for `f`'s signature — a cheap (inference-only) read of whether a
 method is `:nothrow`, `:effect_free`, `:terminates`, `:consistent`, etc. Used by the `:fast`
 triage and by `@assert_effects`.
+
+A signature with no typed body (no method matches it, or its generator raised) raises
+`_UnanalyzableSignature`: the compiler answers it with every effect but `:nothrow`, which
+describes no code.
 """
-effects(@nospecialize(f), @nospecialize(types::Tuple)) = _infer_effects(f, types)
+function effects(@nospecialize(f), @nospecialize(types::Tuple))
+    isnothing(_typed_body(_sigtype(f, types))) &&
+        throw(_UnanalyzableSignature(:effects, f, types, _NO_BODY_WHY))
+    return _infer_effects(f, types)
+end
 
 # Predicate by symbol, so callers can ask `effect_holds(eff, :nothrow)`.
 #

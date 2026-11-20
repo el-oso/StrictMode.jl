@@ -198,6 +198,7 @@ end
 # --- @assert_effects (via Base.infer_effects) -------------------------------------------------
 
 function _assert_effects(target, @nospecialize(f), @nospecialize(types::Tuple), required)
+    isnothing(_typed_body(_sigtype(f, types))) && return _fail(:effects, target, _NO_BODY_WHY)
     eff = effects(f, types)
     missing_eff = Symbol[s for s in required if !effect_holds(eff, s)]
     isempty(missing_eff) || _fail(
@@ -212,7 +213,8 @@ end
 
 Fail unless the compiler infers the requested [effects](https://docs.julialang.org/en/v1/base/base/#Base.@assume_effects)
 for `f(args...)`, via `Base.infer_effects`. Effects are one or more of `:nothrow`, `:effect_free`,
-`:terminates`, `:consistent`, `:nonoverlayed`. This is the *verify* side of effects; to *declare*
+`:terminates`, `:consistent`, `:nonoverlayed`, `:notaskstate`, `:noub`, `:inaccessiblememonly` and
+`:nortcall`. A signature no method matches fails: there is no code to have effects. This is the *verify* side of effects; to *declare*
 them (and influence codegen), use `Base.@assume_effects`. Each argument is evaluated once.
 
 ```julia
