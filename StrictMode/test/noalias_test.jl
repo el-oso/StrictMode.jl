@@ -208,8 +208,7 @@ end
         # The same address is the same memory, and is found.
         @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), y)
         @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), PtrVec(pointer(y), 3))
-        # An address inside another array cannot be told from one outside it without knowing how
-        # the type uses its pointer, so it is not reported.
+        # Disjoint ranges of one buffer.
         @test (@assert_noalias copyto!(PtrVec(pointer(y, 4), 3), view(y, 1:3))) isa PtrVec
     end
 
@@ -241,4 +240,73 @@ end
     from_vs!(dst, ws) = (dst .= ws.v; dst)
     @test_logs (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 4:6))))
     @test_logs (:warn, r"buffer held in a field"s) match_mode = :any (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 2:4))))
+end
+
+@testitem "@assert_noalias compares the memory a pointer-backed array covers" begin
+    using StrictMode
+
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    # A second pointer that is not the data: a library context shared by every vector.
+    struct CtxVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        ctx::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::CtxVec) = (v.n,)
+    Base.getindex(v::CtxVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::CtxVec, x, i::Int) = unsafe_store!(v.p, x, i)
+
+    y = collect(1.0:10.0)
+    z = zeros(10)
+    ctx = Ref(0)
+    GC.@preserve y z ctx begin
+        py, pz = pointer(y), pointer(z)
+        handle = Ptr{Cvoid}(pointer_from_objref(ctx))
+        # A shared handle is not shared data.
+        @test_logs (@assert_noalias copyto!(CtxVec(py, handle, 3), CtxVec(pz, handle, 3)))
+        @test_throws "share memory" @assert_noalias copyto!(CtxVec(py, handle, 3), CtxVec(py, handle, 3))
+        # A view starts where it starts, not where its parent does.
+        @test_logs (@assert_noalias copyto!(PtrVec(py, 3), view(y, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py + 24, 3), view(y, 4:6))
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py + 32, 3), view(y, 4:6))
+        @test_logs (@assert_noalias copyto!(PtrVec(py + 48, 3), view(y, 4:6)))
+        @test_logs (@assert_noalias copyto!(view(y, 7:9), PtrVec(py, 3)))
+        # Two ranges of one buffer that overlap part-way.
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py, 5), PtrVec(py + 8, 5))
+        @test_logs (@assert_noalias copyto!(PtrVec(py, 5), PtrVec(py + 40, 5)))
+    end
+
+    # A struct that is not an array says nothing about how far its pointer reaches, so a pointer
+    # it shares with another argument is reported, and does not raise.
+    struct Handle
+        p::Ptr{Float64}
+    end
+    fill_from!(dst, h) = dst
+    GC.@preserve z begin
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(Handle(pointer(z)), Handle(pointer(z))))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(z, Handle(pointer(z, 3))))
+        @test_logs (@assert_noalias fill_from!(y, Handle(pointer(z))))
+    end
+end
+
+@testitem "@assert_noalias does not take a BigFloat scale factor for the written argument" begin
+    using StrictMode
+
+    scale!(a, v) = (v .*= a; v)
+    z = ones(4)
+    # The `!` default names argument 1, and a number beside an array is not what such a call writes.
+    @test_throws "argument 1 is a `Float64`, which holds no memory to write" @assert_noalias scale!(2.0, z)
+    @test_throws "argument 1 is a `BigFloat`, a number, and the call also takes an array" @assert_noalias scale!(big(2.0), z)
+    @test_throws "mutates = (2,)" @assert_noalias scale!(big(2), z)
+    # Named, the position is taken at its word.
+    @test (@assert_noalias mutates = (2,) scale!(big(2.0), z)) === z
+    # A call on numbers alone does write its first.
+    bx, by = big(2)^80, big(3)^80
+    @test (@assert_noalias Base.GMP.MPZ.add!(bx, by)) == big(2)^80 + big(3)^80
 end

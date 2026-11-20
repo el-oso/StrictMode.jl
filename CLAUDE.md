@@ -61,10 +61,16 @@ StrictMode/src/
                         allocates and gathers the DECLARED ARRAYS found there plus the raw
                         pointers. The arrays are asked of Base.mightalias pairwise, so disjoint
                         views inside two wrappers do not overlap; comparing their dataids would
-                        find the shared parent and raise. A pointer is evidence only when it
-                        equals another pointer or the start of an array: an address INSIDE
-                        another array is undecided and not reported, since what a pointer-backed
-                        type reaches is not known. Arrays held as elements (`[y, z]`, a Dict)
+                        find the shared parent and raise. An array built on a pointer (exactly one
+                        Ptr{eltype} field, _data_pointer_field) is compared by ADDRESS RANGE
+                        (_memory_region: that pointer for length elements; a strided array from
+                        its pointer and strides), because mightalias is false for every isbits
+                        array and a view names its parent START as its data. Its other Ptr
+                        fields are handles and are not read. A raw pointer anywhere else has no
+                        known extent: one pointing at memory the other argument reaches is
+                        :undecided, which warns "may share memory" and never gates. A Number in
+                        the default `!` position beside an array argument is rejected like a
+                        Float64 (a BigFloat scale factor holds memory but is not what is written). Arrays held as elements (`[y, z]`, a Dict)
                         are not followed. An overlap between two arrays GATES; one found only in a field
                         of a non-array argument warns (gates = gates && arrays in _noalias_fail).
                         A written position that holds no memory (_holds_memory: the scalar in

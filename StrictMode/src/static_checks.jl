@@ -437,53 +437,134 @@ end
 
 const _ALIAS_FIELD_DEPTH = 3
 
-# The memory `x` can reach: the arrays that declare their ids, which are taken at their word, and
-# the raw pointers. Anything else (a wrapper array with no `dataids` method, a workspace struct, a
-# factorization, a plain-data array built on a pointer) is read through its fields.
-function _collect_memory!(arrays::Vector{Any}, ptrs::Vector{UInt}, @nospecialize(x), depth::Int)
+# The address range `[lo, hi)` an array's elements lie in, or `nothing` when it is not known.
+# A strided array answers from its pointer and strides. An array type built on a pointer answers
+# from its one `Ptr{eltype}` field and its length; with no such field, or several, which pointer
+# is the data is not known.
+function _memory_region(@nospecialize(x::AbstractArray))
+    isempty(x) && return nothing
+    if x isa StridedArray && isbitstype(eltype(x))
+        lo = hi = UInt(pointer(x))
+        for (n, s) in zip(size(x), strides(x))
+            span = (n - 1) * s * Base.elsize(x)
+            span < 0 ? (lo -= UInt(-span)) : (hi += UInt(span))
+        end
+        return (lo, hi + UInt(Base.elsize(x)))
+    end
+    i = _data_pointer_field(typeof(x))
+    i == 0 && return nothing
+    p = getfield(x, i)::Ptr
+    p == C_NULL && return nothing
+    return (UInt(p), UInt(p) + UInt(length(x) * sizeof(eltype(x))))
+end
+
+# The index of the one field that is a `Ptr` to the array's element type, or 0.
+function _data_pointer_field(@nospecialize(T::Type))
+    (T isa DataType && T <: AbstractArray && isbitstype(eltype(T))) || return 0
+    found = 0
+    for (i, F) in pairs(fieldtypes(T))
+        F === Ptr{eltype(T)} || continue
+        found == 0 || return 0
+        found = i
+    end
+    return found
+end
+
+# What `_collect_memory!` finds in an argument: the arrays that declare their ids, which are taken
+# at their word; the address ranges of the arrays built on a pointer; and the raw pointers, which
+# say where memory starts and not how far it reaches.
+struct _Reached
+    arrays::Vector{Any}
+    regions::Vector{Tuple{UInt, UInt}}
+    ptrs::Vector{UInt}
+end
+_Reached() = _Reached(Any[], Tuple{UInt, UInt}[], UInt[])
+Base.isempty(r::_Reached) = isempty(r.arrays) && isempty(r.regions) && isempty(r.ptrs)
+
+# Anything that is not one of those (a wrapper array with no `dataids` method, a workspace struct,
+# a factorization) is read through its fields. In an array built on a pointer only the data
+# pointer is memory the array covers: another pointer field is a handle, which two arrays can
+# share without sharing an element.
+function _collect_memory!(r::_Reached, @nospecialize(x), depth::Int)
     if x isa Ptr
-        x == C_NULL || push!(ptrs, UInt(x))
+        x == C_NULL || push!(r.ptrs, UInt(x))
         return nothing
     end
     _holds_memory(x) || return nothing
-    if x isa AbstractArray && !isbits(x) && _declares_ids(x)
-        push!(arrays, x)
-        return nothing
+    data = 0
+    if x isa AbstractArray
+        if !isbits(x) && _declares_ids(x)
+            push!(r.arrays, x)
+            return nothing
+        end
+        data = _data_pointer_field(typeof(x))
+        if data != 0
+            region = _memory_region(x)
+            isnothing(region) || push!(r.regions, region)
+        end
     end
     depth <= 0 && return nothing
     for i in 1:nfields(x)
-        isdefined(x, i) && _collect_memory!(arrays, ptrs, getfield(x, i), depth - 1)
+        isdefined(x, i) || continue
+        v = getfield(x, i)
+        (data != 0 && v isa Ptr) && continue
+        _collect_memory!(r, v, depth - 1)
     end
     return nothing
 end
 
+_regions_meet(a::Tuple{UInt, UInt}, b::Tuple{UInt, UInt}) = a[1] < b[2] && b[1] < a[2]
+
+# Whether an address range meets a declared array: by the array's own range where it has one, and
+# otherwise by whether the range holds an address the array names as its data.
+function _region_meets_array(region::Tuple{UInt, UInt}, @nospecialize(x::AbstractArray))
+    other = _memory_region(x)
+    isnothing(other) || return _regions_meet(region, other)
+    return any(id -> region[1] <= id < region[2], Base.dataids(x))
+end
+
+# Whether a raw pointer points at memory the other argument reaches. How far the pointer's own
+# memory extends is not known, so this is evidence of sharing and not a comparison of two ranges.
+function _pointer_meets(p::UInt, r::_Reached)
+    p in r.ptrs && return true
+    any(g -> g[1] <= p < g[2], r.regions) && return true
+    return any(r.arrays) do x
+        g = _memory_region(x)
+        isnothing(g) ? (p in Base.dataids(x)) : (g[1] <= p < g[2])
+    end
+end
+
 # Whether the memory two arguments reach overlaps, by the evidence there is. Two arrays found
 # inside them are asked of `Base.mightalias`, exactly as two plain arguments are, so disjoint views
-# of one parent inside two wrappers do not overlap. A raw pointer is evidence only when it equals
-# another pointer or the start of an array: where a pointer-backed type reaches from there is not
-# known, so an address inside another array is undecided and is not reported.
+# of one parent inside two wrappers do not overlap. An array built on a pointer is compared by the
+# address range it covers. A raw pointer outside such an array has no known extent: one that
+# points at memory the other argument reaches is `:undecided`.
 @noinline function _deep_overlap(@nospecialize(a), @nospecialize(b))
-    aa, pa = Any[], UInt[]
-    _collect_memory!(aa, pa, a, _ALIAS_FIELD_DEPTH)
-    (isempty(aa) && isempty(pa)) && return :none
-    ab, pb = Any[], UInt[]
-    _collect_memory!(ab, pb, b, _ALIAS_FIELD_DEPTH)
-    found = any(x -> any(y -> Base.mightalias(x, y), ab), aa) ||
-        !isdisjoint(pa, pb) ||
-        any(x -> any(p -> p in Base.dataids(x), pb), aa) ||
-        any(y -> any(p -> p in Base.dataids(y), pa), ab)
-    found || return :none
-    return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
+    ra = _Reached()
+    _collect_memory!(ra, a, _ALIAS_FIELD_DEPTH)
+    isempty(ra) && return :none
+    rb = _Reached()
+    _collect_memory!(rb, b, _ALIAS_FIELD_DEPTH)
+    found = any(x -> any(y -> Base.mightalias(x, y), rb.arrays), ra.arrays) ||
+        any(g -> any(h -> _regions_meet(g, h), rb.regions), ra.regions) ||
+        any(g -> any(y -> _region_meets_array(g, y), rb.arrays), ra.regions) ||
+        any(g -> any(x -> _region_meets_array(g, x), ra.arrays), rb.regions)
+    found && return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
+    (any(p -> _pointer_meets(p, rb), ra.ptrs) || any(p -> _pointer_meets(p, ra), rb.ptrs)) &&
+        return :undecided
+    return :none
 end
 
 # How two arguments share memory: `:arrays` when both are arrays, `:fields` when the shared buffer
-# sits in a field of an argument that is not an array, `:none` otherwise. Two arrays that declare
-# their ids are answered by `Base.mightalias` alone, which knows disjoint views of one parent apart
-# and allocates nothing.
+# sits in a field of an argument that is not an array, `:undecided` when the only evidence is a
+# pointer of unknown extent, `:none` otherwise. Two arrays that declare their ids are answered by
+# `Base.mightalias` alone, which knows disjoint views of one parent apart and allocates nothing.
+# It answers `false` for any plain-data array, whatever it points at, so those are compared by
+# address range.
 @inline function _overlap(a, b)
     if a isa AbstractArray && b isa AbstractArray
         Base.mightalias(a, b) && return :arrays
-        (_declares_ids(a) && _declares_ids(b)) && return :none
+        (!isbits(a) && !isbits(b) && _declares_ids(a) && _declares_ids(b)) && return :none
     end
     (_holds_memory(a) && _holds_memory(b)) || return :none
     return _deep_overlap(a, b)
@@ -502,6 +583,18 @@ end
     )
 end
 
+@noinline function _noalias_number_default(target, @nospecialize(f), @nospecialize(args::Tuple), p::Int)
+    q = something(findfirst(x -> x isa AbstractArray, args))
+    throw(
+        ArgumentError(
+            "@assert_noalias $target: argument $p is a `$(typeof(args[p]))`, a number, and the call " *
+                "also takes an array, so the `!` convention does not say which of them " *
+                "`$(_func_name(f))` writes. Name the written positions, for example " *
+                "`mutates = ($q,)`."
+        )
+    )
+end
+
 function _assert_noalias(
         target, @nospecialize(f), @nospecialize(args::Tuple);
         mutates = nothing, default::Bool = isnothing(mutates), gates::Bool = _guarantee_gates(:noalias)
@@ -513,6 +606,11 @@ function _assert_noalias(
     # A position that cannot be written compares nothing, and passing would say the call was checked.
     for p in pos
         _holds_memory(args[p]) || _noalias_unwritable(target, f, args[p], Int(p), default)
+        # A `BigFloat` holds memory, and as the scale factor of `scale!(a, v)` it is no more the
+        # written argument than a `Float64` is. The name alone does not say which the call
+        # writes, so the caller does.
+        (default && args[p] isa Number && any(x -> x isa AbstractArray, args)) &&
+            _noalias_number_default(target, f, args, Int(p))
     end
     # The scan returns on the first overlap and builds the message in a separate frame: a call that
     # satisfies the assertion must allocate nothing, or the assertion changes what it measures.
@@ -525,12 +623,17 @@ end
 
 @noinline function _noalias_fail(target, @nospecialize(args::Tuple), pos, n::Int, gates::Bool)
     overlaps = String[]
+    undecided = String[]
     arrays = false
     for i in pos, j in 1:n
         i == j && continue
         kind = _overlap(args[i], args[j])
         kind === :none && continue
         arrays |= kind === :arrays
+        if kind === :undecided
+            push!(undecided, "argument $i (written) and argument $j")
+            continue
+        end
         # The argument that is not an array is the one whose field holds the shared buffer.
         holder = args[j] isa AbstractArray ? i : j
         push!(
@@ -539,6 +642,19 @@ end
                 "$holder, a `$(typeof(args[holder]))`)"
         )
     end
+    # A pointer of unknown extent that points at the other argument's memory: reported, since
+    # nothing compared says the two do not overlap, and never raised on.
+    if isempty(overlaps)
+        _fail(
+            :noalias, target,
+            "arguments may share memory: " * join(undecided, ", ") * ". A pointer held by one " *
+                "points at memory the other reaches, and how far that pointer's memory extends " *
+                "is not known, so the overlap could not be decided either way.";
+            gates = false
+        )
+        return nothing
+    end
+    isempty(undecided) || append!(overlaps, undecided .* " (a pointer of unknown extent)")
     # Two arrays that overlap are what the kernel reads and writes. A buffer inside a struct
     # argument is shared memory the kernel may never read, so that overlap alone reports.
     _fail(

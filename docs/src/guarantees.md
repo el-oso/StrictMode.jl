@@ -1301,12 +1301,23 @@ So an array type without a `dataids` method, and an argument that is not an arra
 workspace struct, a factorization), is read through its fields, three levels down, and compared by
 the buffers found there.
 
+An array type built on a pointer (a plain-data struct with one `Ptr{T}` field for its `T` elements)
+is compared by the address range it covers: that pointer, for `length` elements. `Base.mightalias`
+answers `false` for every plain-data array, and a view names its parent's start as its data, so
+neither can say whether such an array and a view overlap; the ranges can. Any other pointer field
+of such a type is a handle, and two arrays that share a handle share no element.
+
 Two arrays that overlap raise. An overlap with a buffer held in a field of a non-array argument
 warns: the memory is shared, but nothing says the kernel reads that field.
+A raw pointer anywhere else, such as a field of a struct that is not an array, says where memory
+starts and not how far it reaches. One that points at memory another argument reaches warns that
+the arguments may share memory, and never raises.
 
 ### Which arguments count as written
 
-From the name: a trailing `!` means argument 1, Julia's convention. Anything else must say so with
+From the name: a trailing `!` means argument 1, Julia's convention. A number in that position is
+not taken for the written argument when the call also takes an array: `scale!(2.0, v)` and
+`scale!(big(2.0), v)` are both rejected until `mutates` names the position. Anything else must say so with
 `mutates = (…)`. A call that gives neither is **rejected**, not passed — "nothing is written" would
 compare no pair and accept every call, and a check that cannot fail is worse than no check. Where
 the callee is written as a plain name the rejection happens at macro expansion, before the call
