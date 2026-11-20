@@ -1152,6 +1152,25 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     return out
 end
 
+# The records by what the scan established: a write it read, an atomic write (read, and
+# deliberate), and a site it could not rule out. Each with its heading and the tag its entries carry.
+function _conc_groups(vs::Vector{_ConcViol})
+    writes = filter(v -> v.certain && !v.deliberate, vs)
+    atomics = filter(v -> v.deliberate, vs)
+    undecided = filter(v -> !v.certain && !v.deliberate, vs)
+    return (
+        ("Writes the scan read", "write", writes),
+        ("Atomic writes, which cannot tear", "atomic", atomics),
+        ("Sites the scan could not rule out", "undecided", undecided),
+    )
+end
+
+_conc_counts(groups) = string(
+    length(groups[1][3]), " write(s) the scan read, ",
+    isempty(groups[2][3]) ? "" : string(length(groups[2][3]), " atomic write(s), "),
+    length(groups[3][3]), " site(s) it could not rule out"
+)
+
 function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
@@ -1160,6 +1179,7 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
     # the very thing the certainty split says it could not see.
     # Raise only on a write that is both READ by the scan and not a deliberate atomic one.
     sure = any(v -> v.certain && !v.deliberate, vs)
+    groups = _conc_groups(vs)
     println(
         io,
         sure ?
@@ -1167,12 +1187,20 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
                 "run concurrently" :
             "cannot establish that the plan argument is read-only — sharing it across concurrent " *
             "tasks is unproven, not disproven",
-        " ($(length(vs)) site(s)):"
+        " (", _conc_counts(groups), "):"
     )
-    for (i, v) in enumerate(vs)
-        print(io, "  [", i, "] ", v.message)
-        v.file != "" && print(io, "\n        at ", v.file, ":", v.line)
-        i < length(vs) && println(io)
+    # What the scan proved comes first and under its own heading: among dozens of sites it could
+    # not rule out, the one or two it read are what the reader has to fix.
+    first_group = true
+    for (heading, tag, sites) in groups
+        isempty(sites) && continue
+        first_group || println(io)
+        first_group = false
+        print(io, "  ", heading, " (", length(sites), "):")
+        for (i, v) in enumerate(sites)
+            print(io, "\n  [", tag, " ", i, "] ", v.message)
+            v.file != "" && print(io, "\n        at ", v.file, ":", v.line)
+        end
     end
     # Throws only where the scan READ a write; a record it could not rule out warns instead, which
     # is the same rule `@assert_typestable` and `@assert_trusted` apply to their own uncertain
@@ -1946,14 +1974,20 @@ function _concurrency_safe_finding(
         )
     end
     certain = any(v -> v.certain && !v.deliberate, vs)
+    groups = _conc_groups(vs)
+    # Located at a write the scan read when there is one, and the writes are listed first.
+    at = certain ? groups[1][3][1] : vs[1]
+    listed = String[]
+    for (_, tag, sites) in groups, (i, v) in enumerate(sites)
+        push!(listed, "[" * tag * " " * string(i) * "] " * v.message)
+    end
     return StrictFinding(
         md, fn, sg, :concurrency_safe, certain ? :fail : :info,
-        vs[1].file, vs[1].line,
+        at.file, at.line,
         (
-            certain ? "argument $self is written during the call ($(length(vs)) site(s)): " :
-                "cannot prove argument $self is read-only ($(length(vs)) site(s)): "
-        ) *
-            join((v.message for v in vs), "; "),
+            certain ? "argument $self is written during the call (" :
+                "cannot prove argument $self is read-only ("
+        ) * _conc_counts(groups) * "): " * join(listed, "; "),
         _suggestion(:concurrency_safe), tier, _code(:concurrency_safe)
     )
 end

@@ -1365,3 +1365,48 @@ end
     @test !any(v -> occursin("stores into a value", v.message), shallow_read)
     @test isempty(records(r_get))
 end
+
+@testitem "the concurrency message lists the writes it read before the sites it could not rule out" begin
+    using StrictMode, LinearAlgebra
+
+    mutable struct MPlan
+        buf::Vector{Float64}
+        A::Matrix{Float64}
+        @atomic n::Int
+    end
+    # One write the scan reads, one atomic write, and one BLAS call it cannot read, written with
+    # the undecided one first.
+    mixed(p, x) = (y = p.A * x; @atomic p.n += 1; p.buf[1] = y[1]; nothing)
+    undecided(p, x) = (y = p.A * x; x[1] = y[1]; nothing)
+    p = MPlan(zeros(2), ones(2, 2), 0)
+    x = ones(2)
+
+    msg = try
+        @assert_concurrency_safe mixed(p, x)
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+    @test occursin("1 write(s) the scan read, 1 atomic write(s), 1 site(s) it could not rule out", msg)
+    w = findfirst("Writes the scan read (1):", msg)
+    a = findfirst("Atomic writes, which cannot tear (1):", msg)
+    u = findfirst("Sites the scan could not rule out (1):", msg)
+    @test !isnothing(w) && !isnothing(a) && !isnothing(u)
+    @test first(w) < first(a) < first(u)
+    @test occursin(r"\[write 1\] stores into a buffer reachable from the plan", msg)
+    @test occursin(r"\[atomic 1\] .*ATOMIC", msg)
+    @test occursin(r"\[undecided 1\] hands a plan-reachable pointer to (the|a) foreign function", msg)
+    @test first(findfirst("[write 1]", msg)) < first(findfirst("[undecided 1]", msg))
+
+    # With nothing read, there is no heading for writes, and the call warns.
+    @test_logs (:warn, r"cannot establish.*0 write\(s\) the scan read.*Sites the scan could not rule out \(1\):.*\[undecided 1\]"s) match_mode = :any @assert_concurrency_safe undecided(p, x)
+
+    # The finding a sweep gives says the same, in one line, and points at the write.
+    f = only(findings(mixed, (MPlan, Vector{Float64}); guarantees = (:concurrency_safe,)))
+    @test StrictMode._failed(f)
+    @test occursin("1 write(s) the scan read, 1 atomic write(s), 1 site(s) it could not rule out", f.reason)
+    @test first(findfirst("[write 1]", f.reason)) < first(findfirst("[undecided 1]", f.reason))
+    g = only(findings(undecided, (MPlan, Vector{Float64}); guarantees = (:concurrency_safe,)))
+    @test g.status === :info
+    @test occursin("[undecided 1]", g.reason) && !occursin("[write", g.reason)
+end

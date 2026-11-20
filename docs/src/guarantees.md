@@ -1369,11 +1369,16 @@ end
 # ERROR: StrictViolation (@concurrency_safe): guarantee not satisfied
 #   target:  apply_counted!(CountingPlan(ones(4), 0), ones(4))
 #   reason:  writes state that concurrent tasks share (the plan argument, or a global) — NOT safe
-#            to run concurrently (1 site(s)):
-#              [1] writes field `calls` of the plan argument directly (`setfield!`) — the plan is
-#                  mutated during apply
+#            to run concurrently (1 write(s) the scan read, 0 site(s) it could not rule out):
+#              Writes the scan read (1):
+#              [write 1] writes field `calls` of the plan argument directly (`setfield!`) — the
+#                  plan is mutated during apply
 #                    at …
 ```
+
+The message lists what the scan read first, each entry marked `[write n]`, then atomic writes as
+`[atomic n]`, then the sites it could not rule out as `[undecided n]`. Only a `[write n]` entry
+makes the call raise, so in a long report those are the ones to fix.
 
 The fix is to move what the call writes out of the shared object: return the count, or keep it in
 an argument that each task owns.

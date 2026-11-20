@@ -831,7 +831,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   `_BASE_MUTATORS` callee with the plan at its written position, or a `memmove`-class foreign
   function with the plan at its destination) and left `false` at every "flagged conservatively" or
   "not read" site, a foreign function with no known effect among them, and
-  `_assert_concurrency_safe` raises only when `any(v -> v.certain, vs)`. `typestability.jl` and
+  `_assert_concurrency_safe` raises only when `any(v -> v.certain, vs)`. Its message and the sweep's
+  finding list the records by `_conc_groups`: writes the scan read first, marked `[write n]`, then
+  atomic ones, then `[undecided n]`; a report of 77 sites in which two are proved is otherwise
+  unusable. `typestability.jl` and
   `trusted.jl` do the same for their own uncertain signals. The DEFAULT on a new record is
   `certain = false`, so an unclassified one warns.
 
