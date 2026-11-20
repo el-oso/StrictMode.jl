@@ -147,6 +147,16 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     overridden = _untrusted_getproperty_overridden()
     for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
+        # `invoke(f, T, args...)` calls `f` on `args`, whichever method `T` selects.
+        if callee === Core.invoke && length(args) >= 2
+            callee, args = _unopt_callee(ci, args[1]), args[3:end]
+        end
+        # The escape hatch handed to another call — `map(unsafe_trust, us)`, `unsafe_trust.(us)`,
+        # `u |> unsafe_trust` — reads a payload wherever it is applied: its one method takes an
+        # `Untrusted`. Comparing a value with it applies it to nothing.
+        if !(callee in (===, !==, ==, !=, isequal)) && any(a -> _unopt_callee(ci, a) === unsafe_trust, args)
+            push!(certain, nameof(unsafe_trust))
+        end
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
         T = _unopt_arg_type(ci, args[1])
         T isa Type || continue
@@ -317,7 +327,8 @@ Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f`
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
 The read is any call to `getfield`, `getproperty`, or [`unsafe_trust`](@ref) on an argument
-that inference types as `<:Untrusted`. Registering `f` with [`trust_boundary!`](@ref) permits all of
+that inference types as `<:Untrusted`, directly or through `invoke`, and `unsafe_trust` handed to
+another call as a value (`map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`). Registering `f` with [`trust_boundary!`](@ref) permits all of
 them in that one method.
 
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized

@@ -384,3 +384,27 @@ end
     other_first(t) = (n = getfield(t, 2); v = getfield(t, 1); push!(SINK, v); n)
     @test status(other_first, (Any,)).status === :pass
 end
+
+@testitem "the escape hatch is a read when it is passed as a value or invoked" begin
+    using StrictMode
+
+    const U8 = Untrusted{Vector{UInt8}}
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    piped(u::U8) = length(u |> unsafe_trust)
+    mapped(us::Vector{U8}) = map(unsafe_trust, us)
+    dotted(us::Vector{U8}) = unsafe_trust.(us)
+    invoked(u::U8) = invoke(getproperty, Tuple{Any, Symbol}, u, :x)
+    for (f, T) in ((piped, (U8,)), (mapped, (Vector{U8},)), (dotted, (Vector{U8},)), (invoked, (U8,)))
+        r = status(f, T)
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    u = Untrusted(UInt8[1, 2])
+    @test_throws StrictViolation @assert_trusted piped(u)
+
+    # Comparing with the escape hatch reads nothing, and `invoke` of another function is that call.
+    is_hatch(f) = f === unsafe_trust
+    @test status(is_hatch, (Any,)).status === :pass
+    invoked_clean(x::Vector{UInt8}) = invoke(length, Tuple{AbstractVector}, x)
+    @test status(invoked_clean, (Vector{UInt8},)).status === :pass
+end

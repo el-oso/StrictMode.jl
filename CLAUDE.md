@@ -231,7 +231,9 @@ StrictMode/src/
                         is read SECOND nothing between them that can hand the payload on — a call
                         other than getfield, a foreigncall, a global store — so a read on the other
                         arm of a type test clears nothing), and when the operand is what
-                        iterate/indexed_iterate returned. An erased TWO-argument `getproperty` is NOT
+                        iterate/indexed_iterate returned. `invoke(f, T, args...)` is read as
+                        f(args...), and unsafe_trust as an operand of any call but a comparison is
+                        a certain read. An erased TWO-argument `getproperty` is NOT
                         reported while StrictMode's own method, which raises whatever the name,
                         is the only one an Untrusted reaches; once a package defines a more
                         specific getproperty for one (_untrusted_getproperty_overridden, asked
