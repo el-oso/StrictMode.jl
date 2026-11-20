@@ -583,8 +583,9 @@ const _VEC_RE = r"<(?:vscale x )?\d+ x "
 const _VECTORIZER_SCAFFOLD_RE = r"\b(?:vector\.ph|vector\.body|middle\.block|scalar\.ph|min\.iters\.check|bc\.resume\.val)\b"
 
 # Split the optimized text IR into loop regions. A loop is a back-edge: a `br … label %X` whose target
-# label `X` is defined *at or before* the branch line. The region is the IR text from the loop header
-# (label `X`) through the back-edge line — enough to scan that one loop for vector vs scalar ops.
+# label `X` is defined *at or before* the branch line. Every label a `br` names is a candidate: a
+# conditional latch lists its loop header first as often as last. The region is the IR text from the
+# loop header (label `X`) through the back-edge line — enough to scan that one loop for vector vs scalar ops.
 # Coarse (text, not a CFG), but enough to reason per-loop instead of whole-function.
 function _loop_regions(ir::AbstractString)
     lines = split(ir, '\n')
@@ -595,7 +596,8 @@ function _loop_regions(ir::AbstractString)
     end
     regions = String[]
     for (i, l) in enumerate(lines)
-        for m in eachmatch(r"\bbr\b[^\n]*\blabel %([A-Za-z0-9._]+)", l)
+        occursin(r"\bbr\b", l) || continue
+        for m in eachmatch(r"\blabel %([A-Za-z0-9._]+)", l)
             j = get(labelpos, m.captures[1], 0)
             0 < j <= i && push!(regions, join(view(lines, j:i), '\n'))   # back-edge ⇒ loop region
         end
