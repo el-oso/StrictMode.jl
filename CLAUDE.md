@@ -233,7 +233,8 @@ StrictMode/src/
                         :no_threadid_state is IN _GUARANTEES, so a sweep covers it with no
                         annotation; check.jl clears a signature outright when the compiler proves
                         A sweep has nowhere to name WHICH argument is shared, so it reads argument
-                        1: a `!` method therefore gets :info (its name declares that write) and an
+                        1: a `!` method therefore gets :info (its name declares that write), unless
+                        the scan read a write to a constant global, which stays :fail, and an
                         isbits first argument reports nothing (a copy cannot be written through,
                         and seeding it taints every index derived from it, which made a store into
                         the method own fresh buffer read as a shared write). Both measured in the

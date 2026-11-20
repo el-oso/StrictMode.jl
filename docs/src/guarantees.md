@@ -1749,7 +1749,8 @@ measured in the field rather than reasoned about:
   finding that write is reading the convention back rather than finding a defect. The suggestion
   names the fix — `@assert_concurrency_safe self=N f(…)` at a call site, where you can say which
   argument is actually shared. On one package this was 92 of 134 sweep failures; on another, 755 of
-  762.
+  762. The name says nothing about global state, so a `!` method still gets `:fail` when the scan
+  reads a write to a constant global.
 - **An `isbits` first argument reports nothing at all.** A copy cannot be written through, so the
   guarantee holds trivially — and seeding it as shared taints every index derived from it, which
   made a store into a buffer the method allocated *itself* read as a write to the shared object.

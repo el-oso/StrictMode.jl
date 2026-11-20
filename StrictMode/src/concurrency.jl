@@ -2126,8 +2126,10 @@ function _concurrency_safe_finding(
     # question the guarantee is about, and it says so as `:info` rather than failing. It must not
     # report `:pass`: "could not check here" and "is read-only" are different answers. Measured in
     # the field before this: 92 of 134 sweep failures on one package were `!` methods writing their
-    # own first argument, which buried the 42 that were not.
-    if bang
+    # own first argument, which buried the 42 that were not. The name declares a write to an
+    # argument and nothing about a global, so a write to process-global state the scan read is
+    # still `:fail`.
+    if bang && !any(v -> v.certain && !v.deliberate && v.global_state, vs)
         return StrictFinding(
             md, fn, sg, :concurrency_safe, :info, vs[1].file, vs[1].line,
             "a `!` name declares that argument $self is written, so the sweep cannot tell a " *

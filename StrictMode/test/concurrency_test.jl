@@ -1653,3 +1653,21 @@ end
     @test_throws StrictViolation @assert_concurrency_safe G.g_ptr(G.Plan([1.0]))
 end
 
+
+@testitem "a `!` name does not excuse a write to a global in a sweep" begin
+    using StrictMode
+
+    module BangGlobal
+    const G = zeros(2)
+    reset!(v::Vector{Float64}) = (G[1] = v[1]; nothing)
+    own!(v::Vector{Float64}) = (v[1] = 0.0; nothing)
+    end
+    B = BangGlobal
+    f = only(findings(B.reset!, (Vector{Float64},); guarantees = (:concurrency_safe,)))
+    @test StrictMode._failed(f)
+    @test !occursin("declares that argument 1 is written", f.reason)
+    # A `!` method writing only its first argument is still the convention read back.
+    f = only(findings(B.own!, (Vector{Float64},); guarantees = (:concurrency_safe,)))
+    @test f.status === :info
+end
+
