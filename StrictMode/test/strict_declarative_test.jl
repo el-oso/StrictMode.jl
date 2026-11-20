@@ -154,6 +154,16 @@ end
     @test_throws "`@strict_function signatures = [...]`" load("module AccGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
     # An exemption from none of the policy's guarantees does not account for the method.
     @test_throws "none is checked or accounted for" load("module AccOther; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    # Nor does one from only some of them: under `:default`, a `:noalloc` exemption leaves
+    # `:typestable` and `:noboxing` unanswered.
+    @test_throws "none is checked or accounted for" load("module AccPart; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end")
+    @test_throws "none is checked or accounted for" load("module AccPartTypes; using StrictMode; @strict_exempt :noalloc types = (Vector{Int},) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end")
+    # Exemptions that together name every guarantee of the policy do account for it.
+    @test load("module AccEvery; using StrictMode; @strict_exempt (:typestable, :noalloc, :noboxing) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end") isa Module
+    @test load("module AccSplit; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_exempt (:typestable, :noboxing) gen; @strict_policy :default; end") isa Module
+    # A signature-narrowed exemption counts like a declared instantiation: the method is accounted
+    # for, and only the named signature is excused when it is checked.
+    @test load("module AccTypes; using StrictMode; @strict_exempt types = (Vector{Int},) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end") isa Module
     # A filter that leaves only an undeclared generic method checks nothing.
     @test_throws "none is checked or accounted for" load("module AccOnly; using StrictMode; ok(x::Int) = x; gen(x::AbstractVector) = sum(x); @strict_policy :typestable only = (:gen,); end")
     # A struct beside an undeclared generic method: the constructor is accounted for, and the

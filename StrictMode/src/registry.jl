@@ -857,10 +857,12 @@ end
 
 # For a policy line that had no concrete method to check: `nothing` when some method above it is
 # accounted for anyway, else how many methods it left unread. Accounted for means the policy has
-# an answer for the method without checking it here: it is exempt (by `@strict_exempt` from a
-# guarantee in `policy`, or by this line's own `exempt`), its instantiations are declared with
-# `@strict_function signatures = [...]`, or it is a macro, a constructor or a callable object's
-# method, none of which the policy judges. Only generic methods nobody declared are left unread.
+# an answer for the method without checking it here: it is exempt (by `@strict_exempt` from every
+# guarantee in `policy`, across one or more exemptions, or by this line's own `exempt`), its
+# instantiations are declared with `@strict_function signatures = [...]`, or it is a macro, a
+# constructor or a callable object's method, none of which the policy judges. Only generic methods
+# nobody declared are left unread. An exemption narrowed with `types = (...)` counts here like a
+# declared instantiation: it names a signature of the method, though not every one.
 function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
     ms, skipped = module_methods(mod; only, exempt)
     (get(skipped, :exempt, 0) > 0 || get(skipped, :constructor, 0) > 0) && return nothing
@@ -870,7 +872,7 @@ function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
         startswith(String(m.name), "@") && return nothing
         ft = _method_function(m)
         (ft isa DataType && isdefined(ft, :instance)) || return nothing   # a callable object's
-        any(g -> _is_exempt(ft.instance, m, g), policy) && return nothing
+        all(g -> _is_exempt(ft.instance, m, g), policy) && return nothing
     end
     return length(ms)
 end

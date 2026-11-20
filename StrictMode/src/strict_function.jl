@@ -563,7 +563,10 @@ is written. A method defined below the line is not read. A policy raises an `Arg
 no method above its line is checked or accounted for: written first in a module it would load
 cleanly over methods it never looked at. A method is accounted for when it is exempt, when its
 instantiations are declared with `@strict_function signatures = [...]`, or when it is a
-constructor, a macro or a callable object's method. Place it at the end of the module, or wrap
+constructor, a macro or a callable object's method. An exemption accounts for a method only when
+it covers every guarantee in the policy, alone or with others: under `:default`,
+`@strict_exempt :noalloc` leaves `:typestable` and `:noboxing` unanswered. One narrowed with
+`types = (...)` counts like a declared instantiation. Place it at the end of the module, or wrap
 the module with `@strict module`. A method whose own signature is not concrete cannot be checked
 at load (a generic declaration infers to `Any`); declare its instantiations with
 [`@strict_function`](@ref)'s `signatures = [...]`, or gate on them from the test environment with

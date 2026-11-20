@@ -80,8 +80,11 @@ method above its line is checked or accounted for: nothing is defined above it, 
 methods that nobody declared. Written first, it would otherwise load cleanly over a module it never
 looked at. A method is accounted for when it is exempt, when its instantiations are declared with
 `@strict_function signatures = [...]`, or when it is a constructor, a macro or a callable object's
-method. `@strict module … end` wraps the whole module and has no such position, and `check = false`
-records a policy without checking.
+method. Exempt means exempt from every guarantee the policy names, by one exemption or several: under
+`:default`, `@strict_exempt :noalloc` alone leaves `:typestable` and `:noboxing` unanswered and does
+not count. An exemption narrowed to a signature with `types = (...)` counts, as a declared
+instantiation does. `@strict module … end` wraps the whole module and has no such position, and
+`check = false` records a policy without checking.
 
 ### Declaring a narrower set, rather than excusing a guarantee
 

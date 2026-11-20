@@ -50,9 +50,9 @@ that is a note, because a module's error helpers are not defects. Where the sign
 (`test_signatures`, a `@verify_strict` line, `@strict_function signatures = [...]`) it is a failure.
 
 A module policy is a sweep with a position. `@strict_policy` checks only the methods defined above
-it, and raises when none of them is checked or accounted for (exempt, declared with
-`signatures = [...]`, a constructor, a macro or a callable object's method), so it is written at
-the end of the module ([Automating](automating.md)).
+it, and raises when none of them is checked or accounted for (exempt from every guarantee in the
+policy, declared with `signatures = [...]`, a constructor, a macro or a callable object's
+method), so it is written at the end of the module ([Automating](automating.md)).
 
 Whether a failure throws or warns depends on how sure the check is. A check that observes what it
 reports throws: it read compiled output, the type the compiler assigned, or a store in the IR. A
