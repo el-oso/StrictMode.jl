@@ -78,8 +78,9 @@ end
 
     opt_kernel(x::Vector{Float64}) = sum(x)
     accepted = Dict(
-        "@test_noalloc" => "`types`", "@test_noboxing" => "`types`", "@test_typestable" => "`types`",
-        "@test_trim_compatible" => "`types`", "@test_strict" => "`types`", "@test_kernel" => "`types`",
+        "@test_noalloc" => "`types`, `allow_exempt`", "@test_noboxing" => "`types`, `allow_exempt`",
+        "@test_typestable" => "`types`, `allow_exempt`", "@test_trim_compatible" => "`types`, `allow_exempt`",
+        "@test_strict" => "`types`, `allow_exempt`", "@test_kernel" => "`types`, `allow_exempt`",
         "@test_steady_state" => "`warmups`, `repeats`, `fresh_task`",
         "@test_no_gc_pause" => "`samples`, `warmups`, `max_collections`, `max_q99_ms`, `slow_factor`",
         "@test_allocated_zero" => "`warmups`, `windows`",
@@ -100,4 +101,8 @@ end
     @test_throws "unknown guarantee :noaloc" proof_findings(ProofOptValues.k, (Vector{Float64},); guarantees = (:noaloc,))
     @test_throws "require must be :all or :public, got some" test_coverage(ProofOptValues; require = :some)
     @test_throws MethodError test_registered(; isolate = false)
+    # `allow_exempt` is an option of the gates, and a misspelling of it is not.
+    @test_throws "unknown option `allow_exempts`" @eval @test_noalloc allow_exempts = true opt_kernel([1.0])
+    @test_throws MethodError test_signatures([(ProofOptValues.k, (Vector{Float64},))]; allow_exempts = true)
+    @test (@test_noalloc allow_exempt = true opt_kernel([1.0])) == 1.0
 end

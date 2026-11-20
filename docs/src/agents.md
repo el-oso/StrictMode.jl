@@ -112,9 +112,13 @@ Each finding is one object (here pretty-printed):
   "file": "kernels.jl",
   "line": 42,
   "reason": "boxing / dynamic dispatch",
-  "suggestion": "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter."
+  "suggestion": "boxing / runtime tuple index: use @unroll for fixed-size loops, or dispatch the size into a Val{N} type parameter.",
+  "exempt_by": []
 }
 ```
+
+`exempt_by` is empty except on the allocation proof's SM0018 note, where it lists the functions
+exempt from `:noalloc` that account for every allocation, as `{"function": …, "reason": …}`.
 
 `guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |
 no_scalar_loops | no_spill | trim_compatible | trusted`; the

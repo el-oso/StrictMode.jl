@@ -130,6 +130,16 @@ from AllocCheck's all-paths proof. `divergence_report` / `StrictDivergence` run 
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
 *categories*, and versions only — that you can send to the maintainers to fix the scan.
 
+A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
+dropped. A call whose every allocation lies inside such functions gets a result of its own from the
+proof: status `:info`, code SM0018, and an `exempt_by` field listing each exempt function with the
+`reason` its exemption gave. It is never a pass. `@test_noalloc`, `test_signatures`, `test_compiled`
+and `test_registered` fail it, unless given `allow_exempt = true`, which accepts those exemptions
+for that check. One allocation outside an exempt function makes it an ordinary failure either way,
+and so does an exempt callee that was inlined, since its allocation then belongs to the caller's
+own code. The exemption is matched on the method, so a function of the same name in another
+module excuses nothing.
+
 ```@docs
 ignore_barrier
 set_ignore_barrier!

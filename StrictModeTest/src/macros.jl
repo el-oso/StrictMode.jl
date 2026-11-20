@@ -9,8 +9,12 @@
 
 # Prove `guarantees` and raise if any fails. `kind` names the macro in the exception, so a
 # composite reports as `@strict`/`@kernel` rather than as whichever of its parts failed first.
-function _test_guarantee(kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple))
+function _test_guarantee(
+        kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple);
+        allow_exempt::Bool = false
+    )
     fs = StrictMode._gate_always_throws(_proof_findings(f, types, guarantees))
+    fs = StrictMode._gate_exempt_only(fs, allow_exempt)
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return nothing
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -21,7 +25,7 @@ end
 # prove the guarantees, hand the value back. One `_proof_findings` call covers a composite, so
 # `@test_kernel` runs AllocCheck once rather than once per bundled guarantee.
 function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, args)
-    pos, opts = StrictMode._macro_call(macroname, args, (:types,))
+    pos, opts = StrictMode._macro_call(macroname, args, (:types, :allow_exempt))
     isempty(pos) && throw(ArgumentError("$macroname needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -29,7 +33,7 @@ function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, ar
     return quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(StrictMode._opaque_function(:($(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types))), p.checkfn))
+        $(StrictMode._opaque_function(:($(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types); allow_exempt = $(esc(get(opts, :allow_exempt, false))))), p.checkfn))
         _val
     end
 end
@@ -47,6 +51,11 @@ or a CI gate should use. Each argument is evaluated once and the macro returns t
 Allocations on never-taken throw branches are ignored by default — see [`StrictMode.set_ignore_throw!`](@ref) —
 as is a call whose only allocation is a recognized one-time-init barrier
 (see [`set_ignore_barrier!`](@ref)).
+
+A call that allocates only inside functions exempted from `:noalloc` with `@strict_exempt` is not
+a pass. It fails, with code SM0018, and the message lists each exempt function with the reason its
+exemption gave. `allow_exempt = true` accepts those exemptions for this check: the call then
+passes if nothing else allocates, and still fails if one site is its own.
 
 ```julia
 @test_noalloc dot3(a, b)              # ok

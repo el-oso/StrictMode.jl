@@ -601,7 +601,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         load unless StrictMode.checks_enabled() (otherwise every @assert_* is a
                         bare call, nothing registers, and test_registered() sweeps an empty
                         registry and passes), then announces the proof tier.
-  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _opt_reports (JET,
+  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _exempt_only (a call
+                        whose EVERY allocation site has a frame whose method is exempt from
+                        :noalloc is its own result: :info, SM0018, with StrictFinding.exempt_by
+                        listing each exempt function and its reason. NEVER a pass — the gates
+                        turn it into :fail through StrictMode._gate_exempt_only unless given
+                        `allow_exempt = true`. One site without an exempt frame, or an exempt
+                        callee that was inlined and so has no frame, is a plain failure; the match
+                        is StrictMode._mi_exemption, on the method module and name), _opt_reports (JET,
                         wrapped in AnalysisError). _is_boxing drops a DynamicDispatch that is a C
                         VARARGS call (_c_varargs_call): AllocCheck lists a `ccall` with a required-
                         argument count as a dispatch to an unknown target, and Base.trypoptask holds

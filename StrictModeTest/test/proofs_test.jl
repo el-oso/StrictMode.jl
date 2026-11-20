@@ -198,7 +198,7 @@ end
     only_grows(n::Int) = (b = xgrow_proof!(n); b[1])
     end
     ExemptProof.only_grows(4)
-    # The scan reports the caller as a note; the proof still sees the allocation.
+    # The scan reports the caller as a note; the proof still sees the allocation, and its gate fails.
     @test only(StrictMode.findings(ExemptProof.only_grows, (Int,); guarantees = (:noalloc,))).status === :info
     @test_throws StrictViolation @test_noalloc ExemptProof.only_grows(4)
 end
@@ -438,4 +438,87 @@ end
     @test !failed(rp_allocating)
     @test failed(rp_generic)
     @test failed(rp_caller)
+end
+
+@testitem "a caller that allocates only inside exempt functions is noted, not passed" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ExemptOnly
+    using StrictMode
+    const POOL = Ref(Float64[])
+    # A pool that grows to a high-water mark: exempt from `:noalloc`, with the reason.
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    StrictMode._exempt!(:grow!, ExemptOnly; guarantees = (:noalloc,), reason = "pool grows to a high-water mark")
+    const TABLE = Ref(Int[])
+    @noinline function table!(n::Int)
+        length(TABLE[]) < n && (TABLE[] = collect(1:n))
+        return TABLE[]
+    end
+    StrictMode._exempt!(:table!, ExemptOnly; guarantees = (:noalloc,), reason = "index table built once per size")
+    @inline function grow_inlined!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    StrictMode._exempt!(:grow_inlined!, ExemptOnly; guarantees = (:noalloc,), reason = "inlined growth")
+
+    only_grows(n::Int) = (b = grow!(n); b[1])
+    two_exempt(n::Int) = (b = grow!(n); t = table!(n); b[1] + t[1])
+    # PureBLAS's control: one exempt growth and one allocation of the caller's own.
+    grows_and_allocs(n::Int) = (b = grow!(n); sum(zeros(n)) + b[1])
+    inlined(n::Int) = (b = grow_inlined!(n); b[1])
+    clean(n::Int) = n + 1
+    end
+    # A function of the same name in another module is not the exempt one.
+    module ExemptOther
+    @noinline grow!(n::Int) = zeros(n)
+    caller(n::Int) = (b = grow!(n); b[1])
+    end
+    E = ExemptOnly
+    E.only_grows(4); E.two_exempt(4); E.grows_and_allocs(4); E.inlined(4); ExemptOther.caller(4)
+    proof(f) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,)))
+
+    r = proof(E.only_grows)
+    @test r.status === :info
+    @test r.code === :SM0018
+    @test r.exempt_by == ("grow!" => "pool grows to a high-water mark",)
+    @test occursin("allocates only inside", r.reason) && occursin("`grow!`", r.reason)
+    @test !StrictMode._failed(r)
+    two = proof(E.two_exempt)
+    @test two.status === :info
+    @test Set(first.(two.exempt_by)) == Set(["grow!", "table!"])
+    @test ("table!" => "index table built once per size") in two.exempt_by
+
+    # Never a pass: every gate fails it, and says which functions it is exempt by.
+    @test_throws StrictViolation @test_noalloc E.only_grows(4)
+    @test_throws "pool grows to a high-water mark" @test_noalloc E.only_grows(4)
+    @test_throws "allow_exempt = true" test_signatures([(E.only_grows, (Int,))]; guarantees = (:noalloc,))
+    @test_throws StrictViolation test_compiled(E; guarantees = (:noalloc,), only = [:only_grows])
+    # …unless the caller accepts the exemptions by name.
+    @test (@test_noalloc allow_exempt = true E.only_grows(4)) == E.POOL[][1]
+    ok = test_signatures([(E.only_grows, (Int,))]; guarantees = (:noalloc,), allow_exempt = true)
+    @test only(ok).status === :info && only(ok).code === :SM0018
+    @test test_compiled(E; guarantees = (:noalloc,), only = [:only_grows], allow_exempt = true) isa Vector
+
+    # One site of the caller's own makes it an ordinary failure, with or without the opt-in.
+    mixed = proof(E.grows_and_allocs)
+    @test mixed.status === :fail && mixed.code !== :SM0018 && isempty(mixed.exempt_by)
+    @test_throws StrictViolation @test_noalloc allow_exempt = true E.grows_and_allocs(4)
+    @test_throws StrictViolation test_signatures([(E.grows_and_allocs, (Int,))]; guarantees = (:noalloc,), allow_exempt = true)
+
+    # An exempt callee that was inlined leaves no frame of its own to match, so the allocation is
+    # the caller's: an ordinary failure.
+    inl = proof(E.inlined)
+    @test inl.status === :fail && inl.code !== :SM0018
+    @test_throws StrictViolation @test_noalloc allow_exempt = true E.inlined(4)
+
+    # The exemption is the method's, not the name's.
+    other = proof(ExemptOther.caller)
+    @test other.status === :fail && other.code !== :SM0018
+
+    # A clean call is a pass either way, and the code has a meaning.
+    @test proof(E.clean).status === :pass
+    @test occursin("exempt", StrictMode.explain(:SM0018))
 end

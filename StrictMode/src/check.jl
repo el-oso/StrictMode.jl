@@ -63,13 +63,26 @@ const _ALWAYS_THROWS_FIX = "nothing is wrong if this is an error helper, or a lo
 
 _always_throws_finding(x::StrictFinding, status::Symbol) = StrictFinding(
     x.mod, x.func, x.signature, x.guarantee, status, x.file, x.line,
-    _ALWAYS_THROWS_WHY, _ALWAYS_THROWS_FIX, x.tier, :SM0208, x.policy
+    _ALWAYS_THROWS_WHY, _ALWAYS_THROWS_FIX, x.tier, :SM0208, x.policy, x.exempt_by
 )
 
 # The findings of a signature that always throws: each pass becomes the `:info` note. A failure
 # stays, since it reports something the analysis did read (a throw path, with `ignore_throw` off).
 _mark_always_throws(fs::Vector{StrictFinding}) =
     StrictFinding[x.status === :pass ? _always_throws_finding(x, :info) : x for x in fs]
+
+# The allocation proof's note for a call that allocates only inside functions exempt from
+# `:noalloc` (SM0018) is not a pass. A gate fails it unless its caller accepted the exemptions.
+const _EXEMPT_ONLY_FIX = "every allocation is inside a function exempted from :noalloc. Accept " *
+    "the exemptions listed above for this check with `allow_exempt = true`, or remove the " *
+    "allocation or the exemption"
+
+_gate_exempt_only(fs::Vector{StrictFinding}, allow_exempt::Bool) = allow_exempt ? fs : StrictFinding[
+    (x.code === :SM0018 && x.status === :info) ? StrictFinding(
+            x.mod, x.func, x.signature, x.guarantee, :fail, x.file, x.line, x.reason,
+            _EXEMPT_ONLY_FIX, x.tier, x.code, x.policy, x.exempt_by
+        ) : x for x in fs
+]
 
 # For a caller that named the signature: the note is a failure.
 _gate_always_throws(fs::Vector{StrictFinding}) = StrictFinding[

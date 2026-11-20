@@ -1,21 +1,18 @@
 @testitem "divergence_report — flags scan-vs-proof disagreement, IP-free" begin
     using StrictMode, StrictModeTest
 
-    # A callee exempt from :noalloc allocates. The scan excuses it by declaration; the AllocCheck
-    # proof does not, so the two disagree in the direction a divergence report exists to surface:
-    # the scan passes and the proof fails.
+    # A store into a `Dict` can grow its table, several calls down in Base. The scan reads Base to
+    # a fixed depth and finds nothing; the AllocCheck proof reads all of it. So the two disagree
+    # in the direction a divergence report exists to surface: the scan passes and the proof fails.
     module Quux
-    using StrictMode
     struct QuuxBox
         n::Int
     end
-    @noinline quux_grow(n::Int) = (v = Float64[]; push!(v, n); v)
-    @strict_exempt :quux_grow
-    quux_top(b::QuuxBox) = quux_grow(b.n)
+    quux_top(b::QuuxBox, d::Dict{Int, Float64}) = (d[b.n] = 1.0; nothing)
     end
-    Quux.quux_top(Quux.QuuxBox(1))
+    Quux.quux_top(Quux.QuuxBox(1), Dict{Int, Float64}())
 
-    d = divergence_report(Quux.quux_top, (Quux.QuuxBox,))
+    d = divergence_report(Quux.quux_top, (Quux.QuuxBox, Dict{Int, Float64}))
     @test !isempty(d)
     @test any(t -> t[1] === :noalloc && t[2] == false && t[3] == true, d.diverged)
 

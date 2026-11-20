@@ -28,6 +28,11 @@ guesses that nothing gates on, and `:proof` is `StrictModeTest`'s AllocCheck/JET
 its drivers do gate. A saved `:jsonlines` file read by another process, or by another session, has
 no other way to tell a guess from a proof.
 
+`exempt_by` is empty except on the allocation proof's SM0018 note: a call whose every allocation
+lies inside a function exempted from `:noalloc`. It lists each such function with the `reason` its
+exemption gave, as `"name" => "reason"`, so the reader of a result sees what was excused and why
+without looking the exemptions up.
+
 [`key`](@ref) is the identity of a finding across runs, and [`findings_diff`](@ref) compares two
 runs by it.
 """
@@ -44,7 +49,14 @@ struct StrictFinding
     tier::Symbol
     code::Symbol
     policy::String
+    exempt_by::Tuple{Vararg{Pair{String, String}}}
 end
+
+StrictFinding(
+    mod, func, signature, guarantee, status, file, line, reason, suggestion, tier, code, policy
+) = StrictFinding(
+    mod, func, signature, guarantee, status, file, line, reason, suggestion, tier, code, policy, ()
+)
 
 # The reporting tier and the guarantee's own code are the defaults, so the shorter forms keep their
 # meaning: every construction site inside StrictMode is a value-free verdict, and a site that has
@@ -184,6 +196,9 @@ function Base.show(io::IO, ::MIME"text/plain", fs::AbstractVector{StrictFinding}
             print(io, "\n ", f)
             f.file == "" || print(io, "\n     at ", f.file, ":", f.line)
             f.policy == "" || print(io, "\n     required by ", f.policy)
+            for (name, why) in f.exempt_by
+                print(io, "\n     exempt by `", name, "`", why == "" ? "" : ": " * why)
+            end
             f.suggestion == "" || print(io, "\n     → ", f.suggestion)
         end
         length(group) > 20 && print(io, "\n … and ", length(group) - 20, " more ", label)
@@ -231,6 +246,9 @@ function _fmt_text(io::IO, fs)
         if _failed(f) || f.status === :info
             f.file != "" && println(io, "      at ", f.file, ":", f.line)
             f.policy != "" && println(io, "      required by ", f.policy)
+            for (name, why) in f.exempt_by
+                println(io, "      exempt by `", name, "`", why == "" ? "" : ": " * why)
+            end
             f.suggestion != "" && println(io, "      → ", f.suggestion)
         end
     end
@@ -275,7 +293,16 @@ function _json_obj(io::IO, f::StrictFinding)
         _json_str(io, v)
         print(io, ",")
     end
-    print(io, "\"line\":", f.line, "}")
+    print(io, "\"exempt_by\":[")
+    for (i, (name, why)) in enumerate(f.exempt_by)
+        i > 1 && print(io, ",")
+        print(io, "{\"function\":")
+        _json_str(io, name)
+        print(io, ",\"reason\":")
+        _json_str(io, why)
+        print(io, "}")
+    end
+    print(io, "],\"line\":", f.line, "}")
     return nothing
 end
 

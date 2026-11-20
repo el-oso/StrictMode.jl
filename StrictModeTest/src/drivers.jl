@@ -20,7 +20,7 @@ function _trim_sigs(items)
     return sigs
 end
 
-function _gate(items, kind::Symbol, target::AbstractString)
+function _gate(items, kind::Symbol, target::AbstractString; allow_exempt::Bool = false)
     isempty(items) && @warn "StrictModeTest.$kind: nothing to prove for `$target` (0 signatures). " *
         "This result is green because it checked nothing, not because anything passed. A module " *
         "sweep needs its kernels exercised first (a concrete specialization must exist), and an " *
@@ -38,6 +38,9 @@ function _gate(items, kind::Symbol, target::AbstractString)
     # A listed signature is one its author expects to return; in a sweep, a signature that always
     # throws is an error helper and stays a note.
     kind === :test_signatures && (fs = StrictMode._gate_always_throws(fs))
+    # A call that allocates only inside exempt functions is a note from the proof and a failure
+    # at a gate, unless the gate's caller accepted the exemptions.
+    fs = StrictMode._gate_exempt_only(fs, allow_exempt)
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -61,12 +64,17 @@ test_signatures([
     (gemm!, (Matrix{Float64}, Matrix{Float64}, Matrix{Float64})),
 ])
 ```
+
+A signature that allocates only inside functions exempted from `:noalloc` is not a pass: the proof
+reports it as an SM0018 note that lists the exempt functions and their reasons, and this gate, like
+`test_compiled`, `test_registered` and `@test_noalloc`, fails it. `allow_exempt = true` accepts the
+exemptions for this gate, which then passes it when nothing else allocates.
 """
-function test_signatures(pairs; guarantees = (:typestable, :noalloc))
+function test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exempt::Bool = false)
     # A name no guarantee has is a mistake in the call, not a failing signature.
     StrictMode._check_guarantees(guarantees)
     items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
-    return _gate(items, :test_signatures, "signatures")
+    return _gate(items, :test_signatures, "signatures"; allow_exempt)
 end
 
 """
@@ -85,9 +93,12 @@ excluded, so `exempt = r"^_plan"` scales a mixed hot/cold library without a hand
 
 This is the gate. [`StrictMode.audit`](@ref) is the reporting counterpart for the same scope.
 """
-function test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+function test_compiled(
+        mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+        allow_exempt::Bool = false
+    )
     items = StrictMode._compiled_items(mod; guarantees, only, exempt)
-    return _gate(items, :test_compiled, string(nameof(mod)))
+    return _gate(items, :test_compiled, string(nameof(mod)); allow_exempt)
 end
 
 """
@@ -109,7 +120,7 @@ and an implausibly small count is the signal that something did not register. A 
 a package's own `src/` is stored in that package, so it survives the package's cached load and is
 counted here; one made by a direct `register_strict!` call belongs to the session that made it.
 """
-function test_registered(; guarantees = nothing, modules = nothing)
+function test_registered(; guarantees = nothing, modules = nothing, allow_exempt::Bool = false)
     StrictMode.assert_enabled()
     items = StrictMode._registry_items(guarantees; modules)
     if isempty(items)
@@ -125,7 +136,7 @@ function test_registered(; guarantees = nothing, modules = nothing)
         @info "StrictModeTest: re-proving $(length(items)) registered signature(s) — " *
             join(("$m: $n" for (m, n) in by_mod), ", ")
     end
-    return _gate(items, :test_registered, "registry")
+    return _gate(items, :test_registered, "registry"; allow_exempt)
 end
 
 """

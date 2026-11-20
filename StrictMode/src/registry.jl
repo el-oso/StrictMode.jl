@@ -554,7 +554,7 @@ end
 # made directly carries no source and the field stays empty.
 _restamp(x::StrictFinding, source::AbstractString) = StrictFinding(
     x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason, x.suggestion,
-    x.tier, x.code, String(source)
+    x.tier, x.code, String(source), x.exempt_by
 )
 
 function _with_policy(fs, decls, @nospecialize(f), @nospecialize(types))

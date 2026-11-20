@@ -225,7 +225,11 @@ allocating function, and `:noalloc` cannot express what it really guarantees: "f
 growths, then nothing" is a property of the call sequence rather than of the code, so an all-paths
 proof must report the growth path forever. Excuse it visibly with
 `@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured — warm
-the call, then check that a second identical call allocates nothing.
+the call, then check that a second identical call allocates nothing
+(`StrictModeTest.@test_steady_state`). The allocation proof then reports a caller whose only
+allocations are inside such exempt functions as its own result, SM0018, listing each exempt
+function with its reason. That is not a pass: `@test_noalloc` and the `test_*` gates fail it unless
+they are given `allow_exempt = true`, and a caller with one allocation of its own fails either way.
 
 **A barrier excuses allocation, and nothing else.** Every other guarantee still reads `f` itself: a
 dictionary lookup or a boxed value inside `f` is reported when `f` is checked, once. A caller whose
@@ -1521,7 +1525,13 @@ end
 
 # The name of the function `mi` calls, when an exemption in scope covers `:noalloc` for it at the
 # types it is called with; `nothing` otherwise.
-function _mi_exempt_name(mi::Core.MethodInstance)
+_mi_exempt_name(mi::Core.MethodInstance) =
+    (e = _mi_exemption(mi); isnothing(e) ? nothing : _demangle(mi.def.name))
+
+# The exemption that covers `:noalloc` for the method `mi` is a specialization of, at the types
+# it is called with. Matched on the method's own module as well as its name: a function of the
+# same name elsewhere is another function.
+function _mi_exemption(mi::Core.MethodInstance)
     mi.def isa Method || return nothing
     es = _noalloc_exemptions()
     isempty(es) && return nothing
@@ -1536,7 +1546,7 @@ function _mi_exempt_name(mi::Core.MethodInstance)
         else
             (isnothing(mod) || mod === root) || continue
         end
-        _covers(e, name, types, :noalloc) && return name
+        _covers(e, name, types, :noalloc) && return e
     end
     return nothing
 end

@@ -406,8 +406,10 @@ end
 # Running pending finalizers is not the call's own allocation. Base's `unlock` does it on every lock,
 # `Condition` and `Threads.Event`; finalizers are code registered elsewhere, and they run at other GC
 # points too. A Base slow path that allocates for its own sake (a contended lock) is still judged.
-# An `@strict_exempt` callee is NOT excused here: `@test_noalloc` proves no allocation on any path,
-# and a pool that grows on first use is gated by `@test_steady_state` instead.
+# An `@strict_exempt` callee is NOT dropped here: `@test_noalloc` proves no allocation on any path.
+# A call whose every site is inside one is reported as that (`_exempt_only`, SM0018), which a
+# gate fails unless its caller passes `allow_exempt = true`; a pool that grows on first use is
+# gated on what it does once warm by `@test_steady_state`.
 function _not_own_excused(@nospecialize(f), allocs)
     fin(a) = a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
     kept = filter(!fin, allocs)
@@ -418,6 +420,32 @@ function _not_own_excused(@nospecialize(f), allocs)
 end
 
 _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)
+
+# The exempt functions that account for every allocation site, each with the reason its exemption
+# gave, or `nothing` when one site has no exempt frame. A site is an exempt function's when its
+# backtrace passes through a frame whose METHOD an exemption covers for `:noalloc`: matched on the
+# method's module and name, so a function of the same name elsewhere excuses nothing. An exempt
+# callee that was inlined has no frame with a specialization of its own, so its site reads as the
+# caller's and the result is an ordinary failure.
+function _exempt_only(allocs)
+    isempty(allocs) && return nothing
+    by = Pair{String, String}[]
+    for a in allocs
+        hasproperty(a, :backtrace) || return nothing
+        e = nothing
+        for fr in a.backtrace
+            fr isa Base.StackTraces.StackFrame || continue
+            mi = _frame_mi(fr)
+            mi isa Core.MethodInstance || continue
+            e = StrictMode._mi_exemption(mi)
+            isnothing(e) || break
+        end
+        isnothing(e) && return nothing
+        p = String(e.func) => e.reason
+        p in by || push!(by, p)
+    end
+    return Tuple(by)
+end
 
 _through_barrier(@nospecialize(a)) = any(a.backtrace) do fr
     mi = _frame_mi(fr)
@@ -1159,6 +1187,20 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
                             "if the wait is a pool join that is expected, register the function that joins " *
                                 "with `register_alloc_barrier!` or exempt it with `@strict_exempt` by name";
                             cause = :scheduler
+                        )
+                    )
+                elseif !isnothing(_exempt_only(allocs))
+                    # Every site lies inside a function exempt from `:noalloc`. That is not a
+                    # proof of no allocation, so it is a note with its own code and never a pass:
+                    # a gate fails it unless its caller accepted the exemptions.
+                    by = _exempt_only(allocs)
+                    push!(
+                        out, StrictMode.StrictFinding(
+                            md, fn, sg, g, :info, file, line,
+                            "allocates only inside " * (length(by) == 1 ? "a function" : "functions") *
+                                " exempt from :noalloc ($(length(allocs)) site(s)): " *
+                                join(("`" * n * "`" * (isempty(r) ? "" : " (" * r * ")") for (n, r) in by), ", "),
+                            "", :proof, :SM0018, "", by
                         )
                     )
                 else
