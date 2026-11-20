@@ -669,8 +669,16 @@ end
     StrictModeTest.AllocEntry
 
 One entry point of a function and what an allocation proof says about it. `kind` is `:positional`
-or `:keyword`. `status` is `:pass`, `:fail`, or `:unproven` when no proof ran: the signature names
-no concrete types to run one against, which is always so for a `:keyword` entry.
+or `:keyword`. `status` is one of:
+
+- `:pass` — the proof found no allocation.
+- `:fail` — the proof failed: it found an allocation, or AllocCheck could not analyze the
+  signature; `reason` says which.
+- `:unproven` — nothing was proved: the signature names no concrete types to run a proof against,
+  which is always so for a `:keyword` entry; it always throws, so no returning path was checked; or
+  the proof raised before producing a verdict.
+- `:info` — the proof's exempt-only result (SM0018) accepted with `allow_exempt = true`: every
+  allocation is inside a function exempted from `:noalloc`, and `reason` names them. Not a pass.
 """
 struct AllocEntry
     sig::Any
@@ -712,8 +720,13 @@ function _positional_entry(@nospecialize(f), sig; allow_exempt::Bool = false)
         )
     end
     failed = filter(StrictMode._failed, fs)
-    isempty(failed) && return AllocEntry(sig, :positional, :pass, "")
-    return AllocEntry(sig, :positional, :fail, join((f.reason for f in failed), "; "))
+    isempty(failed) || return AllocEntry(sig, :positional, :fail, join((f.reason for f in failed), "; "))
+    # A note is not a pass: a signature that always throws had nothing on a returning path checked,
+    # and an accepted exempt-only result still allocates inside the exempt functions.
+    notes = filter(x -> x.status !== :pass, fs)
+    isempty(notes) && return AllocEntry(sig, :positional, :pass, "")
+    status = any(x -> x.code === :SM0208, notes) ? :unproven : :info
+    return AllocEntry(sig, :positional, status, join((x.reason for x in notes), "; "))
 end
 
 # A `Core.kwcall` method declares its keyword `NamedTuple` abstract, so its signature is never one

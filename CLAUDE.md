@@ -701,7 +701,9 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         f(args...) covers the positional method; the Core.kwcall method a keyword
                         caller reaches is separate compiled code whose NamedTuple parameter is
                         declared abstract, so it is ALWAYS :unproven and is listed rather than
-                        omitted — omitting it is what makes a suite read as covered. The kwcall
+                        omitted — omitting it is what makes a suite read as covered. A positional
+                        entry whose proof returned only a note is NOT :pass: SM0208 (always
+                        throws) is :unproven, an accepted SM0018 is :info. The kwcall
                         lookup uses Core.Typeof(f): typeof of a type is DataType, which matches
                         every type's keyword constructor. Each driver collects
                         every failure and raises ONCE, so one unanalyzable method leaves the rest

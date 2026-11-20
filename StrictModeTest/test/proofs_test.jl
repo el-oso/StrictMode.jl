@@ -605,7 +605,8 @@ end
     @test entry.status === :fail
     @test occursin("exempt from :noalloc", entry.reason)
     accepted = only(e for e in StrictModeTest.alloc_entry_report(E.typed_grows; allow_exempt = true).entries if e.kind === :positional)
-    @test accepted.status === :pass
+    @test accepted.status === :info
+    @test occursin("exempt from :noalloc", accepted.reason) && occursin("grow!", accepted.reason)
 
     # The two engines say the same thing about this call, each in its own words: the scan notes the
     # exempt callee and the proof reports the exempt-only result. That is not a disagreement, and it
