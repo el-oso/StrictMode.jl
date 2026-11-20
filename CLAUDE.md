@@ -57,19 +57,27 @@ StrictMode/src/
                         answered by Base.mightalias alone, allocation-free, which is what keeps
                         disjoint views of one parent apart. An array type with NO dataids method
                         (_declares_ids: the fallback answers with the wrapper own objectid) and a
-                        non-array struct are read through their fields by _collect_memory!, which
+                        non-array struct (a closure too: _reads_memory) are read through their
+                        fields by _collect_memory!, which
                         allocates and gathers the DECLARED ARRAYS found there plus the raw
                         pointers. The arrays are asked of Base.mightalias pairwise, so disjoint
                         views inside two wrappers do not overlap; comparing their dataids would
-                        find the shared parent and raise. An array built on a pointer (exactly one
-                        Ptr{eltype} field, _data_pointer_field) is compared by ADDRESS RANGE
-                        (_memory_region: that pointer for length elements; a strided array from
-                        its pointer and strides), because mightalias is false for every isbits
-                        array and a view names its parent START as its data. Its other Ptr
-                        fields are handles and are not read. A raw pointer anywhere else has no
-                        known extent: one pointing at memory the other argument reaches is
-                        :undecided, which warns "may share memory" and never gates. A Number in
-                        the default `!` position beside an array argument is rejected like a
+                        find the shared parent and raise. An array built on a pointer (its one
+                        Ptr{eltype} field, else its only Ptr field: _data_pointer_field) is placed
+                        by _layout — pointer, size and Base.strides, which the TYPE must define;
+                        Base strided arrays and range-indexed views of either answer the same
+                        way — because mightalias is false for every isbits array and a view names
+                        its parent START as its data. _Region describes a vector, a strided
+                        vector and a contiguous-column matrix EXACTLY (runs; _regions_meet tests
+                        them run by run, so interleaved submatrices pass) and anything
+                        else by span. Nothing else of such an array is read (handle, owner
+                        vector). With no Base.strides its data pointer is a START: placed only
+                        within the allocation it points into, so it is :undecided against any
+                        region or other start. A view whose indices are not ranges is placed in
+                        its root (_root_place). A raw pointer anywhere else has no known extent:
+                        one equal to another pointer or pointing at memory the other argument
+                        reaches is :undecided. :undecided warns "may share memory",
+                        never gates. A Number in the default `!` position beside an array argument is rejected like a
                         Float64 (a BigFloat scale factor holds memory but is not what is written). Arrays held as elements (`[y, z]`, a Dict)
                         are not followed. An overlap between two arrays GATES; one found only in a field
                         of a non-array argument warns (gates = gates && arrays in _noalias_fail).

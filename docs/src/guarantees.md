@@ -1301,17 +1301,36 @@ So an array type without a `dataids` method, and an argument that is not an arra
 workspace struct, a factorization, a closure), is read through its fields, three levels down, and compared by
 the buffers found there.
 
-An array type built on a pointer (a plain-data struct with one `Ptr{T}` field for its `T` elements)
-is compared by the address range it covers: that pointer, for `length` elements. `Base.mightalias`
-answers `false` for every plain-data array, and a view names its parent's start as its data, so
-neither can say whether such an array and a view overlap; the ranges can. Any other pointer field
-of such a type is a handle, and two arrays that share a handle share no element.
+An array type built on a pointer (a plain-data struct whose one `Ptr{T}` field for its `T`
+elements, or whose only `Ptr` field, holds its data) is compared by where its elements lie.
+`Base.mightalias` answers `false` for every plain-data array, and a view names its parent's start
+as its data, so neither can say whether such an array and a view overlap. The layout can, and the
+type states it the way Julia's strided-array interface asks: by defining `Base.strides`. With it,
+the pointer, the size and the strides place every element, and a view of the array with range
+indices is placed the same way. A vector, a strided vector and a matrix with contiguous columns
+are compared element by element, so two submatrices with a leading dimension whose spans
+interleave are told apart; any other layout is compared by its span. The type's other fields — a
+library handle, the vector that keeps the memory alive — are not memory it covers, so two arrays
+that share one share no element.
+
+```julia
+struct PtrMat <: AbstractMatrix{Float64}
+    p::Ptr{Float64}; m::Int; n::Int; ld::Int
+end
+Base.strides(a::PtrMat) = (1, a.ld)   # without this, only where the elements start is known
+```
 
 Two arrays that overlap raise. An overlap with a buffer held in a field of a non-array argument
 warns: the memory is shared, but nothing says the kernel reads that field.
-A raw pointer anywhere else, such as a field of a struct that is not an array, says where memory
-starts and not how far it reaches. One that points at memory another argument reaches warns that
-the arguments may share memory, and never raises.
+
+What cannot be placed exactly, and may meet the other argument's memory, warns that the arguments
+may share memory, and never raises. That covers an array built on a pointer with no
+`Base.strides`, placed only within the allocation its pointer points into (any other such array,
+or any array whose layout is known but whose allocation is not, may be in the same one); a view
+whose indices are not ranges, placed within its parent; a layout compared by its span; and a raw
+pointer that is not an array's data, such as a field of a struct that is not an array, which says
+where memory starts and not how far it reaches. Such a pointer is reported when it equals another
+pointer or points into memory another argument reaches.
 
 ### Which arguments count as written
 

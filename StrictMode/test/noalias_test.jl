@@ -218,6 +218,7 @@ end
     Base.size(v::PtrVec) = (v.n,)
     Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
     Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)   # its layout; without it only where the elements start is known
     GC.@preserve y z begin
         pv = PtrVec(pointer(z), 6)
         @test (@assert_noalias copyto!(pv, y)) === pv
@@ -269,6 +270,7 @@ end
     Base.size(v::PtrVec) = (v.n,)
     Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
     Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)
     # A second pointer that is not the data: a library context shared by every vector.
     struct CtxVec <: AbstractVector{Float64}
         p::Ptr{Float64}
@@ -278,6 +280,7 @@ end
     Base.size(v::CtxVec) = (v.n,)
     Base.getindex(v::CtxVec, i::Int) = unsafe_load(v.p, i)
     Base.setindex!(v::CtxVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::CtxVec) = (1,)
 
     y = collect(1.0:10.0)
     z = zeros(10)
@@ -309,6 +312,109 @@ end
         @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(Handle(pointer(z)), Handle(pointer(z))))
         @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(z, Handle(pointer(z, 3))))
         @test_logs (@assert_noalias fill_from!(y, Handle(pointer(z))))
+    end
+end
+
+@testitem "@assert_noalias places a pointer-backed array by the layout it declares" begin
+    using StrictMode
+
+    # A BLAS-style submatrix: `ld` elements between the starts of its columns.
+    struct PtrMat <: AbstractMatrix{Float64}
+        p::Ptr{Float64}
+        m::Int
+        n::Int
+        ld::Int
+    end
+    Base.size(a::PtrMat) = (a.m, a.n)
+    Base.getindex(a::PtrMat, i::Int, j::Int) = unsafe_load(a.p, (j - 1) * a.ld + i)
+    Base.setindex!(a::PtrMat, v, i::Int, j::Int) = unsafe_store!(a.p, v, (j - 1) * a.ld + i)
+    Base.strides(a::PtrMat) = (1, a.ld)
+    # The same layout, undeclared: the pointer says where the elements start, not where they lie.
+    struct RawMat <: AbstractMatrix{Float64}
+        p::Ptr{Float64}
+        m::Int
+        n::Int
+        ld::Int
+    end
+    Base.size(a::RawMat) = (a.m, a.n)
+    Base.getindex(a::RawMat, i::Int, j::Int) = unsafe_load(a.p, (j - 1) * a.ld + i)
+    Base.setindex!(a::RawMat, v, i::Int, j::Int) = unsafe_store!(a.p, v, (j - 1) * a.ld + i)
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)
+    # A pointer view that keeps its owner alive: the owner is not memory the view covers.
+    struct PView <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+        owner::Vector{Float64}
+    end
+    Base.size(v::PView) = (v.n,)
+    Base.getindex(v::PView, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PView, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PView) = (1,)
+    # Built on an untyped pointer, as C wrappers often are.
+    struct CVec <: AbstractVector{Float64}
+        p::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::CVec) = (v.n,)
+    Base.getindex(v::CVec, i::Int) = unsafe_load(Ptr{Float64}(v.p), i)
+    Base.setindex!(v::CVec, x, i::Int) = unsafe_store!(Ptr{Float64}(v.p), x, i)
+    Base.strides(::CVec) = (1,)
+    struct RawCVec <: AbstractVector{Float64}
+        p::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::RawCVec) = (v.n,)
+    Base.getindex(v::RawCVec, i::Int) = unsafe_load(Ptr{Float64}(v.p), i)
+    Base.setindex!(v::RawCVec, x, i::Int) = unsafe_store!(Ptr{Float64}(v.p), x, i)
+
+    buf = zeros(16)
+    y = collect(1.0:10.0)
+    z = zeros(10)
+    GC.@preserve buf y z begin
+        p = pointer(buf)
+        # Columns 4 apart. {0,1,4,5} and {4,5,8,9} share two elements; {0,1,4,5} and {2,3,6,7},
+        # whose spans meet, share none.
+        @test_throws "share memory" @assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 32, 2, 2, 4))
+        @test_logs (@assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 16, 2, 2, 4)))
+        @test_logs (@assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 64, 2, 2, 4)))
+        # Undeclared, neither is decided, and neither raises.
+        @test_logs (:warn, r"may share memory.*Base.strides"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), RawMat(p + 32, 2, 2, 4)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), RawMat(p + 16, 2, 2, 4)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), view(buf, 5:8)))
+        @test_logs (@assert_noalias copyto!(RawMat(p, 2, 2, 4), view(z, 1:4)))
+
+        # A view whose index is not a range is placed within its parent.
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(PtrVec(pointer(y, 5), 3), view(y, [5, 6, 7])))
+        @test_logs (@assert_noalias copyto!(PtrVec(pointer(z, 5), 3), view(y, [5, 6, 7])))
+        pw = PtrVec(pointer(y), 6)
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(pw, view(pw, [1, 2, 3])))
+        rw = RawCVec(pointer(z), 6)
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(rw, view(rw, [1, 2, 3])))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(PtrVec(pointer(z), 3), view(rw, [4, 5, 6])))
+
+        # A view of a pointer-backed array covers its own elements, not its parent's.
+        pv = PtrVec(pointer(y), 6)
+        @test_logs (@assert_noalias copyto!(view(pv, 1:3), view(pv, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(view(pv, 1:3), view(pv, 3:5))
+        @test_logs (@assert_noalias copyto!(view(pv, 1:2:5), view(pv, 2:2:6)))
+        @test_throws "share memory" @assert_noalias copyto!(view(pv, 1:2:5), view(pv, 3:2:5))
+
+        # The data pointer is all such an array covers.
+        @test_logs (@assert_noalias copyto!(PView(pointer(y), 3, y), PView(pointer(y, 4), 3, y)))
+        @test_logs (@assert_noalias copyto!(PView(pointer(y), 3, y), view(y, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(PView(pointer(y), 4, y), PView(pointer(y, 4), 3, y))
+
+        # The one pointer of an array type is its data, whatever it points to.
+        @test_throws "share memory" @assert_noalias copyto!(CVec(pointer(z), 5), CVec(pointer(z, 2), 5))
+        @test_logs (@assert_noalias copyto!(CVec(pointer(z), 5), CVec(pointer(z, 6), 5)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawCVec(pointer(z), 5), RawCVec(pointer(z, 2), 5)))
     end
 end
 

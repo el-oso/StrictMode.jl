@@ -447,130 +447,265 @@ end
 
 const _ALIAS_FIELD_DEPTH = 3
 
-# The address range `[lo, hi)` an array's elements lie in, or `nothing` when it is not known.
-# A strided array answers from its pointer and strides. An array type built on a pointer answers
-# from its one `Ptr{eltype}` field and its length; with no such field, or several, which pointer
-# is the data is not known.
-function _memory_region(@nospecialize(x::AbstractArray))
-    isempty(x) && return nothing
-    if x isa StridedArray && isbitstype(eltype(x))
-        lo = hi = UInt(pointer(x))
-        for (n, s) in zip(size(x), strides(x))
-            span = (n - 1) * s * Base.elsize(x)
-            span < 0 ? (lo -= UInt(-span)) : (hi += UInt(span))
-        end
-        return (lo, hi + UInt(Base.elsize(x)))
-    end
+# The address of an array's first element, its element size, and its strides in elements, or
+# `nothing` when they are not known. A Base strided array answers itself. An array type built on a
+# pointer answers from that pointer, and only when it defines `Base.strides`: without it the
+# pointer says where the elements start, not where they lie. A view with range indices into
+# either answers from its parent.
+function _layout(@nospecialize(x::AbstractArray))
+    isbitstype(eltype(x)) || return nothing
+    x isa StridedArray && return (UInt(pointer(x)), Base.elsize(x), Tuple(strides(x)))
     i = _data_pointer_field(typeof(x))
-    i == 0 && return nothing
-    p = getfield(x, i)::Ptr
-    p == C_NULL && return nothing
-    return (UInt(p), UInt(p) + UInt(length(x) * sizeof(eltype(x))))
+    if i != 0
+        hasmethod(strides, Tuple{typeof(x)}) || return nothing
+        p = getfield(x, i)::Ptr
+        p == C_NULL && return nothing
+        return (UInt(p), sizeof(eltype(x)), Tuple(strides(x)))
+    end
+    x isa SubArray || return nothing
+    P, idx = parent(x), parentindices(x)
+    length(idx) == ndims(P) || return nothing
+    all(i -> i isa Union{Integer, AbstractRange{<:Integer}}, idx) || return nothing
+    pl = _layout(P)
+    isnothing(pl) && return nothing
+    off = 0
+    st = Int[]
+    for d in eachindex(idx)
+        i = idx[d]
+        off += (first(i) - first(axes(P, d))) * pl[3][d]
+        i isa Integer || push!(st, step(i) * pl[3][d])
+    end
+    return (pl[1] + (off * pl[2]) % UInt, pl[2], Tuple(st))
 end
 
-# The index of the one field that is a `Ptr` to the array's element type, or 0.
+# Where a non-empty array's elements lie: within `[lo, hi)`, and when `run > 0` exactly there:
+# `count` runs of `run` contiguous bytes, the first at `lo` and each `step` bytes after the one
+# before. A vector, a strided vector and a matrix with contiguous columns are described exactly;
+# any other layout only by its span.
+struct _Region
+    lo::UInt
+    hi::UInt
+    run::Int
+    count::Int
+    step::Int
+end
+
+function _memory_region(@nospecialize(x::AbstractArray))
+    isempty(x) && return nothing
+    l = _layout(x)
+    isnothing(l) && return nothing
+    p, es, st = l
+    sz = size(x)
+    length(st) == length(sz) || return nothing
+    lo = hi = p
+    for (n, s) in zip(sz, st)
+        span = (n - 1) * s * es
+        span < 0 ? (lo -= UInt(-span)) : (hi += UInt(span))
+    end
+    dims = [(n, s) for (n, s) in zip(sz, st) if n > 1 && s != 0]
+    run, nruns, gap = if isempty(dims)
+        (es, 1, es)
+    elseif length(dims) == 1
+        abs(dims[1][2]) == 1 ? (dims[1][1] * es, 1, es) : (es, dims[1][1], abs(dims[1][2]) * es)
+    elseif length(dims) == 2 && dims[1][2] == 1 && dims[2][2] > 0
+        (dims[1][1] * es, dims[2][1], dims[2][2] * es)
+    else
+        (0, 0, 0)
+    end
+    return _Region(lo, hi + UInt(es), run, nruns, gap)
+end
+
+# `:yes` when two regions share a byte, `:none` when they share none, and `:maybe` when their spans
+# meet and where the elements of one lie within its span is not known. For two runs patterns the
+# runs of the one with fewer are each tested against the other's arithmetic progression.
+function _regions_meet(a::_Region, b::_Region)
+    (a.lo < b.hi && b.lo < a.hi) || return :none
+    (a.run > 0 && b.run > 0) || return :maybe
+    a.count > b.count && ((a, b) = (b, a))
+    d = reinterpret(Int, a.lo - b.lo)
+    for j in 0:(a.count - 1)
+        o = d + j * a.step
+        k_lo = max(0, cld(o - b.run + 1, b.step))
+        k_hi = min(b.count - 1, fld(o + a.run - 1, b.step))
+        k_lo <= k_hi && return :yes
+    end
+    return :none
+end
+
+# The index of the field that holds an array type's data: its one `Ptr{eltype}` field, or with none
+# of those its one `Ptr` field of any type (a C wrapper's `Ptr{Cvoid}`). Otherwise 0, since which
+# pointer is the data is not known.
 function _data_pointer_field(@nospecialize(T::Type))
     (T isa DataType && T <: AbstractArray && isbitstype(eltype(T))) || return 0
-    found = 0
+    typed = untyped = ntyped = nptr = 0
     for (i, F) in pairs(fieldtypes(T))
-        F === Ptr{eltype(T)} || continue
-        found == 0 || return 0
-        found = i
+        F <: Ptr || continue
+        nptr += 1
+        untyped = i
+        F === Ptr{eltype(T)} && (ntyped += 1; typed = i)
     end
-    return found
+    ntyped == 1 && return typed
+    return ntyped == 0 && nptr == 1 ? untyped : 0
 end
 
 # What `_collect_memory!` finds in an argument: the arrays that declare their ids, which are taken
-# at their word; the address ranges of the arrays built on a pointer; and the raw pointers, which
-# say where memory starts and not how far it reaches.
+# at their word; the regions of the arrays whose layout is known; the data pointers of arrays
+# built on a pointer whose layout is not, whose elements lie somewhere in that pointer's
+# allocation; and the raw pointers, which say where memory starts and not how far it reaches.
 struct _Reached
     arrays::Vector{Any}
-    regions::Vector{Tuple{UInt, UInt}}
+    regions::Vector{_Region}
+    starts::Vector{UInt}
     ptrs::Vector{UInt}
 end
-_Reached() = _Reached(Any[], Tuple{UInt, UInt}[], UInt[])
-Base.isempty(r::_Reached) = isempty(r.arrays) && isempty(r.regions) && isempty(r.ptrs)
+_Reached() = _Reached(Any[], _Region[], UInt[], UInt[])
+Base.isempty(r::_Reached) =
+    isempty(r.arrays) && isempty(r.regions) && isempty(r.starts) && isempty(r.ptrs)
 
 # Anything that is not one of those (a wrapper array with no `dataids` method, a workspace struct,
-# a factorization) is read through its fields. In an array built on a pointer only the data
-# pointer is memory the array covers: another pointer field is a handle, which two arrays can
-# share without sharing an element.
+# a factorization, a closure) is read through its fields. An array built on a pointer covers only
+# its elements: its other fields are a handle or the object that keeps the memory alive, which two
+# arrays can share without sharing an element.
 function _collect_memory!(r::_Reached, @nospecialize(x), depth::Int)
     if x isa Ptr
         x == C_NULL || push!(r.ptrs, UInt(x))
         return nothing
     end
     _reads_memory(x) || return nothing
-    data = 0
     if x isa AbstractArray
         if !isbits(x) && _declares_ids(x)
             push!(r.arrays, x)
             return nothing
         end
-        data = _data_pointer_field(typeof(x))
-        if data != 0
-            region = _memory_region(x)
-            isnothing(region) || push!(r.regions, region)
+        isempty(x) && return nothing
+        g = _memory_region(x)
+        if !isnothing(g)
+            push!(r.regions, g)
+            return nothing
+        end
+        i = _data_pointer_field(typeof(x))
+        if i != 0
+            p = getfield(x, i)::Ptr
+            p == C_NULL || push!(r.starts, UInt(p))
+            return nothing
         end
     end
     depth <= 0 && return nothing
     for i in 1:nfields(x)
         isdefined(x, i) || continue
-        v = getfield(x, i)
-        (data != 0 && v isa Ptr) && continue
-        _collect_memory!(r, v, depth - 1)
+        _collect_memory!(r, getfield(x, i), depth - 1)
     end
     return nothing
 end
 
-_regions_meet(a::Tuple{UInt, UInt}, b::Tuple{UInt, UInt}) = a[1] < b[2] && b[1] < a[2]
-
-# Whether an address range meets a declared array: by the array's own range where it has one, and
-# otherwise by whether the range holds an address the array names as its data.
-function _region_meets_array(region::Tuple{UInt, UInt}, @nospecialize(x::AbstractArray))
-    other = _memory_region(x)
-    isnothing(other) || return _regions_meet(region, other)
-    return any(id -> region[1] <= id < region[2], Base.dataids(x))
+# The array at the bottom of a chain of wrappers, which holds the allocation the wrappers share.
+function _root_array(@nospecialize(x::AbstractArray), depth::Int = 0)
+    p = parent(x)
+    return (p === x || depth >= 16) ? x : _root_array(p, depth + 1)
 end
+
+# Where the elements of a declared array may lie, from the array at the bottom of its wrappers:
+# that root's region, or, for a root built on a pointer whose layout is not known, the address its
+# data starts at. `nothing` when neither is known. With `allocation`, an `Array` root answers with
+# its whole `Memory`.
+function _root_place(@nospecialize(x::AbstractArray); allocation::Bool = false)
+    root = _root_array(x)
+    (allocation && root isa Array) && (root = root.ref.mem)
+    isempty(root) && return nothing
+    g = _memory_region(root)
+    isnothing(g) || return g
+    i = _data_pointer_field(typeof(root))
+    i == 0 && return nothing
+    p = getfield(root, i)::Ptr
+    return p == C_NULL ? nothing : UInt(p)
+end
+
+# Whether a region meets a declared array: `:yes`/`:none` by the array's own region where it has
+# one. Otherwise (a view whose indices are not ranges) the array's elements lie somewhere in its
+# root's memory, so a meet there is `:maybe`.
+function _region_meets_array(g::_Region, @nospecialize(x::AbstractArray))
+    isempty(x) && return :none
+    own = _memory_region(x)
+    isnothing(own) || return _regions_meet(g, own)
+    w = _root_place(x)
+    w isa _Region && return _regions_meet(g, w) === :none ? :none : :maybe
+    w isa UInt && return :maybe
+    return any(id -> g.lo <= id < g.hi, Base.dataids(x)) ? :maybe : :none
+end
+
+# Whether an address lies in the memory a declared array covers (`own`), or in the allocation the
+# array belongs to (`!own`). Where the array's own elements lie is not always known; then the
+# address is tested against its root's memory.
+function _address_in_array(p::UInt, @nospecialize(x::AbstractArray), own::Bool)
+    isempty(x) && return false
+    g = own ? _memory_region(x) : nothing
+    isnothing(g) || return g.lo <= p < g.hi
+    w = _root_place(x; allocation = !own)
+    # Only Julia's own allocations have known bounds; a root built on a pointer covers part of one.
+    (w isa _Region && !own && !(_root_array(x) isa Union{Array, Memory})) && return true
+    w isa _Region && return w.lo <= p < w.hi
+    w isa UInt && return !own || p == w
+    return p in Base.dataids(x)
+end
+
+# Whether the data pointer of an array whose layout is not known may reach memory the other
+# argument covers. Its elements stay inside the allocation it points into, so a declared array
+# whose allocation does not hold it is apart. A region or another such pointer may be in that
+# allocation, which nothing here can rule out.
+_start_meets(p::UInt, r::_Reached) =
+    !isempty(r.regions) || !isempty(r.starts) || p in r.ptrs ||
+    any(x -> _address_in_array(p, x, false), r.arrays)
 
 # Whether a raw pointer points at memory the other argument reaches. How far the pointer's own
 # memory extends is not known, so this is evidence of sharing and not a comparison of two ranges.
-function _pointer_meets(p::UInt, r::_Reached)
-    p in r.ptrs && return true
-    any(g -> g[1] <= p < g[2], r.regions) && return true
-    return any(r.arrays) do x
-        g = _memory_region(x)
-        isnothing(g) ? (p in Base.dataids(x)) : (g[1] <= p < g[2])
+_pointer_meets(p::UInt, r::_Reached) =
+    p in r.ptrs || p in r.starts || any(g -> g.lo <= p < g.hi, r.regions) ||
+    any(x -> _address_in_array(p, x, true), r.arrays)
+
+# `:yes`, `:maybe` or `:none` for the memory two collections cover.
+function _reached_meet(ra::_Reached, rb::_Reached)
+    any(x -> any(y -> Base.mightalias(x, y), rb.arrays), ra.arrays) && return :yes
+    maybe = false
+    for g in ra.regions, h in rb.regions
+        v = _regions_meet(g, h)
+        v === :yes && return :yes
+        maybe |= v === :maybe
     end
+    for (gs, xs) in ((ra.regions, rb.arrays), (rb.regions, ra.arrays)), g in gs, x in xs
+        v = _region_meets_array(g, x)
+        v === :yes && return :yes
+        maybe |= v === :maybe
+    end
+    maybe && return :maybe
+    (any(p -> _start_meets(p, rb), ra.starts) || any(p -> _start_meets(p, ra), rb.starts)) &&
+        return :maybe
+    (any(p -> _pointer_meets(p, rb), ra.ptrs) || any(p -> _pointer_meets(p, ra), rb.ptrs)) &&
+        return :maybe
+    return :none
 end
 
 # Whether the memory two arguments reach overlaps, by the evidence there is. Two arrays found
 # inside them are asked of `Base.mightalias`, exactly as two plain arguments are, so disjoint views
-# of one parent inside two wrappers do not overlap. An array built on a pointer is compared by the
-# address range it covers. A raw pointer outside such an array has no known extent: one that
-# points at memory the other argument reaches is `:undecided`.
+# of one parent inside two wrappers do not overlap. An array whose layout is known is compared
+# element by element where `_Region` describes it exactly, and by span otherwise. What cannot be
+# placed exactly, and may meet the other's memory, is `:undecided`.
 @noinline function _deep_overlap(@nospecialize(a), @nospecialize(b))
     ra = _Reached()
     _collect_memory!(ra, a, _ALIAS_FIELD_DEPTH)
     isempty(ra) && return :none
     rb = _Reached()
     _collect_memory!(rb, b, _ALIAS_FIELD_DEPTH)
-    found = any(x -> any(y -> Base.mightalias(x, y), rb.arrays), ra.arrays) ||
-        any(g -> any(h -> _regions_meet(g, h), rb.regions), ra.regions) ||
-        any(g -> any(y -> _region_meets_array(g, y), rb.arrays), ra.regions) ||
-        any(g -> any(x -> _region_meets_array(g, x), ra.arrays), rb.regions)
-    found && return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
-    (any(p -> _pointer_meets(p, rb), ra.ptrs) || any(p -> _pointer_meets(p, ra), rb.ptrs)) &&
-        return :undecided
-    return :none
+    v = _reached_meet(ra, rb)
+    v === :yes && return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
+    return v === :maybe ? :undecided : :none
 end
 
 # How two arguments share memory: `:arrays` when both are arrays, `:fields` when the shared buffer
-# sits in a field of an argument that is not an array, `:undecided` when the only evidence is a
-# pointer of unknown extent, `:none` otherwise. Two arrays that declare their ids are answered by
+# sits in a field of an argument that is not an array, `:undecided` when the memory that may meet
+# could not be placed exactly, `:none` otherwise. Two arrays that declare their ids are answered by
 # `Base.mightalias` alone, which knows disjoint views of one parent apart and allocates nothing.
 # It answers `false` for any plain-data array, whatever it points at, so those are compared by
-# address range.
+# where their elements lie.
 @inline function _overlap(a, b)
     if a isa AbstractArray && b isa AbstractArray
         Base.mightalias(a, b) && return :arrays
@@ -652,19 +787,23 @@ end
                 "$holder, a `$(typeof(args[holder]))`)"
         )
     end
-    # A pointer of unknown extent that points at the other argument's memory: reported, since
+    # Memory that could not be placed exactly and may meet the other argument's: reported, since
     # nothing compared says the two do not overlap, and never raised on.
     if isempty(overlaps)
         _fail(
             :noalias, target,
-            "arguments may share memory: " * join(undecided, ", ") * ". A pointer held by one " *
-                "points at memory the other reaches, and how far that pointer's memory extends " *
-                "is not known, so the overlap could not be decided either way.";
+            "arguments may share memory: " * join(undecided, ", ") * ". Where the elements of " *
+                "one of them lie is not known exactly, and that memory may meet the other's, so " *
+                "the overlap could not be decided either way. A raw pointer says where memory " *
+                "starts and not how far it reaches; an array type built on a pointer gives its " *
+                "layout through `Base.strides`, and is placed only within its allocation without " *
+                "it; a view whose indices are not ranges is placed only within its parent, and a " *
+                "layout other than a vector or a matrix with contiguous columns within its span.";
             gates = false
         )
         return nothing
     end
-    isempty(undecided) || append!(overlaps, undecided .* " (a pointer of unknown extent)")
+    isempty(undecided) || append!(overlaps, undecided .* " (not decided)")
     # Two arrays that overlap are what the kernel reads and writes. A buffer inside a struct
     # argument is shared memory the kernel may never read, so that overlap alone reports.
     _fail(
@@ -708,13 +847,29 @@ still compares argument 1 against the rest, which for a two-argument call is the
 
 An argument is compared by the memory it reaches. Two arrays are compared with `Base.mightalias`.
 An array type that defines no `Base.dataids` method (a wrapper struct around a `Vector`) and an
-argument that is not an array (a workspace struct, a factorization, a closure) are read through their fields,
-three levels down, and the arrays found there are compared the same way, so disjoint views inside
-two wrappers do not overlap. A raw pointer (an array type built on a `Ptr`, a `BigInt`) counts
-only where it equals another pointer or the start of an array; an address inside another array
-is undecided and is not reported. Arrays held as ELEMENTS, as in `[y, z]` or a `Dict`, are not
-followed. An overlap between two arrays raises. An overlap with a buffer held in a field
-of a non-array argument warns: the memory is shared, but nothing says the kernel reads that field.
+argument that is not an array (a workspace struct, a factorization, a closure) are read through
+their fields, three levels down, and the arrays found there are compared the same way, so disjoint
+views inside two wrappers do not overlap. Arrays held as ELEMENTS, as in `[y, z]` or a `Dict`, are
+not followed.
+
+An array type built on a pointer (a plain-data struct whose one `Ptr{T}` field, or whose only
+`Ptr` field, is its data) is compared by where its elements lie. That is known when the type
+defines `Base.strides`, which together with the pointer and the size gives its layout; a view of
+it with range indices is placed the same way. A vector, a strided vector and a matrix with
+contiguous columns are compared element by element, so two submatrices with a leading dimension
+whose spans interleave are told apart; another layout is compared by its span. Its other fields (a
+library handle, the vector that keeps the memory alive) are not memory it covers.
+
+What cannot be placed exactly, and may meet the other argument's memory, warns that the arguments
+may share memory and never raises: an array built on a pointer with no `Base.strides`, which is
+placed only within the allocation its pointer points into; a view whose indices are not ranges,
+placed within its parent; a layout compared by its span; and a raw pointer that is not an array's
+data (a field of a struct, a `BigInt`'s limbs), which says where memory starts and not how far it
+reaches, and is reported when it equals another pointer or points into memory the other argument
+reaches.
+
+An overlap between two arrays raises. An overlap with a buffer held in a field of a non-array
+argument warns: the memory is shared, but nothing says the kernel reads that field.
 
 ```julia
 A = rand(8, 8); C = similar(A)
