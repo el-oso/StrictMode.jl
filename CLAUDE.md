@@ -227,7 +227,9 @@ StrictMode/src/
                         read as a non-call it passed `b = unsafe_trust(u)`. An erased read of
                         field 1 is dropped when the SAME VALUE also has another field read
                         (_same_value_has_another_field: same operand, no branch, no jump target
-                        and no reassignment between the two statements, so a read on the other
+                        and no reassignment between the two statements, and when the other field
+                        is read SECOND nothing between them that can hand the payload on — a call
+                        other than getfield, a foreigncall, a global store — so a read on the other
                         arm of a type test clears nothing), and when the operand is what
                         iterate/indexed_iterate returned. An erased TWO-argument `getproperty` is NOT
                         reported while StrictMode's own method, which raises whatever the name,

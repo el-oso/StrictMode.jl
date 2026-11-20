@@ -370,3 +370,17 @@ end
     plain(v::Vector{Any}) = getproperty(v[1], :x)
     @test status(plain, (Vector{Any},)).status === :pass
 end
+
+@testitem "a field read after the payload escaped does not clear the payload read" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    const SINK = Any[]
+    leak(t) = (v = getfield(t, 1); push!(SINK, v); getfield(t, 2))
+    r = status(leak, (Any,))
+    @test StrictMode._failed(r)
+    @test occursin("may read an `Untrusted` payload", r.reason)
+    # Read in the other order, the other field raises on an `Untrusted` before the first is read.
+    other_first(t) = (n = getfield(t, 2); v = getfield(t, 1); push!(SINK, v); n)
+    @test status(other_first, (Any,)).status === :pass
+end

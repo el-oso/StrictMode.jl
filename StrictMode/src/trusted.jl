@@ -202,7 +202,8 @@ end
 # statements they can sit on different arms of a type test, where the operand is an `Untrusted`
 # on one arm and something else on the other, and a variable assigned between them holds a
 # different value at each. A jump INTO the span is a path that skipped the first read, so the
-# span must hold no jump target either.
+# span must hold no jump target either. When the other field is read SECOND, it raises on an
+# `Untrusted` only after the payload read ran, so nothing in between may hand the payload on.
 function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand))
     isempty(other) && return false
     targets = _jump_targets(ci)
@@ -214,13 +215,29 @@ function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand)
             straight || break
             st = ci.code[k]
             if st isa Core.GotoNode || st isa Core.GotoIfNot || st isa Core.ReturnNode ||
-                    st isa Core.EnterNode || (st isa Expr && st.head === :(=) && st.args[1] == operand)
+                    st isa Core.EnterNode || (st isa Expr && st.head === :(=) && st.args[1] == operand) ||
+                    (k > i && _may_hand_on(ci, st))
                 straight = false
             end
         end
         straight && return true
     end
     return false
+end
+
+# Whether a statement can pass a value somewhere: a call other than `getfield`, which only reads,
+# a foreign call, or a store to a global.
+function _may_hand_on(ci, @nospecialize(st))
+    st isa Expr || return false
+    if st.head === :(=)
+        st.args[1] isa GlobalRef && return true
+        st = st.args[2]
+        st isa Expr || return false
+    end
+    st.head === :foreigncall && return true
+    st.head in (:call, :invoke, :invoke_modify) || return false
+    callee, _ = _call_callee_and_args(ci, st)
+    return callee !== Core.getfield
 end
 
 # The statements a jump can land on.
