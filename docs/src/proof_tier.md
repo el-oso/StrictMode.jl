@@ -146,7 +146,11 @@ An exemption covers the exempt function's own code and what that calls. A functi
 exempt function was handed is the caller's code: an allocation made while it runs is the caller's,
 and makes the result an ordinary failure. So `withbuf(b -> sum(zeros(n)) + b[1], n)` fails for an
 exempt `withbuf`, with or without `allow_exempt`, while the pool growth inside `withbuf` is still
-accounted for.
+accounted for. The same holds for a callable struct, and for callables held in a field or in an
+array argument. When the exempt function receives a callable whose type is known only at run time
+(an argument declared `Function` or `Any`, a `Vector{Function}`, a field declared `Function`), a
+dynamic call inside it may reach that callable, whose body is not analyzed, so the dynamic call
+is the caller's and the result is an ordinary failure.
 
 Only an exemption declared in a module counts here, which is what `@strict_exempt` written in a
 package's source is. One declared with no module, from a session, covers by name in every module

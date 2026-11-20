@@ -447,7 +447,7 @@ function _exempt_only(allocs)
             # or closure it was HANDED is the caller's code, and what that allocates is the
             # caller's allocation, whichever frame ran it. An exempt frame further out may still
             # account for the site, so the walk goes on.
-            _runs_handed_in(a.backtrace, k, mi) ? (e = nothing) : break
+            _runs_handed_in(a, k, mi) ? (e = nothing) : break
         end
         isnothing(e) && return nothing
         p = String(e.func) => e.reason
@@ -456,20 +456,27 @@ function _exempt_only(allocs)
     return Tuple(by)
 end
 
-# Whether a frame between the allocation and the exempt frame at `k` runs a callable that the
-# exempt function received as an argument, directly or inside a struct. A frame that kept its
-# specialization is matched on the callable's type; an inlined one has only a name, and is
-# matched on the names of the callable's methods.
-function _runs_handed_in(bt, k::Int, mi::Core.MethodInstance)
-    k > 1 || return false
+# Whether the allocation site `a` runs a callable that the exempt function at backtrace frame `k`
+# received as an argument, directly, inside a struct or inside an array. A frame that kept its
+# specialization is matched on the callable's type; an inlined one has only a name, and is matched
+# on the names of the callable's methods. A dynamic call in or below the exempt frame counts when an
+# argument holds a callable whose type is known only at run time (a `Function` or `Any` argument,
+# a `Vector{Function}`, a field declared `Function`): the call may reach it, and its body is not
+# analyzed at all.
+function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
+    bt = a.backtrace
     types = Any[]
     ps = (mi.specTypes::DataType).parameters
     for i in 2:length(ps)
-        _callable_types!(types, ps[i], 0)
+        _callable_types!(types, ps[i], 0, false)
     end
     isempty(types) && return false
+    a isa AllocCheck.DynamicDispatch && !_c_varargs_call(a) &&
+        any(T -> !isconcretetype(T), types) && return true
+    k > 1 || return false
     names = Set{Symbol}()
     for T in types
+        isconcretetype(T) || continue
         ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
         ms isa Vector || continue
         for match in ms
@@ -491,19 +498,36 @@ function _runs_handed_in(bt, k::Int, mi::Core.MethodInstance)
     return false
 end
 
-# The callable types an argument of type `T` carries: a function, a closure, a callable struct, or
-# one of those held in a field.
-function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int)
-    T isa DataType || return out
+# The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
+# number of call methods), or one of those held in a field or as an array's elements. An abstract
+# type that can hold a function is recorded as itself. A FIELD declared `Any` is not: nearly every
+# runtime struct has one (`Task`'s result and storage), and counting it would make every dynamic
+# call in an exempt function that takes such a struct the caller's.
+function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int, field::Bool)
+    if T isa Union
+        for U in Base.uniontypes(T)
+            _callable_types!(out, U, depth, field)
+        end
+        return out
+    end
+    if !isconcretetype(T)
+        (field && T === Any) || typeintersect(T, Function) === Union{} || push!(out, T)
+        T isa DataType && T <: AbstractArray && depth < 2 &&
+            _callable_types!(out, eltype(T), depth + 1, false)
+        return out
+    end
     if T <: Function
         push!(out, T)
-    elseif isconcretetype(T) && !(T <: Union{Number, AbstractArray, AbstractString, Symbol, Type})
-        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, 1, Base.get_world_counter())
+    elseif T <: AbstractArray
+        depth < 2 && _callable_types!(out, eltype(T), depth + 1, false)
+        return out
+    elseif !(T <: Union{Number, AbstractString, Symbol, Type})
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
         (ms isa Vector && !isempty(ms)) && push!(out, T)
     end
-    if depth < 2 && isconcretetype(T) && !(T <: Union{AbstractArray, AbstractString, Number})
+    if depth < 2 && !(T <: Union{AbstractString, Number})
         for F in fieldtypes(T)
-            _callable_types!(out, F, depth + 1)
+            _callable_types!(out, F, depth + 1, true)
         end
     end
     return out

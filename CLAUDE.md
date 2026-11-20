@@ -645,7 +645,12 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         if no frame between it and the allocation runs a callable the exempt
                         function was HANDED (_runs_handed_in: matched on the argument's type for a
                         frame with a specialization, on its method names for an inlined one);
-                        otherwise an exempt wrapper would launder its caller's closure. One site without an exempt frame, or an exempt
+                        otherwise an exempt wrapper would launder its caller's closure. The
+                        callables are found in arguments, their fields and array elements
+                        (_callable_types!), and an ABSTRACT one (Function, an Any argument or
+                        eltype, a field declared Function) makes every dynamic call at or below
+                        the exempt frame the caller's, since its target is not analyzed; a field
+                        declared Any does not count (Task has several). One site without an exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
                         is StrictMode._mi_exemption, on the method module and name, with
                         declared_in_module = true: an exemption declared with NO module covers

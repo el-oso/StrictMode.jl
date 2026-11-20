@@ -643,14 +643,43 @@ end
     # The callback allocates nothing of its own: every site is the exempt functions' own code.
     cb_clean(n::Int) = withbuf(b -> b[1], n)
     plain(n::Int) = (b = grow!(n); b[1])
+    # A callable struct with more than one call method.
+    struct Cb2
+        n::Int
+    end
+    (c::Cb2)(b::Vector{Float64}) = sum(zeros(c.n)) + b[1]
+    (c::Cb2)(b::Vector{Float64}, k::Int) = b[k]
+    cb_struct2(n::Int) = withbuf(Cb2(n), n)
+    # Callbacks handed in inside an array, of one concrete type and of an abstract one.
+    @noinline withbufs(fs::Vector{F}, n) where {F} = fs[1](grow!(n))
+    @strict_exempt :noalloc reason = "vec" withbufs
+    const FS = [b -> sum(zeros(length(b))) + b[1]]
+    cb_vec(n::Int) = withbufs(FS, n)
+    @noinline withhooks(hooks::Vector{Function}, n::Int) = (b = grow!(n); for h in hooks; h(b); end; b[1])
+    @strict_exempt :noalloc reason = "runs hooks" withhooks
+    const HOOKS = Function[b -> sum(zeros(length(b)))]
+    cb_hooks(n::Int) = withhooks(HOOKS, n)
+    # A callback held in a field declared `Function`, and one passed through `@nospecialize`.
+    struct Hook
+        f::Function
+    end
+    @noinline withhook(h::Hook, n::Int) = (b = grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" withhook
+    const HOOK = Hook(b -> sum(zeros(length(b))))
+    cb_field(n::Int) = withhook(HOOK, n)
+    @noinline withany(@nospecialize(f), n::Int) = (b = grow!(n); f(b); b[1])
+    @strict_exempt :noalloc reason = "nospecialize" withany
+    const ANYCB = Ref{Any}(b -> sum(zeros(length(b))))
+    cb_any(n::Int) = withany(ANYCB[], n)
     end
     E = ExemptCallback
     E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_clean(3); E.plain(3)
+    E.cb_struct2(3); E.cb_vec(3); E.cb_hooks(3); E.cb_field(3); E.cb_any(3)
     proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
 
     # An allocation made by the caller's own closure, run inside the exempt function, is the
     # caller's: an ordinary failure, which no option accepts.
-    for f in (E.cb, E.cb_inline, E.cb_named)
+    for f in (E.cb, E.cb_inline, E.cb_named, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
         r = proof(f; allow_exempt = true)
         @test r.status === :fail
         @test r.code !== :SM0018
