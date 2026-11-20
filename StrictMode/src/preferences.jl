@@ -221,62 +221,87 @@ end
 
 # The preference keys StrictMode reads. `__clear__` is Preferences.jl's own.
 const _KNOWN_PREFERENCES = ("checks_enabled", "banner", "__clear__")
-
-# The keys the preference file `f` sets in the table `header` that StrictMode does not read,
-# pushed onto `out` as `key (file)`. A key it does not read is ignored by Preferences.jl without a
-# word, so `check_enabled = false` leaves checks on. Scans the bytes line by line for the same
-# reason `_names_strictmode` does: this runs from `__init__`, and a TOML parser is not something
-# `juliac --trim` can resolve.
-function _unknown_preference_keys!(out::Vector{String}, f::String, header::String)
+# The keys the preference file `f` sets for StrictMode that StrictMode does not read, pushed onto
+# `out` as `key (file)`. `table` is the dotted path of StrictMode's table in that file. A key it
+# does not read is ignored by Preferences.jl without a word, so `check_enabled = false` leaves
+# checks on. Scans the bytes line by line for the same reason `_names_strictmode` does: this runs
+# from `__init__`, and a TOML parser is not something `juliac --trim` can resolve.
+#
+# A table header and a key are each read as a dotted path, with blanks and quotes dropped and a
+# comment cut off, and a key's path is the current table's followed by its own. So
+# `[ StrictMode ] # note`, `[preferences."StrictMode"]`, and `StrictMode.check_enabled` written as
+# a dotted key, all name StrictMode's table.
+function _unknown_preference_keys!(out::Vector{String}, f::String, table::String)
     isfile(f) || return out
     io = open(f)
-    buf = Vector{UInt8}(undef, 1 << 16)
-    n = readbytes!(io, buf, length(buf))
+    buf = UInt8[]
+    n = readbytes!(io, buf, typemax(Int))    # grows `buf` to the whole file
     close(io)
-    intable = false
+    current = UInt8[]
     pos = 1
     while pos <= n
         stop = pos
         while stop <= n && buf[stop] != UInt8('\n')
             stop += 1
         end
-        a, b = _trim_bytes(buf, pos, stop - 1)
+        a, b = pos, stop - 1
         pos = stop + 1
+        while a <= b && (buf[a] == UInt8(' ') || buf[a] == UInt8('\t') || buf[a] == UInt8('\r'))
+            a += 1
+        end
         (a > b || buf[a] == UInt8('#')) && continue
         if buf[a] == UInt8('[')
-            intable = _bytes_equal(buf, a, b, header)
+            current = _toml_path(buf, a, b)
             continue
         end
-        intable || continue
         eq = a
         while eq <= b && buf[eq] != UInt8('=')
             eq += 1
         end
         eq > b && continue
-        ka, kb = _trim_bytes(buf, a, eq - 1)
-        ka > kb && continue
+        key = _toml_path(buf, a, eq - 1)
+        isempty(key) && continue
+        path = copy(current)
+        isempty(path) || push!(path, UInt8('.'))
+        append!(path, key)
+        name = _key_in_table(path, table)
+        isnothing(name) && continue
         known = false
         for k in _KNOWN_PREFERENCES
-            known |= _bytes_equal(buf, ka, kb, k)
+            known |= _bytes_equal(name, 1, length(name), k)
         end
         known && continue
-        entry = String(buf[ka:kb]) * " (" * f * ")"
+        entry = String(name) * " (" * f * ")"
         any(==(entry), out) || push!(out, entry)
     end
     return out
 end
 
-# The span of `buf[a:b]` without the blanks and quotes around it. Bytes, not `strip` on a
-# `SubString`: the string functions reach error paths that build their message with `print`.
-function _trim_bytes(buf::Vector{UInt8}, a::Int, b::Int)
-    blank(c::UInt8) = c == UInt8(' ') || c == UInt8('\t') || c == UInt8('\r') || c == UInt8('"')
-    while a <= b && blank(buf[a])
-        a += 1
+# The dotted path `buf[a:b]` spells, without its brackets, blanks and quotes, and ending at a
+# comment or at the `]` that closes a table header. Bytes, not `strip` on a `SubString`: the string
+# functions reach error paths that build their message with `print`.
+function _toml_path(buf::Vector{UInt8}, a::Int, b::Int)
+    out = UInt8[]
+    for i in a:b
+        c = buf[i]
+        (c == UInt8('#') || (c == UInt8(']') && !isempty(out))) && break
+        (c == UInt8(' ') || c == UInt8('\t') || c == UInt8('\r') || c == UInt8('"') ||
+            c == UInt8('\'') || c == UInt8('[') || c == UInt8(']')) && continue
+        push!(out, c)
     end
-    while b >= a && blank(buf[b])
-        b -= 1
+    return out
+end
+
+# The first name under `table` in the dotted path `path`, or `nothing` when `path` is not in it.
+function _key_in_table(path::Vector{UInt8}, table::String)
+    m = ncodeunits(table)
+    (length(path) > m + 1 && _bytes_equal(path, 1, m, table) && path[m + 1] == UInt8('.')) ||
+        return nothing
+    stop = m + 2
+    while stop <= length(path) && path[stop] != UInt8('.')
+        stop += 1
     end
-    return a, b
+    return path[(m + 2):(stop - 1)]
 end
 
 function _bytes_equal(buf::Vector{UInt8}, a::Int, b::Int, s::String)
@@ -307,11 +332,31 @@ end
 function _preference_files!(out::Vector{String}, @nospecialize(p))
     p isa String || return out
     dir = isfile(p) ? _parent_dir(p) : p
-    _unknown_preference_keys!(out, joinpath(dir, "LocalPreferences.toml"), "[StrictMode]")
-    _unknown_preference_keys!(out, joinpath(dir, "JuliaLocalPreferences.toml"), "[StrictMode]")
-    _unknown_preference_keys!(out, joinpath(dir, "Project.toml"), "[preferences.StrictMode]")
-    _unknown_preference_keys!(out, joinpath(dir, "JuliaProject.toml"), "[preferences.StrictMode]")
+    _unknown_preference_keys!(out, joinpath(dir, "LocalPreferences.toml"), "StrictMode")
+    _unknown_preference_keys!(out, joinpath(dir, "JuliaLocalPreferences.toml"), "StrictMode")
+    _unknown_preference_keys!(out, joinpath(dir, "Project.toml"), "preferences.StrictMode")
+    _unknown_preference_keys!(out, joinpath(dir, "JuliaProject.toml"), "preferences.StrictMode")
     return out
+end
+
+# The directory of the shared environment a `LOAD_PATH` entry such as `@v#.#` or `@tools` names:
+# `environments/<name>` in the first depot that has it, with `v#.#` standing for this Julia's
+# version, as Base expands it. `nothing` for `@` (the active project, searched on its own),
+# `@stdlib` and `@.`. Read byte by byte, like `_parent_dir`, since this runs from `__init__`.
+function _named_env(e::String)
+    bytes = codeunits(e)
+    out = UInt8[]
+    for k in 2:length(bytes)
+        push!(out, bytes[k])
+    end
+    name = String(out)
+    (name == "" || name == "." || name == "stdlib") && return nothing
+    name == "v#.#" && (name = _DEFAULT_ENV)
+    for depot in Base.DEPOT_PATH
+        d = joinpath(depot, "environments", name)
+        isdir(d) && return d
+    end
+    return nothing
 end
 
 """
@@ -323,7 +368,10 @@ ignored, so a misspelled one leaves the setting it was meant to change at its de
 `check_enabled = false` leaves checks on.
 
 Searched: `LocalPreferences.toml` (table `[StrictMode]`) and the project file (table
-`[preferences.StrictMode]`) of the active project and of every explicit path on `LOAD_PATH`.
+`[preferences.StrictMode]`) of the active project, of every explicit path on `LOAD_PATH`, and of
+every shared environment `LOAD_PATH` names, such as `@v#.#`, which is where preferences go when no
+project is active. Any TOML spelling of the table counts: a comment after the header, blanks or
+quotes inside it, or a dotted key such as `StrictMode.check_enabled`.
 StrictMode prints a warning at load for each key this returns, whatever the `banner` preference
 is set to. Anything unreadable counts as nothing found.
 """
@@ -332,8 +380,7 @@ function unknown_preferences()
     try
         _preference_files!(out, Base.ACTIVE_PROJECT[])
         for e in Base.LOAD_PATH
-            startswith(e, '@') && continue
-            _preference_files!(out, e)
+            _preference_files!(out, startswith(e, '@') ? _named_env(e) : e)
         end
     catch
     end
