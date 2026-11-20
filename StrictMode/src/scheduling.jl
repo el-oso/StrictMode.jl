@@ -903,8 +903,18 @@ end
 # writes `#` and names `xmm`/`ymm`/`zmm`; AArch64 writes `//` (`;` on macOS) and names its
 # floating-point and vector registers `b`/`h`/`s`/`d`/`q`/`v`, SVE's `z` and SME's `za`.
 const _SPILL_RELOAD_RE = r"(?:#|//|;).*\b(?:Spill|Reload)\b"
-_vec_reg_re(arch::Symbol) = arch === :aarch64 ? r"\b(?:[bhsdqvz]\d+|za\w*)\b" : r"\b(?:xmm|ymm|zmm)\d+\b"
-const _VEC_REG_RE = _vec_reg_re(Sys.ARCH)
+# Any other architecture has no pattern: its spill lines name registers neither pattern matches, so
+# reading them with one would count zero spills.
+function _vec_reg_re(arch::Symbol)
+    arch === :aarch64 && return r"\b(?:[bhsdqvz]\d+|za\w*)\b"
+    arch in (:x86_64, :i686) && return r"\b(?:xmm|ymm|zmm)\d+\b"
+    return nothing
+end
+
+# Why vector spills cannot be counted on `arch`, or `nothing` when they can.
+_spill_arch_unread(arch::Symbol = Sys.ARCH) = isnothing(_vec_reg_re(arch)) ?
+    "vector spills cannot be counted on $arch: StrictMode knows the vector register names of x86 " *
+    "and AArch64 only" : nothing
 
 """
     SpillReport
@@ -977,6 +987,8 @@ zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-a
 and can't see spills at all). Assembly that cannot be read raises
 `_UnanalyzableSignature`, naming the signature and the reason, rather than reporting zero spills:
 that is the case for a signature that is not concrete, which names no compiled body.
+On an architecture other than x86 and AArch64, whose vector register names it does not know, it
+raises too.
 
 Each spill is placed by the loop its block is in, from LLVM's own loop annotations. `loop_spills`
 leaves out code that runs once per call — the prologue and the epilogue that stores a tile's
@@ -985,6 +997,8 @@ results — where a spill costs one store and one load per call rather than per 
 so it is not the same as the hot loop.
 """
 function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
+    why = _spill_arch_unread()
+    isnothing(why) || throw(_UnanalyzableSignature(:spill_report, f, types, why))
     return _spill_report(
         _func_name(f) * _sig_string(types), _report_text(_native_asm, :spill_report, f, types)
     )
@@ -1002,6 +1016,7 @@ end
 # marked `Spill` by LLVM. x86-64 has no callee-saved vector register, so those lines are not counted.
 function _spill_counts(lines::AbstractVector{<:AbstractString}, arch::Symbol)
     re = _vec_reg_re(arch)
+    isnothing(re) && throw(ArgumentError(_spill_arch_unread(arch)))
     depth, inner = _asm_loop_depths(lines)
     total = 0
     inloop = 0
@@ -1051,6 +1066,8 @@ function Base.show(io::IO, r::SpillReport)
 end
 
 function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple), scope::Symbol = :loops)
+    why = _spill_arch_unread()
+    isnothing(why) || return _fail(:no_spill, target, why)
     asm = _native_asm(f, types)
     isempty(asm) && return _fail(:no_spill, target, _output_unread(f, types))
     r = _spill_report(_func_name(f) * _sig_string(types), asm)
@@ -1071,7 +1088,7 @@ end
 
 Fail if `f(args...)` compiled to code that **spills a vector register to the stack**
 (**best-effort**): StrictMode scans the post-register-allocation `code_native` output for LLVM's
-`# ... Spill`/`# ... Reload` annotations on a line naming a vector register (`xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64). This is
+`# ... Spill`/`# ... Reload` annotations on a line naming a vector register (`xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64; any other architecture fails, since its registers would read as no spill). This is
 the codegen analogue of [`@assert_noalloc`](@ref) — a kernel can be type-stable, allocation-free,
 and vectorized, and still be "correct but slower" because it needs more live vector registers than
 the target ISA provides (LLVM's portable register allocator has no choice but to spill). A

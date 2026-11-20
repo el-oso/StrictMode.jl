@@ -203,6 +203,8 @@ function _compiled_output_finding(
         return _mkfinding(md, fn, sg, g, _scalar_fp_loops(ir), "scalar hot loop did not vectorize (FP or integer) (best-effort: `phi double`/`phi iN` + scalar ops, no `<N x …>`)", "", 0; tier)
     elseif g === :no_spill
         # Spills inside a loop, the same scope `@assert_no_spill` gates on by default.
+        why = _spill_arch_unread()
+        isnothing(why) || return _unevaluated(md, fn, sg, g, why; tier)
         asm = _native_asm(f, types)
         isempty(asm) && return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
         r = _spill_report(fn * sg, asm)
