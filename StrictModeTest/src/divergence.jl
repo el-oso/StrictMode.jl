@@ -64,7 +64,7 @@ function _anon_signature(@nospecialize(types::Tuple))
 end
 
 function _return_category(@nospecialize(f), @nospecialize(types::Tuple))
-    rts = Base.return_types(f, Tuple{types...})
+    rts = StrictMode._base_return_types(f, types)
     length(rts) == 1 || return "inference-multiple($(length(rts)))"
     R = only(rts)
     R === Any && return "Any"

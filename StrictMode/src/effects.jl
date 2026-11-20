@@ -2036,15 +2036,27 @@ function _return_types(@nospecialize(f), @nospecialize(types))
     interp = _ScanInterpreter()
     try
         f isa _Callable || return Base.return_types(f, types; interp)
-        # `Base.return_types`, read by the signature.
-        tt = _sigtype(f, types)
-        matches = Base.invoke_interp_compiler(interp, :_findall_matches, interp, tt)
-        matches === nothing && Base.raise_match_failure(:return_types, tt)
-        return Any[something(Base.invoke_interp_compiler(interp, :typeinf_type, interp, m::Core.MethodMatch), Any) for m in matches.matches]
+        return _return_types_by_type(_sigtype(f, types), interp, interp)
     finally
         _keep_sources(interp)
         _window_close(n)
     end
+end
+
+# `Base.return_types` for the signature `tt`, with its `passed_interp` and `interp`.
+function _return_types_by_type(@nospecialize(tt), passed_interp, interp)
+    matches = Base.invoke_interp_compiler(passed_interp, :_findall_matches, interp, tt)
+    matches === nothing && Base.raise_match_failure(:return_types, tt)
+    return Any[
+        something(Base.invoke_interp_compiler(passed_interp, :typeinf_type, interp, m::Core.MethodMatch), Any)
+            for m in matches.matches
+    ]
+end
+
+# `Base.return_types(f, Tuple{types...}; world)` under the default interpreter, for a `_Callable` too.
+function _base_return_types(@nospecialize(f), @nospecialize(types); world::UInt = Base.get_world_counter())
+    f isa _Callable || return Base.return_types(f, Tuple{types...}; world)
+    return _return_types_by_type(_sigtype(f, types), nothing, Base.invoke_default_compiler(:_default_interp, world))
 end
 
 function _infer_effects(@nospecialize(f), @nospecialize(types))

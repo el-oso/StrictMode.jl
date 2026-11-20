@@ -116,6 +116,36 @@ function _is_guard_report(@nospecialize(rep))
     end
 end
 
+# AllocCheck takes a function value. A callable object known by its type alone is checked through
+# `StrictMode._call_through`, which takes the callable as its first argument and makes the call:
+# AllocCheck compiles the whole call graph, so the callable's sites are found whether or not it is
+# inlined into the wrapper, and the wrapper only forwards its arguments and result. A signature with
+# no method raises here, as `check_allocs` does, rather than proving the wrapper's `MethodError`.
+function _check_allocs(@nospecialize(f), @nospecialize(types))
+    ignore_throw = StrictMode.ignore_throw()
+    f isa StrictMode._Callable || return AllocCheck.check_allocs(f, types; ignore_throw)
+    StrictMode._which(f, types)
+    allocs = AllocCheck.check_allocs(StrictMode._call_through, (StrictMode._ftype(f), types...); ignore_throw)
+    # The wrapper's frame is not the callable's code, and every reader of a backtrace asks whose code a
+    # site is in.
+    for a in allocs
+        hasproperty(a, :backtrace) && filter!(fr -> !_is_call_through(fr), a.backtrace)
+    end
+    return allocs
+end
+
+function _is_call_through(@nospecialize(fr))
+    fr isa Base.StackTraces.StackFrame || return false
+    mi = _frame_mi(fr)
+    return mi isa Core.MethodInstance && mi.def isa Method && mi.def.name === :_call_through &&
+        mi.def.module === StrictMode
+end
+
+# A JET entry point (`report_opt`, `report_call`) for `f(types...)`, by the signature for a callable
+# object known by its type alone.
+_jet_target(report, @nospecialize(f), @nospecialize(types); kwargs...) = f isa StrictMode._Callable ?
+    report(StrictMode._sigtype(f, types); kwargs...) : report(f, types; kwargs...)
+
 # `StrictMode.ignore_throw()` (default true): don't count allocations on never-taken error/throw branches
 # (BoundsError etc.) — they are not on the hot path and produce false positives on
 # runtime-zero-alloc code.
@@ -123,10 +153,10 @@ function _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types))
     world = Base.get_world_counter()
     # AllocCheck and the walk infer outside the compiler's cache. Inferring the entry into it makes
     # the record that lets these sites hold in a later world.
-    entry() = Base.return_types(f, Tuple{types...}; world)
+    entry() = StrictMode._base_return_types(f, types; world)
     return _kept(_SITES_MEMO, StrictMode._sigtype(f, types), world, entry) do
         vcat(
-            AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
+            _check_allocs(f, types),
             _native_dispatches(f, types)
         )
     end
@@ -210,7 +240,9 @@ function _native_dispatches(@nospecialize(f), @nospecialize(types))
     CC = Base.Compiler
     world = Base.get_world_counter()
     interp = CC.NativeInterpreter(world)
-    entry = Base.method_instance(f, types; world)
+    entry = f isa StrictMode._Callable ?
+        ccall(:jl_method_lookup_by_tt, Any, (Any, Csize_t, Any), StrictMode._sigtype(f, types), world, nothing) :
+        Base.method_instance(f, types; world)
     out = Any[]
     entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
     parent = IdDict{Any, Any}(entry => nothing)
@@ -401,7 +433,7 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     excused = length(allocs) - length(kept)
     if excused > 0
         name = something(_barrier_frame_name(allocs), :barrier)
-        @info "StrictModeTest: `$(f)` reaches `$name`, a one-time-init allocation barrier; " *
+        @info "StrictModeTest: `$(StrictMode._func_name(f))` reaches `$name`, a one-time-init allocation barrier; " *
             "$excused allocation site(s) inside it are excused, $(length(kept)) other(s) checked as " *
             "usual. Disable with set_ignore_barrier!(false)." maxlog = 1
     end
@@ -419,7 +451,7 @@ function _not_own_excused(@nospecialize(f), allocs)
     fin(a) = a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
     kept = filter(!fin, allocs)
     nfin = length(allocs) - length(kept)
-    nfin > 0 && @info "StrictModeTest: `$(f)`: $nfin site(s) that run pending finalizers (from Base's " *
+    nfin > 0 && @info "StrictModeTest: `$(StrictMode._func_name(f))`: $nfin site(s) that run pending finalizers (from Base's " *
         "`unlock`) excused: finalizers are code registered elsewhere, not this call's allocation." maxlog = 1
     return kept
 end
@@ -738,7 +770,7 @@ end
 # propagating raw from inside JET (see `AnalysisError`).
 function _opt_reports(target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple))
     try
-        return filter(r -> !_is_guard_report(r) && !_is_foreign_opt_failure(r), JET.get_reports(JET.report_opt(f, types)))
+        return filter(r -> !_is_guard_report(r) && !_is_foreign_opt_failure(r), JET.get_reports(_jet_target(JET.report_opt, f, types)))
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
     end
@@ -772,7 +804,7 @@ function _call_reports(
     try
         return filter(
             _is_call_defect,
-            JET.get_reports(JET.report_call(f, types; target_modules = (mod,)))
+            JET.get_reports(_jet_target(JET.report_call, f, types; target_modules = (mod,)))
         )
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
@@ -940,9 +972,9 @@ const _TRIM_CHILD_STDERR = Ref("")
 # package, because that is what `using` can load.
 function _trim_child_modules(@nospecialize(f), argtypes::Vector)
     mods = Symbol[]
-    _push_module!(mods, parentmodule(f))
+    _push_module!(mods, parentmodule(f isa Function || f isa Type ? f : StrictMode._ftype(f)))
     try
-        _push_module!(mods, which(f, Tuple{argtypes...}).module)
+        _push_module!(mods, StrictMode._which(f, Tuple{argtypes...}).module)
     catch
     end
     for T in argtypes
@@ -1115,7 +1147,7 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
         r = _trim_validate_subprocess([(f, argtypes)])
         isnothing(r) || isnothing(r[1]) || return (r[1]..., :patched)
         @warn "StrictModeTest: could not run the patched trim verification in a subprocess for " *
-            "`$(nameof(f))` (a closure, a function the child cannot load, or a build shipping no " *
+            "`$(StrictMode._func_name(f))` (a closure, a function the child cannot load, or a build shipping no " *
             "juliac patches). Falling back to STOCK Base in this process, which rejects some code " *
             "juliac builds clean — a failure here may be a false alarm (issue #19)." *
             (isempty(_TRIM_CHILD_STDERR[]) ? "" : "\n  child stderr: " * first(_TRIM_CHILD_STDERR[], 500)) maxlog = 3
@@ -1126,7 +1158,7 @@ end
 # The verification itself, in whatever process calls it. The child runs this with the patches
 # applied; the parent runs it against stock Base.
 function _trim_validate_here(@nospecialize(f), argtypes::Vector)
-    rts = Base.return_types(f, Tuple{argtypes...})
+    rts = StrictMode._base_return_types(f, argtypes)
     if length(rts) != 1
         return (
             false, [
@@ -1141,7 +1173,7 @@ function _trim_validate_here(@nospecialize(f), argtypes::Vector)
         TrimCheck.hook_verify_typeinf_trim() do
             _typeinf_toplevel(
                 Comp,
-                Any[Core.svec(ret_type, Tuple{typeof(f), argtypes...})],
+                Any[Core.svec(ret_type, StrictMode._sigtype(f, argtypes))],
                 [Base.get_world_counter()],
             )
         end
@@ -1411,7 +1443,7 @@ function _proof_findings(
             # the construct frequently lives in a dependency, and a finding pointing at the function
             # under test cannot say so — a rewrite there would not change the verdict.
             m = try
-                which(f, types)
+                StrictMode._which(f, types)
             catch
                 nothing
             end
@@ -1434,7 +1466,7 @@ end
 # optimization analysis must be clean. StrictMode's own `:typestable` uses an IR boxing signal for
 # the second layer, which is why it only warns; this is the proof that replaces it.
 function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
-    rts = Base.return_types(f, Tuple{types...})
+    rts = StrictMode._base_return_types(f, types)
     if length(rts) != 1 || !StrictMode._is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
         cause = StrictMode._instability_cause(f, types)
