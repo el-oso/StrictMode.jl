@@ -89,18 +89,21 @@ function _keep_registration!(@nospecialize(x), mod::Module, name::Symbol, call::
     catch
         false
     end
-    # A registration that is in force for the precompile and gone at every load after it is the
-    # failure this exists to prevent, so a module that cannot take the constant is an error.
-    stored || throw(
-        ArgumentError(
-            "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`, " *
-                "which is closed while another package precompiles, so it would be lost when " *
-                "that package is next loaded from its cache. Name the package making it: " *
-                "`$call` with `mod = @__MODULE__`."
-        )
-    )
+    stored || _registration_lost(mod, call)
     return nothing
 end
+
+# A registration that is in force for the precompile and gone at every load after it is the
+# failure the package-local stores exist to prevent, so a module that cannot take the constant
+# while a package image is being written is an error.
+_registration_lost(mod::Module, call::AbstractString) = throw(
+    ArgumentError(
+        "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`, " *
+            "which is closed while another package precompiles, so it would be lost when " *
+            "that package is next loaded from its cache. Name the package making it: " *
+            "`$call` with `mod = @__MODULE__`."
+    )
+)
 
 # This session's registrations and each loaded package's own, in one vector. Rebuilt when the
 # session's set changes size, when anything registers, or when the world moves, which a package

@@ -67,4 +67,8 @@ end
     @test occursin("mod = @__MODULE__", ConsumerPkg.FOREIGN_UNNAMED)
     @test StrictMode._is_scoped_type(Base.Filesystem.File)
     @test !StrictMode._is_scoped_type(Base.Libc.RawFD)
+    @test occursin("could not be stored in `Base`", ConsumerPkg.FOREIGN_BARRIER_UNNAMED)
+    @test occursin("mod = @__MODULE__", ConsumerPkg.FOREIGN_BARRIER_UNNAMED)
+    @test any(g -> g === Base.Libc.gethostname, StrictMode._barrier_functions())
+    @test !any(g -> g === Base.Libc.getpid, StrictMode._barrier_functions())
 end

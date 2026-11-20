@@ -31,7 +31,7 @@ What it pins:
 4. That the registrations a verdict depends on survive the same way: a trust boundary, a scoped type
    and an allocation barrier registered at the top level of `src/` are in force in the test process,
    where this session registered nothing. Without that, `:trusted` fails on the boundary itself and
-   `:noescape` passes every signature with nothing checked. A type another package owns is refused
+   `:noescape` passes every signature with nothing checked. A type or function another package owns is refused
    unless the call names this package with `mod = @__MODULE__`.
 
 ## Two builds

@@ -759,8 +759,9 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   them); a `stop` entry the reach walk never met raises in `reach_report`, and in `route_parity`
   only when NEITHER route met it. A preference key StrictMode does not read WARNS at load
   (`_warn_unknown_preferences`, called from `__init__`, so it scans the preference files by bytes
-  and is pinned trim-clean in `StrictModeTest/test/trim_test.jl`); it is gated on the `banner`
-  preference, which keeps a load with `banner = false` free of any `__init__` body.
+  and is pinned trim-clean in `StrictModeTest/test/trim_test.jl`); it is NOT gated on the
+  `banner` preference, which hides the tier banner alone: a misspelled `banner` is what the
+  warning is for.
   `test/options_test.jl` holds the list of macros and their accepted options, and fails when a
   macro gains one without it
 - `@contract`-style macro headers in the sibling TypeContracts package can't be module-qualified (e.g. `@contract Base.AbstractLock` fails to parse — needs `import Base: AbstractLock` first) — worth knowing if you're pairing `@strict_contract`/`@verify_strict` with a foreign type.
@@ -789,9 +790,10 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   passed with no type registered. The first two write the constant ONLY while a package image is
   being generated (`_keep_registration!`): in a session the session's set is the registration, and
   a test that empties it to take a registration back must not find it again in `Main`. A store
-  that cannot be written during a precompile (the type belongs to another, closed, package) RAISES
-  and asks for `mod = @__MODULE__`; registering for the precompile only is the failure being
-  prevented. `test/consumer` pins all three.
+  that cannot be written during a precompile (the function or type belongs to another, closed,
+  package) RAISES from all three and asks for `mod = @__MODULE__` (`_registration_lost`);
+  registering for the precompile only is the failure being prevented. `test/consumer` pins all
+  three, with and without `mod`.
 - **Certainty decides throw-vs-warn, and it can be per FINDING, not only per guarantee.** StrictMode
   throws only where it is 100% sure and warns where its verdict is a heuristic; StrictModeTest throws
   by definition, because AllocCheck/JET/TrimCheck are full machinery rather than a scan. `_fail`

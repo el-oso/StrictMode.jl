@@ -184,18 +184,25 @@ end
 
             # What the load prints. The writer goes to the C `stderr`, so it is read back from a
             # file the descriptor is pointed at.
-            if StrictMode.banner_enabled()
-                out = joinpath(dir, "stderr.txt")
-                open(out, "w") do io
-                    redirect_stderr(io) do
-                        StrictMode._warn_unknown_preferences()
-                        Libc.flush_cstdio()
-                    end
+            out = joinpath(dir, "stderr.txt")
+            open(out, "w") do io
+                redirect_stderr(io) do
+                    StrictMode._warn_unknown_preferences()
+                    Libc.flush_cstdio()
                 end
-                printed = read(out, String)
-                @test occursin("StrictMode: unknown preference checks_enable (", printed)
-                @test occursin("StrictMode reads `checks_enabled` and `banner`", printed)
             end
+            printed = read(out, String)
+            @test occursin("StrictMode: unknown preference checks_enable (", printed)
+            @test occursin("StrictMode reads `checks_enabled` and `banner`", printed)
+
+            # `banner = false` hides the tier banner and nothing else: a misspelled key is
+            # reported whatever the banner is set to, so the warning reads no banner setting.
+            reads_banner(@nospecialize(x)) = x isa GlobalRef ? x.name === :BANNER_ENABLED :
+                x isa Expr ? any(reads_banner, x.args) : false
+            warn_code = only(Base.code_lowered(StrictMode._warn_unknown_preferences, ())).code
+            tier_code = only(Base.code_lowered(StrictMode._announce_tier, ())).code
+            @test !any(reads_banner, warn_code)
+            @test any(reads_banner, tier_code)
             # The note is a format string for the writer, so it holds no `%`.
             @test !occursin('%', StrictMode._UNKNOWN_PREFERENCE_NOTE)
         finally

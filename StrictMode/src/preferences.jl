@@ -139,9 +139,10 @@ preference, default `true`. Silence it with
     [preferences.StrictMode]
     banner = false
 
-Baked at precompile like `checks_enabled`, so a change needs a restart. With it off `__init__` has
-no body left at all, which is a second answer to issue #28 for anyone who would rather their load
-be provably silent than trust that the writer stays trim-clean.
+Baked at precompile like `checks_enabled`, so a change needs a restart. It hides the banner and
+nothing else: a preference key StrictMode does not read is still named in a warning at load
+([`StrictMode.unknown_preferences`](@ref)), since a misspelled `banner` or `checks_enabled` is
+exactly what that warning is for.
 
 Even with it on, the reporting-tier notice is printed only where StrictMode was chosen — see
 [`StrictMode.direct_dependency`](@ref). The disabled-and-CI banner is not gated that way.
@@ -323,8 +324,8 @@ ignored, so a misspelled one leaves the setting it was meant to change at its de
 
 Searched: `LocalPreferences.toml` (table `[StrictMode]`) and the project file (table
 `[preferences.StrictMode]`) of the active project and of every explicit path on `LOAD_PATH`.
-StrictMode prints a warning at load for each key this returns, unless the `banner` preference is
-off. Anything unreadable counts as nothing found.
+StrictMode prints a warning at load for each key this returns, whatever the `banner` preference
+is set to. Anything unreadable counts as nothing found.
 """
 function unknown_preferences()
     out = String[]
@@ -353,9 +354,6 @@ const _UNKNOWN_PREFERENCE_NOTE = "│ StrictMode reads `checks_enabled` and `ban
     "└ so the setting it was meant to change is still at its default.\n"
 
 function _warn_unknown_preferences()
-    # With the banner off a load is silent, and `__init__` keeps no body for `juliac --trim` to
-    # verify.
-    BANNER_ENABLED || return nothing
     # Quiet while a dependent package is being precompiled, as the tier banner is.
     iszero(ccall(:jl_generating_output, Cint, ())) || return nothing
     unknown = unknown_preferences()
@@ -369,8 +367,7 @@ function _warn_unknown_preferences()
 end
 
 function _announce_tier()
-    # A compile-time const, so with the banner off this whole function folds to `nothing` and
-    # `juliac --trim` never sees the write at all.
+    # A compile-time const, so with the banner off this whole function folds to `nothing`.
     BANNER_ENABLED || return nothing
     # Quiet while a dependent package is being precompiled: that output is captured and replayed
     # per package, so the banner would appear once per dependent instead of once per session.

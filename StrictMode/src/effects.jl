@@ -233,6 +233,12 @@ per-task state, and it belongs to the accessor, not to every kernel that reaches
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).
 
+The registration is kept in the package that owns `f` as well as in this session, so one made at
+a package's top level is still in force when the package is loaded from its precompile cache.
+`mod` names that package; pass `mod = @__MODULE__` to register a function another package owns.
+Without it such a call raises while a package precompiles, since the registration would hold for
+that precompile and be gone afterwards.
+
 ```julia
 @noinline function _my_calibrator()
     ...   # measures something once, memoizes it in a Ref/const
@@ -240,17 +246,22 @@ end
 register_alloc_barrier!(_my_calibrator)
 ```
 """
-function register_alloc_barrier!(@nospecialize(f))
+function register_alloc_barrier!(@nospecialize(f); mod::Module = parentmodule(f))
     push!(_ALLOC_BARRIERS, f)
     # The registry above lives in this session. A package that registers at its own precompile loses it
     # at the next load, so the registration is also kept in the package that owns the function, which
     # is serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
-    try
-        store = _local_store!(parentmodule(f), _LOCAL_BARRIERS, Any[])
+    stored = try
+        store = _local_store!(mod, _LOCAL_BARRIERS, Any[])
         any(g -> g === f, store) || push!(store, f)
+        true
     catch
-        # A module that is closed to writes keeps the session registration only.
+        false
     end
+    # A module that is closed to writes keeps the session registration only, which is all a
+    # session needs. While a package image is being written it is the registration being lost.
+    (stored || ccall(:jl_generating_output, Cint, ()) != 1) ||
+        _registration_lost(mod, "register_alloc_barrier!($(_func_name(f)))")
     _BARRIER_GEN[] += 1
     clear_cache!()
     return nothing

@@ -57,4 +57,13 @@ catch err
 end
 StrictMode.register_scoped!(Base.Filesystem.File; mod = @__MODULE__)
 
+# The same for an allocation barrier that is another package's function.
+const FOREIGN_BARRIER_UNNAMED = try
+    StrictMode.register_alloc_barrier!(Base.Libc.getpid)
+    "registered"
+catch err
+    sprint(showerror, err)
+end
+StrictMode.register_alloc_barrier!(Base.Libc.gethostname; mod = @__MODULE__)
+
 end # module

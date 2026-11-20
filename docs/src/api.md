@@ -320,8 +320,8 @@ Checks are gated behind a compile-time setting, on by default. Toggling it write
 [Getting Started](getting_started.md) for the `Project.toml` pattern a shipped application wants.
 
 `banner_enabled` reports the `banner` preference, which controls the tier banner printed at load.
-Set `banner = false` to silence it; with it off `__init__` has no body at all, which is what a
-`juliac --trim` build wants.
+Set `banner = false` to silence the banner. It silences nothing else: a preference key StrictMode
+does not read is still reported at load.
 
 The banner also only prints where StrictMode was chosen: `direct_dependency` asks whether an
 environment this session loads from names StrictMode itself. A package that uses StrictMode inside
@@ -331,7 +331,7 @@ nothing about a tier its users can act on, so those sessions stay silent.
 StrictMode reads two preference keys, `checks_enabled` and `banner`. Preferences.jl ignores any
 other key without a word, so `check_enabled = false` leaves checks on. StrictMode names each such key
 in a warning at load, with the file it is in, and `unknown_preferences` returns the same list. The
-warning follows the `banner` preference.
+warning is given whatever `banner` is set to.
 
 ```@docs
 enable_checks!
