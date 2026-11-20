@@ -107,8 +107,8 @@ end
     absf(x::AbstractVector) = sum(x)
     gs = (:no_scalar_loops, :no_spill, :vectorized, :inlined)
 
-    # A signature that is not concrete names no compiled body. `code_llvm` prints a fallback that
-    # dispatches at run time for it, which holds no loop and no spill, so reading it passed.
+    # A signature that is not concrete names no compiled body. `code_llvm` prints the method compiled
+    # for the abstract types, which is not the code a concrete call runs.
     abstract_sig = (AbstractVector{Float64},)
     @test isempty(StrictMode._llvm_ir(absf, abstract_sig))
     @test isempty(StrictMode._native_asm(absf, abstract_sig))
@@ -155,13 +155,17 @@ end
     @test_throws StrictMode._UnanalyzableSignature spill_report(absf, abstract_sig)
     @test_throws "could not analyze `absf(AbstractVector{Float64})`" spill_report(absf, abstract_sig)
     @test_throws "the signature is not concrete" spill_report(absf, abstract_sig)
-    @test_throws "@spill_report" spill_report(absf, abstract_sig)
+    @test_throws "StrictMode spill_report: could not analyze" spill_report(absf, abstract_sig)
     @test_throws "the signature is not concrete" scalar_fp_loops(absf, abstract_sig)
-    @test_throws "@scalar_fp_loops" scalar_fp_loops(absf, abstract_sig)
+    @test_throws "StrictMode scalar_fp_loops: could not analyze" scalar_fp_loops(absf, abstract_sig)
     @test_throws "the signature is not concrete" kernel_report(absf, abstract_sig)
-    @test_throws "@kernel_report" kernel_report(absf, abstract_sig)
+    @test_throws "StrictMode kernel_report: could not analyze" kernel_report(absf, abstract_sig)
     @test_throws "the signature is not concrete" register_report(absf, abstract_sig)
-    @test_throws "@register_report" register_report(absf, abstract_sig)
+    @test_throws "StrictMode register_report: could not analyze" register_report(absf, abstract_sig)
+    @test_throws "the result is UNKNOWN" kernel_report(absf, abstract_sig)
+    # A guarantee's own scan is named as the guarantee.
+    @test_throws "StrictMode :concurrency_safe: could not analyze" StrictMode.concurrency_findings(absf, (Int,))
+    @test_throws "the guarantee is UNKNOWN" StrictMode.concurrency_findings(absf, (Int,))
 
     # A signature no method matches is concrete and still has no output to read.
     @test_throws "compiled output could not be read" spill_report(absf, (Int,))

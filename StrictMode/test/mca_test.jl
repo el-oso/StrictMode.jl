@@ -189,7 +189,7 @@ end
     # A signature that is not concrete names no compiled body. The report says so whether or not
     # llvm-mca is installed: there is no assembly to hand it.
     @test_throws StrictMode._UnanalyzableSignature mca_report(absf, (AbstractVector{Float64},))
-    @test_throws "@mca_report: could not analyze `absf(AbstractVector{Float64})`" mca_report(absf, (AbstractVector{Float64},))
+    @test_throws "StrictMode mca_report: could not analyze `absf(AbstractVector{Float64})`" mca_report(absf, (AbstractVector{Float64},))
     @test_throws "the signature is not concrete" mca_report(absf, (AbstractVector{Float64},))
     @test_throws "compiled output could not be read" mca_report(absf, (Int,))
     @test isempty(StrictMode._native_asm_att(absf, (AbstractVector{Float64},)))

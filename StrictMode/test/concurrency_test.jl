@@ -183,7 +183,8 @@ end
     # this file do.
     @test_throws StrictMode._UnanalyzableSignature pool_balance_report(balanced!, (String,))
     @test_throws "could not analyze" pool_balance_report(balanced!, (String,))
-    @test_throws "UNKNOWN, not satisfied" pool_balance_report(balanced!, (String,))
+    @test_throws "StrictMode pool_balance_report: could not analyze" pool_balance_report(balanced!, (String,))
+    @test_throws "the result is UNKNOWN" pool_balance_report(balanced!, (String,))
 end
 
 @testitem "taint flows through a struct built from a shared argument" begin

@@ -866,10 +866,9 @@ steady_state_report(solve!, ws, A, b)                  # SteadyStateReport: stea
 steady_state_report(scratch, ws; fresh_task = true)    # a per-task initializer shows up here
 ```
 
-It returns what it measured and never raises. Like [`memsafe_report`](@ref) and
-[`mca_report`](@ref) it takes **values** and runs the call, so it sits outside the value-free
-`findings`/`audit` pipeline and does not belong at a `src` call site — put it in a probe, a dogfood
-block, or a REPL session.
+It returns what it measured and never raises. Like [`memsafe_report`](@ref) it takes **values** and
+runs the call, so it sits outside the value-free `findings`/`audit` pipeline and does not belong at
+a `src` call site — put it in a probe, a dogfood block, or a REPL session.
 
 There is deliberately no `@assert_steady_state`. Every `@assert_*` macro is a call-site annotation
 backed by the value-free scan, and this property cannot be settled that way: it needs real argument

@@ -293,11 +293,11 @@ Base.@kwdef struct KernelReport
 end
 
 # A call runs the code compiled for its concrete argument types. For a signature that is not
-# concrete, `code_llvm` and `code_native` print a fallback that dispatches at run time (under
-# "WARNING: This code may not match what actually runs"): it holds none of the method's loops, so
-# every check of loops and registers reads it as clean. `_llvm_ir` and `_native_asm` therefore
-# return "" for it, as they do when the printer raises, and a guarantee reports an empty text as
-# unevaluated (`_output_unread`), never as a pass.
+# concrete, `code_llvm` and `code_native` print the matching method compiled for the abstract types
+# (under "WARNING: This code may not match what actually runs"): one method's body, dispatching at
+# run time where the abstract types leave a call open, and not the code any concrete call runs.
+# `_llvm_ir` and `_native_asm` therefore return "" for it, as they do when the printer raises, and a
+# guarantee reports an empty text as unevaluated (`_output_unread`), never as a pass or a failure.
 #
 # The signature judged is the one asked about, not the one read. A forwarder is read at its
 # callee's compilation signature, which widens an argument the callee does not specialize on and is

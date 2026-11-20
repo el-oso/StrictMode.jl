@@ -8,11 +8,17 @@ public _UnanalyzableSignature
 """
     _UnanalyzableSignature <: Exception
 
-Raised when a scan cannot obtain typed IR for a signature at all. `concurrency_findings`,
-`threadid_state_findings` and `pool_balance_report` all raise it rather than returning an empty
-result: "could not check" and "is fine" would otherwise render identically, on guarantees that GATE
-(see `_guarantee_gates` in report.jl). Returning `_ConcViol[]` here is the vacuous-green shape this
-package exists to remove.
+Raised when a scan or a report cannot read the code it describes: `concurrency_findings`,
+`threadid_state_findings` and `pool_balance_report` when there is no typed IR for the signature;
+`kernel_report`, `spill_report`, `register_report`, `scalar_fp_loops`, `mca_report` and
+`inline_suggestions` when there is no compiled body to read (a signature that is not concrete, or
+one no method matches); `effects` when no method matches. Each would otherwise return an empty
+result, a zero count or a clean report: "could not check" and "is fine" would render identically,
+on guarantees that GATE (see `_guarantee_gates` in report.jl). Returning `_ConcViol[]` here is the
+vacuous-green shape this package exists to remove.
+
+`guarantee` is the guarantee a scan serves (`:concurrency_safe`, `:no_threadid_state`), or the name
+of the report that raised. The message names it as one or the other.
 
 The findings pipeline catches it and records `:fail` with the error text, so a sweep is not stopped
 by one unreadable signature. A caller using these functions directly handles it itself, which is why
@@ -29,9 +35,11 @@ _UnanalyzableSignature(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple),
     _UnanalyzableSignature(g, _func_name(f), _sig_string(types), String(why))
 
 function Base.showerror(io::IO, e::_UnanalyzableSignature)
+    g = e.guarantee in _GUARANTEES
     print(
-        io, "StrictMode @", e.guarantee, ": could not analyze `", e.target, e.signature,
-        "` — the guarantee is UNKNOWN, not satisfied. ", e.why
+        io, "StrictMode ", g ? repr(e.guarantee) : string(e.guarantee), ": could not analyze `",
+        e.target, e.signature, "` — the ", g ? "guarantee is UNKNOWN, not satisfied. " :
+            "result is UNKNOWN. ", e.why
     )
     return nothing
 end
@@ -2021,11 +2029,11 @@ function pool_balance_report(@nospecialize(f), @nospecialize(types::Tuple))
     cts = try
         _code_typed(f, types; optimize = false)   # keep source-level `take!`/`put!` names
     catch err
-        throw(_UnanalyzableSignature(:pool_balanced, f, types, sprint(showerror, err)))
+        throw(_UnanalyzableSignature(:pool_balance_report, f, types, sprint(showerror, err)))
     end
     isempty(cts) && throw(
         _UnanalyzableSignature(
-            :pool_balanced, f, types, "no typed IR for this signature, so nothing was counted."
+            :pool_balance_report, f, types, "no typed IR for this signature, so nothing was counted."
         )
     )
     code = cts[1].first.code
