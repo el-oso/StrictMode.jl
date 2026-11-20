@@ -603,10 +603,13 @@ StrictMode/src/
                         (code_typed_by_type(…; debuginfo = :source); the default strips them),
                         which name a callee only while a statement of it survives. Identity is
                         (module, demangled name), so a keyword method, its `#f#N` body and the
-                        positional method are one function. Reuses spinwait.jl's follow policy and
-                        task-closure reading. A run-time dispatch is followed when it matches at
-                        most _REACH_MAX_METHODS methods; a Base function on Base types is not
-                        counted as unread. `stop` cuts a hub (a pool dispatcher reaches every job).
+                        positional method are one function. Reuses spinwait.jl's task-closure
+                        reading. A Base callee is entered when its signature names a type defined
+                        outside Base (_reach_carries_user: a handed closure, or a user array whose
+                        getindex `sum` calls); one typed only by Base types, abstract ones
+                        included, is neither entered nor counted. A run-time dispatch is followed
+                        when it matches at most _REACH_MAX_METHODS methods. `stop` cuts a hub (a pool
+                        dispatcher reaches every job).
                         unread/dynamic are counted, RouteParity's status is :agree only for two
                         complete non-empty graphs (:incomplete otherwise — an empty graph must not
                         agree with anything), and @assert_reaches throws only when the graph was

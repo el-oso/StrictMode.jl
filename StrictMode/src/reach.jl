@@ -128,6 +128,26 @@ function _reach_argtype(ci::Core.CodeInfo, @nospecialize(sig), @nospecialize(a))
     return T isa Type ? T : Any
 end
 
+# Whether a Base method called with these types can run code outside Base: the signature names a
+# type defined outside Base, at any parameter depth — a user function it was handed, or an argument
+# whose methods it may call (`getindex` from `sum`, `show` from `string`). An argument typed only as
+# an abstract Base type (`Any`, `AbstractVector`) is not counted.
+function _reach_carries_user(@nospecialize(T), depth::Int = 0)
+    depth > 8 && return true
+    T = Base.unwrap_unionall(T)
+    T isa Union && return _reach_carries_user(T.a, depth + 1) || _reach_carries_user(T.b, depth + 1)
+    T isa DataType || return false
+    _sw_is_base(parentmodule(T)) || return true
+    return any(T.parameters) do p
+        p isa Core.TypeofVararg && return isdefined(p, :T) && _reach_carries_user(p.T, depth + 1)
+        return p isa Type && _reach_carries_user(p, depth + 1)
+    end
+end
+
+# A callee outside Base is entered, and one in Base whenever it can run code outside it.
+_reach_follows(mi::Core.MethodInstance) =
+    !_sw_is_base(mi.def.module) || _reach_carries_user(mi.specTypes)
+
 # A call left to run-time dispatch on a known function. The function is reached whatever method
 # runs; the methods are followed only when the argument types narrow them to a few.
 function _reach_dispatch!(
@@ -147,13 +167,13 @@ function _reach_dispatch!(
     if !(ms isa Vector) || isempty(ms)
         # A Base function called on Base's own types stays in Base, which the walk does not enter
         # either way, so nothing of the route is lost behind it.
-        stays_in_base = !isnothing(tt) && _sw_is_base(key[1]) && !_sw_carries_user_function(tt)
+        stays_in_base = !isnothing(tt) && _sw_is_base(key[1]) && !_reach_carries_user(tt)
         stays_in_base || (r.dynamic += 1)
         return nothing
     end
     for match in ms
         m = match.method
-        (!_sw_is_base(m.module) || _sw_carries_user_function(match.spec_types)) &&
+        (!_sw_is_base(m.module) || _reach_carries_user(match.spec_types)) &&
             push!(queue, (match.spec_types, depth))
     end
     return nothing
@@ -175,7 +195,7 @@ function _reach_scan!(
             end
             key = _reach_key(mi.def)
             _reach_record!(r, key, depth, false)
-            key in stop || !_sw_follows(mi) || push!(queue, (mi.specTypes, depth))
+            key in stop || !_reach_follows(mi) || push!(queue, (mi.specTypes, depth))
         elseif st.head === :call
             v = _sw_callee_value(st.args[1])
             if v isa Core.IntrinsicFunction || v isa Core.Builtin
@@ -248,8 +268,10 @@ from one that chooses a route first.
   An entry the call does not name anywhere it reaches raises an `ArgumentError`: it cut nothing.
   A hub the source calls and the optimizer folded away is named, and does not raise.
 
-A callee in Base is entered only when it was handed a function from outside Base, such as a
-closure passed to `foreach`.
+A callee in Base is entered only when its argument types name a type defined outside Base: a
+closure passed to `foreach`, or a user array whose `getindex` a `sum` calls. A Base call whose
+arguments are typed only by Base types, abstract ones such as `Any` included, is neither entered
+nor counted.
 
 `unread` and `dynamic` on the report count what could not be read, and the list is a lower bound
 when either is positive. For a keyword call, pass `Core.kwcall` and its signature:
@@ -276,8 +298,9 @@ _stop_unmet(caller::String, target, unmet) =
     "reach, so nothing was cut there. Check the name, or drop the entry."
 
 # Which of `keys` some body reachable from `sig` calls by name, read from typed IR BEFORE
-# optimization, where every call the source wrote is still a statement. Callees outside Base are
-# followed, at the argument types inference gave the call. A function handed to any callee, Base's
+# optimization, where every call the source wrote is still a statement. Callees outside Base, and
+# Base callees whose argument types name a type defined outside Base, are followed, at the argument
+# types inference gave the call. A function handed to any callee, Base's
 # included, is one the call may run: it counts as named, and its methods are read too. That
 # covers a closure, a `do` block, a generator, a broadcast, a keyword call and a splat, none of
 # which calls the function in a statement of the body that wrote it.
@@ -311,10 +334,11 @@ function _reach_named_unoptimized(@nospecialize(sig), keys::Set{Tuple{Module, Sy
                     continue
                 end
                 key in keys && push!(found, key)
-                _sw_is_base(key[1]) && continue
                 ats = Any[_unopt_arg_type(ci, a) for a in args]
                 all(T -> T isa Type, ats) || continue
-                push!(queue, Tuple{Core.Typeof(callee), ats...})
+                callsig = Tuple{Core.Typeof(callee), ats...}
+                _sw_is_base(key[1]) && !_reach_carries_user(callsig) && continue
+                push!(queue, callsig)
             end
         end
     end

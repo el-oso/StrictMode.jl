@@ -133,3 +133,27 @@ end
     @test StrictMode.reaches(R(via_out, (Int,), ()), far_leaf)
     @test !StrictMode.reaches(R(via_out, (Int,), (hub_out,)), far_leaf)
 end
+
+@testitem "reach enters a Base callee that runs a user type's methods" begin
+    using StrictMode
+    # `sum` stays an out-of-line call into Base, and reaches `hot` only through `getindex(::Lazy)`.
+    abstract type AbstractLazy <: AbstractVector{Float64} end
+    struct Lazy <: AbstractLazy
+        v::Vector{Float64}
+    end
+    Base.size(l::Lazy) = size(l.v)
+    @noinline hot(x) = 2x
+    Base.getindex(l::Lazy, i::Int) = hot(l.v[i])
+    entry(l::Lazy) = sum(l)
+    @test entry(Lazy([1.0, 2.0])) == 6.0
+    r = StrictMode.reach_report(entry, (Lazy,))
+    @test StrictMode.reaches(r, hot)
+    @test (@assert_reaches entry(Lazy([1.0])) hot) == 2.0
+    @test StrictMode.reaches(StrictMode.reach_report(entry, (Lazy,); stop = (hot,)), hot)
+
+    # A Base call left to run-time dispatch on a user type is followed, or counted.
+    viaref(r::Base.RefValue{AbstractLazy}) = sum(r[])
+    @test viaref(Ref{AbstractLazy}(Lazy([1.0]))) == 2.0
+    rd = StrictMode.reach_report(viaref, (Base.RefValue{AbstractLazy},))
+    @test StrictMode.reaches(rd, hot) || !StrictMode.complete(rd)
+end
