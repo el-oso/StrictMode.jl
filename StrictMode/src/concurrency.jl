@@ -355,7 +355,11 @@ struct _ConcViol
     # no single write tears. So it is reported and does not raise, which is a different fact from
     # `certain = false` ("the scan could not see"), and the two must not share a flag.
     deliberate::Bool
+    # The write is to state every caller shares through a constant global, not to the plan. The
+    # headline of a report names the plan only when a record is about it.
+    global_state::Bool
 end
+_ConcViol(message, file, line, certain, deliberate) = _ConcViol(message, file, line, certain, deliberate, false)
 
 # The memory orders a store carries when it is atomic. `:not_atomic` is what an ordinary array store
 # carries, so the presence of an order argument is not enough on its own.
@@ -395,13 +399,13 @@ end
 
 function _record!(
         out::Vector{_ConcViol}, seen::Set{String}, chain::Vector{String}, msg::String, fr::_Frame;
-        certain::Bool = false, deliberate::Bool = false,
+        certain::Bool = false, deliberate::Bool = false, global_state::Bool = false,
     )
     full = isempty(chain) ? msg : msg * " (reached via " * join(chain, " → ") * ")"
     key = full * "@" * fr.file * ":" * string(fr.line)
     key in seen && return nothing
     push!(seen, key)
-    push!(out, _ConcViol(full, fr.file, fr.line, certain, deliberate))
+    push!(out, _ConcViol(full, fr.file, fr.line, certain, deliberate, global_state))
     return nothing
 end
 
@@ -410,7 +414,7 @@ end
 function _taint_scan_ci(
         ci, targs::Set{Int}, chain::Vector{String}, fr::_Frame, depth::Int, max_depth::Int,
         memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String};
-        cargs::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(),
+        cargs::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(), gargs::Set{Int} = Set{Int}(),
     )
     code = ci.code
     types = ci.ssavaluetypes
@@ -438,9 +442,11 @@ function _taint_scan_ci(
     maybe(@nospecialize(a)) = a isa Core.SSAValue && a.id in mset
     setmaybe(j) = (j in mset || j in tset) ? false : (push!(mset, j); changed = true; true)
     # Values reachable from a mutable constant global. Every caller shares it, so a store into one
-    # is shared state whatever argument the check was told is shared.
+    # is shared state whatever argument the check was told is shared. `gargs` are the arguments
+    # a caller passed such a value in.
     gset = BitSet()
-    gtainted(@nospecialize(a)) = (a isa Core.SSAValue && a.id in gset) || _is_mutable_global(a)
+    gtainted(@nospecialize(a)) = (a isa Core.SSAValue && a.id in gset) ||
+        (a isa Core.Argument && a.n in gargs) || _is_mutable_global(a)
     changed = true
     passes = 0
     while changed && passes <= n + 2
@@ -606,7 +612,7 @@ function _taint_scan_ci(
                         "writes process-global state (`$nm` into a mutable constant global) — every " *
                             "concurrent call shares it; pass the buffer in, or own it per task" *
                             (gatomic ? " (the write is atomic, so it cannot tear, but the global is still shared)" : ""),
-                        fr; certain = true, deliberate = gatomic
+                        fr; certain = true, deliberate = gatomic, global_state = true
                     )
                 end
                 if 1 <= pos <= length(dataargs) && maybe(dataargs[pos]) && !_op_tainted(dataargs[pos], tset, targs)
@@ -725,7 +731,7 @@ function _taint_scan_ci(
                     !any(a -> _op_tainted(a, tset, targs), @view dataargs[4:end])
                 ir = _llvmcall_text(dataargs[1])
                 (occursin("atomicrmw", ir) || occursin("cmpxchg", ir) || occursin("store atomic", ir)) &&
-                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true)
+                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true, global_state = true)
                 continue
             end
             if nm === :llvmcall && length(dataargs) >= 4 &&
@@ -750,7 +756,7 @@ function _taint_scan_ci(
             end
             if nm !== nothing && nm in _ATOMIC_POINTER_WRITES && !isempty(dataargs)
                 gtainted(dataargs[1]) &&
-                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true)
+                    _record!(out, seen, chain, _GLOBAL_ATOMIC_WRITE, fr; certain = true, deliberate = true, global_state = true)
                 _op_tainted(dataargs[1], tset, targs) && _record!(
                     out, seen, chain,
                     "stores into a buffer reachable from the plan (`$nm`) — a heap write the plan " *
@@ -779,13 +785,25 @@ function _taint_scan_ci(
                 flds = _direct_fields(dataargs[k], cset, cflds, cargs)
                 isnothing(flds) || (cpos[k] = flds)
             end
-            (isempty(tainted_pos) && isempty(cpos)) && continue
+            # A global handed to a callee is as shared inside it as here: a helper that bumps the
+            # counter it was given writes the global. A lock is written by everyone who takes it.
+            gpos = Int[]
+            if isinvoke
+                mi0 = _invoke_mi(st.args[1])
+                ps = (!isnothing(mi0) && mi0.specTypes isa DataType) ? mi0.specTypes.parameters : nothing
+                for k in eachindex(dataargs)
+                    gtainted(dataargs[k]) || continue
+                    (!isnothing(ps) && k + 1 <= length(ps) && _is_lock_type(ps[k + 1])) && continue
+                    push!(gpos, k)
+                end
+            end
+            (isempty(tainted_pos) && isempty(cpos) && isempty(gpos)) && continue
 
             if isinvoke
                 mi = _invoke_mi(st.args[1])
                 m = mi === nothing ? nothing : mi.def
                 if m isa Method && !_is_base_core(m.module)
-                    rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen; cpos)
+                    rt = _recurse(mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen; cpos, gpos)
                     settaint(rt === true && _may_ref(types[i]))
                 elseif nm !== nothing && nm in _BASE_MUTATORS && _mutator_dest(nm) in tainted_pos
                     _record!(
@@ -800,10 +818,10 @@ function _taint_scan_ci(
                     # result is the plan's memory or a fresh copy. Any other Base callee (a
                     # reduction, a `throw_boundserror`) is treated as non-mutating.
                     bang = endswith(String(_demangle(m.name)), "!")
-                    if bang || _may_alias_result(types[i])
+                    if bang || (_may_alias_result(types[i]) && !(isempty(tainted_pos) && isempty(cpos)))
                         rt = _recurse(
                             mi, m, tainted_pos, chain, depth, max_depth, memo, out, seen;
-                            cpos, base = true, bang
+                            cpos, gpos, base = true, bang
                         )
                         settaint(rt === true && _may_ref(types[i]))
                         rt === :maybe && _may_alias_result(types[i]) && setmaybe(i)
@@ -1053,12 +1071,16 @@ function _recurse(
         mi::Core.MethodInstance, m::Method, tainted_pos::Vector{Int}, chain::Vector{String},
         depth::Int, max_depth::Int, memo::Dict{Any, Any}, out::Vector{_ConcViol}, seen::Set{String};
         cpos::Dict{Int, Set{Int}} = Dict{Int, Set{Int}}(), base::Bool = false, bang::Bool = false,
+        gpos::Vector{Int} = Int[],
     )
     # Canonical, and comparable: sorting the pairs directly falls through to comparing the `Set`
     # values whenever two keys tie, and `isless` has no method for `Set`. Measured on a real
     # package: every `cholesky!` signature came back unanalyzable with a `MethodError` from the
     # memo key rather than from anything about the method.
-    key = (mi, sort(tainted_pos), [k => sort!(collect(v)) for (k, v) in sort!(collect(cpos); by = first)])
+    key = (mi, sort(tainted_pos), [k => sort!(collect(v)) for (k, v) in sort!(collect(cpos); by = first)], sort(gpos))
+    # Entered for a global alone: nothing of the plan is handed over, so there is nothing about
+    # the plan to record when the callee is not read.
+    global_only = isempty(tainted_pos) && isempty(cpos)
     # A result is kept with the depth it was computed at and whether the walk was cut short
     # somewhere beneath it. One that was cut answers only a visit at least as deep: a shallower
     # visit reads further and may find what the deeper one could not.
@@ -1070,7 +1092,7 @@ function _recurse(
     # A Base callee that is not read is reported only when its name declares a write. Base's
     # other functions do not write their arguments, and a record for each one the walk stopped
     # at would report every reduction and every `show` of a plan value.
-    quiet = base && !bang
+    quiet = (base && !bang) || global_only
     if depth >= max_depth + (base ? _BASE_EXTRA_DEPTH : 0)
         quiet || _record!(
             out, seen, chain,
@@ -1078,6 +1100,7 @@ function _recurse(
                 "not read, so not established; pass a larger `max_depth` to check it", _Frame(label, string(m.file), Int(m.line))
         )
         memo[:cut] = get(memo, :cut, 0) + 1
+        global_only && return false
         return quiet ? _unread_result(label, "past the depth the walk reads", m, chain, out, seen) : false
     end
     cut0 = get(memo, :cut, 0)
@@ -1091,6 +1114,7 @@ function _recurse(
                 "not read, so not established", _Frame(label, string(m.file), Int(m.line))
         )
         delete!(memo, key)
+        global_only && return false
         return quiet ? _unread_result(label, "its typed IR could not be read", m, chain, out, seen) : false
     end
     # user param k (1-based) ↔ Core.Argument(k+1)
@@ -1099,7 +1123,7 @@ function _recurse(
     fr = _Frame(label, string(m.file), Int(m.line))
     rt = _taint_scan_ci(
         ci, callee_targs, vcat(chain, label), fr, depth + 1, max_depth, memo, out, seen;
-        cargs = callee_cargs
+        cargs = callee_cargs, gargs = Set{Int}(p + 1 for p in gpos)
     )
     memo[key] = (rt, depth, get(memo, :cut, 0) != cut0)
     return rt
@@ -1191,6 +1215,10 @@ _conc_counts(groups) = string(
     length(groups[3][3]), " site(s) it could not rule out"
 )
 
+# Whether every record is an atomic write to a global: the scan read each one, and none is about
+# the plan.
+_only_global_atomics(vs::Vector{_ConcViol}) = all(v -> v.global_state && v.deliberate && v.certain, vs)
+
 function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types::Tuple); self_arg::Int = 1, max_depth::Int = 4)
     vs = concurrency_findings(f, types; self_arg, max_depth)
     isempty(vs) && return nothing
@@ -1205,6 +1233,9 @@ function _assert_concurrency_safe(target, @nospecialize(f), @nospecialize(types:
         sure ?
             "writes state that concurrent tasks share (the plan argument, or a global) — NOT safe to " *
                 "run concurrently" :
+            _only_global_atomics(vs) ?
+            "makes atomic writes to global state that every concurrent call shares; the plan " *
+                "argument is not written. The writes cannot tear, and the state is still shared" :
             "cannot establish that the plan argument is read-only — sharing it across concurrent " *
             "tasks is unproven, not disproven",
         " (", _conc_counts(groups), "):"
@@ -2006,6 +2037,9 @@ function _concurrency_safe_finding(
         at.file, at.line,
         (
             certain ? "argument $self is written during the call (" :
+                _only_global_atomics(vs) ?
+                "argument $self is not written; global state every concurrent call shares is " *
+                "written atomically (" :
                 "cannot prove argument $self is read-only ("
         ) * _conc_counts(groups) * "): " * join(listed, "; "),
         _suggestion(:concurrency_safe), tier, _code(:concurrency_safe)

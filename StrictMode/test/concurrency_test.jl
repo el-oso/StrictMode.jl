@@ -1449,3 +1449,69 @@ end
     GlobalAtomics.add(p)
     @test only(findings(GlobalAtomics.add, sig; guarantees = (:concurrency_safe,))).status === :info
 end
+
+@testitem "a global handed to a helper is followed into it" begin
+    using StrictMode
+
+    module GlobalHelpers
+    const HITS = Threads.Atomic{Int}(0)
+    const LOG = Float64[]
+    const LK = ReentrantLock()
+    struct Plan
+        buf::Vector{Float64}
+        ctr::Threads.Atomic{Int}
+    end
+    @noinline bump!(c::Threads.Atomic{Int}) = (Threads.atomic_add!(c, 1); nothing)
+    @noinline bump_twice(c) = (bump!(c); bump!(c))
+    @noinline peek(c::Threads.Atomic{Int}) = c[]
+    @noinline note!(log::Vector{Float64}, x) = (log[1] = x; nothing)
+    @noinline with(lk, x) = (lock(lk); y = x + 1; unlock(lk); y)
+    g_helper(p::Plan) = (bump!(HITS); p.buf[1])
+    g_nested(p::Plan) = (bump_twice(HITS); p.buf[1])
+    g_plan(p::Plan) = (bump!(p.ctr); p.buf[1])
+    g_reads(p::Plan) = peek(HITS) + p.buf[1]
+    g_store(p::Plan) = (note!(LOG, 1.0); p.buf[1])
+    g_locks(p::Plan) = with(LK, p.buf[1])
+    end
+    G = GlobalHelpers
+    sig = (G.Plan,)
+    for f in (G.g_helper, G.g_nested)
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate && v.certain, vs)
+        @test any(v -> occursin("process-global state", v.message) && occursin("bump!", v.message), vs)
+    end
+    # The same helper on the plan's own counter is the plan's write, as before.
+    @test any(v -> occursin("reachable from the plan", v.message), StrictMode.concurrency_findings(G.g_plan, sig))
+    # A helper that reads the global, and one that takes a global lock, write nothing.
+    @test isempty(StrictMode.concurrency_findings(G.g_reads, sig))
+    @test isempty(StrictMode.concurrency_findings(G.g_locks, sig))
+    # A plain store through the helper is a write the scan read, and raises.
+    vs = StrictMode.concurrency_findings(G.g_store, sig)
+    @test any(v -> v.certain && !v.deliberate && occursin("process-global state", v.message), vs)
+    push!(G.LOG, 0.0)
+    @test_throws StrictViolation @assert_concurrency_safe G.g_store(G.Plan([1.0], Threads.Atomic{Int}(0)))
+end
+
+@testitem "an atomic write to a global is not reported as a doubt about the plan" begin
+    using StrictMode
+
+    module GlobalHeadline
+    const HITS = Threads.Atomic{Int}(0)
+    struct Plan
+        buf::Vector{Float64}
+    end
+    g_add(p::Plan) = (Threads.atomic_add!(HITS, 1); p.buf[1])
+    end
+    G = GlobalHeadline
+    p = G.Plan([1.0])
+    G.g_add(p)
+    # What was found is an atomic write to a global, and nothing about the plan.
+    headline = r"makes atomic writes to global state that every concurrent call shares; the plan argument is not written"
+    @test_logs (:warn, headline) match_mode = :any @assert_concurrency_safe G.g_add(p)
+    @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe G.g_add(p)
+    f = only(findings(G.g_add, (G.Plan,); guarantees = (:concurrency_safe,)))
+    @test f.status === :info
+    @test occursin("argument 1 is not written; global state every concurrent call shares is written atomically", f.reason)
+    @test !occursin("cannot prove argument 1 is read-only", f.reason)
+end

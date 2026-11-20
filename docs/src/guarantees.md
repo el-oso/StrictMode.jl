@@ -1426,7 +1426,9 @@ A lock, a condition, an event, a channel or a semaphore held by the plan is not 
 is marked: `Threads.atomic_add!(plan.ctr, 1)` and `plan.ctr[] = v` are atomic writes to shared
 state, and warn as `@atomic plan.count += 1` does. The same holds for a constant global
 `Threads.Atomic`: an atomic write to one is reported as an atomic write to process-global state,
-and warns.
+and warns. A global handed to a helper is followed into it, as the plan is, so
+`bump!(HITS)` is reported where `bump!` does the write. When atomic writes to a global are all
+that was found, the report says that, and that the plan argument is not written.
 
 ### Throw or warn
 

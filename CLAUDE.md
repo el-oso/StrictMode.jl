@@ -280,7 +280,12 @@ StrictMode/src/
                         Threads.Atomic is treated the same (_is_mutable_global no longer skips
                         it; the address of a global from jl_value_ptr carries `gset`): an
                         atomic write to it is certain and deliberate, so it warns and never
-                        raises. A lock or channel global is still not data. A Base callee
+                        raises. A lock or channel global is still not data. Global taint
+                        crosses an :invoke like plan taint (`gpos` → `gargs` in _recurse, in the
+                        memo key): a helper handed the global is read, silently when it cannot
+                        be. _ConcViol.global_state marks a record about a global, and when every
+                        record is a certain atomic write to one (_only_global_atomics) the
+                        headline and the finding say the plan is NOT written. A Base callee
                         entered for its result and NOT READ returns :maybe: the call is an
                         undecided record and the result goes into `mset`, through which a store is
                         an undecided record too, never a certain one (a fresh buffer from a deep
