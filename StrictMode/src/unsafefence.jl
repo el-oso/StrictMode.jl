@@ -98,14 +98,13 @@ function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
     depth > 8 && return nothing
     a isa GlobalRef && return isdefined(a.mod, a.name) ? getglobal(a.mod, a.name) : nothing
     a isa QuoteNode && return a.value
+    # `M.name` written where a value is stored (`f = Base.unsafe_load`) is the call itself, with
+    # no statement of its own.
+    Meta.isexpr(a, :call) && return _lowered_global_read(code, a, depth)
     if a isa Core.SSAValue
         s = code[a.id]
-        if Meta.isexpr(s, :call) && length(s.args) == 3 &&
-                _lowered_callee(code, s.args[1], depth + 1) in (getproperty, getfield)
-            M = _lowered_callee(code, s.args[2], depth + 1)
-            nm = s.args[3] isa QuoteNode ? s.args[3].value : s.args[3]
-            return (M isa Module && nm isa Symbol && isdefined(M, nm)) ? getglobal(M, nm) : nothing
-        end
+        v = _lowered_global_read(code, s, depth)
+        isnothing(v) || return v
         # `Ptr{T}` is `Core.apply_type(Ptr, T)` in a statement of its own. The type it names is
         # the one being parameterized, which is all a caller needs to know it is a pointer type.
         if Meta.isexpr(s, :call) && length(s.args) >= 2 &&
@@ -115,6 +114,16 @@ function _lowered_callee(code::Vector{Any}, @nospecialize(a), depth::Int = 0)
         return _lowered_callee(code, s, depth + 1)
     end
     return a isa Expr ? nothing : a
+end
+
+# The value `M.name` reads: `getproperty(M, :name)`, `getfield(M, :name)` or `getglobal(M, :name)`
+# on a module, else `nothing`.
+function _lowered_global_read(code::Vector{Any}, @nospecialize(s), depth::Int)
+    (Meta.isexpr(s, :call) && length(s.args) == 3) || return nothing
+    _lowered_callee(code, s.args[1], depth + 1) in (getproperty, getfield, getglobal) || return nothing
+    M = _lowered_callee(code, s.args[2], depth + 1)
+    nm = s.args[3] isa QuoteNode ? s.args[3].value : s.args[3]
+    return (M isa Module && nm isa Symbol && isdefined(M, nm)) ? getglobal(M, nm) : nothing
 end
 
 function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
@@ -133,7 +142,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         # `f = unsafe_load` as one around the name.
         if Meta.isexpr(st, :(=))
             st = st.args[2]
-            named(st) && note(resolve(st))
+            (named(st) || Meta.isexpr(st, :call)) && note(resolve(st))
         end
         if st isa Core.ReturnNode
             isdefined(st, :val) && named(st.val) && note(resolve(st.val))
@@ -159,7 +168,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         isnothing(callee) && continue
         if _is_ptr_type(callee)
             push!(out, :Ptr)
-        elseif (callee === reinterpret || callee === Core.Intrinsics.bitcast) && length(st.args) >= 2 &&
+        elseif (callee === reinterpret || callee === Core.Intrinsics.bitcast || callee === convert) && length(st.args) >= 2 &&
                 _is_ptr_type(resolve(st.args[2]))
             push!(out, :Ptr)
         elseif callee isa Core.Builtin && length(st.args) >= 3 && st.args[end] === false
@@ -229,15 +238,18 @@ uses any of these.
 | `pointer`, `pointer_from_objref`, and any function whose name begins with `unsafe_` | its name |
 | the pointer intrinsics `pointerref`, `pointerset`, `atomic_pointer…`, and `llvmcall`, `cglobal` | its name |
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
-| a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)` | `:Ptr` |
+| a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)` | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 
 A function counts wherever the method names it, not only where it calls it: `map(unsafe_load, ps)`,
 `unsafe_load.(ps)`, `unsafe_load(args...)`, `unsafe_wrap(Array, p, n; own = false)` and
-`f = unsafe_load; f(p)` are all reported as `unsafe_load` or `unsafe_wrap`. Comparing a value with
+`f = unsafe_load; f(p)` are all reported as `unsafe_load` or `unsafe_wrap`. The name may be
+qualified or looked up: `f = Base.unsafe_load` and `getglobal(Base, :unsafe_load)(p)` name it too. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
 function named `free` is not `Libc.free`. Taking a `Ptr` argument, or naming the type, builds no
 pointer and is not reported.
+A conversion to a pointer type is reported whatever is converted: the scan reads lowered code,
+which carries no types, so `convert(Ptr{Cvoid}, p)` on a pointer reads like one on an address.
 
 This is the scan behind `StrictModeTest.test_no_unsafe`, and the Julia form of Rust's
 `#![forbid(unsafe_code)]`. The language cannot enforce it — `ccall` and `unsafe_load` are ordinary

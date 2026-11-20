@@ -492,7 +492,10 @@ StrictMode/src/
                         matched by IDENTITY, because a package may define its own `free`; :Ptr is a
                         call of a Ptr type or a reinterpret to one (Ptr{T} is apply_type in a
                         statement of its own, which _lowered_callee resolves to the type being
-                        parameterized) — a Ptr argument or annotation is not; :cfunction is a
+                        parameterized), and so is convert to one, whatever is converted, since
+                        lowered code carries no types — a Ptr argument or annotation is not; a
+                        name read through a module (`f = Base.unsafe_load`, getglobal(Base, …)) is
+                        resolved by _lowered_global_read, as a statement or as a stored value; :cfunction is a
                         statement head; a memoryref builtin or getfield with a literal `false`
                         bounds check is reported under its name. _check_allow RAISES on an `allow`
                         entry that is no construct; a misspelling that still begins with

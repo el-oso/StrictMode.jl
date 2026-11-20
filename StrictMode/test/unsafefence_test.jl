@@ -192,6 +192,12 @@ end
     memref_set(v) = Base.memoryrefset!(v.ref, 0.0, :not_atomic, false)
     tuple_unchecked(t, i) = getfield(t, i, false)
     objref(x) = pointer_from_objref(x)
+    stored_qualified(p) = (f = Base.unsafe_load; f(p))
+    stored_libc(p) = (fr = Libc.free; fr(p))
+    stored_intrinsic(p) = (f = Core.Intrinsics.pointerref; f(p, 1, 1))
+    by_getglobal(p) = getglobal(Base, :unsafe_load)(p)
+    stored_getglobal(p) = (f = getglobal(Base, :unsafe_load); f(p))
+    ptr_convert(addr::UInt) = convert(Ptr{Float64}, addr)
     end
 
     expect = Dict(
@@ -206,6 +212,9 @@ end
         "memref_new" => "memoryrefnew", "memref_get" => "memoryrefget",
         "memref_set" => "memoryrefset!", "tuple_unchecked" => "getfield",
         "objref" => "pointer_from_objref",
+        "stored_qualified" => "unsafe_load", "stored_libc" => "free",
+        "stored_intrinsic" => "pointerref", "by_getglobal" => "unsafe_load",
+        "stored_getglobal" => "unsafe_load", "ptr_convert" => "Ptr",
     )
     fs = unsafe_report(FenceSpellings)
     by = Dict{String, String}()
@@ -249,6 +258,10 @@ end
     stringy(x) = string("unsafe_load(", x, ")")
     symbolic() = :unsafe_load
     compares(f) = f === unsafe_load || f == pointer
+    stored_clean(v) = (f = Base.sum; f(v))
+    by_getglobal_clean(v) = getglobal(Base, :sum)(v)
+    qualified_compare(f) = f === Base.unsafe_load
+    converts_number(x) = convert(Int, x)
     end
     @test isempty(unsafe_report(FenceClean))
 
