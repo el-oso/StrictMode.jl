@@ -214,8 +214,9 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             append!(erased, sub[2])
             continue
         end
-        # Comparing a value with a payload-reading function applies it to nothing.
-        if !(callee in (===, !==, ==, !=, isequal))
+        # Comparing a value with a payload-reading function, or testing membership in a collection
+        # of them, applies it to nothing.
+        if !(callee in (===, !==, ==, !=, isequal, in, ∉))
             _handed_on_reads!(certain, erased, ci, st, callee, args)
         end
         # A call that copies out the bits of what it is given reads a payload it can reach:

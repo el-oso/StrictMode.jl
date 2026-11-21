@@ -594,9 +594,14 @@ end
     fields(p::Pt) = getfield.(Ref(p), (:a, :b))
     mapped_clean(ps::Vector{Pt}) = map(getfield, ps, fill(:a, length(ps)))
     fixed_clean(p::Pt) = Base.Fix2(getfield, :a)(p)
+    # A membership test compares with the function and applies it to nothing.
+    is_reader(f) = f in (getfield, getproperty)
+    not_reader(f) = f ∉ (getfield, getproperty)
     @test status(fields, (Pt,)).status === :pass
     @test status(mapped_clean, (Vector{Pt},)).status === :pass
     @test status(fixed_clean, (Pt,)).status === :pass
+    @test status(is_reader, (Any,)).status === :pass
+    @test status(not_reader, (Any,)).status === :pass
 end
 
 @testitem "reinterpret of an array and write of a Ref read the payload bytes" begin
