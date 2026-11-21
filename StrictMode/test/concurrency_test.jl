@@ -1750,3 +1750,29 @@ end
     # A read through the pointer writes nothing.
     @test isempty(StrictMode.threadid_state_findings(T.hr, (Float64,)))
 end
+
+@testitem "copying from a stream into an inert target can suspend" begin
+    using StrictMode
+    module Streams
+    using Base.Threads: threadid
+    const BUF = zeros(Int, 64)
+    # `write(to::IO, from::IO)` reads `from` until its end, and waits on it while it is open.
+    ctx(io::IOContext{IOBuffer}, src::Base.BufferStream) = (i = threadid(); write(io, src); BUF[i] += 1; nothing)
+    top(io::IOBuffer, src::Base.BufferStream) = (i = threadid(); write(io, src); BUF[i] += 1; nothing)
+    @noinline inner(io::IOBuffer, src::Base.BufferStream) = (@noinline write(io, src))
+    nested(io::IOBuffer, src::Base.BufferStream) = (i = threadid(); inner(io, src); BUF[i] += 1; nothing)
+    str(io::IOBuffer, s::String) = (i = threadid(); write(io, s); BUF[i] += 1; nothing)
+    end
+    src() = (s = Base.BufferStream(); write(s, "abc"); close(s); s)
+    Streams.ctx(IOContext(IOBuffer()), src()); Streams.top(IOBuffer(), src())
+    Streams.nested(IOBuffer(), src()); Streams.str(IOBuffer(), "abc")
+    tid(f, t) = only(StrictMode.findings(f, t; guarantees = (:no_threadid_state,))).status
+    @test tid(Streams.ctx, (IOContext{IOBuffer}, Base.BufferStream)) === :fail
+    @test tid(Streams.top, (IOBuffer, Base.BufferStream)) === :fail
+    # Behind a callee the `write` is reached but not read, so it is reported without certainty.
+    @test tid(Streams.nested, (IOBuffer, Base.BufferStream)) === :info
+    @test StrictMode._sig_may_suspend(Tuple{typeof(Streams.inner), IOBuffer, Base.BufferStream}) !== :no
+    # Writing a string into an `IOBuffer` reads no stream.
+    @test tid(Streams.str, (IOBuffer, String)) === :pass
+end
+

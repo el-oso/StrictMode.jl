@@ -1728,12 +1728,27 @@ function _suspends_on(@nospecialize(T))
     return isconcretetype(T) ? :yes : :maybe
 end
 
+# The same, over every argument after the function: the first one the operation acts on, and each
+# later one that may be a stream, since `write(to::IO, from::IO)` reads `from` and waits on it.
+function _suspends_on_args(ps)
+    length(ps) >= 2 || return :maybe
+    on = _suspends_on(ps[2])
+    for k in 3:length(ps)
+        T = ps[k]
+        (T isa Type && typeintersect(T, IO) === Union{}) && continue
+        v = _suspends_on(T isa Type ? T : Any)
+        v === :yes && return :yes
+        v === :maybe && (on = :maybe)
+    end
+    return on
+end
+
 # Callee signature and world => :yes, :maybe or :no. The world is part of the key because the reach
 # follows run-time dispatch, which a method defined anywhere can change.
 const _SUSPEND_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
 const _SUSPEND_LOCK = ReentrantLock()
 
-# Whether a callee signature is an operation in `_SUSPEND_ON` on an object it cannot block on.
+# Whether a callee signature is an operation in `_SUSPEND_ON` on objects it cannot block on.
 function _inert_op(@nospecialize(sig))
     sig = Base.unwrap_unionall(sig)
     (sig isa DataType && length(sig.parameters) >= 2) || return false
@@ -1741,7 +1756,7 @@ function _inert_op(@nospecialize(sig))
     (F isa DataType && isdefined(F, :instance)) || return false
     f = F.instance
     return f isa Function && _sw_is_base(parentmodule(f)) && nameof(f) in _SUSPEND_ON &&
-        _inert_target(sig.parameters[2])
+        _suspends_on_args(sig.parameters) === :no
 end
 
 # Whether a callee can suspend, from the Base functions its call graph reaches. An operation in
@@ -1789,7 +1804,10 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any}, argtype = _ -> Any
             if nm in _SUSPEND_ON
                 ps = mi.specTypes.parameters
                 length(ps) >= 2 || return :maybe
-                on = _suspends_on(ps[2])
+                # Each argument at the narrower of its type at this call and in the instance.
+                at = length(ps) == length(site.parameters) && !any(p -> p isa Core.TypeofVararg, ps) ?
+                    Any[typeintersect(site.parameters[k], ps[k]) for k in eachindex(ps)] : ps
+                on = _suspends_on_args(at)
                 # Writing a value to an inert target still runs that value's `show`, which for a
                 # type outside Base is user code.
                 (on === :no && any(_carries_user_type, site.parameters[3:end])) && return _sig_may_suspend(site)

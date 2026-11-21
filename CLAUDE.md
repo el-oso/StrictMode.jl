@@ -281,6 +281,8 @@ StrictMode/src/
                         Suspension inside a callee is read by _sig_may_suspend from reach.jl's
                         graph; _inert_op leaves out a _SUSPEND_ON operation on an IOBuffer, an
                         IOContext of one, DevNull or a SpinLock, while its callees are still read.
+                        Every later argument whose type meets IO is judged too (_suspends_on_args),
+                        because write(to, from::IO) reads and waits on the source.
                         A sweep has nowhere to name WHICH argument is shared, so it reads argument
                         1: a `!` method therefore gets :info (its name declares that write), unless
                         the scan read a write to a constant global, which stays :fail, and an

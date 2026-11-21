@@ -1556,6 +1556,9 @@ caller then writes it. Suspension points are looked for in callees too. Writing 
 to an `IOContext` around one, and taking a `SpinLock` are not suspension points, so building a
 string is one only when the `show` of a value it prints can suspend, read through Base's default
 `show` of a struct into the `show` of each field.
+Copying from a stream into an `IOBuffer`, as `write(buf, stream)` does, is one: it reads the
+source until its end and waits on it while it is open. Every argument that may be a stream is
+judged, not only the first.
 
 A thread id stored into another array and read back later is not tracked.
 
