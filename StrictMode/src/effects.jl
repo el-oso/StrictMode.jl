@@ -501,7 +501,7 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     # callee of another, and a body is read once.
     topci = _typed_body(sig)
     seen = Base.IdSet{Any}()
-    push!(seen, sig)
+    push!(seen, (sig, mode, false))
     alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated =
         isnothing(topci) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
         _scan_ci(topci, sig, depth, seen, mode, true)
@@ -850,10 +850,11 @@ const _SIGNAL_MEMO_LOCK = ReentrantLock()
 # therefore counts its cuts, and only a body whose subtree met none is memoized.
 _cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)::Base.RefValue{Int}
 
-# A body is scanned once per context: what it allocates on its throw paths counts only in a caught
-# context (`_skip_mask`), so the walk records and memoizes the two separately.
+# A body is scanned once per context and mode: what it allocates on its throw paths counts only in a
+# caught context (`_skip_mask`), and a body below an exempt callee is also read for boxing alone, so
+# the walk records and memoizes each separately.
 function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, caught::Bool = false)
-    visit = caught ? (sig, :caught) : sig
+    visit = (sig, mode, caught)
     if visit in seen
         _cut_counter()[] += 1
         return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
@@ -982,14 +983,14 @@ function _signal_origin(
     )
     top = _sigtype(f, types)
     parent = IdDict{Any, Any}()
-    queue = Any[(top, _FAST_ALLOC_DEPTH[], false)]
+    queue = Any[(top, _FAST_ALLOC_DEPTH[], false, mode)]
     seen = Base.IdSet{Any}()
     out = Any[]
     while !isempty(queue) && length(seen) < _SCAN_BODY_BUDGET[]
-        s, depth, caught = popfirst!(queue)
-        (s, caught) in seen && continue
-        push!(seen, (s, caught))
-        trace, callees = _origin_node(s, mode, caught)
+        s, depth, caught, m = popfirst!(queue)
+        (s, caught, m) in seen && continue
+        push!(seen, (s, caught, m))
+        trace, callees = _origin_node(s, m, caught)
         if !isempty(trace)
             path = Any[]
             c = s
@@ -1006,12 +1007,14 @@ function _signal_origin(
                 isnothing(stops) || push!(stops, mi.specTypes)
                 continue
             end
-            isnothing(_mi_exempt_name(mi)) || continue
+            # A callee exempt from `:noalloc` has its allocation excused and its boxing counted, so
+            # below it only boxing is looked for.
+            cm = m !== :boxing && !isnothing(_mi_exempt_name(mi)) ? :boxing : m
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
             user = _enters_user_code(mi)
             (depth > 0 || (depth < 0 && user)) || continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool))
+            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, cm))
         end
     end
     return out
@@ -1616,8 +1619,16 @@ function _scan_ci(
                             exname = a2 ? _mi_exempt_name(mi) : nothing
                             if isnothing(exname)
                                 a2 && (alloc = true)
-                            elseif isnothing(exempt)
-                                exempt = exname
+                            else
+                                isnothing(exempt) && (exempt = exname)
+                                # The walk above ends at the callee's first allocation, so a boxing
+                                # after it is read by a walk of its own: the boxing is not excused,
+                                # wherever in the callee it lies.
+                                if !b2 && mode !== :boxing
+                                    _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, seen, :boxing, callee_caught(i))
+                                    tr3 && (truncated = true)
+                                    isnothing(barrier_box) && (barrier_box = bb3)
+                                end
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
                             (b2 && !_in_scheduler(mi)) && (boxing = true)

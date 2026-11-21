@@ -303,6 +303,73 @@ end
     @test !any(l -> l.level === Base.CoreLogging.Warn, logs)
 end
 
+@testitem "an exempt callee is a note whether or not its throw is caught" begin
+    using StrictMode, Test
+    # Names unique to this item: an exemption is matched by function name in every loaded module.
+    module ExemptCaught
+    using StrictMode
+    # Its only allocation is the exception of a throw that its own handler catches and returns from.
+    @noinline function xcaught_note!(n::Int)
+        try
+            n < 0 && throw(ArgumentError("negative"))
+        catch
+            return 0
+        end
+        return n
+    end
+    @noinline xplain_note!(n::Int) = n < 0 ? length(zeros(n)) : n
+    # The message of its caught throw is built by `print` over a `Vararg{Any}` tuple, which boxes.
+    @noinline function xcaught_box!(n::Int)
+        try
+            n < 0 && throw(ArgumentError(string("negative: ", n)))
+        catch
+            return 0
+        end
+        return n
+    end
+    const LATE = Any[1]
+    @noinline xlate_box(n::Int) = (LATE[1] + n)::Int
+    # Allocates first, then calls a callee that boxes.
+    @noinline function xgrow_then_box!(n::Int)
+        v = zeros(n)
+        return xlate_box(n) + length(v)
+    end
+    for name in (:xcaught_note!, :xplain_note!, :xcaught_box!, :xgrow_then_box!)
+        StrictMode._exempt!(name; guarantees = (:noalloc,), reason = "grows")
+    end
+    caught_caller(n::Int) = xcaught_note!(n) + 1
+    plain_caller(n::Int) = xplain_note!(n) + 1
+    own_caller(n::Int) = xcaught_note!(n) + sum(zeros(n))
+    boxed_caller(n::Int) = xcaught_box!(n) + 1
+    late_caller(n::Int) = xgrow_then_box!(n) + 1
+    end
+    E = ExemptCaught
+    for fn in (E.caught_caller, E.plain_caller, E.own_caller, E.boxed_caller, E.late_caller)
+        fn(1)
+    end
+    noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
+    reaches_box(fn, name) = any(
+        o -> occursin(name, string(o.signature)) || any(p -> occursin(name, string(p)), o.path),
+        StrictMode._signal_origin(fn, (Int,); mode = :alloc)
+    )
+
+    for (fn, callee) in ((E.caught_caller, "xcaught_note!"), (E.plain_caller, "xplain_note!"))
+        r = noalloc(fn)
+        @test r.status === :info
+        @test !StrictMode._failed(r)
+        @test occursin(callee, r.reason)
+    end
+    # Its own allocation is not excused by reaching an exempt one.
+    @test StrictMode._failed(noalloc(E.own_caller))
+    # The exemption excuses allocation, not boxing, wherever in the callee the boxing lies, and the
+    # walk that names an origin finds it there.
+    for (fn, callee) in ((E.boxed_caller, "xcaught_box!"), (E.late_caller, "xgrow_then_box!"))
+        @test StrictMode._failed(noalloc(fn))
+        @test reaches_box(fn, callee)
+    end
+    @test reaches_box(E.late_caller, "xlate_box")
+end
+
 @testitem "an allocation barrier excuses allocation only; its other causes are reported at it" begin
     using StrictMode, Test
     module BarrierRule

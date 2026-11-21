@@ -196,7 +196,11 @@ StrictMode/src/
                         return (_caught_region_mask) is scanned with _skip_mask(code, true), the
                         unreachable mask alone, and so is everything below it; _signals_by_type
                         keys seen and _SIGNAL_MEMO on the context, and _signal_origin/_origin_node
-                        carry it, so a body has one verdict per context.
+                        carry it, so a body has one verdict per context. A callee exempt from
+                        :noalloc has its allocation excused and its boxing counted: when its own
+                        walk stopped at an allocation, _scan_ci reads it again in :boxing mode
+                        (seen is keyed on (sig, mode, caught) so that second walk is not cut), and
+                        _signal_origin follows it in :boxing mode rather than skipping it.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch

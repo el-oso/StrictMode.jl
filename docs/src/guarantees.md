@@ -267,6 +267,11 @@ the growth path forever. Excuse it visibly with
 `@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured, by
 warming the call and checking that a second identical call allocates nothing.
 
+The value-free scan reports a caller whose only allocations are inside such exempt functions as an
+`:info` note naming one of them. The exemption excuses allocation only: boxing or dynamic dispatch
+anywhere inside the exempt function, including on a throw path that a returning catch handles,
+still fails the caller, and the warning names where it is.
+
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
 [`@assert_noboxing`](@ref) is the easygoing cousin of `@assert_noalloc`. It objects only to
