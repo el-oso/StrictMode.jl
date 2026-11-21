@@ -204,11 +204,12 @@ which no path reaches a `return` carrying a value, not just the `throw`: the mes
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
 never an error path, and neither is a throw that a catch handles: when the `catch` can return, the code
 before the `try` and every statement in the try body, the throw and the message it builds included, run
-on a call that returns normally, and they count. A catch that only rethrows leaves them error paths.
-The proof tier agrees: AllocCheck drops every site that leads to a throw, caught or not, so where a
-caught throw is reachable `StrictModeTest` checks the code a second time without `ignore_throw` and
-keeps the sites a caught throw reaches. That second check is a second AllocCheck compile of the call
-graph, so a proof whose reach holds such a `try` costs about twice as much.
+on a call that returns normally, and they count, as does the handler itself. A catch that only
+rethrows leaves them error paths. The proof tier agrees: AllocCheck drops every site that leads to a
+throw, caught or not, and every site a catch reaches, so where a caught throw is reachable
+`StrictModeTest` checks the code a second time without `ignore_throw` and keeps the sites a caught
+throw reaches on a call that returns. That second check is a second AllocCheck run over the call graph,
+so a proof whose reach holds such a `try` costs about twice as much.
 
 What this does not cover: a throw raised *inside a callee* the try body calls, such as the
 `BoundsError` of a `v[i]` that a `catch` turns into a default. Inside the callee that throw is still an

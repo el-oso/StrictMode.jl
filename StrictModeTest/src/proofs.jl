@@ -122,10 +122,11 @@ end
 # inlined into the wrapper, and the wrapper only forwards its arguments and result. A signature with
 # no method raises here, as `check_allocs` does, rather than proving the wrapper's `MethodError`.
 #
-# `caught` says the native walk read a statement that `ignore_throw()` keeps live only because a
-# catch handles a throw on its way. AllocCheck's `ignore_throw` drops every site that leads to a throw,
-# caught or not, so the code is then checked a second time without it, and of the extra sites the
-# ones a caught throw reaches on a normal return are kept (`_caught_sites`).
+# `caught` says the native walk read a statement that a caught throw reaches on a call that returns:
+# one in a try region whose handler can return, or one of that handler (`_caught_mask`). AllocCheck's
+# `ignore_throw` drops the sites of both, as it drops every site that leads to a throw or follows a
+# catch, so the code is then checked a second time without it and those extra sites are kept
+# (`_caught_sites`).
 function _check_allocs(@nospecialize(f), @nospecialize(types); caught::Bool = false)
     ignore_throw = StrictMode.ignore_throw()
     callable = f isa StrictMode._Callable
@@ -154,10 +155,11 @@ const _THROW_ONLY_RUNTIME = (
 )
 
 # Of the sites AllocCheck reports only without `ignore_throw`, those on a path that returns normally
-# because a catch handles its throw. A backtrace is read as one group of frames per compiled body,
-# innermost first, each ending at the body's own frame. A site is kept when no group lies on an error
-# path of its body and at least one lies where only a catch makes it live (`_location_class`). A
-# backtrace AllocCheck cut short ("multiple call sites") is judged on the groups it has.
+# because a catch handles its throw, in the try body or in the handler. A backtrace is read as one
+# group of frames per compiled body, innermost first, each ending at the body's own frame. A site is
+# kept when no group lies on an error path of its body and at least one lies on a statement a caught
+# throw reaches (`_location_class`). A backtrace AllocCheck cut short ("multiple call sites") is judged
+# on the groups it has.
 function _caught_sites(extra)
     interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
     bodies = IdDict{Core.MethodInstance, Any}()
@@ -181,8 +183,8 @@ function _caught_sites(extra)
 end
 
 # Each statement of `mi`'s optimized body as `:dead` (an error path under `ignore_throw()`),
-# `:caught` (live only because a catch handles a throw on its way) or `:live`, with the line of each
-# inlining level, outermost first. `nothing` for a body that cannot be read.
+# `:caught` (reached by a caught throw on a call that returns, `_caught_mask`) or `:live`, with the
+# line of each inlining level, outermost first. `nothing` for a body that cannot be read.
 function _body_classes(interp, mi::Core.MethodInstance)
     src = try
         Base.Compiler.typeinf_code(interp, mi, true)
@@ -196,13 +198,14 @@ function _body_classes(interp, mi::Core.MethodInstance)
     return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)])
 end
 
-# Live statements in a try region whose handler can return: what a caught throw reaches.
+# The live statements a caught throw reaches: those in a try region whose handler can return, and
+# those of a handler itself (`_catch_only_mask`) that are not an error path.
 function _caught_mask(code::Vector{Any}, dead::BitVector)
     handlers = StrictMode._try_handlers(code)
-    mask = falses(length(code))
-    isnothing(handlers) && return mask
+    isnothing(handlers) && return falses(length(code))
+    mask = _catch_only_mask(code) .& .!dead
     for i in eachindex(code)
-        mask[i] = !dead[i] && any(d -> !dead[d], handlers[i])
+        mask[i] |= !dead[i] && any(d -> !dead[d], handlers[i])
     end
     return mask
 end
@@ -329,15 +332,16 @@ end
 #
 # The bodies are read as the native interpreter optimizes them: the entry's, then each `:invoke`
 # target's, to the end of the call graph. A `:call` whose callee is not a builtin is compiled to
-# `jl_apply_generic`. Statements that only lead to a throw, or are only reached from a `catch`, are
-# skipped under `ignore_throw()`, as AllocCheck skips them. A body that cannot be read raises, so the
-# verdict is "unproven" and not a pass.
+# `jl_apply_generic`. Statements that only lead to a throw are skipped under `ignore_throw()`, as
+# AllocCheck skips them; a handler that can return is not one, though AllocCheck skips it too
+# (`_check_allocs` puts its sites back). A body that cannot be read raises, so the verdict is
+# "unproven" and not a pass.
 #
 # What this does not report: a value boxed to be passed to a widened callee, with no dispatch.
 _native_dispatches(@nospecialize(f), @nospecialize(types)) = first(_native_walk(f, types))
 
-# The dispatches `_native_dispatches` reports, and whether a body it read holds a statement live only
-# because a catch handles a throw on its way.
+# The dispatches `_native_dispatches` reports, and whether a body it read holds a statement a caught
+# throw reaches (`_caught_mask`).
 function _native_walk(@nospecialize(f), @nospecialize(types))
     CC = Base.Compiler
     world = Base.get_world_counter()
@@ -380,17 +384,16 @@ end
 
 # What the walk reads from one optimized body: in statement order, the specialization of each
 # `:invoke` (a `MethodInstance`) and the callee name of each dynamic call (a `Symbol`); and whether a
-# statement read is live only because a catch handles a throw on its way (`_caught_mask`).
+# statement read is one a caught throw reaches (`_caught_mask`).
 function _walk_body(interp, world::UInt, mi::Core.MethodInstance)
     return _kept(_WALK_MEMO, mi, world, Returns(nothing)) do
         src = Base.Compiler.typeinf_code(interp, mi, true)
         src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
         dead = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) : falses(length(src.code))
-        skip = StrictMode.ignore_throw() ? dead .| _catch_only_mask(src.code) : dead
         caught = StrictMode.ignore_throw() && any(_caught_mask(src.code, dead))
         steps = Any[]
         for (i, st) in pairs(src.code)
-            skip[i] && continue
+            dead[i] && continue
             if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
                 callee = StrictMode._invoke_mi(st.args[1])
                 isnothing(callee) || push!(steps, callee)

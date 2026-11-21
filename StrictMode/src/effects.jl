@@ -649,8 +649,9 @@ successful call ever builds. A loop is never an error path: a statement is live 
 it returns.
 
 A throw that a catch handles is not an error path when the catch can return: every statement in the try
-body has the handler as a successor, so the message it builds and the exception it boxes count. A throw
-raised inside a callee is judged in that callee's own body, where it is still an error path.
+body has the handler as a successor, so the message it builds and the exception it boxes count, and so
+does the handler. A throw raised inside a callee is judged in that callee's own body, where it is still
+an error path.
 """
 ignore_throw() = _IGNORE_THROW[]
 

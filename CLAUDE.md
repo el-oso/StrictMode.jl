@@ -846,8 +846,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         box; do NOT narrow it to `Any` slots: an abstract-eltype slot boxes the same
                         way and the site carries no destination.
                         CAUGHT THROWS: AllocCheck's ignore_throw drops every site leading to a throw,
-                        caught or not. When the walk read a statement live only because a returning
-                        catch handles its throw (_caught_mask), _check_allocs runs AllocCheck again
+                        caught or not, and every site a catch reaches. When the walk read a statement
+                        a caught throw reaches on a call that returns (_caught_mask: a try region
+                        whose handler can return, or that handler, which the walk enters and
+                        _catch_only_mask finds), _check_allocs runs AllocCheck again
                         with ignore_throw = false and _caught_sites keeps the extra sites whose
                         frame groups (one per compiled body) are all live and at least one caught,
                         matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode

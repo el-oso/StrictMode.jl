@@ -376,13 +376,14 @@ end
         @test StrictMode._failed(only(StrictModeTest._proof_findings(split_fallback, (Float64,), (g,))))
     end
 
-    # A dispatch that only a `catch` reaches is skipped, as AllocCheck skips it.
+    # A dispatch in a `catch` that returns runs on a call that returns, so it is reported, though
+    # AllocCheck skips everything a catch reaches.
     recover(x::Float64) = try
         x < 0 ? throw(DomainError(x)) : sqrt(x)
     catch
         HOOK[](x)::Float64
     end
-    @test isempty(StrictModeTest._native_dispatches(recover, (Float64,)))
+    @test !isempty(StrictModeTest._native_dispatches(recover, (Float64,)))
     @test StrictModeTest._catch_only_mask(Any[Core.EnterNode(3), Core.ReturnNode(1), Core.ReturnNode(2)]) == [false, false, true]
 end
 
@@ -876,6 +877,51 @@ end
     end
     for f in (uncaught, normal_exit, rethrows)
         f(3)
+        @test isempty(StrictModeTest._raw_allocs(f, tt))
+        @test !StrictMode._failed(proof(f))
+        @test !StrictMode._failed(scan(f))
+    end
+end
+
+@testitem "code in a catch that returns normally fails the proof" begin
+    using StrictMode, StrictModeTest
+    # The throw is raised inside a callee, so the try body allocates nothing of its own; the handler
+    # runs on every call and returns what it allocates.
+    @noinline thrower(n::Int) = throw(ArgumentError("x"))
+    @noinline function handler_only(n::Int)
+        try
+            thrower(n)
+        catch
+            return zeros(n)
+        end
+    end
+    # Passing controls: a handler that allocates and then rethrows is an error path, and so is
+    # everything a try with a normal exit does not reach.
+    const SINK = Ref{Any}(nothing)
+    @noinline function handler_rethrows(n::Int)
+        try
+            thrower(n)
+        catch
+            SINK[] = zeros(n)
+            rethrow()
+        end
+    end
+    @noinline function normal_exit(n::Int)
+        try
+            n += 1
+        catch
+        end
+        return n
+    end
+    tt = (Int,)
+    proof(f) = only(StrictModeTest._proof_findings(f, tt, (:noalloc,)))
+    scan(f) = only(findings(f, tt; guarantees = (:noalloc,)))
+    handler_only(3)
+    @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(handler_only, tt))
+    @test StrictMode._failed(proof(handler_only))
+    @test StrictMode._failed(scan(handler_only))
+    @test isempty(StrictModeTest.divergence_report(handler_only, tt; guarantees = (:noalloc,)))
+    for f in (handler_rethrows, normal_exit)
         @test isempty(StrictModeTest._raw_allocs(f, tt))
         @test !StrictMode._failed(proof(f))
         @test !StrictMode._failed(scan(f))
