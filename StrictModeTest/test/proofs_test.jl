@@ -927,3 +927,50 @@ end
         @test !StrictMode._failed(scan(f))
     end
 end
+
+@testitem "a barrier excuses its sites on a path a catch handles" begin
+    using StrictMode, StrictModeTest, Test
+    # `refresh` throws inside its try body and returns false from the catch; the caller then calls
+    # the registered barrier `regrow!`. The exception box is the call's own allocation, and the
+    # barrier's buffer is not.
+    module CaughtBarrier
+    @noinline regrow!(n::Int) = zeros(n)
+    @inline fits(n::Int) = (n > 4 && throw(ArgumentError("too big")); true)
+    @noinline function refresh(n::Int)
+        try
+            return fits(n)
+        catch
+            return false
+        end
+    end
+    step(n::Int) = (refresh(n) || regrow!(n); n)
+    # Passing control: the same barrier behind a try that exits normally.
+    @noinline function refresh_ok(n::Int)
+        try
+            n += 1
+        catch
+            return false
+        end
+        return n > 4
+    end
+    step_ok(n::Int) = (refresh_ok(n) || regrow!(n); n)
+    end
+    M = CaughtBarrier
+    M.step(8); M.step_ok(8)
+    register_alloc_barrier!(M.regrow!)
+    try
+        tt = (Int,)
+        proof(f) = only(StrictModeTest.proof_findings(f, tt; guarantees = (:noalloc,)))
+        kept, _ = StrictModeTest._checked_allocs(M.step, tt)
+        @test !isempty(kept)
+        @test !any(StrictModeTest._through_barrier, kept)
+        @test StrictMode._failed(proof(M.step))
+        @test !StrictMode._failed(proof(M.step_ok))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, M.regrow!)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(M)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== M.regrow!, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end

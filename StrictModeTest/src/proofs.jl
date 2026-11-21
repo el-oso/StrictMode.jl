@@ -528,18 +528,20 @@ end
 # function is reached only through a barrier (`_only_through_barrier`). Every other site stands, so a
 # buffer grown later through the barrier's accessor is still reported where it grows; the value-free
 # scan stops two calls deep and cannot see it.
-# A call whose scan already finds allocation, boxing or an abstract-eltype container gets the
-# unfiltered proof, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
+# The filter applies to every site, whichever AllocCheck run found it. When the scan finds allocation,
+# boxing or an abstract-eltype container and the filter leaves no site, the unfiltered proof is
+# returned, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     allocs = _not_own_excused(f, _raw_allocs(f, types))
     _IGNORE_BARRIER[] || return (allocs, false)
     sig = StrictMode._alloc_signals(f, types)
-    (sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)) || return (allocs, false)
+    sig.barrier || return (allocs, false)
     kept = filter(a -> !_through_barrier(a) && _has_user_frame(a), allocs)
     if !isempty(kept)
         inside = _only_through_barrier(StrictMode._sigtype(f, types))
         isnothing(inside) || filter!(a -> !(_site_mi(a) in inside), kept)
     end
+    isempty(kept) && (sig.alloc || sig.boxing || !isnothing(sig.abscontainer)) && return (allocs, false)
     excused = length(allocs) - length(kept)
     if excused > 0
         name = something(_barrier_frame_name(allocs), :barrier)

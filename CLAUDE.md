@@ -832,7 +832,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         reached ONLY through a barrier (_only_through_barrier, over the :invoke
                         graph of optimized IR — a helper called from several places is compiled
                         once and its backtrace ends at "multiple call sites"). A graph that cannot
-                        be read in full keeps the site. _is_boxing drops a DynamicDispatch that is a C
+                        be read in full keeps the site. The filter runs on every site, from
+                        either AllocCheck run, whenever the call reaches a barrier; only when it
+                        leaves NO site and the scan finds alloc/boxing/abscontainer is the
+                        unfiltered list returned (never more permissive than the scan). _is_boxing drops a DynamicDispatch that is a C
                         VARARGS call (_c_varargs_call): AllocCheck lists a `ccall` with a required-
                         argument count as a dispatch to an unknown target, and Base.trypoptask holds
                         one (a jl_safe_printf) that every wait reaches, as _string_n does for

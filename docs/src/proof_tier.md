@@ -127,10 +127,11 @@ AnalysisError
 
 `ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier
 is exempt from AllocCheck's all-paths proof. The proof still runs on a call that reaches a
-barrier. When the value-free scan finds no allocation, boxing or abstract-eltype container in
-the call apart from the barrier, the allocation sites the barrier accounts for are dropped;
-otherwise every site is kept and reported, the barrier's included, so the proof is never more
-permissive than the scan. A site is the barrier's when its backtrace passes through the barrier,
+barrier, and the allocation sites the barrier accounts for are dropped, from either AllocCheck
+run (see "Error paths" in the guarantees page for the second one). When no site is left but the
+value-free scan finds allocation, boxing or an abstract-eltype container in the call, every site
+is kept and reported, the barrier's included, so the proof is never more permissive than the scan.
+A site is the barrier's when its backtrace passes through the barrier,
 when none of its frames lies outside Base and Core, or when its function is reached from a barrier
 and on no path from the call that avoids one. The last case covers a helper the barrier calls
 from several places: it is compiled once, and AllocCheck ends its backtrace at a frame named

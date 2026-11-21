@@ -229,8 +229,7 @@ A lazy calibration memoized with `Base.OncePerProcess`/`OncePerThread` allocates
 the memoized value forever after. AllocCheck's all-paths proof sees the initializer's one-time
 allocation as statically reachable and would red a call that's provably alloc-free in steady
 state. The IR scan recognizes the two `Base` once-guard types automatically and stops at them,
-and `@test_noalloc`/`@test_noboxing` honor that: on a call whose ONLY allocation risk is the
-barrier, they keep AllocCheck's all-paths proof and drop the sites the barrier accounts for
+and `@test_noalloc`/`@test_noboxing` honor that: on a call that reaches the barrier, they keep AllocCheck's all-paths proof and drop the sites the barrier accounts for
 rather than report the cold-path allocation as a violation — logged once per session via `@info`, never
 silently:
 

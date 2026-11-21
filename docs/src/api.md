@@ -371,7 +371,7 @@ set_ignore_throw!
 `Base.OncePerProcess`/`OncePerThread`-memoized lazy init allocates once, then reads a memoized
 value forever after. The IR scan recognizes those two `Base` once-guard types automatically and
 stops at them instead of counting the initializer, and `StrictModeTest` honors the same
-recognition: on a call whose only allocation risk is the barrier, `@test_noalloc` keeps AllocCheck's
+recognition: on a call that reaches the barrier, `@test_noalloc` keeps AllocCheck's
 all-paths proof and drops the allocation sites the barrier accounts for, rather than reporting the
 initializer's one-time allocation as a violation. That exemption is logged once per session via
 `@info`, never silently, and `StrictModeTest.set_ignore_barrier!(false)` turns it off.
