@@ -97,7 +97,8 @@ function's other methods. A submodule or a package extension is a module of its 
 No annotation needed, but coverage is whatever executed, and a module that mixes hot and cold
 (plan-time) helpers will be noisy — cold helpers that legitimately allocate show up too. Scope it
 with `only` / `exempt`, each a collection of functions / name `Symbol`s, a **`Regex`** matched
-against the (demangled) name, or a predicate `f -> Bool`. `@strict_exempt` names are always
+against the (demangled) name, or a predicate `f -> Bool`; for a callable object with no instance
+the predicate receives the type its method declares for it (`Reader`, `Boxed`). `@strict_exempt` names are always
 excluded, so `exempt = r"^_plan"` scales a mixed hot/cold library without a hand-listed set.
 
 This is the gate. [`StrictMode.audit`](@ref) is the reporting counterpart for the same scope.

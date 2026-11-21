@@ -175,3 +175,41 @@ end
     @test Set(f.func for f in audit(P; sweep = true, only = r"^Box", dispatch_suggest = false) if f.guarantee === :noalloc) ==
         Set(["Boxed{Int64}", "Boxed{Any}"])
 end
+
+@testitem "a predicate only or exempt receives a callable object's type" begin
+    using StrictMode
+    module PredCallables
+    using StrictMode
+    struct Mut
+        k::Any
+    end
+    (m::Mut)(x::Int) = x + m.k
+    struct Boxed{T}
+        v::Vector{T}
+    end
+    (b::Boxed)(n::Int) = fill(b.v[1], n)
+    plain(n::Int) = zeros(n)
+    end
+    P = PredCallables
+    P.Mut(1)(1); P.Boxed([1])(1); P.Boxed(Any[1])(1); P.plain(1)
+
+    sweep(; kw...) = Set(f.func for f in audit(P; sweep = true, dispatch_suggest = false, kw...))
+    # The predicate is asked with the type the method declares for its callable.
+    seen = Any[]
+    sweep(; only = f -> (push!(seen, f); true))
+    @test P.Mut in seen && P.Boxed in seen && P.plain in seen
+
+    @test sweep(; only = f -> f === P.Mut) == Set(["Mut"])
+    @test sweep(; only = f -> f isa Type && f <: P.Boxed) == Set(["Boxed{Int64}", "Boxed{Any}"])
+    @test isempty(sweep(; only = f -> f === Int))
+    all_ = sweep()
+    @test sweep(; exempt = f -> f === P.Mut) == setdiff(all_, ["Mut"])
+    @test sweep(; exempt = f -> f === Int) == all_
+    @test "Mut" in all_ && "plain" in all_
+
+    # The census answers the same way.
+    ms, _ = StrictMode.module_methods(P; only = f -> f === P.Boxed)
+    @test length(ms) == 1 && StrictMode._method_function(only(ms)) <: P.Boxed
+    ms, _ = StrictMode.module_methods(P; exempt = f -> f === P.Boxed)
+    @test !any(m -> StrictMode._method_function(m) <: P.Boxed, ms)
+end

@@ -1191,6 +1191,11 @@ code rather than asking what a declaration covers: `:constructor` (a constructor
 `exempt` by its type's name), `:closure` and `:unreadable` (a method whose callable has no type to
 name it by, such as `(k::Union{A, B})(x)`; it matches no `only`). Any other entry raises.
 
+`only` and `exempt` take what the module sweeps take. A predicate is asked about a function with
+the function, and about a callable object with no instance with the type its method declares for
+the callable (`Reader`, `Boxed`, `Boxed{<:Integer}`). A capturing closure is not asked about and
+stays in the census.
+
 It reads the global method table, not the module's bindings, because a method on a **foreign**
 function — `Base.getindex`, `Base.size`, `Base.show` — belongs to the module that wrote it while
 its name is bound in `Base`. Those are frequently a package's hottest methods. Measured on
@@ -1223,15 +1228,18 @@ function module_methods(
         end
         f = reason === :constructor ? F.parameters[1] : isdefined(F, :instance) ? F.instance : nothing
         # A capturing closure or a callable object with fields has no instance. A filter by name, and
-        # an exemption, still answer for it through its type; a filter that is the caller's own
-        # function expects a function, so it is not asked, and the method stays in the census.
+        # an exemption, still answer for it through its type. A predicate is asked about a callable
+        # object with the type its method declares for it (`Boxed`, `Boxed{<:Integer}`); a closure
+        # has no type a caller could name, so the predicate is not asked and it stays in the census.
         typed = isnothing(f) && F isa DataType
         typed && (f = F)
+        closure = typed && _is_closure_type(F)
+        pf = typed && !closure ? Base.rewrap_unionall(Base.unwrap_unionall(m.sig).parameters[1], m.sig) : f
         reason === :unreadable && !isnothing(onlypred) && return bump!(:filtered)
         if !isnothing(f)
             (!include_exempt && _is_exempt(f, m)) && return bump!(:exempt)
-            !isnothing(exemptpred) && !(typed && exempt isa Function) && exemptpred(f) && return bump!(:exempt)
-            isnothing(onlypred) || (typed && only isa Function) || onlypred(f) || return bump!(:filtered)
+            !isnothing(exemptpred) && !(closure && exempt isa Function) && exemptpred(pf) && return bump!(:exempt)
+            isnothing(onlypred) || (closure && only isa Function) || onlypred(pf) || return bump!(:filtered)
         end
         push!(out, m)
         return nothing

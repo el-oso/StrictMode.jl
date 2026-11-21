@@ -388,7 +388,9 @@ StrictMode/src/
                         sweeping that method only, and each callable object's method
                         (not a capturing closure), whose specializations it hands on as
                         (_callee(F), types): _Callable{F}() for a type with no instance. The census
-                        filters a callable with no instance by its type, and _decl_key keys on the
+                        filters a callable with no instance by its type (a predicate only/exempt
+                        receives the type the METHOD declares, rewrapped: Boxed, not Boxed{T} with
+                        a free T; a closure is not asked), and _decl_key keys on the
                         callable's TYPE, so a declaration made on an instance stamps those rows; an
                         exemption of such a function excuses only the declaring module's methods
                         (_exempt_in, asked per method by _is_exempt(f, m)). A submodule's or an

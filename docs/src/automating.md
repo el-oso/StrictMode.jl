@@ -223,9 +223,14 @@ no instance of the object, and needs none: it checks the signature `Tuple{Reader
 [`findings`](@ref) does. Its findings name it by its type with the type's parameters, `Reader`,
 `Boxed{Int64}` and `Boxed{Float64}`, so each instantiation has its own [`StrictMode.key`](@ref) and
 a comparison of two runs keeps them apart. `only`, `exempt` and `@strict_exempt` name it by the
-type's name alone, `Reader` or `Boxed`, which matches every instantiation. An `only` or `exempt` that is a predicate function is not asked about a
-callable object with no instance, which stays in the sweep. A capturing closure is part of the
-function it is written in, and is not swept on its own.
+type's name alone, `Reader` or `Boxed`, which matches every instantiation. An `only` or `exempt`
+that is a predicate function receives, for a callable object with no instance, the type its method
+declares for the callable: `Reader`, `Boxed` for `(b::Boxed)(x)`, `Boxed{<:Integer}` for
+`(b::Boxed{<:Integer})(x)`. So `only = f -> f === Reader` or `exempt = f -> f isa Type && f <: Boxed`
+selects it, and a predicate written for functions alone excludes it from `only` and keeps it under
+`exempt`. The predicate is asked once per method, so it selects or drops every instantiation of
+that method together. A capturing closure is part of the function it is written in, and is not
+swept on its own.
 
 ## The coverage gate — default-deny
 
