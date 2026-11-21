@@ -391,7 +391,8 @@ StrictMode/src/
                         in the module (m.module === mod): the module own functions' methods, then
                         from the census each method it defines on a function another module owns,
                         sweeping that method only, and each callable object's method
-                        (not a capturing closure), whose specializations it hands on as
+                        (not a capturing closure; a <: Function callable no name in the module
+                        holds is swept here too, since the name walk skips only what it met), whose specializations it hands on as
                         (_callee(F), types): _Callable{F}() for a type with no instance. The census
                         filters a callable with no instance by its type (a predicate only/exempt
                         receives the type the METHOD declares, rewrapped: Boxed, not Boxed{T} with

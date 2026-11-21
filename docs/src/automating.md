@@ -234,8 +234,9 @@ that is a predicate function receives, for a callable object with no instance, t
 declares for the callable: `Reader`, `Boxed` for `(b::Boxed)(x)`, `Boxed{<:Integer}` for
 `(b::Boxed{<:Integer})(x)`. So `only = f -> f === Reader` or `exempt = f -> f isa Type && f <: Boxed`
 selects it, and a predicate written for functions alone excludes it from `only` and keeps it under
-`exempt`. The predicate is asked once per method, so it selects or drops every instantiation of
-that method together. A capturing closure is part of the function it is written in, and is not
+`exempt`. A callable whose type subtypes `Function` is swept whether or not a name in the module
+holds an instance of it. The predicate is asked once per method, so it selects or drops every
+instantiation of that method together. A capturing closure is part of the function it is written in, and is not
 swept on its own.
 
 ## The coverage gate — default-deny

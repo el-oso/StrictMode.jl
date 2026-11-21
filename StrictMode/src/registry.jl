@@ -1261,10 +1261,14 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
     _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
+    # The functions the walk over names meets. The census below skips exactly these, so a callable
+    # whose type subtypes `Function` but which no name in `mod` holds is still swept once.
+    walked = Base.IdSet{Any}()
     for nm in names(mod; all = true)
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
         (f isa Function && parentmodule(f) === mod) || continue
+        push!(walked, f)
         (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
         onlypred === nothing || onlypred(f) || continue
         for mth in methods(f)
@@ -1283,8 +1287,7 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
     for mth in first(module_methods(mod; only, exempt))
         mth.module === mod || continue
         F = _method_function(mth)
-        isdefined(F, :instance) && F.instance isa Function && parentmodule(F.instance) === mod &&
-            continue      # the module's own, walked above
+        isdefined(F, :instance) && F.instance in walked && continue
         # A capturing closure is part of the function it is written in, and is not swept. A callable
         # object is: each specialization names its concrete type, which is the callee.
         _is_closure_type(F) && continue

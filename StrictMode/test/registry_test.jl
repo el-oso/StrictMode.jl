@@ -431,3 +431,24 @@ end
     @test all(f -> f.status === :info && startswith(f.reason, "exempt"), tr)
     Base.delete_method(which(getproperty, (Untrusted{N.Sub.MyT}, Symbol)))
 end
+
+@testitem "a module sweep covers a callable that subtypes Function and has no binding" begin
+    using StrictMode
+    module UnboundCallable
+    struct K <: Function end                 # a singleton with no `const k = K()` in the module
+    (::K)(x::Int) = x > 0 ? x : "neg"
+    struct KF <: Function                    # one with a field, so it has no instance
+        a::Int
+    end
+    (k::KF)(x::Int) = x > k.a ? x : "neg"
+    bound(x::Int) = x > 0 ? x : "neg"        # bound to a name: walked once, not twice
+    end
+    U = UnboundCallable
+    U.K()(1); U.KF(0)(1); U.bound(1)
+    fs = audit(U; sweep = true, guarantees = (:typestable,), dispatch_suggest = false)
+    @test StrictMode._failed(only(f for f in fs if f.func == "K"))
+    @test StrictMode._failed(only(f for f in fs if f.func == "KF"))
+    @test count(f -> f.func == "bound", fs) == 1
+    items = StrictMode._compiled_items(U; guarantees = (:typestable,))
+    @test length(items) == 3
+end
