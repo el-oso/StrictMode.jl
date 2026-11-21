@@ -519,3 +519,28 @@ end
     @test isempty(sweep(; exempt = (:Plain,), only = (:Plain,)))
     @test all(f -> f.func == "Plain", sweep(; only = (:Plain,)))
 end
+
+@testitem "a module sweep leaves functions written inside a function to that function" begin
+    using StrictMode
+    module InnerFunctions
+    using StrictMode
+    function outer(v)
+        h(y) = [y]                           # a closure that captures nothing has an instance
+        g(y; z = 1) = [y + z]                # so does its keyword body
+        a = map(x -> [x], v)
+        b = [[x] for x in v]
+        (h(1), g(1), a, b)
+    end
+    const top = map(x -> [x], [1])           # an anonymous function at top level
+    struct K <: Function end                 # a callable written as a type is swept
+    (::K)(x; by = 2) = [x * by]
+    @strict_exempt :noalloc outer
+    end
+    I = InnerFunctions
+    I.outer([1, 2]); I.K()(1)
+    fs = audit(I; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    @test all(f -> f.func in ("outer", "K"), fs)
+    @test only(f for f in fs if f.func == "outer").status === :info
+    @test !isempty(fs) && all(StrictMode._failed, (f for f in fs if f.func == "K"))
+    @test count(f -> f.func == "K", fs) == 2      # the positional method and its keyword body
+end

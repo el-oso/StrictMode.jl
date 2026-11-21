@@ -1131,6 +1131,19 @@ function _kwcall_body(m::Method)
     return callee isa Function && !(callee isa Core.Builtin) ? callee : nothing
 end
 
+# Whether the module sweep's census leaves the function type `F` alone: a type Julia named (the name
+# starts with `#`) other than the keyword body of a callable written as a type — a constructor, a
+# callable object, a `struct K <: Function`. That is a closure, an anonymous function or a generator,
+# which belong to the function they are written in, or a keyword body of one of those. A named
+# function and its keyword body also answer yes; the sweep meets both through their bindings.
+function _is_inner_function(@nospecialize(F))
+    (F isa DataType && F <: Function && startswith(String(nameof(F)), "#")) || return false
+    owner = _kwbody_owner(F)
+    isnothing(owner) && return true
+    o = something(owner)
+    return o isa Function && startswith(String(nameof(typeof(o))), "#")
+end
+
 # The name a method answers to: its function's, with a keyword body named after its owner.
 function _method_label(m::Method)
     n = _demangle(m.name)
@@ -1386,9 +1399,11 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
         mth.module === mod || continue
         F = _method_function(mth)
         isdefined(F, :instance) && F.instance in walked && continue
-        # A capturing closure is part of the function it is written in, and is not swept. A callable
-        # object is: each specialization names its concrete type, which is the callee.
-        _is_closure_type(F) && continue
+        # A closure, an anonymous function, a generator, or a keyword body of one of those is part of
+        # the function it is written in, and is not swept. A callable object is: each specialization
+        # names its concrete type, which is the callee. So is the keyword body of a constructor or a
+        # callable object, under the callable's name.
+        (_is_closure_type(F) || (parentmodule(F) === mod && _is_inner_function(F))) && continue
         for mi in _specializations(mth)
             sig = mi.specTypes
             (sig isa DataType && Base.isdispatchtuple(sig)) || continue

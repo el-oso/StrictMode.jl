@@ -241,8 +241,9 @@ holds an instance of it. The predicate is asked once per method, so it selects o
 instantiation of that method together. The body Julia generates for a keyword method answers to
 what the method was written on: the body of `Tracker{T}(x; c) where {T}`, an inner constructor, is
 named `Tracker`, and the body of `(s::Scaled)(x; by)` is named `Scaled`, in its findings and for
-`only`, `exempt` and `@strict_exempt` alike. A capturing closure is part of the function it is written in, and is not
-swept on its own.
+`only`, `exempt` and `@strict_exempt` alike. A closure, whether or not it captures,
+an anonymous function, a generator, and the keyword body of any of these are part of the function
+they are written in, and are not swept on their own.
 
 ## The coverage gate — default-deny
 
