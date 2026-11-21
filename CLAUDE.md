@@ -307,7 +307,10 @@ StrictMode/src/
                         followed from the positional and kwcall methods, and a registered
                         boundary's body is the boundary (_is_trust_boundary).
                         A getfield/getproperty handed on with a constant field uses the direct
-                        path's field rules (_handed_on_cleared), and a read inside a try is kept
+                        path's field rules (_handed_on_cleared). A Core.tuple holding one whose only
+                        uses are _COMPARISONS operands (===, ==, isequal, in, ∉; slot and SSA copies
+                        followed) applies nothing (_only_compared); returned, indexed or passed on,
+                        it is a read. A read inside a try is kept
                         when its catch can finish without raising (_may_return) or any statement
                         reachable from the handler reads a slot or SSA value the payload flows into
                         between the payload read and the raising field read (copies, field reads

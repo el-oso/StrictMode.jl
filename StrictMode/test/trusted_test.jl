@@ -430,6 +430,26 @@ end
     # Comparing with the escape hatch reads nothing, and `invoke` of another function is that call.
     is_hatch(f) = f === unsafe_trust
     @test status(is_hatch, (Any,)).status === :pass
+    # A tuple of the escape hatch used only in a membership test or a comparison applies nothing.
+    is_reader(f) = f in (unsafe_trust, getfield)
+    not_reader(f) = f ∉ (unsafe_trust, getfield)
+    named_reader(f) = (t = (unsafe_trust, getfield); f in t)
+    same_readers(fs) = fs == (unsafe_trust, getfield)
+    @test is_reader(unsafe_trust) && !is_reader(length)
+    for f in (is_reader, not_reader, named_reader, same_readers)
+        @test status(f, (Any,)).status === :pass
+    end
+    # A tuple of it that is returned, indexed and called, or passed to any other call still hands it on.
+    readers() = (unsafe_trust, getfield)
+    called(u::U8) = length((unsafe_trust, identity)[1](u))
+    named_called(u::U8) = (t = (unsafe_trust, identity); f = t[1]; length(f(u)))
+    passed(f) = f in collect((unsafe_trust, getfield))
+    @test called(u) == 2
+    for (f, T) in ((readers, ()), (called, (U8,)), (named_called, (U8,)), (passed, (Any,)))
+        r = status(f, T)
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
     invoked_clean(x::Vector{UInt8}) = invoke(length, Tuple{AbstractVector}, x)
     @test status(invoked_clean, (Vector{UInt8},)).status === :pass
 end

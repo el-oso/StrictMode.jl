@@ -232,8 +232,8 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             continue
         end
         # Comparing a value with a payload-reading function, or testing membership in a collection
-        # of them, applies it to nothing.
-        if !(callee in (===, !==, ==, !=, isequal, in, ∉))
+        # of them, applies it to nothing, and so does building a tuple used only that way.
+        if !(callee in _COMPARISONS) && !(callee === Core.tuple && _only_compared(ci, i, st))
             _handed_on_reads!(certain, erased, ci, st, callee, args, overridden)
         end
         # A call that copies out the bits of what it is given reads a payload it can reach:
@@ -267,6 +267,39 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         end
     end
     return (certain, erased, held)
+end
+
+const _COMPARISONS = (===, !==, ==, !=, isequal, in, ∉)
+
+# Whether the value statement `i` builds — an SSA value, or the slot it is assigned to — reaches
+# nothing but copies of itself and operands of `_COMPARISONS` calls. Returned, stored, called, or
+# handed to any other call, it does not.
+function _only_compared(ci, i::Int, @nospecialize(st))
+    held = Any[Core.SSAValue(i)]
+    Meta.isexpr(st, :(=)) && st.args[1] isa Core.SlotNumber && push!(held, st.args[1])
+    # A copy `%k = t` or `s = %j` holds the value too; a loop may read a slot before the statement
+    # that assigns it, so this runs to a fixed point.
+    grown = true
+    while grown
+        grown = false
+        for (k, s) in pairs(ci.code)
+            rhs = Meta.isexpr(s, :(=)) ? s.args[2] : s
+            rhs in held || continue
+            for v in (Core.SSAValue(k), Meta.isexpr(s, :(=)) ? s.args[1] : nothing)
+                (v isa Core.SSAValue || v isa Core.SlotNumber) && !(v in held) &&
+                    (push!(held, v); grown = true)
+            end
+        end
+    end
+    for (k, s) in pairs(ci.code)
+        k == i && continue
+        _mentions(s, held) || continue
+        rhs = Meta.isexpr(s, :(=)) ? s.args[2] : s
+        rhs in held && continue
+        callee, _ = _call_callee_and_args(ci, s)
+        (callee in _COMPARISONS && !_mentions(_call_operand(s), held)) || return false
+    end
+    return true
 end
 
 # A payload-reading function handed to a call as a value, bare or held by a callable such as
@@ -652,8 +685,10 @@ It is also any of `getfield`, `getproperty` and `unsafe_trust` handed to another
 bare or held by a callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
 `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. Comparing one
 of the three with a value (`===`, `==`, `isequal`) or testing membership (`in`, `∉`) applies it to
-nothing and is not a read. `unsafe_trust` handed to any other call is a read, since its one method
-takes an `Untrusted`; that includes building the tuple in `f in (unsafe_trust, g)`. `getfield` and
+nothing and is not a read, and so is building a tuple of them whose only uses are those calls, as
+in `f in (unsafe_trust, g)`. `unsafe_trust` handed to any other call is a read, since its one
+method takes an `Untrusted`; that includes a tuple of it that is returned, stored, indexed or
+passed to another call. `getfield` and
 `getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,
 array or `Ref` of them, and a read that cannot be ruled out when an operand's type does not rule
 one out (an `Any`, an abstract type, a struct with such a field). Handed on with a constant field,
