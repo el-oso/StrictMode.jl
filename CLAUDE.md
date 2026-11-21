@@ -652,9 +652,13 @@ StrictMode/src/
                         _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
                         @propagate_inbounds method is clean and the caller that wrote @inbounds
                         carries the finding. Gating form: StrictModeTest.test_no_unsafe
-                        A Ptr TYPE counts as `:Ptr` only where a call applies it — the function
-                        operand of a fixed list (_PTR_APPLIERS: map, broadcasted, foreach, sum, …),
-                        the right of |>, any operand of ∘ — never where it is merely named
+                        A Ptr TYPE counts as `:Ptr` as an operand of ANY call except those that
+                        only name it (_PTR_NAMERS: apply_type, isa, typeassert, <:, sizeof,
+                        getfield of the type, cglobal, the ccall glue cconvert/unsafe_convert —
+                        cconvert(Ptr{T}, addr) returns the integer, measured — and the one-operand
+                        getindex of `Ptr{T}[]`), since lowered code cannot tell ntuple, Generator,
+                        a splat or a tuple applied later from a namer; `C_NULL + addr` (+/- with a
+                        pointer constant) is :Ptr too, arithmetic on a pointer argument is not
                         It reads the census's constructors, closures and unnamed callables too
                         (module_methods' `keep`): the census skips them because no declaration
                         names them, which says nothing about their code.

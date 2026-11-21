@@ -489,7 +489,7 @@ end
     @test all(f -> occursin("`Ptr`", f.reason), fs)
     @test isempty(unsafe_report(FencePtrApplied; allow = (:Ptr,)))
 
-    # Naming the pointer type builds no pointer, whatever call the name is handed to.
+    # Naming the pointer type, in a call that only names it, builds no pointer.
     module FencePtrNamed
     ptr_typed(v) = Ptr{Float64}[]
     is_ptr(x) = isa(x, Ptr{Float64})
@@ -502,4 +502,36 @@ end
     collected(ps) = map(identity, Ptr{Float64}[])
     end
     @test isempty(unsafe_report(FencePtrNamed))
+end
+
+@testitem "unsafe_report sees a pointer type handed to any call that may apply it" begin
+    using StrictMode
+
+    module FencePtrBuilt
+    splatted(xs) = Ptr{Cvoid}(xs...)
+    tupled(n) = ntuple(Ptr{Cvoid}, n)
+    generated(a) = collect(Base.Generator(Ptr{Cvoid}, a))
+    literal(a) = Ptr{Cvoid}[a]
+    shifted(a) = C_NULL + a
+    end
+    @test FencePtrBuilt.tupled(2) == (Ptr{Cvoid}(1), Ptr{Cvoid}(2))
+    @test FencePtrBuilt.literal(UInt(3)) == [Ptr{Cvoid}(3)]
+    fs = unsafe_report(FencePtrBuilt)
+    @test Set(f.func for f in fs) == Set(["splatted", "tupled", "generated", "literal", "shifted"])
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+
+    # Naming the type builds no pointer.
+    module FencePtrNamedMore
+    size_of() = sizeof(Ptr{Float64})
+    either(x) = x::Union{Ptr{Float64}, Nothing}
+    is_sub(T) = T <: Ptr{Float64}
+    converted(a) = Base.cconvert(Ptr{Cvoid}, a)    # returns the integer
+    # A `ccall` converts its pointer arguments through `cconvert` and `unsafe_convert`; the
+    # `ccall` is the finding, and its lowering adds no `Ptr`.
+    strlen(s::String) = ccall(:strlen, Csize_t, (Ptr{UInt8},), s)
+    end
+    @test FencePtrNamedMore.converted(UInt(4)) === UInt(4)
+    fs = unsafe_report(FencePtrNamedMore)
+    @test only(fs).func == "strlen"
+    @test occursin("`ccall`", only(fs).reason) && !occursin("`Ptr`", only(fs).reason)
 end

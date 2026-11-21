@@ -85,25 +85,27 @@ end
 
 _is_ptr_type(@nospecialize(v)) = v isa Type && v <: Ptr && v !== Union{}
 
-# The higher-order functions that call the function in their first operand. A pointer type there is
-# applied to each element, so `map(Ptr{T}, addrs)` builds pointers as `Ptr{T}(addr)` does. `|>`
-# applies its second operand, and `∘` and `ComposedFunction` every one.
-const _PTR_APPLIERS = (
-    map, map!, broadcast, broadcast!, Base.broadcasted, foreach, mapreduce, mapfoldl, mapfoldr,
-    filter, filter!, any, all, sum, count, findall, Iterators.map, Base.Fix1, Base.Fix2,
+# The calls that take a pointer type only to name it: building another type from it
+# (`Vector{Ptr{T}}`, `Union{Ptr{T}, Nothing}`), testing or asserting a type, its size, a field of
+# the type object (`Ptr.body`), `cglobal`, which is reported by its own name, and the two
+# conversions a `ccall` lowers its arguments through: `cconvert(Ptr{T}, addr)` returns the integer,
+# and `unsafe_convert` is reported by its own name. Core has its own `sizeof`, `cconvert` and
+# `unsafe_convert`, which code written with Core's names calls. Any other call handed a pointer
+# type may apply it, as `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Base.Generator(Ptr{T}, addrs)`,
+# a splat `Ptr{T}(xs...)` and a keyword call do, and lowered code carries no types to tell which,
+# so it is reported. A comparison never reaches this.
+const _PTR_NAMERS = (
+    Core.apply_type, isa, Core.typeassert, <:, >:, sizeof, Core.sizeof, typeintersect, getfield,
+    getproperty, cglobal, Base.cconvert, Base.unsafe_convert,
+    (getglobal(Core, n) for n in (:cconvert, :unsafe_convert) if isdefined(Core, n))...,
 )
 
-# Whether a call hands a pointer type to a function that applies it. A keyword call,
-# `Core.kwcall(kws, f, args...)`, is judged as the call to `f`.
+# Whether a call hands a pointer type to a function that may apply it. `Ptr{T}[]` names the type
+# for an empty vector, and `Ptr{T}[a, b]` converts each element to it.
 function _ptr_applied(@nospecialize(callee), args::Vector{Any}, resolve)
-    ops = args[2:end]
-    if callee === Core.kwcall && length(ops) >= 2
-        callee, ops = resolve(ops[2]), ops[3:end]
-    end
-    fs = callee === (|>) ? ops[2:end] :
-        (callee === (∘) || callee === ComposedFunction) ? ops :
-        any(g -> g === callee, _PTR_APPLIERS) ? ops[1:min(1, end)] : Any[]
-    return any(a -> _is_ptr_type(resolve(a)), fs)
+    any(g -> g === callee, _PTR_NAMERS) && return false
+    callee === getindex && length(args) == 2 && return false
+    return any(a -> _is_ptr_type(resolve(a)), args[2:end])
 end
 
 # `allow` names constructs by bare `Symbol`, but a reader looks for the macro they wrote.
@@ -288,11 +290,10 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
             named(a) && noteval(a)
         end
         _ptr_applied(callee, st.args, resolve) && push!(out, :Ptr)
+        # Arithmetic on a pointer constant, `C_NULL + addr`, makes a pointer from an integer.
+        (callee === (+) || callee === (-)) && any(a -> resolve(a) isa Ptr, st.args[2:end]) && push!(out, :Ptr)
         isnothing(callee) && continue
         if _is_ptr_type(callee)
-            push!(out, :Ptr)
-        elseif (callee === reinterpret || callee === Core.Intrinsics.bitcast || callee === convert) && length(st.args) >= 2 &&
-                _is_ptr_type(resolve(st.args[2]))
             push!(out, :Ptr)
         elseif callee isa Core.Builtin && length(st.args) >= 3 && st.args[end] === false
             nm = nameof(callee)
@@ -381,7 +382,7 @@ own are read like every other method.
 | `pointer`, `pointer_from_objref`, and any function whose name begins with `unsafe_` | its name |
 | the pointer intrinsics `pointerref`, `pointerset`, `atomic_pointer…`, and `llvmcall`, `cglobal` | its name |
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
-| a pointer made from an integer: `Ptr{T}(addr)`, `reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, or `Ptr{T}` handed to a function that applies it | `:Ptr` |
+| a pointer made from an integer: `Ptr{T}(addr)`, `Ptr{T}` handed to any call that may apply it (`reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`, `Ptr{T}[addr]`), or arithmetic on a pointer constant (`C_NULL + addr`) | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 | a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
 | code evaluated at run time: `eval`, `@eval`, `Core.eval`, `include_string`, `include`, whether called or passed on | `:eval` |
@@ -397,13 +398,17 @@ kept in a local to every module it is assigned, typed or not: `B = Base; B.unsaf
 `getglobal(Base, nm)`, cannot be resolved to a function, so it is reported as `dynamic_global`
 instead of passing. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
-function named `free` is not `Libc.free`. A pointer type is reported where a call applies it to
-each element: as the function operand of `map`, `map!`, `broadcast`, `broadcast!`,
-`Base.broadcasted` (so `Ptr{T}.(addrs)`), `foreach`, `mapreduce`, `mapfoldl`, `mapfoldr`, `filter`,
-`filter!`, `any`, `all`, `sum`, `count`, `findall`, `Iterators.map`, `Base.Fix1` and `Base.Fix2`,
-as the right operand of `|>`, and as any operand of `∘` or `ComposedFunction`, including through a
-keyword call. Taking a `Ptr` argument, or naming the type anywhere else (`Ptr{T}[]`,
-`isa(x, Ptr{T})`, `Vector{Ptr{T}}`, `Ref{Ptr{Cvoid}}`), builds no pointer and is not reported.
+function named `free` is not `Libc.free`. A pointer type is reported as an operand of any call
+other than one that only names it, since lowered code carries no types to tell a call that applies
+it (`map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`, `Base.Generator(Ptr{T}, addrs)`,
+`addr |> Ptr{T}`, a splat, a keyword call, a tuple that is applied later) from one that does not.
+The calls that only name it are building another type (`Vector{Ptr{T}}`, `Ref{Ptr{Cvoid}}`,
+`Union{Ptr{T}, Nothing}`), `isa`, a type assertion, `<:`, `>:`, a comparison, `sizeof`,
+`typeintersect`, a field of the type object, `cglobal`, the `ccall` conversions `cconvert` and
+`unsafe_convert`, and the empty typed literal `Ptr{T}[]`; `Ptr{T}[addr]` converts `addr` and is
+reported. Taking a `Ptr` argument builds no pointer and is not reported, and neither is arithmetic
+on one (`p + 8`): only arithmetic on a pointer constant such as `C_NULL` is, since the scan cannot
+tell a pointer argument from an integer in lowered code.
 A conversion to a pointer type is reported whatever is converted: the scan reads lowered code,
 which carries no types, so `convert(Ptr{Cvoid}, p)` on a pointer reads like one on an address.
 
