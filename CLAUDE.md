@@ -688,7 +688,8 @@ StrictMode/src/
                         since lowered code cannot tell ntuple, Generator, a splat or a tuple
                         holding a value from a namer. `C_NULL + addr` (+/- with a pointer
                         constant) is :Ptr, and so is an OFFSET on a pointer argument (p + 8,
-                        8 + p, p - 1, add_ptr/sub_ptr), the pointer operand read from m.sig
+                        8 + p, p - 1, add_ptr/sub_ptr), and p - q of two pointer arguments is
+                        :ptr_difference, the pointer operands read from m.sig
                         (_ptr_arg_slots): reading it from typed IR cost ~5x the whole Base scan
                         (measured), so an offset on a Ptr LOCAL is missed.
                         It reads the census's constructors, closures and unnamed callables too

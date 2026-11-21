@@ -1009,12 +1009,13 @@ test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, the re
 
 It looks for `ccall`, `@cfunction`, `pointer`, any function whose name begins with `unsafe_`, the
 pointer intrinsics (`pointerref`, `pointerset`), `llvmcall`, `cglobal`, the C allocator
-(`Libc.malloc`, `Libc.free`), a pointer made from an integer or an offset (`Ptr{T}(addr)`, `C_NULL + addr`, `p + 8` on an argument
-declared as a pointer type, and `Ptr{T}` handed to
+(`Libc.malloc`, `Libc.free`), a pointer made from an integer or an offset (`Ptr{T}(addr)`, `C_NULL + addr`, `p + 8`, `8 + p` and
+`p - 1` on an argument declared as a pointer type, and `Ptr{T}` handed to
 any call that may apply it: `map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`;
 only calls that merely look at the type, such as `Vector{Ptr{T}}`, `isa`, `promote_type`, `string`
-and a tuple of types used as a signature, are exempt), and a `memoryrefnew`
-or `getfield` whose bounds check is a literal `false`. A function counts wherever the method names
+and a tuple of types used as a signature, are exempt), the difference of two pointer arguments, `p - q` (an integer, but Go needs package
+`unsafe` to take it and Rust's `offset_from` is an `unsafe fn`; comparing them is not reported), and
+a `memoryrefnew` or `getfield` whose bounds check is a literal `false`. A function counts wherever the method names
 it: `map(unsafe_load, ps)`, `unsafe_load.(ps)`, a splat, a keyword call and a local alias are
 reported like the plain call. [`unsafe_report`](@ref) lists each construct with the name `allow`
 takes.

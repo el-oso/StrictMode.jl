@@ -25,11 +25,11 @@ const _UNSAFE_LIBC = Base.IdSet{Any}(
 )
 
 # The construct names that are not the name of a function: a `ccall` statement, an `@cfunction`,
-# `@inbounds`, a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`), a
-# global of a module read by a name that is a run-time value (`getglobal(Base, nm)`), which may be
-# any function the module holds, and code evaluated at run time (`eval`, `include_string`), which
-# may do anything.
-const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr, :dynamic_global, :eval)
+# `@inbounds`, a pointer made from an integer or by reinterpreting one (`Ptr{T}(addr)`), the
+# difference of two pointers (`p - q`), a global of a module read by a name that is a run-time
+# value (`getglobal(Base, nm)`), which may be any function the module holds, and code evaluated at
+# run time (`eval`, `include_string`), which may do anything.
+const _UNSAFE_FORMS = (:ccall, :cfunction, :inbounds, :Ptr, :ptr_difference, :dynamic_global, :eval)
 
 # The functions that evaluate code at run time. What that code does is a value of the call, so,
 # like a `dynamic_global` read, it cannot be read from the method or cleared. A module's own `eval`
@@ -134,7 +134,8 @@ end
 
 # `allow` names constructs by bare `Symbol`, but a reader looks for the macro they wrote.
 _render_construct(nm::Symbol) =
-    nm === :inbounds ? "`@inbounds`" : nm === :cfunction ? "`@cfunction`" : "`" * String(nm) * "`"
+    nm === :inbounds ? "`@inbounds`" : nm === :cfunction ? "`@cfunction`" :
+    nm === :ptr_difference ? "`ptr_difference` (a pointer difference)" : "`" * String(nm) * "`"
 
 const _UNSAFE_LIBC_NAMES = Tuple(sort!(Symbol[nameof(f) for f in _UNSAFE_LIBC]))
 
@@ -317,8 +318,14 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve, ptrargs::Ve
         _ptr_applied(callee, st.args, resolve) && push!(out, :Ptr)
         # Arithmetic on a pointer constant, `C_NULL + addr`, makes a pointer from an integer, and
         # offsetting a pointer argument, `p + 8`, makes one the language did not hand out: Go needs
-        # package `unsafe` for it and Rust an `unsafe` block.
-        (callee === (+) || callee === (-)) && any(ptrish, st.args[2:end]) && push!(out, :Ptr)
+        # package `unsafe` for it and Rust an `unsafe` block. The difference of two pointers,
+        # `p - q`, is an integer and builds no pointer, but Go needs `unsafe` for it too and
+        # Rust's `offset_from` is an `unsafe fn`, so it is reported under its own name.
+        if callee === (-) && length(st.args) == 3 && all(ptrish, st.args[2:3])
+            push!(out, :ptr_difference)
+        elseif (callee === (+) || callee === (-)) && any(ptrish, st.args[2:end])
+            push!(out, :Ptr)
+        end
         any(g -> g === callee, _PTR_OFFSETS) && push!(out, :Ptr)
         isnothing(callee) && continue
         if _is_ptr_type(callee)
@@ -411,6 +418,7 @@ own are read like every other method.
 | the pointer intrinsics `pointerref`, `pointerset`, `atomic_pointer…`, and `llvmcall`, `cglobal` | its name |
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
 | a pointer made from an integer: `Ptr{T}(addr)`, `Ptr{T}` handed to any call that may apply it (`reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`, `Ptr{T}[addr]`), arithmetic on a pointer constant (`C_NULL + addr`), or an offset on a pointer argument (`p + 8`, `8 + p`, `p - 1`, `Core.Intrinsics.add_ptr`) | `:Ptr` |
+| the difference of two pointer arguments, `p - q` | `:ptr_difference` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 | a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
 | code evaluated at run time: `eval`, `@eval`, `Core.eval`, `include_string`, `include`, whether called or passed on | `:eval` |
@@ -440,7 +448,10 @@ holding any other value, `(Ptr{T}, addr)`, which may be applied later. A tuple o
 followed to where it is used, so `t = (Ptr{T}, Int); t[1](addr)` is missed.
 Taking a `Ptr` argument builds no pointer and is not reported, but offsetting one is: `p + 8`, `8 + p`
 and `p - 1` on an argument declared as a pointer type make a pointer the language did not hand out,
-as Go's `unsafe.Add` and Rust's `ptr.add` do. Lowered code carries no types, so which operand is a
+as Go's `unsafe.Add` and Rust's `ptr.add` do. The difference of two pointer arguments, `p - q`, is
+an integer and builds no pointer, but Go needs package `unsafe` to take it and Rust's `offset_from`
+is an `unsafe fn`, so it is reported as `:ptr_difference`; comparing them (`p == q`, `p < q`) is
+not. Lowered code carries no types, so which operand is a
 pointer is read from the method's signature: an offset on a pointer kept in a local, or on an
 argument declared wider than `Ptr` (`p::Any`, `p::Union{Ptr{T}, Nothing}`), is missed. Arithmetic
 on a pointer constant such as `C_NULL` is reported wherever it is written.

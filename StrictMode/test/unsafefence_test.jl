@@ -583,4 +583,25 @@ end
     mixed(p::Ptr{Float64}, a::Int) = (p, a + 8)
     end
     @test isempty(unsafe_report(FencePtrNoOffset))
+
+    # The difference of two pointer arguments is an integer, and is reported by its own name.
+    module FencePtrDiff
+    diff(p::Ptr{UInt8}, q::Ptr{UInt8}) = p - q
+    end
+    @test FencePtrDiff.diff(Ptr{UInt8}(24), Ptr{UInt8}(16)) == 8
+    d = only(unsafe_report(FencePtrDiff))
+    @test d.func == "diff"
+    @test occursin("pointer difference", d.reason)
+    @test !occursin("`Ptr`", d.reason)
+    @test occursin(":ptr_difference", d.suggestion)
+    @test isempty(unsafe_report(FencePtrDiff; allow = (:ptr_difference,)))
+    @test !isempty(unsafe_report(FencePtrDiff; allow = (:Ptr,)))
+
+    # Comparing two pointers, and subtracting two integers, builds nothing.
+    module FencePtrCompare
+    eqp(p::Ptr{UInt8}, q::Ptr{UInt8}) = p == q
+    lt(p::Ptr{UInt8}, q::Ptr{UInt8}) = p < q
+    intdiff(a::Int, b::Int) = a - b
+    end
+    @test isempty(unsafe_report(FencePtrCompare))
 end
