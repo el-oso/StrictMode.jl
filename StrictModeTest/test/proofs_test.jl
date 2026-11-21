@@ -723,15 +723,54 @@ end
     @strict_exempt :noalloc reason = "nospecialize" withany
     const ANYCB = Ref{Any}(b -> sum(zeros(length(b))))
     cb_any(n::Int) = withany(ANYCB[], n)
+    # Callables nested three and five levels deep in tuples.
+    @noinline run3(h, n::Int) = h[1][1][1](grow!(n))
+    @strict_exempt :noalloc reason = "runs" run3
+    const H3A = (((b -> sum(zeros(length(b))) + b[1],),),)
+    const H3B = (((b -> (BOXES[1] + b[1])::Float64,),),)
+    cb_deep3(n::Int) = run3(H3A, n)
+    cb_deep3box(n::Int) = run3(H3B, n)
+    @noinline run5(h, n::Int) = h[1][1][1][1][1](grow!(n))
+    @strict_exempt :noalloc reason = "runs" run5
+    const H5A = (((((b -> sum(zeros(length(b))) + b[1],),),),),)
+    cb_deep5(n::Int) = run5(H5A, n)
+    # A callable struct held in a field of an abstract type that `Function` does not intersect, and
+    # a closure held in a field declared `Any`.
+    abstract type AbsCb end
+    struct CbImpl <: AbsCb end
+    (::CbImpl)(b::Vector{Float64}) = sum(zeros(length(b))) + b[1]
+    struct AbsHook
+        f::AbsCb
+    end
+    @noinline withabs(h::AbsHook, n::Int) = (b = grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" withabs
+    const ABSHOOK = AbsHook(CbImpl())
+    cb_absfield(n::Int) = withabs(ABSHOOK, n)
+    struct AnyHook
+        f::Any
+    end
+    @noinline withanyf(h::AnyHook, n::Int) = (b = grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" withanyf
+    const ANYHOOK = AnyHook(b -> sum(zeros(length(b))))
+    cb_anyfield(n::Int) = withanyf(ANYHOOK, n)
+    # Plain data nested five levels deep holds no callable.
+    @noinline withdata(d, n::Int) = (b = grow!(n); b[1] + d[1][1][1][1][1])
+    @strict_exempt :noalloc reason = "pool" withdata
+    const D5 = (((((1.0,),),),),)
+    data_deep(n::Int) = withdata(D5, n)
     end
     E = ExemptCallback
     E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_box(3); E.cb_clean(3); E.plain(3)
     E.cb_struct2(3); E.cb_vec(3); E.cb_hooks(3); E.cb_field(3); E.cb_any(3)
+    E.cb_deep3(3); E.cb_deep3box(3); E.cb_deep5(3); E.cb_absfield(3); E.cb_anyfield(3); E.data_deep(3)
     proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
 
     # An allocation made by the caller's own closure, run inside the exempt function, is the
     # caller's: an ordinary failure, which no option accepts.
-    for f in (E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
+    for f in (
+            E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield,
+        )
         r = proof(f; allow_exempt = true)
         @test r.status === :fail
         @test r.code !== :SM0018
@@ -744,6 +783,8 @@ end
     @test proof(E.plain; allow_exempt = true).status === :info
     clean = proof(E.cb_clean; allow_exempt = true)
     @test clean.status === :info && clean.code === :SM0018
+    data = proof(E.data_deep; allow_exempt = true)
+    @test data.status === :info && data.code === :SM0018
 end
 
 @testitem "the proof honors a callable barrier registered as its type" begin

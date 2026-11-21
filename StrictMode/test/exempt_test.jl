@@ -432,17 +432,55 @@ end
     @strict_exempt :noalloc reason = "nospecialize" xh_withany
     const ANYCB = Ref{Any}(b -> sum(zeros(length(b))))
     cb_any(n::Int) = xh_withany(ANYCB[], n)
+    # Callables nested three and five levels deep in tuples.
+    @noinline xh_run3(h, n::Int) = h[1][1][1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "runs" xh_run3
+    const H3A = (((b -> sum(zeros(length(b))) + b[1],),),)
+    const H3B = (((b -> (BOXES[1] + b[1])::Float64,),),)
+    cb_deep3(n::Int) = xh_run3(H3A, n)
+    cb_deep3box(n::Int) = xh_run3(H3B, n)
+    @noinline xh_run5(h, n::Int) = h[1][1][1][1][1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "runs" xh_run5
+    const H5A = (((((b -> sum(zeros(length(b))) + b[1],),),),),)
+    cb_deep5(n::Int) = xh_run5(H5A, n)
+    # A callable struct held in a field of an abstract type that `Function` does not intersect, and
+    # a closure held in a field declared `Any`.
+    abstract type AbsCb end
+    struct CbImpl <: AbsCb end
+    (::CbImpl)(b::Vector{Float64}) = sum(zeros(length(b))) + b[1]
+    struct AbsHook
+        f::AbsCb
+    end
+    @noinline xh_withabs(h::AbsHook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withabs
+    const ABSHOOK = AbsHook(CbImpl())
+    cb_absfield(n::Int) = xh_withabs(ABSHOOK, n)
+    struct AnyHook
+        f::Any
+    end
+    @noinline xh_withanyf(h::AnyHook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withanyf
+    const ANYHOOK = AnyHook(b -> sum(zeros(length(b))))
+    cb_anyfield(n::Int) = xh_withanyf(ANYHOOK, n)
     # The callback allocates and boxes nothing: every site is the exempt functions' own code.
     cb_clean(n::Int) = xh_withbuf(b -> b[1], n)
     plain(n::Int) = (b = xh_grow!(n); b[1])
+    # Plain data nested five levels deep holds no callable.
+    @noinline xh_data(d, n::Int) = (b = xh_grow!(n); b[1] + d[1][1][1][1][1])
+    @strict_exempt :noalloc reason = "pool" xh_data
+    const D5 = (((((1.0,),),),),)
+    data_deep(n::Int) = xh_data(D5, n)
     end
     E = ExemptHanded
     noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
-    for fn in (E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
+    for fn in (
+            E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield,
+        )
         fn(3)
         @test StrictMode._failed(noalloc(fn))
     end
-    for fn in (E.cb_clean, E.plain)
+    for fn in (E.cb_clean, E.plain, E.data_deep)
         fn(3)
         r = noalloc(fn)
         @test r.status === :info && !StrictMode._failed(r)

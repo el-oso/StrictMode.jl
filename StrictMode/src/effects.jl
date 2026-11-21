@@ -1181,7 +1181,8 @@ function _signal_origin(
             (depth > 0 || (depth < 0 && user)) || continue
             cm = m
             # Below a callee exempt from `:noalloc`, the scan's `:noalloc` verdict counts only the
-            # callables it was handed, and its boxing when one of them is called by dispatch.
+            # callables it was handed, or all of its code when the walk of those cannot finish or
+            # an argument holds callables its type cannot list.
             if m !== :boxing && !isnothing(_mi_exempt_name(mi))
                 haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
                 hs, dyn, whole = _handed_code(mi.specTypes)
@@ -1631,39 +1632,40 @@ function _handed_params(sig::DataType)
 end
 
 # The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
-# number of call methods), or one of those held in a field or as an array's elements. An abstract
-# type that can hold a function is recorded as itself. A FIELD declared `Any` is not: nearly every
-# runtime struct has one (`Task`'s result and storage), and counting it would make every dynamic
-# call in an exempt function that takes such a struct the caller's.
-function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int, field::Bool)
+# number of call methods), or one of those held in a field or as an array's elements, at any depth.
+# A type that is not concrete anywhere in that walk (an abstract argument, field or element type,
+# `Any` included) is recorded as itself: the values it may hold, and so the callables, cannot be
+# listed from the type, and a caller treats such an entry as code it cannot excuse. A type argument
+# (`Type{T}`, `DataType`) is not a callable here.
+function _callable_types!(out::Vector{Any}, @nospecialize(T), seen::Base.IdSet{Any} = Base.IdSet{Any}())
     # A signature's `Vararg` tail carries its element type, and a type variable its upper bound.
-    T isa Core.TypeofVararg && return _callable_types!(out, isdefined(T, :T) ? T.T : Any, depth, field)
-    T isa TypeVar && return _callable_types!(out, T.ub, depth, field)
-    T isa Type || return out
+    T isa Core.TypeofVararg && return _callable_types!(out, isdefined(T, :T) ? T.T : Any, seen)
+    T isa TypeVar && return _callable_types!(out, T.ub, seen)
+    (T isa Type && T !== Union{}) || return out
     if T isa Union
         for U in Base.uniontypes(T)
-            _callable_types!(out, U, depth, field)
+            _callable_types!(out, U, seen)
         end
         return out
     end
+    T <: Type && return out
+    T in seen && return out
+    push!(seen, T)
     if !isconcretetype(T)
-        (field && T === Any) || typeintersect(T, Function) === Union{} || push!(out, T)
-        T isa DataType && T <: AbstractArray && depth < 2 &&
-            _callable_types!(out, eltype(T), depth + 1, false)
+        push!(out, T)
         return out
     end
     if T <: Function
         push!(out, T)
     elseif T <: AbstractArray
-        depth < 2 && _callable_types!(out, eltype(T), depth + 1, false)
-        return out
-    elseif !(T <: Union{Number, AbstractString, Symbol, Type})
+        return _callable_types!(out, eltype(T), seen)
+    elseif !(T <: Union{Number, AbstractString, Symbol})
         ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
         (ms isa Vector && !isempty(ms)) && push!(out, T)
     end
-    if depth < 2 && !(T <: Union{AbstractString, Number})
+    if !(T <: Union{AbstractString, Number})
         for F in fieldtypes(T)
-            _callable_types!(out, F, depth + 1, true)
+            _callable_types!(out, F, seen)
         end
     end
     return out
@@ -1672,9 +1674,11 @@ end
 # What an exempt function `sig` runs on its caller's behalf: the code of the callables it was handed
 # (`_callable_types!` over its arguments). Returns the signatures of those callables wherever they
 # are called below it, invoked or inlined, so they can be read as the caller's code; whether it holds
-# a callable whose type is known only at run time, whose calls are then dynamic and whose bodies
-# cannot be read; and whether the walk finished. The walk enters only the callees the callables
-# are passed on to, so it is short unless they are handed deep.
+# a value whose callables its type cannot list (an abstract type anywhere in an argument, `Any` and
+# `Function` included), whose calls are then dynamic and whose bodies cannot be read; and whether
+# the walk finished. Such a value also ends the walk unfinished, so that nothing below the exempt
+# function is excused: any of its code may be running what the caller handed it. The walk enters
+# only the callees the callables are passed on to, so it is short unless they are handed deep.
 const _HANDED_MEMO = IdDict{Any, Tuple{UInt, Vector{Any}, Bool, Bool}}()
 
 function _handed_code(@nospecialize(sig))
@@ -1683,8 +1687,9 @@ function _handed_code(@nospecialize(sig))
     (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3], hit[4]
     types = _handed_types(sig)
     found = Any[]
-    complete = true
-    if !isempty(types)
+    dynamic = any(T -> !isconcretetype(T), types)
+    complete = !dynamic
+    if complete && !isempty(types)
         seen = Base.IdSet{Any}()
         queue = Any[sig]
         while !isempty(queue)
@@ -1723,7 +1728,6 @@ function _handed_code(@nospecialize(sig))
             end
         end
     end
-    dynamic = any(T -> !isconcretetype(T), types)
     @lock _SIGNAL_MEMO_LOCK (_HANDED_MEMO[sig] = (world, found, dynamic, complete))
     return found, dynamic, complete
 end
@@ -1733,7 +1737,7 @@ function _handed_types(@nospecialize(sig))
     s = Base.unwrap_unionall(sig)
     s isa DataType || return types
     for P in Iterators.drop(s.parameters, 1)
-        _callable_types!(types, P, 0, false)
+        _callable_types!(types, P)
     end
     return types
 end
@@ -2023,9 +2027,9 @@ function _scan_ci(
                             # clean. `:boxing`, which `:noboxing` reads, excuses nothing, and the
                             # callee's dictionary lookups still count. Code the callee was handed
                             # by its caller is the caller's (`_handed_code`): each such callable is
-                            # read as the caller's own callee, and a callable whose type is known
-                            # only at run time is called by dispatch, so then the callee's boxing
-                            # counts. A walk that cannot finish excuses nothing.
+                            # read as the caller's own callee. A walk that cannot finish excuses
+                            # nothing, and neither does an argument whose callables its type
+                            # cannot list.
                             exname = (mode !== :boxing && (a2 || b2)) ? _mi_exempt_name(mi) : nothing
                             if isnothing(exname)
                                 a2 && (alloc = true)

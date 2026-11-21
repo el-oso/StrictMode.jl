@@ -722,20 +722,19 @@ end
 # Whether the allocation site `a` runs a callable that the exempt function at backtrace frame `k`
 # received as an argument, directly, inside a struct or inside an array. A frame that kept its
 # specialization is matched on the callable's type; an inlined one has only a name, and is matched
-# on the names of the callable's methods. A dynamic call in or below the exempt frame counts when an
-# argument holds a callable whose type is known only at run time (a `Function` or `Any` argument,
-# a `Vector{Function}`, a field declared `Function`): the call may reach it, and its body is not
-# analyzed at all.
+# on the names of the callable's methods. Every site in or below the exempt frame counts when an
+# argument holds a value whose callables its type cannot list (an abstract type anywhere in it: a
+# `Function` or `Any` argument, a `Vector{Function}`, a field declared `Function`, `Any` or another
+# abstract type): any of that code may be running it, and a dynamic call's target is not analyzed.
 function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
     bt = a.backtrace
     types = Any[]
     ps = (mi.specTypes::DataType).parameters
     for i in 2:length(ps)
-        StrictMode._callable_types!(types, ps[i], 0, false)
+        StrictMode._callable_types!(types, ps[i])
     end
     isempty(types) && return false
-    a isa AllocCheck.DynamicDispatch && !_c_varargs_call(a) &&
-        any(T -> !isconcretetype(T), types) && return true
+    any(T -> !isconcretetype(T), types) && return true
     k > 1 || return false
     names = Set{Symbol}()
     for T in types

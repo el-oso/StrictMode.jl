@@ -297,9 +297,13 @@ function or not.
 Two things are not excused. Code the exempt function was handed by its caller is the caller's: a
 function, closure or callable struct passed as an argument, in a field of one or as an array's
 elements, whether the exempt function calls it or inlines it. What it allocates or boxes fails the
-caller, in both tiers. When the handed callable's type is known only at run time (a `Function` or
-`Any` argument, a `Vector{Function}`), it is called by dispatch and its body cannot be read, so the
-scan counts the exempt function's boxing, and the proof its dynamic calls. And the exemption names
+caller, in both tiers, at any depth of nesting. When an argument's type cannot list the callables it
+holds, because an abstract type appears anywhere in it (a `Function` or `Any` argument, a
+`Vector{Function}`, a field declared `Any` or another abstract type), the exemption excuses nothing
+in that call: what the exempt function and its callees allocate or box fails the caller, in both
+tiers, since any of it may be running a callable the caller handed in. A `Task` has fields declared
+`Any`, so this includes a `ReentrantLock`, a `Threads.Condition` or a `Channel`, which hold tasks.
+A type argument (`Type{T}`) is not a callable here. And the exemption names
 `:noalloc` only: under `:noboxing` the exempt function's boxing still fails the caller, and the
 warning names where it is.
 

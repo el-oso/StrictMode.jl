@@ -243,10 +243,14 @@ StrictMode/src/
                         its arguments carry (_callable_types!, shared with StrictModeTest's
                         _runs_handed_in) wherever they are invoked or inlined below it (read from
                         inlining edges), and each is scanned as the caller's own callee, its entry
-                        removed from seen first since the exempt walk already visited it. A
-                        callable typed only at run time, or a walk that cannot finish, counts the
-                        exempt callee's boxing (a second walk in :boxing mode; seen is keyed on
-                        (sig, mode, caught) so it is not cut). _signal_origin mirrors this.
+                        removed from seen first since the exempt walk already visited it.
+                        _callable_types! walks fields and eltypes to any depth (a seen set stops a
+                        recursive type) and records every NON-CONCRETE type it meets (Any fields
+                        included, so a Task and anything holding one); such an entry, or a walk
+                        that cannot finish, makes _handed_code incomplete and excuses NOTHING below
+                        the exempt callee: its allocation and boxing count (a second walk in
+                        :boxing mode; seen is keyed on (sig, mode, caught) so it is not cut).
+                        _signal_origin mirrors this.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch
@@ -885,10 +889,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         frame with a specialization, on its method names for an inlined one);
                         otherwise an exempt wrapper would launder its caller's closure. The
                         callables are found in arguments, their fields and array elements
-                        (_callable_types!), and an ABSTRACT one (Function, an Any argument or
-                        eltype, a field declared Function) makes every dynamic call at or below
-                        the exempt frame the caller's, since its target is not analyzed; a field
-                        declared Any does not count (Task has several). One site without an exempt frame, or an exempt
+                        (_callable_types!), and an argument holding a NON-CONCRETE type anywhere
+                        (Function, Any, an abstract field or eltype) makes every site at or below
+                        the exempt frame the caller's, as in the scan. One site without an
+                        exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
                         is StrictMode._mi_exemption, on the method module and name, with
                         declared_in_module = true: an exemption declared with NO module covers
