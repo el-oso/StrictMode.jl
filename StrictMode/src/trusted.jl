@@ -293,12 +293,15 @@ end
 # on one arm and something else on the other, and a variable assigned between them holds a
 # different value at each. A jump INTO the span is a path that skipped the first read, so the
 # span must hold no jump target either. When the other field is read SECOND, it raises on an
-# `Untrusted` only after the payload read ran, so nothing in between may hand the payload on.
+# `Untrusted` only after the payload read ran, so nothing in between may hand the payload on, and
+# the payload read must not sit in a `try` that catches: the catch swallows the raise, and a local
+# the payload was stored in is still read after it.
 function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand))
     isempty(other) && return false
     targets = _jump_targets(ci)
     for (j, a) in other
         a == operand || continue
+        i < j && _in_try(ci, i) && continue
         lo, hi = minmax(i, j)
         straight = !any(t -> lo < t <= hi, targets)
         for k in lo:(hi - 1)
@@ -329,6 +332,12 @@ function _may_hand_on(ci, @nospecialize(st))
     callee, _ = _call_callee_and_args(ci, st)
     return callee !== Core.getfield
 end
+
+# Whether statement `i` lies between an `enter` and the catch block it jumps to. Lowering places a
+# `try` body after its `enter` and before its catch; an `enter` with no catch (`catch_dest == 0`,
+# the scope-only form) catches nothing.
+_in_try(ci, i::Int) =
+    any(k -> (st = ci.code[k]; st isa Core.EnterNode && st.catch_dest > 0 && k < i < st.catch_dest), 1:(i - 1))
 
 # The statements a jump can land on.
 function _jump_targets(ci)

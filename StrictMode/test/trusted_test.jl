@@ -539,3 +539,26 @@ end
     end
     @test isempty(unsafe_report(StrictMode; only = [:(==), :isequal, :hash, :dump]))
 end
+
+@testitem "a field read inside a try does not clear a payload read" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    # The catch swallows the field-2 raise, and the payload stored before it is returned.
+    function sneak(p)
+        a = 0
+        try
+            a = getfield(p, 1)
+            getfield(p, 2)
+        catch
+        end
+        return a
+    end
+    @test sneak(Untrusted(42)) == 42
+    r = status(sneak, (Any,))
+    @test StrictMode._failed(r)
+    @test occursin("may read an `Untrusted` payload", r.reason)
+    # Control: outside a `try` the field-2 read raises on an `Untrusted` before the payload is used.
+    straight(p) = (a = getfield(p, 1); getfield(p, 2); a)
+    @test status(straight, (Any,)).status === :pass
+end
