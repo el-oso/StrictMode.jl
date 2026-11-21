@@ -188,7 +188,7 @@ the union-typed local) report.
 
 ### What the scan leaves out of your body
 
-Two kinds of statement are in the compiled body but never counted against it.
+Three kinds of statement are in the compiled body but never counted against it.
 
 **StrictMode's own machinery.** With checks enabled, a `@strict` or `@assert_*` site leaves a live call
 to StrictMode's scan behind a per-site flag, so a function containing one carries the tool in its IR.
@@ -202,6 +202,14 @@ which no path reaches a `return` carrying a value, not just the `throw`: the mes
 `ArgumentError("… $x …")` builds is usually assembled in an earlier block that jumps to the throw, and
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
 never an error path.
+
+**A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
+follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the
+same value twice: `ldiv!(U, b)` for a triangular `U` solves in place by calling `_ldiv!(b, U, b)`, which
+inlines to `b === b ? b : copyto!(b, b)`. LLVM folds the comparison and the copy never
+runs, but it is still in the optimized IR, and its unaliasing allocates. Only an SSA value or an
+argument compared with itself counts: `d === s` for two arguments `d` and `s` keeps both sides, since
+whether they are the same object depends on the values passed.
 
 ### One-time-init calibration doesn't have to break this
 

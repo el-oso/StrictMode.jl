@@ -710,6 +710,60 @@ function _deadend_mask(code::Vector{Any})
     return map(!, alive)
 end
 
+# Is statement `c` the call `x === x`, one value compared with itself? Egal is reflexive, so it is
+# true whatever `x` holds. Only an SSA value or an argument counts as "the same value": two
+# separate arguments may or may not be the same object, and that is not known without values.
+function _reflexive_egal(code::Vector{Any}, @nospecialize(c))
+    c isa Core.SSAValue && 1 <= c.id <= length(code) || return false
+    st = code[c.id]
+    Meta.isexpr(st, :call) && length(st.args) == 3 || return false
+    _static_callee(nothing, st.args[1]) === (===) || return false
+    a, b = st.args[2], st.args[3]
+    return (a isa Core.SSAValue || a isa Core.Argument) && a == b
+end
+
+# Statements no execution reaches from the entry, reading a `goto … if not` whose condition is
+# `x === x` as never jumping. Inlining a callee that takes the same value twice leaves exactly that
+# guard: a triangular `ldiv!(U, b)` forwards to `_ldiv!(b, U, b)` and inlines to
+# `b === b ? b : copyto!(b, b)`, and the copy, whose unaliasing allocates, never runs. The optimizer keeps the comparison and LLVM folds it, so AllocCheck sees
+# no copy; without this the scan counts code that cannot execute. Every other branch keeps both
+# successors, so the mask only removes a path that egal's reflexivity rules out.
+function _unreachable_mask(code::Vector{Any})
+    n = length(code)
+    reached = falses(n)
+    work = [1]
+    while !isempty(work)
+        i = pop!(work)
+        (1 <= i <= n && !reached[i]) || continue
+        reached[i] = true
+        st = code[i]
+        if st isa Core.ReturnNode
+            continue
+        elseif st isa Core.GotoNode
+            push!(work, st.label)
+        elseif st isa Core.GotoIfNot
+            _reflexive_egal(code, st.cond) || push!(work, st.dest)
+            push!(work, i + 1)
+        elseif Meta.isexpr(st, :gotoifnot)
+            t = st.args[2]
+            t isa Integer && push!(work, t)
+            push!(work, i + 1)
+        elseif st isa Core.EnterNode
+            # The catch destination is reached by a throw from anywhere in the try body.
+            iszero(st.catch_dest) || push!(work, st.catch_dest)
+            push!(work, i + 1)
+        else
+            push!(work, i + 1)
+        end
+    end
+    return map(!, reached)
+end
+
+# The statements a scan of one body skips: those no execution reaches, and, under `ignore_throw()`,
+# those from which no path returns normally.
+_skip_mask(code::Vector{Any}) =
+    ignore_throw() ? _deadend_mask(code) .| _unreachable_mask(code) : _unreachable_mask(code)
+
 # Session memo for the per-signature scan: the callee recursion re-visits shared helpers (Base
 # internals especially) from every caller, and each visit pays a `code_typed_by_type`. Without
 # this, `:fast`'s median went 2.9 ms → 73 ms on the corpus study. Invalidated with the findings
@@ -912,7 +966,7 @@ function _origin_node(@nospecialize(s), mode::Symbol)
         own = Base.IdSet{Any}()
         push!(own, s)
         _scan_ci(ci, s, 0, own, mode, false, trace)
-        dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+        dead = _skip_mask(ci.code)
         for (j, st) in enumerate(ci.code)
             (Meta.isexpr(st, :invoke) && !dead[j]) || continue
             a1 = st.args[1]
@@ -1355,7 +1409,7 @@ function _scan_ci(
     # Corpus-measured (PureBLAS + PureIPM, 120 specializations): 57 frames reach no such statement.
     escmemo = Ref{Union{Nothing, Bool}}(nothing)
     newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
-    dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+    dead = _skip_mask(ci.code)
     # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
     # Both branches are asserted, like `newsdead` above. Without it the memo's `Union{Nothing, …}`
     # is the closure's return type: the `isnothing` check narrows the FIRST load of the `Ref`, and

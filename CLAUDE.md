@@ -191,7 +191,14 @@ StrictMode/src/
                         Every one is a PROOF: false means the compiler could not establish the
                         property, NOT that it fails — :noub is false for a non-const global read
                         and for a dynamic call, neither of which is undefined behavior (measured),
-                        so a caller may act on true and must treat false as unknown
+                        so a caller may act on true and must treat false as unknown.
+                        _skip_mask is what a body scan leaves out: _deadend_mask (no path returns,
+                        under ignore_throw) OR _unreachable_mask (not reached from the entry, where a
+                        `goto if not` on `x === x` — one SSA value or argument compared with
+                        itself — never jumps). An in-place triangular ldiv! inlines
+                        `b === b ? b : copyto!(b, b)`; LLVM folds it, and the dead copy's unalias
+                        allocation would otherwise fail a body AllocCheck proves clean. Two
+                        DIFFERENT arguments compared keep both sides: identity is a value fact
   scheduling.jl       — @assert_vectorized, @assert_effects, @assert_no_scalar_loops,
                         @assert_no_spill, kernel_report/KernelReport, register_report/RegisterReport,
                         spill_report/SpillReport, descend, _CACHE_BYTES. :vectorized, KernelReport.vectorized
