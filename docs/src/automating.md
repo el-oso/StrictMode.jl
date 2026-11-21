@@ -207,11 +207,15 @@ test_compiled(MyPkg; guarantees = (:noalloc, :noboxing))          # prove and ga
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
 best-effort and defensive. In return, it needs no marks at all.
 
-The sweep covers the module's own functions and the methods it, its submodules and its loaded
-extensions define on a function the module does not own, such as its `Base.getproperty`,
-`Base.size` or `Base.:*` methods, or a submodule's own function. Only the method the package
-wrote is swept, not the function's other methods. `only` and `exempt` name such a method by
-the function's name, as they do the module's own.
+The sweep covers the methods written in the module itself: its own functions' methods, and the
+methods it defines on a function another module owns, such as its `Base.getproperty`, `Base.size`
+or `Base.:*` methods. Only the method the module wrote is swept, not the function's other methods.
+`only` and `exempt` name such a method by the function's name, as they do the module's own.
+
+A submodule or a package extension is a module of its own: sweep it by name
+(`audit(MyPkg.Sub; sweep = true)`, `test_compiled(Base.get_extension(MyPkg, :MyPkgExt))`), and
+its own `@strict_exempt` declarations apply. Its methods never appear in the parent's sweep, so no
+method is listed twice. The coverage gate below still counts them as the package's.
 
 A callable object's method, `(r::Reader)(x)`, is swept too, once for each concrete type it compiled
 for: `Reader`, and `Boxed{Int}` and `Boxed{Float64}` separately for `(b::Boxed)(x)`. The sweep has

@@ -374,16 +374,19 @@ StrictMode/src/
                         module_methods is the CENSUS (Base.visit(Core.methodtable) filtered by
                         module, so a method on a FOREIGN function counts); _module_specializations,
                         the one enumerator behind every compiled sweep (audit sweep, test_compiled,
-                        inline/dispatch/static-ownership suggestions), walks the module own
-                        functions and then takes from the census each method the module, a
-                        submodule or a loaded extension defines on a function the module does
-                        not own, sweeping that method only, and each callable object's method
+                        inline/dispatch/static-ownership suggestions), sweeps only methods WRITTEN
+                        in the module (m.module === mod): the module own functions' methods, then
+                        from the census each method it defines on a function another module owns,
+                        sweeping that method only, and each callable object's method
                         (not a capturing closure), whose specializations it hands on as
                         (_callee(F), types): _Callable{F}() for a type with no instance. The census
                         filters a callable with no instance by its type, and _decl_key keys on the
                         callable's TYPE, so a declaration made on an instance stamps those rows; an
                         exemption of such a function excuses only the declaring module's methods
-                        (_exempt_in, asked per method by _is_exempt(f, m)); _coverage_all_findings
+                        (_exempt_in, asked per method by _is_exempt(f, m)). A submodule's or an
+                        extension's methods are in the census but only in THAT module's sweep, so
+                        a method gets one row, under the exemptions of the module that wrote it;
+                        _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function
                         form; _is_parametric_def keeps a `where` definition out of the registry.
                         _STORES/_store_for memoize each module's store so a reader never touches a

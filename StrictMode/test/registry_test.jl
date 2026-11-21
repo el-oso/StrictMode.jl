@@ -379,30 +379,55 @@ end
     Base.delete_method(which(getproperty, (Untrusted{F.MyT}, Symbol)))
 end
 
-@testitem "a module sweep covers the methods its submodules define" begin
+@testitem "a module sweep covers the methods written in that module only" begin
     using StrictMode
 
-    module NestedForeign
+    module Nested
     using StrictMode
+    pf(x::Int) = x + 1
     module Sub
     using StrictMode
+    import ..pf
     struct MyT
         v::Int
     end
+    struct Tracker
+        v::Vector{Float64}
+    end
+    Tracker(; n::Int = 3) = Tracker(zeros(n))
+    @strict_exempt :noalloc Tracker
     Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    subf(x::Int) = x + 1
+    pf(x::Float64) = x + 1          # a method of the parent's function, written here
     end
-    own(x::Int) = x + 1
+    struct Grows
+        n::Int
     end
-    N = NestedForeign
-    Untrusted(N.Sub.MyT(1)).x; N.own(1)
+    Base.collect(g::Grows) = zeros(g.n)
+    end
+    N = Nested
+    Untrusted(N.Sub.MyT(1)).x; N.Sub.Tracker(; n = 2); N.Sub.subf(1); N.pf(1); N.pf(1.0)
+    collect(N.Grows(3))
 
-    # The census counts the submodule's method as the package's, so the sweep reads it.
-    @test any(m -> m.name === :getproperty, first(StrictMode.module_methods(N)))
-    fs = audit(N; sweep = true, guarantees = (:trusted,), dispatch_suggest = false)
-    rs = [f for f in fs if f.func == "getproperty"]
-    @test length(rs) == 1
-    @test StrictMode._failed(only(rs))
-    @test only(rs).mod === :Sub
-    @test any(f -> f.func == "own" && f.status === :pass, fs)
+    sweep(m) = audit(m; sweep = true, guarantees = (:trusted, :noalloc), dispatch_suggest = false)
+    parent, sub = sweep(N), sweep(N.Sub)
+    # The census still counts every method in the package, the submodule's among them.
+    census = first(StrictMode.module_methods(N))
+    @test count(m -> m.module === N.Sub, census) >= 4
+    # The parent's sweep has no row for a method the submodule wrote.
+    @test !isempty(parent)
+    @test all(f -> f.mod === :Nested, parent)
+    @test !any(f -> f.func == "pf" && occursin("Float64", f.signature), parent)
+    # A foreign method the parent wrote is still swept.
+    @test any(f -> f.func == "collect" && f.guarantee === :noalloc && StrictMode._failed(f), parent)
+    @test any(f -> f.func == "pf" && occursin("Int", f.signature), parent)
+    # The submodule's own sweep has them, once each, with its exemption applied.
+    @test all(f -> f.mod === :Sub, sub)
+    @test count(f -> f.func == "getproperty" && f.guarantee === :trusted && StrictMode._failed(f), sub) == 1
+    @test any(f -> f.func == "subf", sub)
+    @test count(f -> f.func == "pf" && occursin("Float64", f.signature) && f.guarantee === :noalloc, sub) == 1
+    tr = [f for f in sub if occursin("Tracker", f.func) && f.guarantee === :noalloc]
+    @test !isempty(tr)
+    @test all(f -> f.status === :info && startswith(f.reason, "exempt"), tr)
     Base.delete_method(which(getproperty, (Untrusted{N.Sub.MyT}, Symbol)))
 end
