@@ -202,7 +202,8 @@ your code allocates.
 which no path reaches a `return` carrying a value, not just the `throw`: the message an
 `ArgumentError("… $x …")` builds is usually assembled in an earlier block that jumps to the throw, and
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
-never an error path.
+never an error path, and neither is the code before a `try` whose `catch` returns: a throw in the try body
+continues at the handler.
 
 **A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
 follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the

@@ -356,6 +356,47 @@ end
     @test isempty(StrictMode._deadend_mask(Any[]))
 end
 
+@testitem "a try whose catch returns keeps the code before it live" begin
+    using StrictMode
+    # The try body always throws, but the catch returns `v`, so the `zeros` runs on every call.
+    @noinline function before_try(n::Int)
+        v = zeros(n)
+        try
+            throw(ArgumentError("x"))
+        catch
+        end
+        return v
+    end
+    # Passing control: an allocation only on a throw that nothing catches stays an error path.
+    @noinline function uncaught(n::Int)
+        n < 0 && throw(ArgumentError(string("negative: ", n)))
+        return n + 1
+    end
+    tt = (Int,)
+    before_try(3); uncaught(3)
+    code = Base.code_typed_by_type(Tuple{typeof(before_try), Int})[1][1].code
+    enter = findfirst(st -> st isa Core.EnterNode, code)
+    @test !isnothing(enter)
+    dead = StrictMode._deadend_mask(code)
+    @test !dead[enter]
+    # The vector `zeros` builds (its `:new`); the bounds-error branch inside `zeros` stays dead.
+    @test any(i -> Meta.isexpr(code[i], :new) && !dead[i], 1:enter)
+    @test StrictMode._alloc_signals(before_try, tt).alloc
+    @test StrictMode._failed(only(StrictMode.findings(before_try, tt; guarantees = (:noalloc,))))
+    @test !StrictMode._alloc_signals(uncaught, tt).alloc
+    @test !StrictMode._failed(only(StrictMode.findings(uncaught, tt; guarantees = (:noalloc,))))
+
+    # The same shape, hand-written: the EnterNode's handler is the only way to the return.
+    code = Any[
+        Expr(:call, GlobalRef(Base, :zeros), Core.Argument(2)),
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Core, :throw), 1),
+        Core.ReturnNode(),                        # unreachable
+        Core.ReturnNode(Core.SSAValue(1)),        # the catch returns
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [3, 4]
+end
+
 @testitem ":noescape reports a scoped handle that leaves the frame" begin
     using StrictMode
 
@@ -558,7 +599,7 @@ end
     eff = StrictMode.effects(mul, (Float64, Float64))
     syms = (
         :nothrow, :effect_free, :terminates, :consistent, :nonoverlayed,
-        :notaskstate, :noub, :inaccessiblememonly, :nortcall
+        :notaskstate, :noub, :inaccessiblememonly, :nortcall,
     )
     for s in syms
         @test StrictMode.effect_holds(eff, s) isa Bool

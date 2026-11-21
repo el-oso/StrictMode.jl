@@ -698,6 +698,11 @@ function _deadend_mask(code::Vector{Any})
             elseif Meta.isexpr(st, :gotoifnot)
                 t = st.args[2]
                 (t isa Integer && 1 <= t <= n && alive[t]) || (i < n && alive[i + 1])
+            elseif st isa Core.EnterNode
+                # A throw in the try body continues at the handler, so a catch that returns keeps
+                # everything before the `try` live.
+                d = st.catch_dest
+                (1 <= d <= n && alive[d]) || (i < n && alive[i + 1])
             else
                 i < n && alive[i + 1]                    # falls through
             end

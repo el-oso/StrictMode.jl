@@ -192,8 +192,8 @@ StrictMode/src/
                         property, NOT that it fails — :noub is false for a non-const global read
                         and for a dynamic call, neither of which is undefined behavior (measured),
                         so a caller may act on true and must treat false as unknown.
-                        _skip_mask is what a body scan leaves out: _deadend_mask (no path returns,
-                        under ignore_throw) OR _unreachable_mask (not reached from the entry, where a
+                        _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
+                        under ignore_throw; an EnterNode reaches its catch_dest) OR _unreachable_mask (not reached from the entry, where a
                         `goto if not` on `x === x` — one SSA value or argument compared with
                         itself — never jumps). An in-place triangular ldiv! inlines
                         `b === b ? b : copyto!(b, b)`; LLVM folds it, and the dead copy's unalias
