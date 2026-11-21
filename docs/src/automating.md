@@ -44,8 +44,10 @@ the type of the callable. That form needs no instance, which is how a callable o
 checked from its type alone: for `(r::Reader)(x::Int)`, `findings(Tuple{Reader, Int})` reads what
 `findings(Reader(1), (Int,))` reads, and both name the finding `Reader`.
 
-`findings` never throws: it is the data half of the API, and the caller decides what a finding is
-worth. To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
+`findings` never throws on a violation: it is the data half of the API, and the caller decides what
+a finding is worth. An argument that names nothing to check raises an `ArgumentError`: an unknown
+guarantee, or a signature type with free type parameters or no callable (`Tuple{Vector{T}, Int} where
+T`, `Tuple{}`). To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
 `test_signatures` takes the same list, runs AllocCheck and JET instead of the value-free scan, and
 throws a `StrictViolation` collecting every failure:
 
