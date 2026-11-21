@@ -238,7 +238,10 @@ StrictMode/src/
                         UNOPTIMIZED typed IR via effects.jl's _unopt_* helpers because a small
                         boundary inlines and its getfield would surface in an innocent caller.
                         `reinterpret(T, u)` raises like `u.x` (Base's generic reinterpret copies an
-                        isbits payload) and the scan reports it; `show` and `dump` print `<redacted>`.
+                        isbits payload) and the scan reports it; reinterpret/write/unsafe_write
+                        (_BYTE_COPIERS) are reported by _untrusted_reach of every operand past the
+                        first, so `reinterpret(T, [u])` and `write(io, Ref(u))`, which copy the bits
+                        without raising, are certain reads; `show` and `dump` print `<redacted>`.
                         ==, isequal and hash raise (so an Untrusted is no Dict/Set key, and [u] == [v]
                         raises); === is a builtin and, with objectid/IdDict, still reads the bits.
                         A keyword function is judged by its body (_keyword_body: Base.bodyfunction,

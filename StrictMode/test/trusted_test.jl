@@ -598,3 +598,25 @@ end
     @test status(mapped_clean, (Vector{Pt},)).status === :pass
     @test status(fixed_clean, (Pt,)).status === :pass
 end
+
+@testitem "reinterpret of an array and write of a Ref read the payload bytes" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    const UI = Untrusted{Int}
+    peek_array(u::UI) = reinterpret(Int, [u])[1]
+    peek_write(u::UI) = (io = IOBuffer(); write(io, Ref(u)); reinterpret(Int, take!(io))[1])
+    peek_write_array(u::UI) = (io = IOBuffer(); write(io, [u]); reinterpret(Int, take!(io))[1])
+    for f in (peek_array, peek_write, peek_write_array)
+        @test f(Untrusted(42)) == 42
+        r = status(f, (UI,))
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    @test_throws StrictViolation @assert_trusted peek_array(Untrusted(42))
+    # Controls: the same calls on plain data, next to an `Untrusted` that is only passed along.
+    clean_array(u::UI, x::Vector{Int}) = (u, reinterpret(UInt8, x))
+    clean_write(u::UI, x::Int) = (io = IOBuffer(); write(io, Ref(x)); write(io, "s"); (u, take!(io)))
+    @test status(clean_array, (UI, Vector{Int})).status === :pass
+    @test status(clean_write, (UI, Int)).status === :pass
+end

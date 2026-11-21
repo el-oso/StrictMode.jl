@@ -23,7 +23,8 @@ handed over by a device.
 The wrapped value is meant to be passed along or given to a **trust boundary**: a function that
 validates it and returns a plain value, registered with [`trust_boundary!`](@ref). Methods written
 for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a `MethodError`
-instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. The one deliberate way out
+instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. `reinterpret(T, [u])` and
+`write(io, Ref(u))` do not, and [`@assert_trusted`](@ref) reports them. The one deliberate way out
 is [`unsafe_trust`](@ref).
 
 `show`, `print`, `string`, `repr` and `dump` print the type and `<redacted>` in place of the
@@ -154,8 +155,9 @@ end
 # it at check time is more use than a runtime error in whatever session first hits that branch.
 const _DEREF_FUNCS = (Core.getfield, Base.getproperty, unsafe_trust)
 
-# Whether a value is typed as an `Untrusted`. `Union{}` is a subtype of every type and types no value.
-_is_untrusted_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Untrusted
+# The calls that copy out the bits of an `isbits` value they are given, inside an array or a `Ref`
+# as well as bare.
+const _BYTE_COPIERS = (reinterpret, write, unsafe_write)
 
 # Callee names of the payload reads in `f`'s OWN body — empty when there are none, and `nothing`
 # when the typed IR could not be obtained, which a caller must not read as "no sites".
@@ -216,9 +218,13 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         if !(callee in (===, !==, ==, !=, isequal))
             _handed_on_reads!(certain, erased, ci, st, callee, args)
         end
-        # `reinterpret(T, u)` raises at run time, like `u.x`; reporting it here says so before then.
-        if callee === reinterpret && any(a -> _is_untrusted_type(_unopt_arg_type(ci, a)), args)
-            push!(certain, :reinterpret)
+        # A call that copies out the bits of what it is given reads a payload it can reach:
+        # `reinterpret(T, u)` (which raises at run time, like `u.x`), `reinterpret(T, [u])`,
+        # `write(io, Ref(u))`, `write(io, [u])`. The first operand is the target type or the stream.
+        if callee in _BYTE_COPIERS && length(args) >= 2
+            r = foldl(_max_reach, (_untrusted_reach(_unopt_arg_type(ci, a)) for a in args[2:end]); init = :none)
+            r === :certain && push!(certain, nameof(callee))
+            r === :maybe && push!(erased, nameof(callee))
             continue
         end
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
@@ -489,8 +495,12 @@ end
 Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f` is not registered
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
-The read is any call to `getfield`, `getproperty`, `reinterpret` or [`unsafe_trust`](@ref) on an
-argument that inference types as `<:Untrusted`, directly or through `invoke`. It is also any of
+The read is any call to `getfield`, `getproperty` or [`unsafe_trust`](@ref) on an argument that
+inference types as `<:Untrusted`, directly or through `invoke`, and any call to `reinterpret`,
+`write` or `unsafe_write` handed an `Untrusted` or a tuple, array or `Ref` of them past its first
+operand: `reinterpret(T, u)`, `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])` copy
+out the bits of an `isbits` payload. Handed an operand whose type cannot rule one out, those three
+are reads that cannot be ruled out. It is also any of
 `getfield`, `getproperty` and `unsafe_trust` handed to another call as a value, bare or held by a
 callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
 `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. `unsafe_trust`
@@ -511,7 +521,8 @@ name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the
 reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
 from then on `p.x`, `p.v` or a property of any name read from an untyped value is reported like
 the other two, since that method returns what it chooses whatever the name. A method for the form
-with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside a generic Base method that accepts any value (`dump`, `==`, `hash`) is not seen, and nothing verifies that a registered boundary really validates or
+with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside any other generic method that copies what it is given, such as
+`Serialization.serialize`, is not seen, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
