@@ -1225,11 +1225,12 @@ that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `m
 field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
 `getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, and so are the calls that copy out the bits of
 an array or a `Ref` of them: `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])`. All of
-these also raise when they run, as does `unsafe_write(io, Ref(u), n)`. Handed a value of a type that can hold an `Untrusted`
-(`Any`, `Vector{Any}`), those calls warn and name the type; `write(io, x::Real)` and
-`reinterpret(UInt64, x::Integer)` do not, since an abstract type with no container shape and no
-parameter naming an `Untrusted` is taken to hold none. A struct subtype of such a type with an
-`Untrusted` field, passed under the abstract type, is therefore not seen. Another generic method that copies what it is given, such as
+these also raise when they run, as does `unsafe_write(io, Ref(u), n)`. Handed a value of a type that can hold an `Untrusted`,
+those calls warn and name the type. Any abstract type can, `Real` and `IO` included, since a package
+can subtype it with a struct that has an `Untrusted` field, so `write(io, x::Real)` and
+`reinterpret(UInt64, m::AbstractMsg)` warn, as do `Any` and `Vector{Any}`. A concrete type is judged
+exactly: `write(io, x::Float64)` passes, and `reinterpret(UInt64, r)` of a struct with an `Untrusted`
+field warns. Another generic method that copies what it is given, such as
 `Serialization.serialize`, is not seen. Printing,
 `dump` included, shows `<redacted>` in place of the payload. `==`, `isequal` and `hash` raise
 rather than compare or hash it, and so do the same calls on a container holding one, so an

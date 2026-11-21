@@ -752,20 +752,36 @@ end
     using StrictMode
 
     status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
-    # Abstract types that are no container and name no `Untrusted` cannot hand one over.
+    # A concrete type is judged exactly: one with no `Untrusted` field hands none over.
+    w_float(io::IO, x::Float64) = write(io, x)
+    r_int64(x::Int64) = reinterpret(UInt64, x)
+    @test status(w_float, (IOBuffer, Float64)).status === :pass
+    @test status(r_int64, (Int64,)).status === :pass
+    # Any package can subtype an abstract type with a struct holding an `Untrusted`, and its bits
+    # copy out through the abstract signature.
+    abstract type Msg end
+    struct Raw <: Msg
+        u::Untrusted{UInt64}
+    end
+    @test reinterpret(UInt64, Raw(Untrusted(UInt64(0xbeef)))) === UInt64(0xbeef)
+    leak_abs(m::Msg) = reinterpret(UInt64, m)
+    leak_conc(m::Raw) = reinterpret(UInt64, m)
+    @test leak_abs(Raw(Untrusted(UInt64(0xbeef)))) === UInt64(0xbeef)
+    # A type that can hold one is a copy that cannot be ruled out, and the reason names it.
     w_real(io::IO, x::Real) = write(io, x)
     w_str(io::IO, s::AbstractString) = write(io, s)
     w_io(io::IO, src::IO) = write(io, src)
     r_int(x::Integer) = reinterpret(UInt64, x)
-    @test status(w_real, (IOBuffer, Real)).status === :pass
-    @test status(w_str, (IOBuffer, AbstractString)).status === :pass
-    @test status(w_io, (IOBuffer, IO)).status === :pass
-    @test status(r_int, (Integer,)).status === :pass
-    # A type that can hold one is still a copy that cannot be ruled out, and the reason names it.
     w_any(io::IO, x) = write(io, x)
     r_vany(v::Vector{Any}) = reinterpret(UInt8, v)
     w_dict(io::IO, d::AbstractDict{Int, Untrusted{Int}}) = write(io, d)
     for (f, T, nm) in (
+            (leak_abs, (Msg,), "reinterpret of $(Msg)"),
+            (leak_conc, (Raw,), "reinterpret of $(Raw)"),
+            (w_real, (IOBuffer, Real), "write of Real"),
+            (w_str, (IOBuffer, AbstractString), "write of AbstractString"),
+            (w_io, (IOBuffer, IO), "write of IO"),
+            (r_int, (Integer,), "reinterpret of Integer"),
             (w_any, (IOBuffer, Any), "write of Any"),
             (r_vany, (Vector{Any},), "reinterpret of Vector{Any}"),
             (w_dict, (IOBuffer, AbstractDict{Int, Untrusted{Int}}), "write of AbstractDict{Int64, Untrusted{Int64}}"),

@@ -249,7 +249,8 @@ StrictMode/src/
                         (_BYTE_COPIERS) are reported by _untrusted_reach of every operand past the
                         first, so `reinterpret(T, [u])` and `write(io, Ref(u))` are certain reads, and an
                         operand whose type can hold one is a `held` site whose reason names the
-                        type (an abstract non-container type with no such parameter holds none).
+                        type (every abstract type can, since any package may subtype it; a concrete
+                        type is judged by its fields).
                         Those array/Ref forms, the reshape reinterpret and unsafe_write of a Ref
                         also RAISE at run time (methods on AbstractArray/StridedArray/Ref{<:Untrusted};
                         Base's write(::IO, ::StridedArray) needs its own); Serialization.serialize

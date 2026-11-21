@@ -367,16 +367,8 @@ function _untrusted_reach(@nospecialize(T), depth::Int = 0)
         return r
     end
     (T <: AbstractArray || T <: Ref) && return _untrusted_reach(eltype(T), depth + 1)
-    # An abstract type that is no container holds an `Untrusted` only where a type parameter
-    # names one: `Real`, `AbstractString` and `IO` hold none, `AbstractDict{K, Untrusted{V}}` may.
-    if T isa DataType && isabstracttype(T) && !(T <: Tuple)
-        for p in T.parameters
-            p isa Type && _untrusted_reach(p, depth + 1) === :none && continue
-            p isa Type || p isa TypeVar || continue
-            return :maybe
-        end
-        return :none
-    end
+    # Any package can subtype an abstract type, `Real` and `IO` included, with a struct holding an
+    # `Untrusted`, so an abstract type rules none out.
     (T isa DataType && isconcretetype(T)) || return :maybe
     for F in fieldtypes(T)
         _untrusted_reach(F, depth + 1) === :none || return :maybe
