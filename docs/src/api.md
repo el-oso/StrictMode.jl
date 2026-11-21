@@ -204,7 +204,9 @@ incomplete: there `@assert_reaches` warns about an absent target instead of thro
 A Base method compiled for `Any` (`@nospecialize`) that is handed a value of a type defined outside
 Base is read at the type it is handed. Base's default `show` of a struct is called this way,
 through a compiler barrier, and the walk reads the barrier's operand, so the `show` of each field
-is reached.
+is reached. When that type would select another method, as an explicit
+`invoke(show, Tuple{IO, Any}, io, x)` does for a type with its own `show`, reading it at that type
+would read the other method, so the call is counted as unread instead.
 
 ```@docs
 @assert_reaches

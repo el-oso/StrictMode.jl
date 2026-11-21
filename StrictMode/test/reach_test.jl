@@ -266,3 +266,18 @@ end
         @test !StrictMode._reach_open(Tuple{typeof(sum), T})
     end
 end
+
+@testitem "an invoke of a less specific Base method is not read as complete" begin
+    using StrictMode
+    @noinline hot(x) = 2x
+    struct In end
+    Base.show(io::IO, ::In) = print(io, hot(1))
+    struct Out; x::In; end
+    Base.show(io::IO, ::Out) = print(io, "O")
+    # `invoke` selects Base's default `show`, compiled for `Any`, though `Out` has its own method.
+    @noinline dflt(io::IOBuffer, o::Out) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
+    io = IOBuffer(); dflt(io, Out(In()))
+    @test endswith(String(take!(io)), "Out(2)")
+    r = StrictMode.reach_report(dflt, (IOBuffer, Out))
+    @test StrictMode.reaches(r, hot) || !StrictMode.complete(r)
+end

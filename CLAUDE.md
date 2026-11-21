@@ -717,7 +717,8 @@ StrictMode/src/
                         _reach_argtype reads a compilerbarrier (and a π of one) as its operand, and
                         a @nospecialize Base :invoke handed a user type is ENTERED at the call-site
                         types when they select the same method (_reach_same_method) — the default
-                        show of a struct is reached that way. _reach(…; quiet) leaves a callee
+                        show of a struct is reached that way. One the site types do NOT select (an
+                        explicit invoke of a less specific method) is counted as dynamic. _reach(…; quiet) leaves a callee
                         signature out of `found` while still following it.
                         So a route that computes with fetch(t) (inferred Any) is incomplete. A run-time dispatch is followed
                         when it matches at most _REACH_MAX_METHODS methods. `stop` cuts a hub (a pool

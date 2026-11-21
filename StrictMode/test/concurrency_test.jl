@@ -1776,3 +1776,21 @@ end
     @test tid(Streams.str, (IOBuffer, String)) === :pass
 end
 
+@testitem "an invoke of a less specific Base method can suspend in a user show" begin
+    using StrictMode
+    module Invokes
+    using Base.Threads: threadid
+    const BUF = zeros(Int, 64)
+    struct Inner end
+    Base.show(io::IO, ::Inner) = (yield(); print(io, "i"))
+    struct Outer; x::Inner; end
+    Base.show(io::IO, ::Outer) = print(io, "O")
+    # The default `show` is chosen explicitly; it runs `show` of the field, which yields.
+    @noinline dflt(io::IOBuffer, o::Outer) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
+    h(io::IOBuffer, o::Outer) = (i = threadid(); dflt(io, o); BUF[i] += 1; nothing)
+    end
+    Invokes.h(IOBuffer(), Invokes.Outer(Invokes.Inner()))
+    @test StrictMode._sig_may_suspend(Tuple{typeof(Invokes.dflt), IOBuffer, Invokes.Outer}) !== :no
+    @test only(StrictMode.findings(Invokes.h, (IOBuffer, Invokes.Outer);
+        guarantees = (:no_threadid_state,))).status !== :pass
+end

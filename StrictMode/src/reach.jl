@@ -265,7 +265,10 @@ function _reach_scan!(
             elseif _reach_carries_user(site) && _reach_same_method(site, mi.def)
                 # A Base method compiled for `Any` (`@nospecialize`) is handed a user value.
                 push!(queue, (site, depth))
-            elseif _reach_open(site)
+            elseif _reach_carries_user(site) || _reach_open(site)
+                # A user value handed to a Base method the call-site types do not select, as an
+                # explicit `invoke` of a less specific method does: reading the site would read
+                # the other method, so the call is counted instead.
                 r.dynamic += 1
             end
         elseif st.head === :call
