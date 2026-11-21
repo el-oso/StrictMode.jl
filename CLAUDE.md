@@ -665,18 +665,19 @@ StrictMode/src/
                         defects. @inbounds is covered as :inbounds, read from ci.ssaflags via
                         _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
                         @propagate_inbounds method is clean and the caller that wrote @inbounds
-                        carries the finding. A Ptr TYPE handed to any call is :Ptr
-                        (fail closed: lowered code cannot tell map(Ptr{T}, xs) from a call that
-                        only looks at the type) unless the callee is in _PTR_NAMERS or the call
-                        builds a tuple of nothing but types (a signature). Gating form:
-                        StrictModeTest.test_no_unsafe
+                        carries the finding. Gating form: StrictModeTest.test_no_unsafe
                         A Ptr TYPE counts as `:Ptr` as an operand of ANY call except those that
-                        only name it (_PTR_NAMERS: apply_type, isa, typeassert, <:, sizeof,
+                        only look at it (_PTR_NAMERS: apply_type, isa, typeassert, <:, sizeof,
+                        isbitstype, promote_type, hasintersect, similar, zero, string, print,
                         getfield of the type, cglobal, the ccall glue cconvert/unsafe_convert —
-                        cconvert(Ptr{T}, addr) returns the integer, measured — and the one-operand
-                        getindex of `Ptr{T}[]`), since lowered code cannot tell ntuple, Generator,
-                        a splat or a tuple applied later from a namer; `C_NULL + addr` (+/- with a
-                        pointer constant) is :Ptr too, arithmetic on a pointer argument is not
+                        cconvert(Ptr{T}, addr) returns the integer, measured — the one-operand
+                        getindex of `Ptr{T}[]`, and a tuple of nothing but types, a signature),
+                        since lowered code cannot tell ntuple, Generator, a splat or a tuple
+                        holding a value from a namer. `C_NULL + addr` (+/- with a pointer
+                        constant) is :Ptr, and so is an OFFSET on a pointer argument (p + 8,
+                        8 + p, p - 1, add_ptr/sub_ptr), the pointer operand read from m.sig
+                        (_ptr_arg_slots): reading it from typed IR cost ~5x the whole Base scan
+                        (measured), so an offset on a Ptr LOCAL is missed.
                         It reads the census's constructors, closures and unnamed callables too
                         (module_methods' `keep`): the census skips them because no declaration
                         names them, which says nothing about their code.

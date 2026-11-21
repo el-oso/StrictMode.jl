@@ -561,3 +561,26 @@ end
     # StrictMode's own precompile workload names a pointer signature as a tuple of types.
     @test !any(f -> f.func == "_run_workload", unsafe_report(StrictMode))
 end
+
+@testitem "unsafe_report sees an offset on a pointer argument" begin
+    using StrictMode
+
+    module FencePtrOffset
+    offset(p::Ptr{Float64}) = p + 8
+    offset_left(p::Ptr{Float64}) = 8 + p
+    back(p::Ptr{UInt8}) = p - 1
+    generic(p::Ptr{T}) where {T} = p + sizeof(T)
+    intrinsic(p::Ptr{UInt8}) = Core.Intrinsics.add_ptr(p, UInt(1))
+    end
+    @test FencePtrOffset.offset(Ptr{Float64}(16)) == Ptr{Float64}(24)
+    fs = unsafe_report(FencePtrOffset)
+    @test Set(f.func for f in fs) == Set(["offset", "offset_left", "back", "generic", "intrinsic"])
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+
+    # Integer arithmetic and passing a pointer along build no pointer.
+    module FencePtrNoOffset
+    ints(a::Int, b::Int) = a + b
+    mixed(p::Ptr{Float64}, a::Int) = (p, a + 8)
+    end
+    @test isempty(unsafe_report(FencePtrNoOffset))
+end

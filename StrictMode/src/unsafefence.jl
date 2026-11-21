@@ -85,6 +85,24 @@ end
 
 _is_ptr_type(@nospecialize(v)) = v isa Type && v <: Ptr && v !== Union{}
 
+# The intrinsics `+` and `-` on a pointer lower to.
+const _PTR_OFFSETS =
+    Tuple(getglobal(Core.Intrinsics, n) for n in (:add_ptr, :sub_ptr) if isdefined(Core.Intrinsics, n))
+
+# The slots of the arguments `sig` declares as a pointer type. Slot 1 is the function itself and
+# slot `i` is the argument `sig` lists `i`th. Read from the signature, because lowered code carries
+# no types: a pointer kept in a local, or an argument declared wider than `Ptr`, is not seen.
+function _ptr_arg_slots(@nospecialize(sig))
+    params = (Base.unwrap_unionall(sig)::DataType).parameters
+    slots = Int[]
+    for i in 2:length(params)
+        t = params[i]
+        t isa TypeVar && (t = t.ub)
+        (t isa Type && t !== Union{} && t <: Ptr) && push!(slots, i)
+    end
+    return slots
+end
+
 # The calls that take a pointer type only to look at it: building another type from it
 # (`Vector{Ptr{T}}`, `Union{Ptr{T}, Nothing}`), testing or asserting a type, its size, a field of
 # the type object (`Ptr.body`), promoting or intersecting it, printing it, an uninitialized or
@@ -247,7 +265,7 @@ function _lowered_global_reads(code::Vector{Any}, @nospecialize(s))
     return out
 end
 
-function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
+function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve, ptrargs::Vector{Int} = Int[])
     # One finding per method, so the span an `@inbounds` block covers does not matter: a bare
     # `@inbounds a[i]` flags one statement and `@inbounds for …` flags most of the loop, and both
     # mean the same thing about this method.
@@ -261,6 +279,7 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
         return nothing
     end
     dynamic(@nospecialize(s)) = _dynamic_global_read(ci.code, s)
+    ptrish(@nospecialize(a)) = resolve(a) isa Ptr || (a isa Core.SlotNumber && a.id in ptrargs)
     # A value a statement can hold by name: lowering gives a global its own statement, so the
     # name is judged where it is USED. A use as a callee, an argument, a stored local or a
     # returned value hands the function on; a comparison (`f === unsafe_load`) does not.
@@ -296,8 +315,11 @@ function _scan_unsafe!(out::Set{Symbol}, ci::Core.CodeInfo, resolve)
             named(a) && noteval(a)
         end
         _ptr_applied(callee, st.args, resolve) && push!(out, :Ptr)
-        # Arithmetic on a pointer constant, `C_NULL + addr`, makes a pointer from an integer.
-        (callee === (+) || callee === (-)) && any(a -> resolve(a) isa Ptr, st.args[2:end]) && push!(out, :Ptr)
+        # Arithmetic on a pointer constant, `C_NULL + addr`, makes a pointer from an integer, and
+        # offsetting a pointer argument, `p + 8`, makes one the language did not hand out: Go needs
+        # package `unsafe` for it and Rust an `unsafe` block.
+        (callee === (+) || callee === (-)) && any(ptrish, st.args[2:end]) && push!(out, :Ptr)
+        any(g -> g === callee, _PTR_OFFSETS) && push!(out, :Ptr)
         isnothing(callee) && continue
         if _is_ptr_type(callee)
             push!(out, :Ptr)
@@ -325,7 +347,7 @@ function _generated_constructs!(out::Set{Symbol}, m::Method, @nospecialize(sig))
         ci isa Core.CodeInfo || continue
         mi = ci.parent
         (mi isa Core.MethodInstance && mi.def !== m) && continue
-        _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a))
+        _scan_unsafe!(out, ci, a -> _unopt_callee(ci, a), _ptr_arg_slots(sig))
         read = true
     end
     return read
@@ -365,7 +387,7 @@ function _unsafe_constructs(m::Method)
         catch
             return nothing
         end
-        _scan_unsafe!(out, src, a -> _lowered_callee(src.code, a))
+        _scan_unsafe!(out, src, a -> _lowered_callee(src.code, a), _ptr_arg_slots(m.sig))
     end
     # A `ccall` already says this method leaves the language; its own argument conversion is not a
     # second thing to fix.
@@ -388,7 +410,7 @@ own are read like every other method.
 | `pointer`, `pointer_from_objref`, and any function whose name begins with `unsafe_` | its name |
 | the pointer intrinsics `pointerref`, `pointerset`, `atomic_pointer…`, and `llvmcall`, `cglobal` | its name |
 | `Libc.malloc`, `calloc`, `realloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp` | its name |
-| a pointer made from an integer: `Ptr{T}(addr)`, `Ptr{T}` handed to any call that may apply it (`reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`, `Ptr{T}[addr]`), or arithmetic on a pointer constant (`C_NULL + addr`) | `:Ptr` |
+| a pointer made from an integer: `Ptr{T}(addr)`, `Ptr{T}` handed to any call that may apply it (`reinterpret(Ptr{T}, addr)`, `convert(Ptr{T}, addr)`, `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`, `Ptr{T}[addr]`), arithmetic on a pointer constant (`C_NULL + addr`), or an offset on a pointer argument (`p + 8`, `8 + p`, `p - 1`, `Core.Intrinsics.add_ptr`) | `:Ptr` |
 | `memoryrefnew`, `memoryrefget`, `memoryrefset!` or `getfield` with a literal `false` bounds check | its name |
 | a global of a module read by a name that is a run-time value: `getglobal(M, nm)`, `getproperty(Base, nm)` | `:dynamic_global` |
 | code evaluated at run time: `eval`, `@eval`, `Core.eval`, `include_string`, `include`, whether called or passed on | `:eval` |
@@ -416,9 +438,12 @@ that does not. The calls that only look at it are building another type (`Vector
 empty typed literal `Ptr{T}[]`; `Ptr{T}[addr]` converts `addr` and is reported, and so is a tuple
 holding any other value, `(Ptr{T}, addr)`, which may be applied later. A tuple of types is not
 followed to where it is used, so `t = (Ptr{T}, Int); t[1](addr)` is missed.
-Taking a `Ptr` argument builds no pointer and is not reported, and neither is arithmetic on one
-(`p + 8`): only arithmetic on a pointer constant such as `C_NULL` is, since the scan cannot tell a
-pointer argument from an integer in lowered code.
+Taking a `Ptr` argument builds no pointer and is not reported, but offsetting one is: `p + 8`, `8 + p`
+and `p - 1` on an argument declared as a pointer type make a pointer the language did not hand out,
+as Go's `unsafe.Add` and Rust's `ptr.add` do. Lowered code carries no types, so which operand is a
+pointer is read from the method's signature: an offset on a pointer kept in a local, or on an
+argument declared wider than `Ptr` (`p::Any`, `p::Union{Ptr{T}, Nothing}`), is missed. Arithmetic
+on a pointer constant such as `C_NULL` is reported wherever it is written.
 A conversion to a pointer type is reported whatever is converted: the scan reads lowered code,
 which carries no types, so `convert(Ptr{Cvoid}, p)` on a pointer reads like one on an address.
 
