@@ -262,7 +262,10 @@ StrictMode/src/
                         boundary's body is the boundary (_is_trust_boundary).
                         A getfield/getproperty handed on with a constant field uses the direct
                         path's field rules (_handed_on_cleared), and a read inside a try is kept
-                        only when its catch can finish without raising (_may_return).
+                        when its catch can finish without raising (_may_return) or any statement
+                        reachable from the handler reads a slot or SSA value assigned between the
+                        payload read and the raising field read (_reaches_use): a handler runs
+                        before it rethrows, so a finally that stores the local hands it on.
                         trust_boundary! calls clear_cache!, like every registration a verdict
                         depends on (register_scoped!, register_alloc_barrier!, _exempt!). A
                         read whose result is STORED is the right-hand side of an assignment in

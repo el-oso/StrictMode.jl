@@ -438,14 +438,13 @@ end
 # different value at each. A jump INTO the span is a path that skipped the first read, so the
 # span must hold no jump target either. When the other field is read SECOND, it raises on an
 # `Untrusted` only after the payload read ran, so nothing in between may hand the payload on, and
-# the payload read must not sit in a `try` whose catch can finish without raising: that catch
-# swallows the raise, and a local the payload was stored in is still read after it.
+# the payload read must not sit in a `try` whose handler can see the payload (`_in_try`).
 function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand))
     isempty(other) && return false
     targets = _jump_targets(ci)
     for (j, a) in other
         a == operand || continue
-        i < j && _in_try(ci, i) && continue
+        i < j && _in_try(ci, i, j) && continue
         lo, hi = minmax(i, j)
         straight = !any(t -> lo < t <= hi, targets)
         for k in lo:(hi - 1)
@@ -477,13 +476,59 @@ function _may_hand_on(ci, @nospecialize(st))
     return callee !== Core.getfield
 end
 
-# Whether statement `i` lies between an `enter` and the catch block it jumps to, and that block can
-# finish without raising. Lowering places a `try` body after its `enter` and before its catch; an
-# `enter` with no catch (`catch_dest == 0`, the scope-only form) catches nothing. A `finally`
-# lowers to a catch block that ends in `rethrow()`, so it swallows nothing.
-_in_try(ci, i::Int) = any(1:(i - 1)) do k
-    st = ci.code[k]
-    st isa Core.EnterNode && st.catch_dest > 0 && k < i < st.catch_dest && _may_return(ci, st.catch_dest)
+# Whether the payload read at statement `i`, followed by the raising field read at `j`, lies between
+# an `enter` and the catch block it jumps to, and that block can either finish without raising or
+# read a value the payload may be held in by the time `j` raises: the SSA values and the slots
+# assigned in `i:(j - 1)`. A handler runs before it rethrows, so a catch ending in `rethrow()`, or a
+# `finally` (which lowers to one), still hands on a local it reads. Lowering places a `try` body
+# after its `enter` and before its catch; an `enter` with no catch (`catch_dest == 0`, the
+# scope-only form) catches nothing.
+function _in_try(ci, i::Int, j::Int)
+    held = Any[Core.SSAValue(k) for k in i:(j - 1)]
+    for k in i:(j - 1)
+        st = ci.code[k]
+        Meta.isexpr(st, :(=)) && st.args[1] isa Core.SlotNumber && push!(held, st.args[1])
+    end
+    return any(1:(i - 1)) do k
+        st = ci.code[k]
+        st isa Core.EnterNode && st.catch_dest > 0 && k < i < st.catch_dest &&
+            (_may_return(ci, st.catch_dest) || _reaches_use(ci, st.catch_dest, held))
+    end
+end
+
+# Whether a statement reachable from statement `s` reads one of the slots or SSA values `vals`.
+function _reaches_use(ci, s::Int, vals)
+    seen = falses(length(ci.code))
+    todo = [s]
+    while !isempty(todo)
+        k = pop!(todo)
+        (1 <= k <= length(ci.code) && !seen[k]) || continue
+        seen[k] = true
+        st = ci.code[k]
+        _mentions(st, vals) && return true
+        if st isa Core.ReturnNode
+        elseif st isa Core.GotoNode
+            push!(todo, st.label)
+        elseif st isa Core.GotoIfNot
+            push!(todo, k + 1, st.dest)
+        elseif st isa Core.EnterNode
+            push!(todo, k + 1, st.catch_dest)
+        elseif !(_call_callee_and_args(ci, st)[1] in (rethrow, throw))
+            push!(todo, k + 1)
+        end
+    end
+    return false
+end
+
+# Whether `x`, a statement or an operand of one, reads one of `vals`. The target of an assignment
+# is written, not read.
+function _mentions(@nospecialize(x), vals)
+    (x isa Core.SlotNumber || x isa Core.SSAValue) && return x in vals
+    x isa Core.ReturnNode && return isdefined(x, :val) && _mentions(x.val, vals)
+    x isa Core.GotoIfNot && return _mentions(x.cond, vals)
+    x isa Expr || return false
+    args = x.head === :(=) ? x.args[2:end] : x.args
+    return any(a -> _mentions(a, vals), args)
 end
 
 # Whether some path from statement `s` reaches a `return` rather than a `throw` or `rethrow`. A

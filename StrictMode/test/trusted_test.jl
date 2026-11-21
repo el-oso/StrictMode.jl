@@ -601,6 +601,54 @@ end
     end
     @test sometimes(Untrusted(42), false) == 42
     @test StrictMode._failed(status(sometimes, (Any, Bool)))
+    # A handler runs before it rethrows, so one that reads the local holding the payload hands it
+    # on, whether it is a `catch` or a `finally`.
+    SINK = Ref{Any}(nothing)
+    function sneak_finally(p)
+        local v
+        try
+            v = getfield(p, 1)
+            getfield(p, 2)
+        finally
+            SINK[] = v
+        end
+        return nothing
+    end
+    function sneak_rethrow(p)
+        local v
+        try
+            v = getfield(p, 1)
+            getfield(p, 2)
+        catch
+            SINK[] = v
+            rethrow()
+        end
+        return nothing
+    end
+    for f in (sneak_finally, sneak_rethrow)
+        SINK[] = nothing
+        @test_throws BoundsError f(Untrusted(42))
+        @test SINK[] == 42
+        res = status(f, (Any,))
+        @test StrictMode._failed(res)
+        @test occursin("may read an `Untrusted` payload", res.reason)
+    end
+    # A local copied from the payload local before the raise is the payload too.
+    function sneak_copy(p)
+        local w
+        try
+            v = getfield(p, 1)
+            w = v
+            getfield(p, 2)
+        finally
+            SINK[] = w
+        end
+        return nothing
+    end
+    SINK[] = nothing
+    @test_throws BoundsError sneak_copy(Untrusted(42))
+    @test SINK[] == 42
+    @test StrictMode._failed(status(sneak_copy, (Any,)))
 end
 
 @testitem "getfield handed to another call as a value is a read" begin
