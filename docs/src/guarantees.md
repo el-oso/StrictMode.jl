@@ -202,8 +202,17 @@ your code allocates.
 which no path reaches a `return` carrying a value, not just the `throw`: the message an
 `ArgumentError("… $x …")` builds is usually assembled in an earlier block that jumps to the throw, and
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
-never an error path, and neither is the code before a `try` whose `catch` returns: a throw in the try body
-continues at the handler.
+never an error path, and neither is a throw that a catch handles: when the `catch` can return, the code
+before the `try` and every statement in the try body, the throw and the message it builds included, run
+on a call that returns normally, and they count. A catch that only rethrows leaves them error paths.
+The proof tier agrees: AllocCheck drops every site that leads to a throw, caught or not, so where a
+caught throw is reachable `StrictModeTest` checks the code a second time without `ignore_throw` and
+keeps the sites a caught throw reaches. That second check is a second AllocCheck compile of the call
+graph, so a proof whose reach holds such a `try` costs about twice as much.
+
+What this does not cover: a throw raised *inside a callee* the try body calls, such as the
+`BoundsError` of a `v[i]` that a `catch` turns into a default. Inside the callee that throw is still an
+error path, so neither tier counts the exception it allocates.
 
 **A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
 follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the

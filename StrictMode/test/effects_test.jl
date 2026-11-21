@@ -386,7 +386,8 @@ end
     @test !StrictMode._alloc_signals(uncaught, tt).alloc
     @test !StrictMode._failed(only(StrictMode.findings(uncaught, tt; guarantees = (:noalloc,))))
 
-    # The same shape, hand-written: the EnterNode's handler is the only way to the return.
+    # The same shape, hand-written: the EnterNode's handler is the only way to the return, and the
+    # throw it catches is not an error path either.
     code = Any[
         Expr(:call, GlobalRef(Base, :zeros), Core.Argument(2)),
         Core.EnterNode(5),
@@ -394,7 +395,93 @@ end
         Core.ReturnNode(),                        # unreachable
         Core.ReturnNode(Core.SSAValue(1)),        # the catch returns
     ]
-    @test findall(StrictMode._deadend_mask(code)) == [3, 4]
+    @test findall(StrictMode._deadend_mask(code)) == [4]
+end
+
+@testitem "a throw that a catch handles is not an error path" begin
+    using StrictMode
+    # The try body builds a message and throws on every call, and the catch returns normally, so the
+    # message is built on every call.
+    @noinline function caught_message(n::Int)
+        try
+            throw(ArgumentError(string("x", n)))
+        catch
+        end
+        return n
+    end
+    # The handler runs on every call and returns what it allocates.
+    @noinline function handler_allocates(n::Int)
+        try
+            throw(ArgumentError("x"))
+        catch
+            return zeros(n)
+        end
+    end
+    # Passing controls: a throw nothing catches, a try that exits normally, a catch that rethrows.
+    @noinline function uncaught(n::Int)
+        n < 0 && throw(ArgumentError(string("negative: ", n)))
+        return n + 1
+    end
+    @noinline function normal_exit(n::Int)
+        try
+            n += 1
+        catch
+        end
+        return n
+    end
+    @noinline function rethrows(n::Int)
+        try
+            n < 0 && throw(ArgumentError(string("negative: ", n)))
+        catch
+            rethrow()
+        end
+        return n
+    end
+    tt = (Int,)
+    noalloc(f) = only(StrictMode.findings(f, tt; guarantees = (:noalloc,)))
+    for f in (caught_message, handler_allocates)
+        f(3)
+        @test StrictMode._alloc_signals(f, tt).alloc
+        @test StrictMode._failed(noalloc(f))
+    end
+    for f in (uncaught, normal_exit, rethrows)
+        f(3)
+        @test !StrictMode._alloc_signals(f, tt).alloc
+        @test !StrictMode._failed(noalloc(f))
+    end
+
+    # Hand-written: the throw inside the try reaches the handler, which returns. The `unreachable`
+    # after the throw never executes.
+    code = Any[
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(2)),
+        Core.ReturnNode(),
+        Core.ReturnNode(Core.Argument(2)),
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [4]
+    # A handler that rethrows leaves every statement an error path.
+    code = Any[
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(2)),
+        Core.ReturnNode(),
+        Expr(:call, GlobalRef(Base, :rethrow)),
+        Core.ReturnNode(),
+    ]
+    @test all(StrictMode._deadend_mask(code))
+    # The region ends at the `:leave` that names its EnterNode: a throw after it is not caught.
+    code = Any[
+        Core.EnterNode(4),
+        Expr(:leave, Core.SSAValue(1)),
+        Core.GotoNode(6),
+        Expr(:pop_exception, Core.SSAValue(1)),
+        Core.ReturnNode(Core.Argument(2)),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(6)),
+        Core.ReturnNode(),
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [2, 3, 6, 7, 8]
 end
 
 @testitem ":noescape reports a scoped handle that leaves the frame" begin

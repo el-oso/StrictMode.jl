@@ -193,7 +193,9 @@ StrictMode/src/
                         and for a dynamic call, neither of which is undefined behavior (measured),
                         so a caller may act on true and must treat false as unknown.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
-                        under ignore_throw; an EnterNode reaches its catch_dest) OR _unreachable_mask (not reached from the entry, where a
+                        under ignore_throw; an EnterNode reaches its catch_dest, and every statement
+                        of a try region does too, via _try_handlers, so a throw a returning catch
+                        handles is NOT an error path) OR _unreachable_mask (not reached from the entry, where a
                         `goto if not` on `x === x` — one SSA value or argument compared with
                         itself — never jumps). An in-place triangular ldiv! inlines
                         `b === b ? b : copyto!(b, b)`; LLVM folds it, and the dead copy's unalias
@@ -843,6 +845,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         DynamicDispatch. _is_boxing reads a heap allocation of an isbits type as a
                         box; do NOT narrow it to `Any` slots: an abstract-eltype slot boxes the same
                         way and the site carries no destination.
+                        CAUGHT THROWS: AllocCheck's ignore_throw drops every site leading to a throw,
+                        caught or not. When the walk read a statement live only because a returning
+                        catch handles its throw (_caught_mask), _check_allocs runs AllocCheck again
+                        with ignore_throw = false and _caught_sites keeps the extra sites whose
+                        frame groups (one per compiled body) are all live and at least one caught,
+                        matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode
+                        (a raw getdebugidx line can index a further line table). The second
+                        run is the cost: ~20 s on a @strict-guarded signature, measured.
                         _kept/_Stamp keep two reads for the session: the sites of a signature
                         (_SITES_MEMO) and what the walk
                         reads from one body (_WALK_MEMO, by MethodInstance, shared by every

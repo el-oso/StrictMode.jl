@@ -825,3 +825,59 @@ end
     r = only(test_registered(; guarantees = (:noalloc,), modules = [D], allow_exempt = true))
     @test r.exempt_by == ("grow!" => "pool",)
 end
+
+@testitem "an allocation on the way to a throw a catch handles fails the proof" begin
+    using StrictMode, StrictModeTest
+    # The message is built and the exception boxed on every call, since the catch returns normally.
+    @noinline function caught_message(n::Int)
+        try
+            throw(ArgumentError(string("x", n)))
+        catch
+        end
+        return n
+    end
+    # Only the box of the thrown exception: 16 bytes a call.
+    @noinline function caught_box(n::Int)
+        try
+            throw(ArgumentError("x"))
+        catch
+        end
+        return n
+    end
+    # Passing controls: a throw nothing catches, a try that exits normally, a catch that rethrows.
+    @noinline function uncaught(n::Int)
+        n < 0 && throw(ArgumentError(string("negative: ", n)))
+        return n + 1
+    end
+    @noinline function normal_exit(n::Int)
+        try
+            n += 1
+        catch
+        end
+        return n
+    end
+    @noinline function rethrows(n::Int)
+        try
+            n < 0 && throw(ArgumentError(string("negative: ", n)))
+        catch
+            rethrow()
+        end
+        return n
+    end
+    tt = (Int,)
+    proof(f) = only(StrictModeTest._proof_findings(f, tt, (:noalloc,)))
+    scan(f) = only(findings(f, tt; guarantees = (:noalloc,)))
+    for f in (caught_message, caught_box)
+        f(3)
+        # AllocCheck's own sites, not only the native walk's dispatches.
+        @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(f, tt))
+        @test StrictMode._failed(proof(f))
+        @test StrictMode._failed(scan(f))
+    end
+    for f in (uncaught, normal_exit, rethrows)
+        f(3)
+        @test isempty(StrictModeTest._raw_allocs(f, tt))
+        @test !StrictMode._failed(proof(f))
+        @test !StrictMode._failed(scan(f))
+    end
+end

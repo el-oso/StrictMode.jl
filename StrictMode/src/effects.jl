@@ -647,6 +647,10 @@ An error path is every statement from which no path reaches a `return` carrying 
 the throw, so counting only the throw's own block reported `print_to_string`'s allocation for text no
 successful call ever builds. A loop is never an error path: a statement is live when *some* path from
 it returns.
+
+A throw that a catch handles is not an error path when the catch can return: every statement in the try
+body has the handler as a successor, so the message it builds and the exception it boxes count. A throw
+raised inside a callee is judged in that callee's own body, where it is still an error path.
 """
 ignore_throw() = _IGNORE_THROW[]
 
@@ -678,19 +682,25 @@ end
 # A statement is alive when one of its successors is, and a `ReturnNode` carrying a value is alive: the
 # fixed point of that, taken over the statements from the last to the first until nothing changes. A
 # loop cannot fool it: a statement is alive when *some* path from it returns, and everything left over
-# leads only to a throw or to an unreachable terminator. No per-statement storage: a body is a few
-# thousand statements and this runs for every body a walk reads.
+# leads only to a throw or to an unreachable terminator. No per-statement storage outside a `try`: a
+# body is a few thousand statements and this runs for every body a walk reads.
+#
+# A throw that a catch handles is not an error path: every statement in a try region also has the
+# region's handler as a successor, so it is alive when the handler can return.
 function _deadend_mask(code::Vector{Any})
     n = length(code)
     iszero(n) && return falses(0)
     alive = falses(n)
+    handlers = _try_handlers(code)
     changed = true
     while changed
         changed = false
         for i in n:-1:1
             alive[i] && continue
             st = code[i]
-            up = if st isa Core.ReturnNode
+            up = if !isnothing(handlers) && any(d -> alive[d], handlers[i])
+                true
+            elseif st isa Core.ReturnNode
                 isdefined(st, :val)
             elseif st isa Core.GotoNode
                 1 <= st.label <= n && alive[st.label]
@@ -714,6 +724,46 @@ function _deadend_mask(code::Vector{Any})
         end
     end
     return map(!, alive)
+end
+
+# For each statement, the handlers (`catch_dest`s) of the try regions it lies in, or `nothing` for a
+# body with no `try`. A region is what the body of an `EnterNode` reaches before the `:leave` that
+# names it, a nested handler included, since a throw there still lands in the outer one. A
+# `ReturnNode` is left out: a `return` cannot throw, and an `unreachable` never executes.
+function _try_handlers(code::Vector{Any})
+    n = length(code)
+    handlers = nothing
+    for e in 1:n
+        st = code[e]
+        (st isa Core.EnterNode && 1 <= st.catch_dest <= n) || continue
+        isnothing(handlers) && (handlers = [Int[] for _ in 1:n])
+        seen = falses(n)
+        work = [e + 1]
+        while !isempty(work)
+            i = pop!(work)
+            (1 <= i <= n && !seen[i]) || continue
+            seen[i] = true
+            s = code[i]
+            Meta.isexpr(s, :leave) && any(==(Core.SSAValue(e)), s.args) && continue
+            s isa Core.ReturnNode && continue
+            push!(handlers[i], st.catch_dest)
+            if s isa Core.GotoNode
+                push!(work, s.label)
+            elseif s isa Core.GotoIfNot
+                push!(work, s.dest, i + 1)
+            elseif Meta.isexpr(s, :gotoifnot)
+                t = s.args[2]
+                t isa Integer && push!(work, t)
+                push!(work, i + 1)
+            elseif s isa Core.EnterNode
+                1 <= s.catch_dest <= n && push!(work, s.catch_dest)
+                push!(work, i + 1)
+            else
+                push!(work, i + 1)
+            end
+        end
+    end
+    return handlers
 end
 
 # Is statement `c` the call `x === x`, one value compared with itself? Egal is reflexive, so it is
