@@ -1591,6 +1591,10 @@ end
 # runtime struct has one (`Task`'s result and storage), and counting it would make every dynamic
 # call in an exempt function that takes such a struct the caller's.
 function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int, field::Bool)
+    # A signature's `Vararg` tail carries its element type, and a type variable its upper bound.
+    T isa Core.TypeofVararg && return _callable_types!(out, isdefined(T, :T) ? T.T : Any, depth, field)
+    T isa TypeVar && return _callable_types!(out, T.ub, depth, field)
+    T isa Type || return out
     if T isa Union
         for U in Base.uniontypes(T)
             _callable_types!(out, U, depth, field)

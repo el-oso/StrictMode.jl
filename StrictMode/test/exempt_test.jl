@@ -447,6 +447,10 @@ end
         r = noalloc(fn)
         @test r.status === :info && !StrictMode._failed(r)
     end
+    # A signature with a `Vararg` tail, as a callee called with a splat has: its element type is what
+    # an argument carries.
+    @test StrictMode._handed_types(Tuple{typeof(E.plain), Vararg{Union{Char, String}}}) == Any[]
+    @test StrictMode._handed_types(Tuple{typeof(E.plain), Int, Vararg{typeof(E.named_cb)}}) == Any[typeof(E.named_cb)]
 end
 
 @testitem "an allocation barrier excuses allocation only; its other causes are reported at it" begin
