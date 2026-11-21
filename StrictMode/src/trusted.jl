@@ -23,9 +23,11 @@ handed over by a device.
 The wrapped value is meant to be passed along or given to a **trust boundary**: a function that
 validates it and returns a plain value, registered with [`trust_boundary!`](@ref). Methods written
 for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a `MethodError`
-instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. `reinterpret(T, [u])` and
-`write(io, Ref(u))` do not, and [`@assert_trusted`](@ref) reports them. The one deliberate way out
-is [`unsafe_trust`](@ref).
+instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. So do the calls that copy
+the bits of an array or a `Ref` of them: `reinterpret(T, [u])`, `reinterpret(reshape, T, [u])`,
+`write(io, [u])`, `write(io, Ref(u))` and `unsafe_write(io, Ref(u), n)`; [`@assert_trusted`](@ref)
+reports them as well. `Serialization.serialize` copies the payload too and does not throw. The one
+deliberate way out is [`unsafe_trust`](@ref).
 
 `show`, `print`, `string`, `repr` and `dump` print the type and `<redacted>` in place of the
 payload, so a log line cannot leak it. `==`, `isequal` and `hash` raise, as `u.x` does, since
@@ -64,6 +66,18 @@ Base.getproperty(::Untrusted, name::Symbol) = _untrusted_read_error(".$name")
 # Base's generic `reinterpret(T, x)` copies the bits of any `isbits` value, so without this method it
 # would hand out an `isbits` payload. Base's other `reinterpret` methods take an array or a float.
 Base.reinterpret(::Type, ::Untrusted) = _untrusted_read_error("reinterpret")
+
+# An array or a `Ref` of `Untrusted` values holds the payloads' bits inline, and these calls copy
+# those bits out, so they raise as well. `Serialization.serialize` copies them too and is not
+# covered: it is one generic method among many that walk a value's fields.
+Base.reinterpret(::Type, ::AbstractArray{<:Untrusted}) = _untrusted_read_error("reinterpret")
+Base.reinterpret(::typeof(reshape), ::Type, ::AbstractArray{<:Untrusted}) =
+    _untrusted_read_error("reinterpret")
+# Base's `write(::IO, ::StridedArray)` is more specific than an `AbstractArray` method, so the
+# strided form needs its own.
+Base.write(::IO, ::Union{Ref{<:Untrusted}, AbstractArray{<:Untrusted}}) = _untrusted_read_error("write")
+Base.write(::IO, ::StridedArray{<:Untrusted}) = _untrusted_read_error("write")
+Base.unsafe_write(::IO, ::Ref{<:Untrusted}, ::Integer) = _untrusted_read_error("unsafe_write")
 
 # Comparing and hashing read the payload — `hash` of an `isbits` payload depends on its value — so
 # they raise as a field read does. A container compares and hashes its elements with these, so

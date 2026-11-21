@@ -240,14 +240,22 @@ StrictMode/src/
                         `reinterpret(T, u)` raises like `u.x` (Base's generic reinterpret copies an
                         isbits payload) and the scan reports it; reinterpret/write/unsafe_write
                         (_BYTE_COPIERS) are reported by _untrusted_reach of every operand past the
-                        first, so `reinterpret(T, [u])` and `write(io, Ref(u))`, which copy the bits
-                        without raising, are certain reads; `show` and `dump` print `<redacted>`.
+                        first, so `reinterpret(T, [u])` and `write(io, Ref(u))` are certain reads, and an
+                        operand whose type can hold one is a `held` site whose reason names the
+                        type (an abstract non-container type with no such parameter holds none).
+                        Those array/Ref forms, the reshape reinterpret and unsafe_write of a Ref
+                        also RAISE at run time (methods on AbstractArray/StridedArray/Ref{<:Untrusted};
+                        Base's write(::IO, ::StridedArray) needs its own); Serialization.serialize
+                        does not. `show` and `dump` print `<redacted>`.
                         ==, isequal and hash raise (so an Untrusted is no Dict/Set key, and [u] == [v]
                         raises); === is a builtin and, with objectid/IdDict, still reads the bits.
                         A keyword function is judged by its body (_keyword_body: Base.bodyfunction,
                         accepted only when it carries the `#f#N` name of the method's function),
                         followed from the positional and kwcall methods, and a registered
                         boundary's body is the boundary (_is_trust_boundary).
+                        A getfield/getproperty handed on with a constant field uses the direct
+                        path's field rules (_handed_on_cleared), and a read inside a try is kept
+                        only when its catch can finish without raising (_may_return).
                         trust_boundary! calls clear_cache!, like every registration a verdict
                         depends on (register_scoped!, register_alloc_barrier!, _exempt!). A
                         read whose result is STORED is the right-hand side of an assignment in

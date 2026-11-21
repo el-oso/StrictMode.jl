@@ -653,12 +653,18 @@ end
     peek_write(u::UI) = (io = IOBuffer(); write(io, Ref(u)); reinterpret(Int, take!(io))[1])
     peek_write_array(u::UI) = (io = IOBuffer(); write(io, [u]); reinterpret(Int, take!(io))[1])
     for f in (peek_array, peek_write, peek_write_array)
-        @test f(Untrusted(42)) == 42
+        @test_throws "no readable fields" f(Untrusted(42))
         r = status(f, (UI,))
         @test StrictMode._failed(r)
         @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
     end
-    @test_throws StrictViolation @assert_trusted peek_array(Untrusted(42))
+    # The call raises at run time; a caller that catches the raise is still reported.
+    peek_caught(u::UI) = try
+        reinterpret(Int, [u])[1]
+    catch
+        0
+    end
+    @test_throws StrictViolation @assert_trusted peek_caught(Untrusted(42))
     # Controls: the same calls on plain data, next to an `Untrusted` that is only passed along.
     clean_array(u::UI, x::Vector{Int}) = (u, reinterpret(UInt8, x))
     clean_write(u::UI, x::Int) = (io = IOBuffer(); write(io, Ref(x)); write(io, "s"); (u, take!(io)))
@@ -722,4 +728,29 @@ end
         @test occursin(nm, r.reason)
         @test !occursin("inference lost", r.reason)
     end
+end
+
+@testitem "copying an Untrusted's bits out of an array or a Ref raises" begin
+    using StrictMode, Test
+
+    u = Untrusted(42)
+    io = IOBuffer()
+    @test_throws "(tried `reinterpret`)" reinterpret(Int, [u])
+    @test_throws "(tried `reinterpret`)" reinterpret(Int, view([u, u], 1:2))
+    @test_throws "(tried `reinterpret`)" reinterpret(reshape, Int, [u])
+    @test_throws "(tried `write`)" write(io, Ref(u))
+    @test_throws "(tried `write`)" write(io, [u])
+    @test_throws "(tried `write`)" write(io, [u u])
+    @test_throws "(tried `write`)" write(io, view([u, u], [2]))
+    @test_throws "(tried `unsafe_write`)" unsafe_write(io, Ref(u), sizeof(Int))
+    @test isempty(take!(io))
+    # Controls: the same calls on plain `isbits` data still copy its bits.
+    @test reinterpret(Int, reinterpret(UInt8, [5])) == [5]
+    @test vec(reinterpret(reshape, UInt8, [1.0f0])) == [0x00, 0x00, 0x80, 0x3f]
+    @test write(io, Ref(7)) == sizeof(Int)
+    @test write(io, [1, 2]) == 2 * sizeof(Int)
+    @test unsafe_write(io, Ref(3), sizeof(Int)) == sizeof(Int)
+    @test reinterpret(Int, take!(io)) == [7, 1, 2, 3]
+    # The methods that raise add no ambiguity with Base.
+    @test isempty(filter(p -> any(m -> parentmodule(m) === StrictMode, p), Test.detect_ambiguities(Base, StrictMode)))
 end

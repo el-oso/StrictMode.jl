@@ -1209,9 +1209,9 @@ Two limits, both real.
 that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `map(unsafe_trust, us)`,
 `getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. On untyped values a constant
 field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
-`getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs, and so are the
-calls that copy out an `isbits` payload's bits without raising: `reinterpret(T, [u])`,
-`write(io, Ref(u))`, `write(io, [u])`. Handed a value of a type that can hold an `Untrusted`
+`getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, and so are the calls that copy out the bits of
+an array or a `Ref` of them: `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])`. All of
+these also raise when they run, as does `unsafe_write(io, Ref(u), n)`. Handed a value of a type that can hold an `Untrusted`
 (`Any`, `Vector{Any}`), those calls warn and name the type; `write(io, x::Real)` and
 `reinterpret(UInt64, x::Integer)` do not, since an abstract type with no container shape and no
 parameter naming an `Untrusted` is taken to hold none. A struct subtype of such a type with an
