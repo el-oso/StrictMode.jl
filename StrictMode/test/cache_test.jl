@@ -148,3 +148,30 @@ end
     empty!(StrictMode._REGISTRATION_MEMO)
     @test !StrictMode._is_scoped_type(LdHandle)
 end
+
+@testitem "a cached verdict follows an exemption taken back" begin
+    using StrictMode
+    module ExTakenBack
+    @noinline helper(n) = zeros(n)
+    caller(n::Int) = sum(helper(n))
+    end
+    E = ExTakenBack
+    E.caller(3)
+    verdict() = only(findings(E.caller, (Int,); guarantees = (:noalloc,)))
+    # Control: with no exemption the allocation is a failure.
+    @test StrictMode._failed(verdict())
+    StrictMode._exempt!(:helper; guarantees = (:noalloc,))
+    @test verdict().status === :info
+    empty!(StrictMode.exempt_strict())
+    @test StrictMode._failed(verdict())
+    # The same number of exemptions, but a different one: the content decides, not the count.
+    push!(StrictMode.exempt_strict(), StrictMode.Exemption(:helper, nothing, (:noalloc,), "", "", 0, nothing))
+    @test verdict().status === :info
+    StrictMode.exempt_strict()[1] = StrictMode.Exemption(:other, nothing, (:noalloc,), "", "", 0, nothing)
+    @test StrictMode._failed(verdict())
+    # A module's own exemption, removed with `clear_declarations!`.
+    StrictMode._exempt!(:helper, E; guarantees = (:noalloc,))
+    @test verdict().status === :info
+    StrictMode.clear_declarations!()
+    @test StrictMode._failed(verdict())
+end

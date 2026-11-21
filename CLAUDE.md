@@ -484,6 +484,10 @@ StrictMode/src/
                         (measured on 1.12 and 1.13), and a more specific method added later takes
                         a signature over without touching the old record. No memo depends on a
                         Revise callback or on clear_cache!() to follow an edit
+                        exempt_strict() is the live session vector, so findings, _alloc_signals
+                        and _noalloc_exemptions call _sync_exemptions! (registry.jl): a content
+                        hash of it that moved bumps _EXEMPT_GEN and runs clear_cache!();
+                        _exempt! and clear_declarations! bump and clear directly
   report.jl           — StrictViolation exception, _fail, _guarantee_gates (which guarantees
                         THROW from StrictMode and which only WARN — observation vs. inference)
   backend.jl          — the llvm-mca seam ONLY (`_be_mca_*`, mca_available). The analysis tier is

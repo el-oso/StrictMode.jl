@@ -275,6 +275,8 @@ function clear_declarations!()
         s = _store_for(m, _LOCAL_EXEMPT)
         isnothing(s) || empty!(s)
     end
+    _EXEMPT_GEN[] += 1
+    clear_cache!()
     return nothing
 end
 
@@ -407,22 +409,38 @@ end
 # `exemptions()` walks each loaded package's store, so the result is kept until the world advances
 # (a package load or a method definition, which is how a package's stored exemptions appear) or
 # this session records one.
-# Bumped by every `_exempt!`. A module's exemption goes to that module's own store, which changes
-# neither the world counter nor `STRICT_EXEMPT`, so neither can tell the memo below it is stale.
+# Bumped by every change to the exemptions in scope: by `_exempt!` and `clear_declarations!`, and by
+# `_sync_exemptions!` when the session vector changed. A module's exemption goes to that module's own
+# store, which changes neither the world counter nor `STRICT_EXEMPT`, so neither can tell the memo
+# below it is stale.
 const _EXEMPT_GEN = Ref(0)
+
+# `exempt_strict()` hands out the live session vector, and a caller that changes it directly calls
+# nothing here. Its content is hashed on every read instead: a hash that moved bumps `_EXEMPT_GEN`
+# and clears the findings cache and the scan memos, every one of which may hold a verdict that read
+# an exemption. Hashing is by content, so an equal-length replacement is seen as a change.
+const _EXEMPT_SEEN = Ref{UInt}(hash(Exemption[]))
+function _sync_exemptions!()
+    h = hash(STRICT_EXEMPT)
+    h == _EXEMPT_SEEN[] && return nothing
+    _EXEMPT_SEEN[] = h
+    _EXEMPT_GEN[] += 1
+    clear_cache!()
+    return nothing
+end
 
 # The `:noalloc` exemptions, each with the package root that declared it, or `nothing` for one this
 # session declared. A package's exemption covers that package's methods only: matched by name alone,
 # exempting a method of `Base.string` excused every caller of every `string`.
-const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Int, Vector{Tuple{Union{Nothing, Module}, Exemption}}}}(
-    (typemax(UInt), -1, -1, Tuple{Union{Nothing, Module}, Exemption}[])
+const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Vector{Tuple{Union{Nothing, Module}, Exemption}}}}(
+    (typemax(UInt), -1, Tuple{Union{Nothing, Module}, Exemption}[])
 )
 function _noalloc_exemptions()
+    _sync_exemptions!()
     w = Base.get_world_counter()
-    n = length(STRICT_EXEMPT)
     gen = _EXEMPT_GEN[]
     m = _NOALLOC_EXEMPT_MEMO[]
-    (m[1] == w && m[2] == n && m[3] == gen) && return m[4]
+    (m[1] == w && m[2] == gen) && return m[3]
     covers(e) = isnothing(e.guarantees) || :noalloc in e.guarantees
     v = Tuple{Union{Nothing, Module}, Exemption}[]
     for mod in _store_modules()
@@ -435,7 +453,7 @@ function _noalloc_exemptions()
     for e in STRICT_EXEMPT
         covers(e) && push!(v, (nothing, e))
     end
-    _NOALLOC_EXEMPT_MEMO[] = (w, n, gen, v)
+    _NOALLOC_EXEMPT_MEMO[] = (w, gen, v)
     return v
 end
 
@@ -540,7 +558,8 @@ end
 """
     exempt_strict() -> Vector{Exemption}
 
-The opt-outs recorded in **this session**. Mutable, so a test can `empty!` it.
+The opt-outs recorded in **this session**. Mutable, so a test can `empty!` it; the next check notices
+the change and drops every cached verdict that an exemption could have decided.
 [`StrictMode.exemptions`](@ref) adds each loaded package's own.
 """
 exempt_strict() = STRICT_EXEMPT

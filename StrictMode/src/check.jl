@@ -259,6 +259,8 @@ function findings(
     # function through everything below, `@nospecialize` or not: the whole scan inferred again for
     # every such caller (99 ms per call site, against 5 ms).
     f = Base.inferencebarrier(f)
+    # The key cannot see a change to `exempt_strict()`; this clears the cache when one happened.
+    _sync_exemptions!()
     key = _cache_key(f, types, guarantees)
     if !isnothing(key)
         cached = @lock _CACHE_LOCK get(_CACHE, key, nothing)

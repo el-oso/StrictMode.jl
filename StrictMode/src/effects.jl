@@ -481,6 +481,7 @@ const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, _AllocSign
 function _alloc_signals(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
     )
+    _sync_exemptions!()   # the memo key cannot see a change to `exempt_strict()`
     sig = _sigtype(f, types)
     key = (depth, Base.get_world_counter(), mode)
     memo = @lock _SIGNAL_MEMO_LOCK begin
