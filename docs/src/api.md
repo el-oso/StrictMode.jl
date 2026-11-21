@@ -194,9 +194,11 @@ compares two entries and names what only one of them reaches.
 
 The walk does not enter Base. A Base call on concrete Base types stays in Base and costs nothing;
 one with an argument typed abstractly (`Any`, `AbstractVector{Float64}`) may run a user type's
-methods at run time, so it is counted as unread and the graph is not complete. `fetch(t)` returns
-`Any`, so a route that fetches a task and computes with the result is incomplete: there
-`` warns about an absent target instead of throwing, and `route_parity` reports
+methods at run time, so it is counted as unread and the graph is not complete. Type parameters
+count at every depth: a concrete container of abstract elements (`Vector{Any}`,
+`Dict{Symbol, Any}`, `Vector{Vector{Any}}`) holds values of any type, so `sum` of one is counted
+too. `fetch(t)` returns `Any`, so a route that fetches a task and computes with the result is
+incomplete: there `@assert_reaches` warns about an absent target instead of throwing, and `route_parity` reports
 `:incomplete` rather than `:agree`.
 
 A Base method compiled for `Any` (`@nospecialize`) that is handed a value of a type defined outside

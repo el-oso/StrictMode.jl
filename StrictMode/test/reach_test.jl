@@ -234,3 +234,35 @@ end
     rh = StrictMode.reach_report(viaholds, (Holds,))
     @test StrictMode.reaches(rh, hot)
 end
+
+@testitem "a Base call on a container of abstract elements is counted as unread" begin
+    using StrictMode
+    # A concrete Base container whose type parameter is abstract holds values of any type, and the
+    # Base method runs their methods: `sum` of a `Vector{Any}` runs the `+` of whatever it holds.
+    @noinline hot(x) = 2x
+    struct N
+        v::Float64
+    end
+    Base.:+(a::N, b::N) = N(hot(a.v) + b.v)
+    vany(v::Vector{Any}) = sum(v)
+    vnest(v::Vector{Vector{Any}}) = sum(first(v))
+    @test vany(Any[N(1.0), N(1.0)]).v == 3.0
+    @test vnest([Any[N(1.0), N(1.0)]]).v == 3.0
+    for (f, T) in ((vany, (Vector{Any},)), (vnest, (Vector{Vector{Any}},)))
+        r = StrictMode.reach_report(f, T)
+        @test !StrictMode.reaches(r, hot)
+        @test r.dynamic > 0
+        @test !StrictMode.complete(r)
+    end
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches vany(Any[N(1.0)]) hot
+
+    # Parameters are judged at every depth, and a parameter that is not a type is not judged.
+    for T in (Vector{Any}, Dict{Symbol, Any}, Base.RefValue{Any}, Vector{Vector{Any}},
+              Tuple{Vector{Any}}, Vector{AbstractVector{Float64}}, Vector{Vector})
+        @test StrictMode._reach_open(Tuple{typeof(sum), T})
+    end
+    for T in (Vector{Float64}, Vector{Vector{Float64}}, Dict{Symbol, Int},
+              Vector{Union{Nothing, Int}}, Val{:a}, Array{Float64, 2}, Vector{Type{Int}})
+        @test !StrictMode._reach_open(Tuple{typeof(sum), T})
+    end
+end

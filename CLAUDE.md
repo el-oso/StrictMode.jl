@@ -695,8 +695,12 @@ StrictMode/src/
                         outside Base (_reach_carries_user: a handed closure, or a user array whose
                         getindex `sum` calls); one on concrete Base types is neither entered nor
                         counted. One with an ABSTRACT argument type (_reach_open: Any,
-                        AbstractVector{Float64}, Vararg{Any}; top level only, so Vector{Any} is
-                        closed) is not entered but counts as dynamic, whether reached by :invoke,
+                        AbstractVector{Float64}, Vararg{Any}; type parameters at EVERY depth, so
+                        Vector{Any}, Dict{Symbol,Any} and Vector{Vector{Any}} are open too, since
+                        sum of a Vector{Any} runs the + of what it holds; a non-type parameter such
+                        as Val{:a} or an array's rank is not judged; spinwait.jl and
+                        concurrency.jl's _sig_may_suspend share this) is not entered but counts as
+                        dynamic, whether reached by :invoke,
                         an enumerated dispatch or an unenumerable one: a user value may arrive
                         there. An :invoke is judged by its CALL-SITE argument types, since a
                         @nospecialize method instance (print_to_string, Vararg{Any}) is wider than

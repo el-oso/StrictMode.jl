@@ -168,8 +168,10 @@ _reach_follows(mi::Core.MethodInstance) =
 # Whether a signature has an argument typed abstractly (`Any`, `AbstractVector{Float64}`,
 # `Vararg{Any}`), so that a value of a type defined outside Base may arrive there at run time and the
 # Base method run that type's methods. Such a Base callee is not entered, so the walk counts it as
-# a call site it could not read. A `Type{T}` and a union of concrete types are closed. Only the top
-# level is judged: a concrete Base container of abstract elements (`Vector{Any}`) is closed.
+# a call site it could not read. A `Type{T}` and a union of concrete types are closed. Type
+# parameters are judged at every depth, since a concrete container of abstract elements
+# (`Vector{Any}`, `Dict{Symbol, Any}`, `Vector{Vector{Any}}`) holds values of any type and the Base
+# method runs their methods; a parameter that is not a type (`Val{:a}`, an array's rank) is not.
 function _reach_open(@nospecialize(sig))
     sig = Base.unwrap_unionall(sig)
     sig isa DataType || return true
@@ -194,11 +196,13 @@ function _reach_same_method(@nospecialize(site), m::Method)
     end
     return ms isa Vector && length(ms) == 1 && only(ms).method === m
 end
-function _reach_open_arg(@nospecialize(T))
-    T isa Core.TypeofVararg && return !isdefined(T, :T) || _reach_open_arg(T.T)
-    T isa Union && return _reach_open_arg(T.a) || _reach_open_arg(T.b)
+function _reach_open_arg(@nospecialize(T), depth::Int = 0)
+    depth > 8 && return true
+    T isa Core.TypeofVararg && return !isdefined(T, :T) || _reach_open_arg(T.T, depth + 1)
+    T isa Union && return _reach_open_arg(T.a, depth + 1) || _reach_open_arg(T.b, depth + 1)
     T isa DataType || return T !== Union{}
-    return !(isconcretetype(T) || T <: Type)
+    isconcretetype(T) || return !(T <: Type)
+    return any(p -> p isa Type && _reach_open_arg(p, depth + 1), T.parameters)
 end
 
 # A call left to run-time dispatch on a known function. The function is reached whatever method
@@ -341,8 +345,9 @@ closure passed to `foreach`, or a user array whose `getindex` a `sum` calls. A B
 concrete Base types is neither entered nor counted. A Base call with an argument typed abstractly
 (`Any`, `AbstractVector{Float64}`) is not entered either, but a value of a user type may arrive
 there at run time, so it is counted in `dynamic`. That includes the value of `fetch(t)`, which is
-`Any`: a route that fetches a task and computes with the result is not complete. Only the top
-level of an argument type is judged, so a `Vector{Any}` argument is concrete and not counted.
+`Any`: a route that fetches a task and computes with the result is not complete. Type parameters
+count at every depth: `sum` of a `Vector{Any}` (or a `Dict{Symbol, Any}`, or a `Vector{Vector{Any}}`)
+runs the `+` of whatever the container holds, so it is counted too.
 Argument types are read at the call, and through a compiler barrier: Base's default `show` of a
 struct, compiled for `Any`, is entered at the struct's type when the struct is defined outside Base.
 
