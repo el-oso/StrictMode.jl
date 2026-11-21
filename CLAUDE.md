@@ -192,6 +192,11 @@ StrictMode/src/
                         property, NOT that it fails — :noub is false for a non-const global read
                         and for a dynamic call, neither of which is undefined behavior (measured),
                         so a caller may act on true and must treat false as unknown.
+                        CAUGHT CONTEXT: a callee :invoked from a try region whose handler can
+                        return (_caught_region_mask) is scanned with _skip_mask(code, true), the
+                        unreachable mask alone, and so is everything below it; _signals_by_type
+                        keys seen and _SIGNAL_MEMO on the context, and _signal_origin/_origin_node
+                        carry it, so a body has one verdict per context.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch
@@ -854,9 +859,11 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         caught or not, and every site a catch reaches. When the walk read a statement
                         a caught throw reaches on a call that returns (_caught_mask: a try region
                         whose handler can return, or that handler, which the walk enters and
-                        _catch_only_mask finds), _check_allocs runs AllocCheck again
+                        _catch_only_mask finds, or a callee read in a caught context: _walk_body
+                        keeps those in _WALK_CAUGHT_MEMO and skips nothing), _check_allocs runs AllocCheck again
                         with ignore_throw = false and _caught_sites keeps the extra sites whose
-                        frame groups (one per compiled body) are all live and at least one caught,
+                        frame groups (one per compiled body) include a caught one with no dead group
+                        OUTSIDE it (groups inside it are a callee the try body called),
                         matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode
                         (a raw getdebugidx line can index a further line table). The second
                         run is the cost: ~20 s on a @strict-guarded signature, measured.

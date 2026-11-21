@@ -155,30 +155,33 @@ const _THROW_ONLY_RUNTIME = (
 )
 
 # Of the sites AllocCheck reports only without `ignore_throw`, those on a path that returns normally
-# because a catch handles its throw, in the try body or in the handler. A backtrace is read as one
-# group of frames per compiled body, innermost first, each ending at the body's own frame. A site is
-# kept when no group lies on an error path of its body and at least one lies on a statement a caught
-# throw reaches (`_location_class`). A backtrace AllocCheck cut short ("multiple call sites") is judged
-# on the groups it has.
+# because a catch handles its throw, in the try body, in a callee it calls, or in the handler. A
+# backtrace is read as one group of frames per compiled body, innermost first, each ending at the
+# body's own frame. A site is kept when some group lies on a statement a caught throw reaches
+# (`_location_class`) and no group outside it lies on an error path of its body: what the groups
+# inside it do on their own error paths ends in the handler. A backtrace AllocCheck cut short
+# ("multiple call sites") is judged on the groups it has.
 function _caught_sites(extra)
     interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
     bodies = IdDict{Core.MethodInstance, Any}()
     return filter(extra) do a
         a isa AllocCheck.AllocatingRuntimeCall && a.name in _THROW_ONLY_RUNTIME && return false
         hasproperty(a, :backtrace) || return false
-        found = false
+        classes = Symbol[]
         group = Base.StackTraces.StackFrame[]
         for fr in a.backtrace
             push!(group, fr)
             fr.inlined && continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || break
-            c = _location_class(get!(() -> _body_classes(interp, mi), bodies, mi), group)
-            c === :dead && return false
-            found |= c === :caught
+            push!(classes, _location_class(get!(() -> _body_classes(interp, mi), bodies, mi), group))
             empty!(group)
         end
-        return found
+        for c in Iterators.reverse(classes)
+            c === :dead && return false
+            c === :caught && return true
+        end
+        return false
     end
 end
 
@@ -295,8 +298,10 @@ end
 const _MEMO_LOCK = ReentrantLock()
 # By signature type: the sites of `_raw_allocs_unfiltered`.
 const _SITES_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
-# By specialization: what the native walk reads from its body (`_walk_body`).
+# By specialization: what the native walk reads from its body (`_walk_body`), outside and inside a
+# caught context.
 const _WALK_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
+const _WALK_CAUGHT_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
 
 # `read()`, or what an earlier call kept under `key`, a signature type or a specialization. `world`
 # is the world `read` reads in. `entry()` is called after the read and makes the compiler record the
@@ -341,7 +346,8 @@ end
 _native_dispatches(@nospecialize(f), @nospecialize(types)) = first(_native_walk(f, types))
 
 # The dispatches `_native_dispatches` reports, and whether a body it read holds a statement a caught
-# throw reaches (`_caught_mask`).
+# throw reaches (`_caught_mask`). A callee called from a try region whose handler can return is read
+# in a caught context, with no statement skipped, as the scan reads it (`StrictMode._skip_mask`).
 function _native_walk(@nospecialize(f), @nospecialize(types))
     CC = Base.Compiler
     world = Base.get_world_counter()
@@ -353,16 +359,19 @@ function _native_walk(@nospecialize(f), @nospecialize(types))
     caught = false
     entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
     parent = IdDict{Any, Any}(entry => nothing)
-    work = Any[entry]
+    visited = Set{Tuple{Core.MethodInstance, Bool}}([(entry, false)])
+    work = Tuple{Core.MethodInstance, Bool}[(entry, false)]
     while !isempty(work)
-        mi = pop!(work)
-        steps, c = _walk_body(interp, world, mi)
-        caught |= c
+        mi, incaught = pop!(work)
+        steps, c = _walk_body(interp, world, mi, incaught)
+        caught |= c | incaught
         for step in steps
-            if step isa Core.MethodInstance
-                haskey(parent, step) && continue
-                parent[step] = mi
-                push!(work, step)
+            if step isa Tuple
+                callee, ctx = step
+                (callee, ctx) in visited && continue
+                push!(visited, (callee, ctx))
+                haskey(parent, callee) || (parent[callee] = mi)
+                push!(work, (callee, ctx))
             else
                 bt = Base.StackTraces.StackFrame[]
                 m = mi
@@ -382,21 +391,24 @@ function _native_walk(@nospecialize(f), @nospecialize(types))
     return out, caught
 end
 
-# What the walk reads from one optimized body: in statement order, the specialization of each
-# `:invoke` (a `MethodInstance`) and the callee name of each dynamic call (a `Symbol`); and whether a
-# statement read is one a caught throw reaches (`_caught_mask`).
-function _walk_body(interp, world::UInt, mi::Core.MethodInstance)
-    return _kept(_WALK_MEMO, mi, world, Returns(nothing)) do
+# What the walk reads from one optimized body: in statement order, each `:invoke` as its
+# specialization and whether it is called in a caught context, and the callee name of each dynamic
+# call (a `Symbol`); and whether a statement read is one a caught throw reaches (`_caught_mask`). In a
+# caught context (`incaught`) no statement is an error path, and every callee is read in one too.
+function _walk_body(interp, world::UInt, mi::Core.MethodInstance, incaught::Bool = false)
+    return _kept(incaught ? _WALK_CAUGHT_MEMO : _WALK_MEMO, mi, world, Returns(nothing)) do
         src = Base.Compiler.typeinf_code(interp, mi, true)
         src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
-        dead = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) : falses(length(src.code))
-        caught = StrictMode.ignore_throw() && any(_caught_mask(src.code, dead))
+        skip = StrictMode.ignore_throw() && !incaught
+        dead = skip ? StrictMode._deadend_mask(src.code) : falses(length(src.code))
+        caught = skip && any(_caught_mask(src.code, dead))
+        region = skip ? StrictMode._caught_region_mask(src.code, dead) : nothing
         steps = Any[]
         for (i, st) in pairs(src.code)
             dead[i] && continue
             if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
                 callee = StrictMode._invoke_mi(st.args[1])
-                isnothing(callee) || push!(steps, callee)
+                isnothing(callee) || push!(steps, (callee, incaught || (!isnothing(region) && region[i])))
             elseif Meta.isexpr(st, :call)
                 ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
                 ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue

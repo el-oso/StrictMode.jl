@@ -211,9 +211,12 @@ throw, caught or not, and every site a catch reaches, so where a caught throw is
 throw reaches on a call that returns. That second check is a second AllocCheck run over the call graph,
 so a proof whose reach holds such a `try` costs about twice as much.
 
-What this does not cover: a throw raised *inside a callee* the try body calls, such as the
-`BoundsError` of a `v[i]` that a `catch` turns into a default. Inside the callee that throw is still an
-error path, so neither tier counts the exception it allocates.
+The same holds for a throw raised *inside a callee* the try body calls, inlined or not, such as the
+`BoundsError` of a `v[i]` that a `catch` turns into a default: a callee called from a try region whose
+handler can return is read with none of its statements skipped as error paths, and so is everything it
+calls, since any throw below it ends in that handler. Both tiers count what the callee allocates there:
+the scan keeps a separate verdict for each body read in that context, and the proof keeps a site whose
+frames outside the caught call lie on no error path.
 
 **A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
 follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the

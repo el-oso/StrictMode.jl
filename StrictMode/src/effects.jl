@@ -650,8 +650,8 @@ it returns.
 
 A throw that a catch handles is not an error path when the catch can return: every statement in the try
 body has the handler as a successor, so the message it builds and the exception it boxes count, and so
-does the handler. A throw raised inside a callee is judged in that callee's own body, where it is still
-an error path.
+does the handler. A throw raised inside a callee the try body calls counts too: the callee, and
+everything it calls, is read with no statement skipped as an error path.
 """
 ignore_throw() = _IGNORE_THROW[]
 
@@ -817,9 +817,21 @@ function _unreachable_mask(code::Vector{Any})
 end
 
 # The statements a scan of one body skips: those no execution reaches, and, under `ignore_throw()`,
-# those from which no path returns normally.
-_skip_mask(code::Vector{Any}) =
-    ignore_throw() ? _deadend_mask(code) .| _unreachable_mask(code) : _unreachable_mask(code)
+# those from which no path returns normally. A body scanned in a caught context (`caught`) is called
+# from a try region whose handler can return, so a throw anywhere in it ends in that handler and no
+# statement of it is an error path.
+_skip_mask(code::Vector{Any}, caught::Bool = false) =
+    ignore_throw() && !caught ? _deadend_mask(code) .| _unreachable_mask(code) : _unreachable_mask(code)
+
+# The statements of a try region whose handler is not an error path (`dead`): a call there whose
+# callee throws continues at a handler that can return, so the callee is scanned in a caught context.
+# `nothing` for a body with no such region.
+function _caught_region_mask(code::Vector{Any}, dead::BitVector)
+    handlers = _try_handlers(code)
+    isnothing(handlers) && return nothing
+    mask = BitVector(any(d -> !dead[d], handlers[i]) for i in eachindex(code))
+    return any(mask) ? mask : nothing
+end
 
 # Session memo for the per-signature scan: the callee recursion re-visits shared helpers (Base
 # internals especially) from every caller, and each visit pays a `code_typed_by_type`. Without
@@ -829,7 +841,7 @@ _skip_mask(code::Vector{Any}) =
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 # A body already on this walk contributes nothing a second time, so a result computed below such a
@@ -838,13 +850,16 @@ const _SIGNAL_MEMO_LOCK = ReentrantLock()
 # therefore counts its cuts, and only a body whose subtree met none is memoized.
 _cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)::Base.RefValue{Int}
 
-function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full)
-    if sig in seen
+# A body is scanned once per context: what it allocates on its throw paths counts only in a caught
+# context (`_skip_mask`), so the walk records and memoizes the two separately.
+function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, caught::Bool = false)
+    visit = caught ? (sig, :caught) : sig
+    if visit in seen
         _cut_counter()[] += 1
         return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     end
-    push!(seen, sig)
-    key = (depth, Base.get_world_counter(), mode)   # any new method definition invalidates (coarse, safe)
+    push!(seen, visit)
+    key = (depth, Base.get_world_counter(), mode, caught)   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_SIGNAL_MEMO, sig, nothing)
         bysig === nothing ? nothing : get(bysig, key, nothing)
@@ -852,9 +867,9 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any},
     memo === nothing || return memo
     cuts = _cut_counter()
     before = cuts[]
-    r = _signals_by_type_uncached(sig, depth, seen, mode)
+    r = _signals_by_type_uncached(sig, depth, seen, mode, caught)
     cuts[] == before || return r
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -967,14 +982,14 @@ function _signal_origin(
     )
     top = _sigtype(f, types)
     parent = IdDict{Any, Any}()
-    queue = Any[(top, _FAST_ALLOC_DEPTH[])]
+    queue = Any[(top, _FAST_ALLOC_DEPTH[], false)]
     seen = Base.IdSet{Any}()
     out = Any[]
     while !isempty(queue) && length(seen) < _SCAN_BODY_BUDGET[]
-        s, depth = popfirst!(queue)
-        s in seen && continue
-        push!(seen, s)
-        trace, callees = _origin_node(s, mode)
+        s, depth, caught = popfirst!(queue)
+        (s, caught) in seen && continue
+        push!(seen, (s, caught))
+        trace, callees = _origin_node(s, mode, caught)
         if !isempty(trace)
             path = Any[]
             c = s
@@ -985,7 +1000,7 @@ function _signal_origin(
             push!(out, (; signature = s, path, statements = trace))
             first_only && break
         end
-        for mi in callees
+        for (mi, c) in callees
             mi = mi::Core.MethodInstance
             if _mi_is_barrier(mi)
                 isnothing(stops) || push!(stops, mi.specTypes)
@@ -996,23 +1011,24 @@ function _signal_origin(
             user = _enters_user_code(mi)
             (depth > 0 || (depth < 0 && user)) || continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1)))
+            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool))
         end
     end
     return out
 end
 
 # One body of the walk above: the statements of its own that set `mode`'s signal, and the callees it
-# invokes off its throw paths. Every warning walks the call graph below its call, and the calls of
-# one package share most of that graph, so a body is scanned once per world and not once per warning.
+# invokes off its throw paths, each with whether it is called in a caught context (`_skip_mask`).
+# Every warning walks the call graph below its call, and the calls of one package share most of that
+# graph, so a body is scanned once per world and context and not once per warning.
 # Emptied with the other scan memos.
-const _ORIGIN_MEMO = IdDict{Any, Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
+const _ORIGIN_MEMO = IdDict{Any, Dict{Tuple{Symbol, Bool}, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
 
-function _origin_node(@nospecialize(s), mode::Symbol)
+function _origin_node(@nospecialize(s), mode::Symbol, caught::Bool = false)
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK begin
         bymode = get(_ORIGIN_MEMO, s, nothing)
-        isnothing(bymode) ? nothing : get(bymode, mode, nothing)
+        isnothing(bymode) ? nothing : get(bymode, (mode, caught), nothing)
     end
     (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3]
     trace = Any[]
@@ -1022,19 +1038,20 @@ function _origin_node(@nospecialize(s), mode::Symbol)
         # `push!` and not `IdSet{Any}([s])`: a vector literal of a type is a method compiled for that type.
         own = Base.IdSet{Any}()
         push!(own, s)
-        _scan_ci(ci, s, 0, own, mode, false, trace)
-        dead = _skip_mask(ci.code)
+        _scan_ci(ci, s, 0, own, mode, false, trace; caught)
+        dead = _skip_mask(ci.code, caught)
+        region = caught || !ignore_throw() ? nothing : _caught_region_mask(ci.code, dead)
         for (j, st) in enumerate(ci.code)
             (Meta.isexpr(st, :invoke) && !dead[j]) || continue
             a1 = st.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
             _mi_is_strictmode(mi) && continue
-            push!(callees, mi)
+            push!(callees, (mi, caught || (!isnothing(region) && region[j])))
         end
     end
     @lock _SIGNAL_MEMO_LOCK begin
-        get!(Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[mode] = (world, trace, callees)
+        get!(Dict{Tuple{Symbol, Bool}, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[(mode, caught)] = (world, trace, callees)
     end
     return trace, callees
 end
@@ -1087,15 +1104,15 @@ end
 # the depth the verdict reads to. What the scheduler's own code calls is the scheduler's.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     parent = IdDict{Any, Any}()
-    queue = Any[_sigtype(f, types)]
+    queue = Any[(_sigtype(f, types), false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
-        s = popfirst!(queue)
-        s in seen && continue
+        s, caught = popfirst!(queue)
+        (s, caught) in seen && continue
         length(seen) < _SCAN_BODY_BUDGET[] || return missing
-        push!(seen, s)
+        push!(seen, (s, caught))
         isnothing(_typed_body(s)) && return missing
-        trace, callees = _origin_node(s, :alloc)
+        trace, callees = _origin_node(s, :alloc, caught)
         if !isempty(trace)
             path = Any[]
             c = s
@@ -1105,11 +1122,11 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             end
             return (; signature = s, path, statements = trace)
         end
-        for mi in callees
+        for (mi, c) in callees
             mi = mi::Core.MethodInstance
             (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi)) || _in_scheduler(mi)) && continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, mi.specTypes)
+            push!(queue, (mi.specTypes, c::Bool))
         end
     end
     return nothing
@@ -1137,10 +1154,10 @@ function _barrier_stops(@nospecialize(f), @nospecialize(types::Tuple))
     return unique(stops)
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol)
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught::Bool)
     ci = _typed_body(sig)
     isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
-    return _scan_ci(ci, sig, depth, seen, mode)
+    return _scan_ci(ci, sig, depth, seen, mode; caught)
 end
 
 # Would a value of this type have to be boxed to flow through a union-typed slot? An isbits type
@@ -1445,7 +1462,7 @@ end
 
 function _scan_ci(
         ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
-        trace::Union{Nothing, Vector{Any}} = nothing
+        trace::Union{Nothing, Vector{Any}} = nothing; caught::Bool = false
     )
     alloc = false
     boxing = false
@@ -1466,7 +1483,10 @@ function _scan_ci(
     # Corpus-measured (PureBLAS + PureIPM, 120 specializations): 57 frames reach no such statement.
     escmemo = Ref{Union{Nothing, Bool}}(nothing)
     newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
-    dead = _skip_mask(ci.code)
+    dead = _skip_mask(ci.code, caught)
+    # A callee called from a try region whose handler can return is scanned in a caught context.
+    region = caught || !ignore_throw() ? nothing : _caught_region_mask(ci.code, dead)
+    callee_caught(i) = caught || (!isnothing(region) && region[i])
     # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
     # Both branches are asserted, like `newsdead` above. Without it the memo's `Union{Nothing, …}`
     # is the closure's return type: the `isnothing` check narrows the FIRST load of the `Ref`, and
@@ -1549,7 +1569,7 @@ function _scan_ci(
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
                         barrier = true
                         if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen, mode)
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen, mode, callee_caught(i))
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
@@ -1584,7 +1604,7 @@ function _scan_ci(
                             truncated = true
                         elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode)
+                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode, callee_caught(i))
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)

@@ -974,3 +974,40 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "a throw raised in a callee that a catch handles fails the proof" begin
+    using StrictMode, StrictModeTest
+    # A throw raised inside a callee the try body calls, inlined or not, lands in the catch, which
+    # returns normally: the message and the exception are built on every call that throws.
+    @noinline thrower(n::Int) = throw(ArgumentError(string("x", n)))
+    @inline thrower_inl(n::Int) = throw(ArgumentError(string("x", n)))
+    @noinline middle(n::Int) = (thrower(n); n)
+    @noinline caught_callee(n::Int) = (try thrower(n) catch end; n)
+    @noinline caught_inlined(n::Int) = (try thrower_inl(n) catch end; n)
+    @noinline caught_deep(n::Int) = (try middle(n) catch end; n)
+    # An out-of-bounds index builds a `BoundsError` inside `throw_boundserror`.
+    @noinline caught_index(v::Vector{Int}, i::Int) = try v[i] catch; 0 end
+    # Passing controls: the callee's throw is uncaught, the catch rethrows, the call sits outside
+    # the try, and a try that exits normally.
+    @noinline uncaught_callee(n::Int) = (n < 0 && thrower(n); n + 1)
+    @noinline rethrows_callee(n::Int) = (try n < 0 && thrower(n) catch; rethrow() end; n)
+    @noinline outside_try(n::Int) = (try n += 1 catch end; n < 0 && thrower(n); n)
+    @noinline normal_exit(n::Int) = (try n += 1 catch end; n)
+    caught = ((caught_callee, (Int,)), (caught_inlined, (Int,)), (caught_deep, (Int,)),
+        (caught_index, (Vector{Int}, Int)))
+    clean = ((uncaught_callee, (Int,)), (rethrows_callee, (Int,)), (outside_try, (Int,)),
+        (normal_exit, (Int,)))
+    caught_callee(1); caught_inlined(1); caught_deep(1); caught_index([1], 2)
+    uncaught_callee(1); rethrows_callee(1); outside_try(1); normal_exit(1)
+    proof(f, tt) = only(StrictModeTest._proof_findings(f, tt, (:noalloc,)))
+    for (f, tt) in caught
+        @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(f, tt))
+        @test StrictMode._failed(proof(f, tt))
+        @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
+    end
+    for (f, tt) in clean
+        @test isempty(StrictModeTest._raw_allocs(f, tt))
+        @test !StrictMode._failed(proof(f, tt))
+    end
+    @test isempty(StrictModeTest._raw_allocs(middle, (Int,)))
+end
