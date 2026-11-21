@@ -534,6 +534,10 @@ end
     @test occursin("Sort", string(StrictMode._nonscheduler_origin(wait_then_sort, tv).signature))
     g = only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,)))
     @test StrictMode._failed(g) && g.code === :SM0002
+    # the package's code run by the lock is not the scheduler's, nor is what that code calls
+    alloc_under_lock(l::ReentrantLock, n::Int) = lock(() -> zeros(n), l)
+    h = only(StrictMode.findings(alloc_under_lock, (ReentrantLock, Int); guarantees = (:noalloc,)))
+    @test StrictMode._failed(h) && h.code === :SM0002
     # Whether `yield` reaches an allocation depends on Base's implementation of it; the rest needs one.
     if StrictMode._alloc_signals(only_waits, (Int,)).alloc
         @test only(StrictMode.findings(only_waits, (Int,); guarantees = (:noalloc,))).code === :SM0017

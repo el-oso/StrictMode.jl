@@ -1103,13 +1103,23 @@ end
 
 # Whether an origin `_signal_origin` found is the scheduler's: in its code, or in Base code its code
 # reached. The package's code a scheduler call runs (the function given to `lock`) is the package's,
-# and so is everything below it.
+# and so is everything below it, inlined into the scheduler call or not.
 function _origin_in_scheduler(o)
-    _sig_in_scheduler(o.signature) && return true
     chain = Any[o.path..., o.signature]
     k = findlast(_sig_in_scheduler, chain)
     isnothing(k) && return false
-    return !any(_sig_runs_user_code, @view chain[(k + 1):end])
+    return !_names_user_type(chain[k]) && !any(_sig_runs_user_code, @view chain[(k + 1):end])
+end
+
+# Whether a signature names a concrete type defined outside Base and Core, at any parameter depth (the
+# closure `lock(f, l)` is called with). An abstract parameter (`yieldto(::Task, ::Any)`) names none.
+function _names_user_type(@nospecialize(T), depth::Int = 0)
+    depth > 8 && return true
+    T = Base.unwrap_unionall(T)
+    T isa Union && return _names_user_type(T.a, depth + 1) || _names_user_type(T.b, depth + 1)
+    T isa DataType || return false
+    isconcretetype(T) && !_sw_is_base(parentmodule(T)) && return true
+    return any(p -> p isa Type && _names_user_type(p, depth + 1), T.parameters)
 end
 
 function _sig_runs_user_code(@nospecialize(sig))

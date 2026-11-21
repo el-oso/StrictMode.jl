@@ -174,8 +174,11 @@ StrictMode/src/
                         many calls down a wait allocates depends on what Base inlines (yield's queue
                         growth is one Base level deeper on 1.12 than on 1.13, measured), so a fixed
                         depth passed `yield()` on one release and failed it on the other. An origin
-                        below a scheduler call is the scheduler's (_origin_in_scheduler) unless the
-                        path from it passes through the package's code.
+                        below a scheduler call is the scheduler's (_origin_in_scheduler) unless that
+                        call names one of the package's types (`lock(f, l)`, _names_user_type) or the
+                        path from it passes through the package's code. The proof's _scheduler_site
+                        ends its frame walk the same way, at an inlined frame whose file is not one of
+                        Base's image-relative "./" files, since an inlined frame has no method instance.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an

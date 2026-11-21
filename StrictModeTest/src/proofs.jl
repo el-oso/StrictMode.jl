@@ -850,6 +850,13 @@ function _scheduler_site(@nospecialize(a))
                 !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
             break
         end
+        # An inlined frame carries no method instance, only its file. Base's own files are recorded
+        # relative to the image ("./lock.jl"): any other file is the package's code (the function
+        # given to `lock`, inlined into it), and the walk ends there too.
+        if fr isa Base.StackTraces.StackFrame && isnothing(mi) && fr.inlined &&
+                !startswith(string(fr.file), "./")
+            break
+        end
         fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES && (sched = true)
     end
     return sched

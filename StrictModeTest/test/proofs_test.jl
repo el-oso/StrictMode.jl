@@ -264,6 +264,11 @@ end
     @test StrictMode._failed(g) && g.code !== :SM0017
     @test !occursin("blocks in the task scheduler", g.reason)
     @test only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,))).code === :SM0002
+    # an allocation in the package's code a lock runs is the package's, inlined into `lock` or not
+    alloc_under_lock(l::ReentrantLock, n::Int) = lock(() -> zeros(n), l)
+    h = only(StrictModeTest._proof_findings(alloc_under_lock, (ReentrantLock, Int), (:noalloc,)))
+    @test StrictMode._failed(h) && h.code === :SM0002
+    @test only(StrictMode.findings(alloc_under_lock, (ReentrantLock, Int); guarantees = (:noalloc,))).code === :SM0002
 end
 
 @testitem "a C varargs call is not reported as dispatch" begin
