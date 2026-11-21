@@ -165,6 +165,8 @@ const _THROW_ONLY_RUNTIME = (
 # it has. A try region whose handler returns only for a type `T` (`StrictMode._handler_filter`) keeps
 # the site only when no group inside it is on the way to a throw known to be no `T`: each group inside
 # is judged in that caught context (`StrictMode._join_caught`), as the scan reads those bodies.
+# A site on the way to a bounds check's `BoundsError` (`_bounds_error_site`) that no enclosing handler
+# returns for is on an error path.
 function _caught_sites(extra)
     interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
     bodies = Dict{Tuple{Core.MethodInstance, Any}, Any}()
@@ -185,8 +187,10 @@ function _caught_sites(extra)
         end
         ctx = false
         inhandler = false
+        inner = nothing
         for (mi, g, c) in Iterators.reverse(groups)
-            cls, rctx = _location_class(get!(() -> _body_classes(interp, mi, ctx), bodies, (mi, ctx)), g, c)
+            inner = get!(() -> _body_classes(interp, mi, ctx), bodies, (mi, ctx))
+            cls, rctx = _location_class(inner, g, c)
             cls === :dead && return false
             if cls === :caught
                 ctx = StrictMode._join_caught(ctx, rctx)
@@ -195,8 +199,38 @@ function _caught_sites(extra)
                 inhandler |= cls === :handler
             end
         end
+        ctx isa Type && !(BoundsError <: ctx) && !isempty(groups) &&
+            _bounds_error_site(a, extra, inner, groups[1][2]) && return false
         return ctx !== false || inhandler
     end
+end
+
+# Whether site `a` is a bounds check's throw of a `BoundsError`: a call to a `jl_bounds_error*` runtime
+# function, which throws one, or the box of the memory reference such a call reports, at the same
+# frames as the call, where the innermost body's statements (`group` locates them, as
+# `_location_class` does) are all ones that allocate nothing on their way to returning normally and
+# one is a `memoryrefnew` of a reference of the box's type. Codegen emits that check for a `memoryrefnew`
+# (on Julia 1.12 under `--check-bounds=yes` also for one the IR marks unchecked) and boxes the reference
+# only to pass it to the call.
+_bounds_error_call(@nospecialize(a)) =
+    a isa AllocCheck.AllocatingRuntimeCall && startswith(a.name, "jl_bounds_error")
+
+function _bounds_error_site(@nospecialize(a), extra, body, group::Vector{Base.StackTraces.StackFrame})
+    _bounds_error_call(a) && return true
+    (a isa AllocCheck.AllocationSite && a.type isa Type && a.type <: Core.GenericMemoryRef) || return false
+    same(x, y) = length(x) == length(y) && all(
+        ((p, q),) -> p.func === q.func && p.file === q.file && p.line == q.line && p.inlined == q.inlined,
+        zip(x, y)
+    )
+    any(b -> _bounds_error_call(b) && same(b.backtrace, a.backtrace), extra) || return false
+    isnothing(body) && return false
+    refs, stacks = body[5], body[2]
+    want = [fr.line for fr in Iterators.reverse(group)]
+    at = [length(s) for s in stacks]
+    best = maximum((k for (k, s) in zip(at, stacks) if 0 < k <= length(want) && s == view(want, 1:k)); init = 0)
+    best > 0 || return false
+    matched = [i for i in eachindex(stacks) if at[i] == best && stacks[i] == view(want, 1:best)]
+    return all(i -> refs[i] !== nothing, matched) && any(i -> refs[i] === a.type, matched)
 end
 
 # Each statement of `mi`'s optimized body as `:dead` (an error path under `ignore_throw()`),
@@ -223,7 +257,20 @@ function _body_classes(interp, mi::Core.MethodInstance, ctx = false)
     invoked = [
         Meta.isexpr(st, :invoke) ? StrictMode._invoke_mi(st.args[1]) : nothing for st in src.code
     ]
-    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs)
+    refs = Any[_quiet_stmt(src, mi.specTypes, st) for st in src.code]
+    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs, refs)
+end
+
+# For a statement that allocates nothing on its way to returning normally: the reference type of a
+# `memoryrefnew`, `true` for the other such statements (`nothing`, a `boundscheck`, a branch, a
+# `getfield` or a `memoryrefget`). `nothing` for any other statement.
+function _quiet_stmt(src::Core.CodeInfo, @nospecialize(sig), @nospecialize(st))
+    (st === nothing || st isa Core.GotoNode || st isa Core.GotoIfNot || Meta.isexpr(st, :boundscheck)) && return true
+    Meta.isexpr(st, :call) || return nothing
+    c = StrictMode._static_callee(src, st.args[1])
+    c === Core.memoryrefnew && length(st.args) >= 2 &&
+        return StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, sig, st.args[2]))
+    return c === Core.getfield || c === Core.memoryrefget ? true : nothing
 end
 
 # The live statements a caught throw reaches: those in a try region whose handler can return, and

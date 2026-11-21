@@ -881,6 +881,25 @@ end
 # returns for.
 _join_caught(a, b) = (a === true || b === true) ? true : a === false ? b : b === false ? a : Union{a, b}
 
+# Whether a throw of an `E` in the caught context `ctx` (`_join_caught`) continues at a handler that
+# returns normally.
+_returns_for(ctx, @nospecialize(E)) = ctx === true || (ctx isa Type && E <: ctx)
+
+# Whether `st` is `memoryrefnew(ref, i)` or `memoryrefnew(ref, i, boundscheck)` on a memory reference,
+# an `Int` and a `Bool`. The compiler proves such a call cannot throw except by its bounds check
+# (`memoryref_builtin_common_nothrow`), and the check throws a `BoundsError`. On Julia 1.12 under
+# `--check-bounds=yes`, codegen emits the check even when `boundscheck` is `false`.
+function _bounds_checked_ref(ci, @nospecialize(sig), @nospecialize(st))
+    (Meta.isexpr(st, :call) && 3 <= length(st.args) <= 4 && _static_callee(ci, st.args[1]) === Core.memoryrefnew) ||
+        return false
+    t(k) = _unwrap_lattice(_stmt_arg_type(ci, sig, st.args[k]))
+    r, i = t(2), t(3)
+    (r isa Type && r <: Core.GenericMemoryRef && i isa Type && i <: Int) || return false
+    length(st.args) == 3 && return true
+    b = t(4)
+    return b isa Type && b <: Bool
+end
+
 # The exception type the handler at `d` returns for, when it begins `catch err; err isa T || rethrow()`:
 # its first test is `isa` of the caught exception against a constant type, and the branch where the
 # test fails only rethrows. `nothing` for any other handler, which is taken to return whatever is
@@ -942,11 +961,13 @@ function _rethrown(ci, @nospecialize(sig), i::Int, @nospecialize(T), memo::Dict{
     return !isnothing(ts) && all(E -> !(E <: T), ts)
 end
 
-# The types the statement `i` can throw when it always throws and every one is known and concrete:
-# `throw(x)` with `x` of a concrete type, or a call into a body whose every throw is one (a few
-# levels deep, as `throw_boundserror` is one). `nothing` otherwise.
+# The types the statement `i` can throw, when every one is known and concrete: `throw(x)` with `x` of a
+# concrete type, a bounds-checked `memoryrefnew` (`_bounds_checked_ref`), which throws only a
+# `BoundsError`, or a call that always throws into a body whose every throw is one (a few levels
+# deep, as `throw_boundserror` is one). `nothing` otherwise.
 function _thrown_types(ci, @nospecialize(sig), i::Int, level::Int = 0)
     st = ci.code[i]
+    _bounds_checked_ref(ci, sig, st) && return Any[BoundsError]
     if Meta.isexpr(st, :call) && length(st.args) == 2 && _static_callee(ci, st.args[1]) === Core.throw
         E = _unwrap_lattice(_stmt_arg_type(ci, sig, st.args[2]))
         return E isa DataType && isconcretetype(E) ? Any[E] : nothing
@@ -2059,6 +2080,13 @@ function _scan_ci(
                     _boxing_store(ci, sig, st, callee) && !schedstmt(i)
                 boxing = true
                 isnothing(trace) || push!(trace, (i, st, :boxing))
+            end
+            # A bounds-checked `memoryrefnew` throws the `BoundsError` it builds itself, so the call is an
+            # allocation wherever that throw returns normally (`_returns_for`).
+            if !(mode === :boxing || alloc || dead[i]) && _maythrow(ci, i) && _bounds_checked_ref(ci, sig, st) &&
+                    (!ignore_throw() || _returns_for(callee_caught(i), BoundsError))
+                alloc = true
+                isnothing(trace) || push!(trace, (i, st, :alloc))
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
                 if !(mode === :boxing || alloc || dead[i] || newsdead())

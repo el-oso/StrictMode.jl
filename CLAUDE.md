@@ -231,7 +231,10 @@ StrictMode/src/
                         keeps a statement alive through it only when the statement may throw (the
                         optimizer's IR_FLAG_NOTHROW is unset) and is not a throw whose types are
                         all known, concrete and no T (_rethrown/_thrown_types, which follow an
-                        always-throwing :invoke like throw_boundserror a few levels). A callee in a
+                        always-throwing :invoke like throw_boundserror a few levels, and name a bounds-checked
+                        memoryrefnew (_bounds_checked_ref: ref/Int/Bool arguments, so only its check
+                        can throw) as a BoundsError; the scan also counts such a call that may throw
+                        as an allocation where _returns_for(context, BoundsError)). A callee in a
                         T context reads its own throws the same way. StrictModeTest's
                         _body_classes/_caught_sites/_walk_body use the same functions. A callee exempt from
                         :noalloc has its allocation AND its boxing excused in :alloc/:full mode (a
@@ -927,7 +930,13 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         calls is outside the try, so its own throw is an error path). A try-region
                         group whose handlers return only for a type (_handler_filter) does not end
                         the walk: the groups inside it are classified in that caught context
-                        (_body_classes(interp, mi, ctx)), and a dead one drops the site. Groups are
+                        (_body_classes(interp, mi, ctx)), and a dead one drops the site. In a type's
+                        context a jl_bounds_error* call, and the MemoryRef box reported at the same
+                        frames where the statements there are a memoryrefnew of that type plus
+                        allocation-free ones (_bounds_error_site/_quiet_stmt), is a BoundsError
+                        throw and is dropped when the type does not cover it — on 1.12 under
+                        --check-bounds=yes codegen checks memoryrefnew even where the IR marks it
+                        unchecked. Groups are
                         matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode
                         (a raw getdebugidx line can index a further line table) and, for a group
                         that called a callee, by the :invoke of that callee: a try-body call and a

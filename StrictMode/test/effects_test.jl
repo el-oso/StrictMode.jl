@@ -829,6 +829,11 @@ end
     @noinline caught_deep(n::Int) = (try middle(n) catch end; n)
     # An out-of-bounds index builds a `BoundsError` inside `throw_boundserror`.
     @noinline caught_index(v::Vector{Int}, i::Int) = try v[i] catch; 0 end
+    # A bounds-checked `memoryrefnew` throws its `BoundsError` itself, with no call to read: through
+    # `getindex` on a `Memory` on Julia 1.12, and written out on every version.
+    @noinline caught_memory(m::Memory{Int}, i::Int) = try m[i] catch; 0 end
+    @noinline caught_ref(m::Memory{Int}, i::Int) =
+        try Core.memoryrefget(Core.memoryrefnew(Core.memoryrefnew(m), i, true), :not_atomic, false) catch; 0 end
     # Passing controls: the callee's throw is uncaught, the catch rethrows, the call sits outside
     # the try, and a try that exits normally.
     @noinline uncaught_callee(n::Int) = (n < 0 && thrower(n); n + 1)
@@ -836,10 +841,12 @@ end
     @noinline outside_try(n::Int) = (try n += 1 catch end; n < 0 && thrower(n); n)
     @noinline normal_exit(n::Int) = (try n += 1 catch end; n)
     caught = ((caught_callee, (Int,)), (caught_inlined, (Int,)), (caught_deep, (Int,)),
-        (caught_index, (Vector{Int}, Int)))
+        (caught_index, (Vector{Int}, Int)), (caught_memory, (Memory{Int}, Int)),
+        (caught_ref, (Memory{Int}, Int)))
     clean = ((uncaught_callee, (Int,)), (rethrows_callee, (Int,)), (outside_try, (Int,)),
         (normal_exit, (Int,)))
     caught_callee(1); caught_inlined(1); caught_deep(1); caught_index([1], 2)
+    caught_memory(Memory{Int}([1]), 2); caught_ref(Memory{Int}([1]), 2)
     uncaught_callee(1); rethrows_callee(1); outside_try(1); normal_exit(1)
     noalloc(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:noalloc,)))
     for (f, tt) in caught

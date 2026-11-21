@@ -228,6 +228,15 @@ name, still counts, and so does any statement on the way that may itself throw, 
 may be a `T`. A handler that decides by anything else, such as a value, is taken to return whatever is
 thrown. Both tiers read handlers this way.
 
+A bounds-checked `memoryrefnew` throws its `BoundsError` itself, with no call to follow: indexing a
+`Memory` on Julia 1.12 does, and on 1.12 under `--check-bounds=yes` codegen also checks a `memoryrefnew`
+the IR marks unchecked. Both tiers name that throw as a `BoundsError`. The scan counts a
+`memoryrefnew` whose check is in the IR as an allocation wherever a handler returns for that throw. The
+proof treats a `jl_bounds_error*` runtime call as that throw, together with the box of the memory reference
+it is passed when the box has the same frames and the IR statements there are a `memoryrefnew` of a
+reference of the box's type plus others that allocate nothing. Under `err isa ArgumentError || rethrow()`
+neither counts the `BoundsError`; under a handler that returns for it, both do.
+
 **A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
 follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the
 same value twice: `ldiv!(U, b)` for a triangular `U` solves in place by calling `_ldiv!(b, U, b)`, which

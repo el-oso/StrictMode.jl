@@ -1148,6 +1148,94 @@ end
         end
         return true
     end
+    # A bounds-checked `memoryrefnew` throws its `BoundsError` itself, with no call to read:
+    # `getindex` on a `Memory` on Julia 1.12, and one written out on every version.
+    @noinline mget(m::Memory{Int}, i::Int) = m[i]
+    @noinline mref(m::Memory{Int}, i::Int) =
+        Core.memoryrefget(Core.memoryrefnew(Core.memoryrefnew(m), i, true), :not_atomic, false)
+    @noinline function mem_rethrows(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mget(m, i)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function mem_rethrows_inline(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            m[i]
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function ref_rethrows(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mref(m, i)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    # Failing controls: an `ArgumentError` the handler returns for, and a handler that returns for a
+    # `BoundsError` too.
+    @noinline function mem_keeps_argument(m::Memory{Int}, i::Int)
+        try
+            argmsg(i)
+            mget(m, i)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function mem_on_value(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mget(m, i)
+        catch err
+            FLAG[] || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function ref_on_value(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mref(m, i)
+        catch err
+            FLAG[] || rethrow()
+            return false
+        end
+        return true
+    end
+    # Failing controls: a handler that returns for exactly the `BoundsError`.
+    @noinline function mem_keeps_bounds(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mget(m, i)
+        catch err
+            err isa BoundsError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function ref_keeps_bounds(m::Memory{Int}, i::Int)
+        try
+            argcheck(i)
+            mref(m, i)
+        catch err
+            err isa BoundsError || rethrow()
+            return false
+        end
+        return true
+    end
     end
     T = TypedCatch
     tt = (Vector{Int}, Int)
@@ -1173,6 +1261,28 @@ end
     end
     for f in (T.rethrows_bounds, T.rethrows_bounds_inline, T.keeps_argument, T.rethrows_on_value)
         @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
+    end
+    mt = (Memory{Int}, Int)
+    mclean = (T.mem_rethrows, T.mem_rethrows_inline, T.ref_rethrows)
+    mcaught = (T.mem_keeps_argument, T.mem_on_value, T.ref_on_value, T.mem_keeps_bounds, T.ref_keeps_bounds)
+    for f in (mclean..., mcaught...), i in (1, -1, 3)
+        try
+            f(Memory{Int}([1]), i)
+        catch
+        end
+    end
+    mproof(f) = only(StrictModeTest._proof_findings(f, mt, (:noalloc,)))
+    mscan(f) = only(StrictMode.findings(f, mt; guarantees = (:noalloc,)))
+    for f in mclean
+        @test !StrictMode._failed(mscan(f))
+        @test !StrictMode._failed(mproof(f))
+    end
+    for f in mcaught
+        @test StrictMode._failed(mscan(f))
+        @test StrictMode._failed(mproof(f))
+    end
+    for f in (mclean..., mcaught...)
+        @test isempty(StrictModeTest.divergence_report(f, mt; guarantees = (:noalloc,)))
     end
 end
 
