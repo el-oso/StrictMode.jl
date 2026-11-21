@@ -490,8 +490,10 @@ function _raw_allocs(@nospecialize(f), @nospecialize(types))
 end
 
 # Runtime calls AllocCheck lists as allocating that do not allocate. `jl_hrtime` (behind `time_ns`)
-# reads the system clock and returns an integer: a call measured at 0 bytes.
-const _NONALLOCATING_RUNTIME = (:jl_hrtime,)
+# reads the system clock and returns an integer: a call measured at 0 bytes. `jl_current_exception`
+# (a handler reading the exception it caught) loads it from the task's exception stack, and the
+# runtime declares it `JL_NOTSAFEPOINT`, which an allocating function cannot be.
+const _NONALLOCATING_RUNTIME = (:jl_hrtime, :jl_current_exception)
 _nonallocating_runtime_call(@nospecialize(a)) =
     a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) in _NONALLOCATING_RUNTIME
 

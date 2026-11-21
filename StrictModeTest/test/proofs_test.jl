@@ -1085,3 +1085,40 @@ end
     @test s.status === :info && occursin("pb_box!", s.reason)
     @test StrictMode._failed(only(StrictMode.findings(E.calls_boxer, (Int,); guarantees = (:noboxing,))))
 end
+
+@testitem "reading the caught exception is not an allocation" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ReadsErr
+    const NEG = ArgumentError("negative")
+    const BIG = DomainError(0)
+    # The handler returns, and reads the exception it caught: `jl_current_exception` loads it.
+    @noinline function reads_err(i::Int)
+        try
+            i < 0 && throw(NEG)
+            i > 100 && throw(BIG)
+        catch err
+            return err isa ArgumentError ? 0 : -1
+        end
+        return i
+    end
+    # Failing control: the handler that returns also builds a string from what it caught.
+    @noinline function shows_err(i::Int)
+        try
+            i < 0 && throw(NEG)
+            i > 100 && throw(BIG)
+        catch err
+            return length(sprint(showerror, err))
+        end
+        return i
+    end
+    end
+    R = ReadsErr
+    R.reads_err(1); R.reads_err(-1); R.shows_err(1); R.shows_err(-1)
+    sites = StrictModeTest._raw_allocs_unfiltered(R.reads_err, (Int,))
+    @test any(a -> a isa StrictModeTest.AllocCheck.AllocatingRuntimeCall && a.name == "jl_current_exception", sites)
+    proof(f) = only(StrictModeTest._proof_findings(f, (Int,), (:noalloc,)))
+    @test !StrictMode._failed(proof(R.reads_err))
+    @test !StrictMode._failed(only(StrictMode.findings(R.reads_err, (Int,); guarantees = (:noalloc,))))
+    @test StrictMode._failed(proof(R.shows_err))
+end
