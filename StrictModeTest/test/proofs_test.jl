@@ -291,6 +291,12 @@ end
     for f in (plain, ul)
         @test proof(f, (ReentrantLock,), :noalloc).code === scan(f, (ReentrantLock,), :noalloc).code === :SM0017
     end
+    # so is a condition or channel wait, reached through a keyword body handed its own function
+    condwait(c::Threads.Condition) = (lock(c); try wait(c) finally unlock(c) end; nothing)
+    chtake(ch::Channel{Int}) = take!(ch)
+    for (f, T) in ((condwait, (Threads.Condition,)), (chtake, (Channel{Int},)))
+        @test proof(f, T, :noalloc).code === scan(f, T, :noalloc).code === :SM0017
+    end
 end
 
 @testitem "the proof warns about a guard only for a body that has one" begin

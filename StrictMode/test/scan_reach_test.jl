@@ -567,6 +567,11 @@ end
     wait_under_lock(l::ReentrantLock, c::Threads.Condition) = lock(Base.Fix1(wait, c), l)
     @test noalloc(plain, (R,)).code === :SM0017
     @test noalloc(wait_under_lock, (R, Threads.Condition)).code === :SM0017
+    # a keyword body is handed its own function as an argument; that is not a callable to run
+    condwait(c::Threads.Condition) = (lock(c); try wait(c) finally unlock(c) end; nothing)
+    chtake(ch::Channel{Int}) = take!(ch)
+    @test noalloc(condwait, (Threads.Condition,)).code === :SM0017
+    @test noalloc(chtake, (Channel{Int},)).code === :SM0017
     @test !StrictMode._failed(noboxing(plain, (R,)))
 end
 

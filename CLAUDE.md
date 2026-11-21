@@ -181,7 +181,9 @@ StrictMode/src/
                         queues; stopping there passed unlock(l)). A CALLABLE THE SCHEDULER WAS HANDED
                         (the f of lock(f, l)) is its caller's code whoever defined its type
                         (_calls_argument: the callee's function type IS one of the scheduler call's
-                        argument types), so its allocation is SM0002 and its boxing counts, inlined or
+                        argument types, _handed_params: other than the f a keyword body #f#N is
+                        passed as itself, so wait's keyword body calling wait() is not a callable),
+                        so its allocation is SM0002 and its boxing counts, inlined or
                         not; a wait it makes is the scheduler's again. Telling an inlined callable's
                         statements from the scheduler's needs debug-info edges, which a compiled body
                         does not keep: _typed_body re-reads such a body with debuginfo = :source

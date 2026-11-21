@@ -1567,7 +1567,7 @@ function _runs_handed_callable(@nospecialize(sig))
     sig = Base.unwrap_unionall(sig)
     sig isa DataType || return false
     world = Base.get_world_counter()
-    return any(Iterators.drop(sig.parameters, 1)) do P
+    return any(_handed_params(sig)) do P
         P isa DataType && isconcretetype(P) || return false
         ms = Base._methods_by_ftype(Tuple{P, Vararg{Any}}, -1, world)
         return ms isa Vector && !isempty(ms)
@@ -1582,7 +1582,23 @@ function _calls_argument(@nospecialize(caller), @nospecialize(callee))
     callee = Base.unwrap_unionall(callee)
     (caller isa DataType && callee isa DataType && !isempty(callee.parameters)) || return false
     F = callee.parameters[1]
-    return any(P -> P === F, Iterators.drop(caller.parameters, 1))
+    return any(P -> P === F, _handed_params(caller))
+end
+
+# The argument types of `sig` that a caller may have handed in, its function excluded. A keyword body
+# `#f#N(kws..., ::typeof(f), args...)` is also passed `f` itself, the function it is the body of:
+# that is its own code calling itself, not a callable it was given.
+function _handed_params(sig::DataType)
+    ps = Iterators.drop(sig.parameters, 1)
+    F = sig.parameters[1]
+    (F isa DataType && isdefined(F, :instance) && F.instance isa Function) || return ps
+    nm = nameof(F.instance)
+    owner = _demangle(nm)
+    owner === nm && return ps
+    return Iterators.filter(ps) do P
+        !(P isa DataType && isdefined(P, :instance) && P.instance isa Function &&
+          nameof(P.instance) === owner && parentmodule(P.instance) === parentmodule(F))
+    end
 end
 
 # The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
