@@ -1779,9 +1779,11 @@ split their own signals the same way.
 [`static_ownership_suggestions`](@ref), and the measured ones —
 [`steady_state_report`](@ref), [`gc_pause_report`](@ref), [`latency_report`](@ref),
 [`kernel_report`](@ref), [`register_report`](@ref), [`spill_report`](@ref), [`mca_report`](@ref),
-[`memsafe_report`](@ref). Thirteen of the seventeen `@assert_` guarantees are also swept by
-[`audit`](@ref) with nothing written at the call site; the four that are not need actual argument
-values, or an optional dependency, or a set of effects only the caller can name.
+[`memsafe_report`](@ref). Thirteen of the eighteen `@assert_` guarantees are also swept by
+[`audit`](@ref) with nothing written at the call site; the five that are not need actual argument
+values (`@assert_memsafe`, `@assert_noalias`), an optional dependency (`@assert_mca`), a set of
+effects only the caller can name (`@assert_effects`), or a target only the caller can name
+(`@assert_reaches`).
 
 **[`audit`](@ref) is the second step, not the first.** It never throws on a violation (an invalid
 argument, such as an unknown guarantee or an `only` entry that matches no function, does raise) and returns no exit status, so
@@ -1857,7 +1859,7 @@ per signature, for the property you actually need:
 
 Nothing in that column is a trade against correctness, and nothing is all-or-nothing: a module can
 require allocation-freedom of three kernels and say nothing about the rest. The guarantee is scoped
-to where it earns its place, which is why there are seventeen of them rather than one mode.
+to where it earns its place, which is why there are eighteen of them rather than one mode.
 
 A garbage collector only pauses code that allocates. Remove the allocation from the hot path — the
 property [`@assert_noalloc`](@ref) checks and `StrictModeTest.@test_noalloc` proves — and the pause
