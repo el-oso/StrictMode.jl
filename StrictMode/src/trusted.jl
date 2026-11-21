@@ -180,9 +180,10 @@ end
 # `certain` are reads of a value typed `<:Untrusted`, `erased` are reads of a value whose type
 # merely FAILS TO RULE OUT `Untrusted` — an `Any` carries no `Untrusted` for dispatch to match on,
 # and a type the scan cannot narrow is not a type it has cleared. `nothing` when the typed IR could
-# not be obtained, which a caller must not read as "none".
+# not be obtained, which a caller must not read as "none". `held` names, as "write of T", each call
+# that copies out the bits of a value whose type T can hold an `Untrusted`.
 function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
-    _is_trust_boundary(f) && return (Symbol[], Symbol[])
+    _is_trust_boundary(f) && return (Symbol[], Symbol[], String[])
     cts = try
         _code_typed(f, types; optimize = false)
     catch
@@ -192,6 +193,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     ci = first(cts)[1]
     certain = Symbol[]
     erased = Symbol[]
+    held = String[]
     # A value the body also reads ANOTHER field of is not an `Untrusted`, which has one. That is
     # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
     # loop over a loosely typed collection reads as a possible payload read.
@@ -212,6 +214,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             isnothing(sub) && return nothing
             append!(certain, sub[1])
             append!(erased, sub[2])
+            append!(held, sub[3])
             continue
         end
         # Comparing a value with a payload-reading function, or testing membership in a collection
@@ -223,9 +226,13 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         # `reinterpret(T, u)` (which raises at run time, like `u.x`), `reinterpret(T, [u])`,
         # `write(io, Ref(u))`, `write(io, [u])`. The first operand is the target type or the stream.
         if callee in _BYTE_COPIERS && length(args) >= 2
-            r = foldl(_max_reach, (_untrusted_reach(_unopt_arg_type(ci, a)) for a in args[2:end]); init = :none)
-            r === :certain && push!(certain, nameof(callee))
-            r === :maybe && push!(erased, nameof(callee))
+            Ts = [_unopt_arg_type(ci, a) for a in args[2:end]]
+            rs = map(_untrusted_reach, Ts)
+            if :certain in rs
+                push!(certain, nameof(callee))
+            elseif :maybe in rs
+                push!(held, "$(nameof(callee)) of $(Ts[findfirst(==(:maybe), rs)])")
+            end
             continue
         end
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
@@ -245,7 +252,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             push!(erased, nameof(callee))
         end
     end
-    return (certain, erased)
+    return (certain, erased, held)
 end
 
 # A payload-reading function handed to a call as a value, bare or held by a callable such as
@@ -346,6 +353,16 @@ function _untrusted_reach(@nospecialize(T), depth::Int = 0)
         return r
     end
     (T <: AbstractArray || T <: Ref) && return _untrusted_reach(eltype(T), depth + 1)
+    # An abstract type that is no container holds an `Untrusted` only where a type parameter
+    # names one: `Real`, `AbstractString` and `IO` hold none, `AbstractDict{K, Untrusted{V}}` may.
+    if T isa DataType && isabstracttype(T) && !(T <: Tuple)
+        for p in T.parameters
+            p isa Type && _untrusted_reach(p, depth + 1) === :none && continue
+            p isa Type || p isa TypeVar || continue
+            return :maybe
+        end
+        return :none
+    end
     (T isa DataType && isconcretetype(T)) || return :maybe
     for F in fieldtypes(T)
         _untrusted_reach(F, depth + 1) === :none || return :maybe
@@ -491,7 +508,7 @@ function _jump_targets(ci)
     return out
 end
 
-function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
+function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol}, held::Vector{String})
     parts = String[]
     isempty(certain) || push!(
         parts,
@@ -506,6 +523,13 @@ function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
             "which is the one hole in this guarantee: annotate the value, or move the read into a " *
             "boundary registered with `trust_boundary!`"
     )
+    isempty(held) || push!(
+        parts,
+        "may read an `Untrusted` payload — $(length(held)) call(s) copy out the bits of a value " *
+            "whose type can hold one ($(join(sort(unique(held)), ", "))), so the read cannot be " *
+            "ruled out: give the value a type that holds no `Untrusted`, or move the call into a " *
+            "boundary registered with `trust_boundary!`"
+    )
     return join(parts, "; ")
 end
 
@@ -513,15 +537,15 @@ function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn,
     sites = _untrusted_deref_sites(f, types)
     isnothing(sites) &&
         return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature"; tier)
-    certain, erased = sites
+    certain, erased, held = sites
     m = try
         _which(f, types)
     catch
         nothing
     end
     return _mkfinding(
-        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased),
-        _trusted_reason(certain, erased),
+        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased) || !isempty(held),
+        _trusted_reason(certain, erased, held),
         isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line);
         tier
     )
@@ -533,19 +557,19 @@ function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple))
         _fail(:trusted, target, "no typed IR for this signature, so the guarantee is unchecked")
         return nothing
     end
-    certain, erased = sites
+    certain, erased, held = sites
     if !isempty(certain)
         _fail(
-            :trusted, target, _trusted_reason(certain, erased) * ": move the read into a " *
+            :trusted, target, _trusted_reason(certain, erased, held) * ": move the read into a " *
                 "validating function that returns a plain value, and register it with " *
                 "`trust_boundary!`."
         )
-    elseif !isempty(erased)
+    elseif !isempty(erased) || !isempty(held)
         # An erased object type is inference failing to answer, not the scan observing a read, so
         # this reports where a certain site throws — the same split `_guarantee_gates` draws between
         # a check that OBSERVES and one that cannot. A `getfield` on an `Any` is ordinary code, and
         # aborting a build over one would make the guarantee unusable.
-        _fail(:trusted, target, _trusted_reason(certain, erased) * "."; gates = false)
+        _fail(:trusted, target, _trusted_reason(certain, erased, held) * "."; gates = false)
     end
     return nothing
 end
@@ -560,8 +584,11 @@ The read is any call to `getfield`, `getproperty` or [`unsafe_trust`](@ref) on a
 inference types as `<:Untrusted`, directly or through `invoke`, and any call to `reinterpret`,
 `write` or `unsafe_write` handed an `Untrusted` or a tuple, array or `Ref` of them past its first
 operand: `reinterpret(T, u)`, `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])` copy
-out the bits of an `isbits` payload. Handed an operand whose type cannot rule one out, those three
-are reads that cannot be ruled out. It is also any of
+out the bits of an `isbits` payload. Handed an operand whose type cannot rule one out (`Any`,
+`Vector{Any}`), those three are reads that cannot be ruled out, and the reason names that type. An
+abstract type that is no tuple, array or `Ref` and has no type parameter that can hold an
+`Untrusted` (`Real`, `Integer`, `AbstractString`, `IO`) rules one out, so a struct subtype of one
+of those with an `Untrusted` field, passed under the abstract type, is not seen. It is also any of
 `getfield`, `getproperty` and `unsafe_trust` handed to another call as a value, bare or held by a
 callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
 `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. `unsafe_trust`

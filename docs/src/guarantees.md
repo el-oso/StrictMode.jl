@@ -1211,7 +1211,11 @@ that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `m
 field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
 `getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs, and so are the
 calls that copy out an `isbits` payload's bits without raising: `reinterpret(T, [u])`,
-`write(io, Ref(u))`, `write(io, [u])`. Another generic method that copies what it is given, such as
+`write(io, Ref(u))`, `write(io, [u])`. Handed a value of a type that can hold an `Untrusted`
+(`Any`, `Vector{Any}`), those calls warn and name the type; `write(io, x::Real)` and
+`reinterpret(UInt64, x::Integer)` do not, since an abstract type with no container shape and no
+parameter naming an `Untrusted` is taken to hold none. A struct subtype of such a type with an
+`Untrusted` field, passed under the abstract type, is therefore not seen. Another generic method that copies what it is given, such as
 `Serialization.serialize`, is not seen. Printing,
 `dump` included, shows `<redacted>` in place of the payload. `==`, `isequal` and `hash` raise
 rather than compare or hash it, and so do the same calls on a container holding one, so an

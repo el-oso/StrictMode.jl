@@ -693,3 +693,33 @@ end
         @test occursin("may read an `Untrusted` payload", r.reason)
     end
 end
+
+@testitem "a byte copier is judged by the type it is handed" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    # Abstract types that are no container and name no `Untrusted` cannot hand one over.
+    w_real(io::IO, x::Real) = write(io, x)
+    w_str(io::IO, s::AbstractString) = write(io, s)
+    w_io(io::IO, src::IO) = write(io, src)
+    r_int(x::Integer) = reinterpret(UInt64, x)
+    @test status(w_real, (IOBuffer, Real)).status === :pass
+    @test status(w_str, (IOBuffer, AbstractString)).status === :pass
+    @test status(w_io, (IOBuffer, IO)).status === :pass
+    @test status(r_int, (Integer,)).status === :pass
+    # A type that can hold one is still a copy that cannot be ruled out, and the reason names it.
+    w_any(io::IO, x) = write(io, x)
+    r_vany(v::Vector{Any}) = reinterpret(UInt8, v)
+    w_dict(io::IO, d::AbstractDict{Int, Untrusted{Int}}) = write(io, d)
+    for (f, T, nm) in (
+            (w_any, (IOBuffer, Any), "write of Any"),
+            (r_vany, (Vector{Any},), "reinterpret of Vector{Any}"),
+            (w_dict, (IOBuffer, AbstractDict{Int, Untrusted{Int}}), "write of AbstractDict{Int64, Untrusted{Int64}}"),
+        )
+        r = status(f, T)
+        @test StrictMode._failed(r)
+        @test occursin("may read an `Untrusted` payload", r.reason)
+        @test occursin(nm, r.reason)
+        @test !occursin("inference lost", r.reason)
+    end
+end
