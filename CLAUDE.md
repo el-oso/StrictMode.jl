@@ -188,7 +188,7 @@ StrictMode/src/
                         statements from the scheduler's needs debug-info edges, which a compiled body
                         does not keep: _typed_body re-reads such a body with debuginfo = :source
                         (_runs_handed_callable), and without edges every statement counts as the
-                        caller's. The re-read keeps the scan's answer the same before and after
+                        caller's (_unsplit, asked once per body, not per statement). The re-read keeps the scan's answer the same before and after
                         the proof compiles the call (measured to differ without it). An origin below a scheduler call is the
                         scheduler's (_origin_in_scheduler) unless it is in such a callable or the path
                         from it passes through the package's code; _nonscheduler_origin reads a

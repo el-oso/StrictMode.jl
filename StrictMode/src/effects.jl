@@ -1268,7 +1268,8 @@ function _origin_in_scheduler(o)
     end
     ci = _typed_body(chain[k])
     isnothing(ci) && return false
-    return all(st -> _stmt_in_scheduler(ci, chain[k], st[1], true), o.statements)
+    unsplit = _unsplit(ci, chain[k])
+    return all(st -> _stmt_in_scheduler(ci, chain[k], st[1], true, unsplit), o.statements)
 end
 
 function _sig_runs_user_code(@nospecialize(sig))
@@ -1305,7 +1306,8 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
         ci = _typed_body(s)
         isnothing(ci) && return missing
         trace, callees = _origin_node(s, :alloc, caught)
-        sched && (trace = filter(st -> !_stmt_in_scheduler(ci, s, st[1], true), trace))
+        unsplit = sched && _unsplit(ci, s)
+        sched && (trace = filter(st -> !_stmt_in_scheduler(ci, s, st[1], true, unsplit), trace))
         if !isempty(trace)
             path = Any[]
             c = s
@@ -1318,7 +1320,7 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
         for (mi, c, j) in callees
             mi = mi::Core.MethodInstance
             (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi))) && continue
-            arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true))
+            arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true, unsplit))
             (sched && !arg) && continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
             push!(queue, (mi.specTypes, c, !arg && _in_scheduler(mi)))
@@ -1527,10 +1529,9 @@ end
 # code (or in such a body, `frame`), with neither the package's code nor a callable the scheduler was
 # handed (`_calls_argument`) inlined inside that? The proof tier asks the same of an allocation site's
 # frames (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
-function _stmt_in_scheduler(ci, @nospecialize(sig), pc::Int, frame::Bool = false)
-    # Without the record of what was inlined, a body that may run a handed callable cannot be split:
-    # every statement is counted as the caller's.
-    (frame && !_has_inlining_info(ci) && _runs_handed_callable(sig)) && return false
+# `unsplit` (`_unsplit`) depends on the body alone, so a caller asking about many statements passes it.
+function _stmt_in_scheduler(ci, @nospecialize(sig), pc::Int, frame::Bool = false, unsplit::Bool = frame && _unsplit(ci, sig))
+    (frame && unsplit) && return false
     di = ci.debuginfo
     sched = frame
     encl = sig
@@ -1562,6 +1563,10 @@ end
 
 # Whether a body records the calls inlined into its statements.
 _has_inlining_info(ci) = ci.debuginfo isa Core.DebugInfo && !isempty(ci.debuginfo.edges)
+
+# Whether a scheduler body may run a handed callable and does not record what was inlined: it cannot
+# be split, and every statement is counted as the caller's.
+_unsplit(ci, @nospecialize(sig)) = !_has_inlining_info(ci) && _runs_handed_callable(sig)
 
 # Whether `sig` is a scheduler body handed a callable it may run: an argument whose type has a call
 # method, as the function given to `lock(f, l)` has.
@@ -1873,7 +1878,9 @@ function _scan_ci(
     # function given to `lock(f, l)` is its caller's, inlined or called (`_calls_argument`).
     schedmemo = Ref{Union{Nothing, Bool}}(nothing)
     insched() = isnothing(schedmemo[]) ? (schedmemo[] = _sig_in_scheduler(sig))::Bool : schedmemo[]::Bool
-    schedstmt(i) = _stmt_in_scheduler(ci, sig, i, insched())
+    unsplitmemo = Ref{Union{Nothing, Bool}}(nothing)
+    unsplit() = isnothing(unsplitmemo[]) ? (unsplitmemo[] = _unsplit(ci, sig))::Bool : unsplitmemo[]::Bool
+    schedstmt(i) = insched() ? _stmt_in_scheduler(ci, sig, i, true, unsplit()) : _stmt_in_scheduler(ci, sig, i, false, false)
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if top && abscontainer === nothing && _abstract_container(T)
