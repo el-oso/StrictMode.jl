@@ -217,3 +217,52 @@
 
     @test_throws "no method matches" StrictMode.spin_wait_report(SpinPool.start_broken, (Int,))
 end
+
+@testitem "spin_wait_report reads a spin behind a Base call handed a user value" begin
+    using StrictMode
+
+    module SpinShow
+    const go = Threads.Atomic{Bool}(false)
+    struct Spin end
+    @noinline function spinwait()
+        while !go[]
+            yield()
+        end
+        return 1
+    end
+    # A `show` method that spins: Base's printing runs it.
+    Base.show(io::IO, ::Spin) = (spinwait(); print(io, "Spin"))
+    struct Parks end
+    @noinline park() = wait(Threads.Event())
+    Base.show(io::IO, ::Parks) = (park(); print(io, "Parks"))
+
+    direct() = fetch(Threads.@spawn spinwait())
+    # Blocks properly, and hands Base nothing of its own.
+    blocks() = fetch(Threads.@spawn park())
+    # The user type is concrete at the Base call; the spin is inside Base's printing of it.
+    viashow(s::Spin) = fetch(Threads.@spawn repr(s))
+    # The value reaches Base typed `Any`, so which `show` runs is not known from the IR.
+    viaany(r::Base.RefValue{Any}) = fetch(Threads.@spawn string("a", r[]))
+    # A `show` that parks, reached the same way as `viashow`.
+    viashow_parks(s::Parks) = fetch(Threads.@spawn repr(s))
+    end
+
+    clean(r) = isempty(r.findings) && isempty(r.unread) && iszero(r.unfollowed)
+
+    @test :yield in only(StrictMode.spin_wait_report(SpinShow.direct, ()).findings).polls
+
+    @test clean(StrictMode.spin_wait_report(SpinShow.blocks, ()))
+
+    # Base is not entered for a user value, so the call is counted and the report is not clean,
+    # whether the value's type is concrete at the call or not.
+    for (f, T) in (
+            (SpinShow.viashow, (SpinShow.Spin,)), (SpinShow.viaany, (Base.RefValue{Any},)),
+            (SpinShow.viashow_parks, (SpinShow.Parks,)),
+        )
+        r = StrictMode.spin_wait_report(f, T)
+        @test isempty(r.findings)
+        @test r.unfollowed > 0
+        @test !clean(r)
+        @test !occursin("no spin-wait loop", sprint(show, r))
+    end
+end

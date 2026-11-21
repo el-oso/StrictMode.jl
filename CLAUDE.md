@@ -551,7 +551,12 @@ StrictMode/src/
                         usually a named function) and into a Base callee only when it carries a
                         user function (a comprehension's Generator); Base is otherwise judged by
                         name and argument types and NOT entered, because yield itself parks through
-                        wait. `lock` is not a blocking operation (a SpinLock spins) and take! on an
+                        wait. A Base callee handed any other user value, or an argument typed
+                        abstractly (reach.jl's _reach_carries_user/_reach_open at the call-site
+                        types), may run that value's methods (show from repr) and is COUNTED as
+                        unfollowed, not entered: entering cost 25x on a worker passing user
+                        structs to repr/sort!/Dict (1.3 ms -> 32 ms, 44 bodies), measured.
+                        `lock` is not a blocking operation (a SpinLock spins) and take! on an
                         IO is not either. A task is created BOUND (Task(f), @async); only
                         Threads.@spawn's `sticky = false` write, matched on the task's own SSA
                         value, makes it migratable — bound tasks are counted, not judged, and the

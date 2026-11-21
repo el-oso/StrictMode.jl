@@ -18,7 +18,8 @@
 # The scan follows `:invoke` into callees outside Base, so a worker loop written as a named
 # function is read. A callee in Base is judged by its name and argument types and entered only
 # when it carries a user function: `yield` itself parks through `wait`, and entering it would read
-# every spin as blocking.
+# every spin as blocking. A Base callee handed any other user value, or an argument typed
+# abstractly, may run a method of that value (`show` from `repr`) and is counted as not followed.
 #
 # Whatever the scan could not read is counted and shown — a task whose closure type is unknown, a
 # dynamic call, a callee past the body limit — because an unread task is not a task that parks.
@@ -237,8 +238,17 @@ function _sw_scan!(r::_SwReach, ci::Core.CodeInfo, @nospecialize(sig), queue::Ve
                 r.unfollowed += 1
                 continue
             end
-            k = _sw_record!(r, mi.def.name, mi.specTypes)
-            k === :other && _sw_follows(mi) && push!(queue, mi.specTypes)
+            _sw_record!(r, mi.def.name, mi.specTypes) === :other || continue
+            if _sw_follows(mi)
+                push!(queue, mi.specTypes)
+            else
+                # A Base callee handed a user value, or an argument typed abstractly that may hold
+                # one, can run that value's methods (`show` from `repr`). It is not entered, since
+                # reading Base's bodies for every user value multiplies the bodies read, so it is
+                # counted.
+                site = _reach_invoke_types(ci, sig, st, mi)
+                (_reach_carries_user(site) || _reach_open(site)) && (r.unfollowed += 1)
+            end
         elseif st.head === :call
             v = _sw_callee_value(st.args[1])
             if v isa Core.IntrinsicFunction || v isa Core.Builtin
@@ -332,7 +342,10 @@ create a bound task, and `Threads.@spawn` releases it.
 Advisory, with these limits:
 
 - A blocking call inside a call that was not followed reads as absent. Those calls are counted in
-  each finding and in the report's `unfollowed`.
+  each finding and in the report's `unfollowed`. They include every Base call handed a value of
+  a type defined outside Base, or an argument typed abstractly (`Any`), other than a user function:
+  Base may run that value's methods, `show` from `repr` or `string`, and the scan does not enter
+  Base to see whether it does.
 - A task whose closure type is not concrete at the spawn site is listed in `unread`.
 - A loop that yields between units of work, without waiting for anything, is reported as well.
 - The tasks of `Threads.@threads` are created inside Base and are not found.
