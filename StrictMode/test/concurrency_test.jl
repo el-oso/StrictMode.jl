@@ -1163,17 +1163,20 @@ end
     struct Y end
     Base.show(io::IO, ::Y) = (yield(); print(io, "y"))
     struct Z; a::Int; end
+    struct ZY; y::Y; end
     held(::Int) = (i = threadid(); s = string(Y()); BUF[i] += length(s); nothing)
     plain(x::Int) = (i = threadid(); s = string(x, "a", 2.0); BUF[i] += length(s); nothing)
     zplain(z::Z) = (i = threadid(); s = string(z); BUF[i] += length(s); nothing)
+    zheld(z::ZY) = (i = threadid(); s = string(z); BUF[i] += length(s); nothing)
     end
-    Shows.held(1); Shows.plain(1); Shows.zplain(Shows.Z(1))
+    Shows.held(1); Shows.plain(1); Shows.zplain(Shows.Z(1)); Shows.zheld(Shows.ZY(Shows.Y()))
     tid(f, t) = only(StrictMode.findings(f, t; guarantees = (:no_threadid_state,))).status
-    # A yielding `show` is never cleared. On 1.13 `string` inlines to `print` and the yield is read
-    # (:fail); on 1.12 `print_to_string` stays out of line and is not read in full (:info).
-    @test tid(Shows.held, (Int,)) === (VERSION >= v"1.13-" ? :fail : :info)
+    @test tid(Shows.held, (Int,)) === :fail
     @test tid(Shows.plain, (Int,)) === :pass
-    @test tid(Shows.zplain, (Shows.Z,)) === (VERSION >= v"1.13-" ? :pass : :info)
+    # Base's default `show` of a struct is compiled for `Any` and called through a compiler barrier;
+    # it is read at the struct's own type, so the `show` of each field is read too.
+    @test tid(Shows.zplain, (Shows.Z,)) === :pass
+    @test tid(Shows.zheld, (Shows.ZY,)) === :fail
 end
 
 @testitem "per-thread state wrapped in a struct or tuple is still per-thread" begin

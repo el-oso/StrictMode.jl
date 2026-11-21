@@ -1539,7 +1539,10 @@ The scan reports a store to `buf[threadid()]`, whether the index is written in p
 local. It also reports a store into an object loaded out of such a slot, as in
 `buf[threadid()].field = …`, `buf[threadid()][i] = …` and `rand(rngs[threadid()])`. A slot's value
 passed to a callee that was not inlined counts when the callee writes it, or returns it and the
-caller then writes it. Suspension points are looked for in callees too.
+caller then writes it. Suspension points are looked for in callees too. Writing to an `IOBuffer`, or
+to an `IOContext` around one, and taking a `SpinLock` are not suspension points, so building a
+string is one only when the `show` of a value it prints can suspend, read through Base's default
+`show` of a struct into the `show` of each field.
 
 A thread id stored into another array and read back later is not tracked.
 

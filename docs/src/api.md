@@ -199,6 +199,11 @@ methods at run time, so it is counted as unread and the graph is not complete. `
 `` warns about an absent target instead of throwing, and `route_parity` reports
 `:incomplete` rather than `:agree`.
 
+A Base method compiled for `Any` (`@nospecialize`) that is handed a value of a type defined outside
+Base is read at the type it is handed. Base's default `show` of a struct is called this way,
+through a compiler barrier, and the walk reads the barrier's operand, so the `show` of each field
+is reached.
+
 ```@docs
 @assert_reaches
 reach_report

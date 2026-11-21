@@ -60,6 +60,8 @@ mutable struct _Reach
     bodies::Int
     unread::Int
     dynamic::Int
+    # A call whose callee signature this accepts is followed as usual and not recorded in `found`.
+    quiet::Any
 end
 
 _reach_key(m::Method) = (m.module, _demangle(m.name))
@@ -82,7 +84,8 @@ function _reach_inlined!(r::_Reach, di, depth::Int, stop)
         m = e.def isa Core.MethodInstance ? e.def.def : e.def
         if m isa Method
             key = _reach_key(m)
-            _reach_record!(r, key, depth, true)
+            e.def isa Core.MethodInstance && r.quiet(e.def.specTypes) ||
+                _reach_record!(r, key, depth, true)
             key in stop && continue
         end
         _reach_inlined!(r, e, depth, stop)
@@ -112,7 +115,21 @@ function _reach_inlined_through(di, pc::Int, stop)
     return false
 end
 
+# `Core.compilerbarrier` (`Base.inferencebarrier`) hands its operand back unchanged and typed `Any`;
+# Base's default `show` of a struct is called through one. The operand's type is the value's, and a
+# `π` of a barrier's result is that type narrowed by the `π`.
 function _reach_argtype(ci::Core.CodeInfo, @nospecialize(sig), @nospecialize(a))
+    if a isa Core.SSAValue
+        st = ci.code[a.id]
+        Meta.isexpr(st, :call) && length(st.args) == 3 &&
+            _sw_callee_value(st.args[1]) === Core.compilerbarrier &&
+            return _reach_argtype(ci, sig, st.args[3])
+        if st isa Core.PiNode
+            P = Core.Compiler.widenconst(st.typ)
+            T = typeintersect(P, _reach_argtype(ci, sig, st.val))
+            return T === Union{} ? P : T
+        end
+    end
     T = if a isa Core.SSAValue
         ci.ssavaluetypes isa Vector ? _widen_taint(ci.ssavaluetypes[a.id]) : Any
     elseif a isa Core.Argument
@@ -167,6 +184,16 @@ function _reach_invoke_types(ci::Core.CodeInfo, @nospecialize(sig), st::Expr, mi
         mi.specTypes
     end
 end
+# Whether the call-site types select the method an `:invoke` runs, so that reading the body at those
+# types reads that method. An `invoke` of a less specific method selects another one there.
+function _reach_same_method(@nospecialize(site), m::Method)
+    ms = try
+        Base._methods_by_ftype(site, 1, Base.get_world_counter())
+    catch
+        nothing
+    end
+    return ms isa Vector && length(ms) == 1 && only(ms).method === m
+end
 function _reach_open_arg(@nospecialize(T))
     T isa Core.TypeofVararg && return !isdefined(T, :T) || _reach_open_arg(T.T)
     T isa Union && return _reach_open_arg(T.a) || _reach_open_arg(T.b)
@@ -181,13 +208,13 @@ function _reach_dispatch!(
         depth::Int, stop, queue::Vector{Any}
     )
     key = _reach_key(f)
-    _reach_record!(r, key, depth, false)
-    key in stop && return nothing
     tt = try
         Tuple{Core.Typeof(f), (_reach_argtype(ci, sig, a) for a in st.args[2:end])...}
     catch
         nothing
     end
+    !isnothing(tt) && r.quiet(tt) || _reach_record!(r, key, depth, false)
+    key in stop && return nothing
     ms = isnothing(tt) ? nothing :
         Base._methods_by_ftype(tt, _REACH_MAX_METHODS, Base.get_world_counter())
     if !(ms isa Vector) || isempty(ms)
@@ -226,11 +253,15 @@ function _reach_scan!(
                 continue
             end
             key = _reach_key(mi.def)
-            _reach_record!(r, key, depth, false)
+            site = _reach_invoke_types(ci, sig, st, mi)
+            r.quiet(site) || _reach_record!(r, key, depth, false)
             if key in stop
             elseif _reach_follows(mi)
                 push!(queue, (mi.specTypes, depth))
-            elseif _reach_open(_reach_invoke_types(ci, sig, st, mi))
+            elseif _reach_carries_user(site) && _reach_same_method(site, mi.def)
+                # A Base method compiled for `Any` (`@nospecialize`) is handed a user value.
+                push!(queue, (site, depth))
+            elseif _reach_open(site)
                 r.dynamic += 1
             end
         elseif st.head === :call
@@ -252,8 +283,8 @@ function _reach_scan!(
 end
 
 # Breadth first, so a function's depth is its nearest occurrence.
-function _reach(@nospecialize(sig), stop)
-    r = _Reach(Dict{Tuple{Module, Symbol}, ReachedFunction}(), 0, 0, 0)
+function _reach(@nospecialize(sig), stop; quiet = Returns(false))
+    r = _Reach(Dict{Tuple{Module, Symbol}, ReachedFunction}(), 0, 0, 0, quiet)
     seen = Set{Any}()
     queue = Any[(sig, 0)]
     while !isempty(queue)
@@ -312,6 +343,8 @@ concrete Base types is neither entered nor counted. A Base call with an argument
 there at run time, so it is counted in `dynamic`. That includes the value of `fetch(t)`, which is
 `Any`: a route that fetches a task and computes with the result is not complete. Only the top
 level of an argument type is judged, so a `Vector{Any}` argument is concrete and not counted.
+Argument types are read at the call, and through a compiler barrier: Base's default `show` of a
+struct, compiled for `Any`, is entered at the struct's type when the struct is defined outside Base.
 
 `unread` and `dynamic` on the report count what could not be read, and the list is a lower bound
 when either is positive. For a keyword call, pass `Core.kwcall` and its signature:

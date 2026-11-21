@@ -214,3 +214,23 @@ end
     s2(r::Base.RefValue{Any}) = string("a", r[])
     @test !StrictMode.complete(StrictMode.reach_report(s2, (Base.RefValue{Any},)))
 end
+
+@testitem "a struct's default show is read at the struct's type" begin
+    using StrictMode
+    # `show` of a struct without its own method runs Base's `_show_default`, compiled for `Any` and
+    # called through a compiler barrier. The value is the struct, so it is read at that type.
+    @noinline hot(x) = 2x
+    struct W; v::Int; end
+    Base.show(io::IO, w::W) = print(io, hot(w.v))
+    struct Plain; a::Int; end
+    struct Holds; w::W; end
+    viaplain(p::Plain) = string(p)
+    viaholds(h::Holds) = string(h)
+    @test endswith(viaplain(Plain(1)), "Plain(1)")
+    @test endswith(viaholds(Holds(W(1))), "Holds(2)")
+    rp = StrictMode.reach_report(viaplain, (Plain,))
+    @test rp.dynamic == 0
+    @test StrictMode.complete(rp)
+    rh = StrictMode.reach_report(viaholds, (Holds,))
+    @test StrictMode.reaches(rh, hot)
+end

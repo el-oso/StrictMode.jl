@@ -270,6 +270,9 @@ StrictMode/src/
                         :notaskstate and runs the taint scan only otherwise. It GATES, because a
                         reported site is a store read from typed IR, not an unprovable inference —
                         its limit is recall, a threadid store in an unfollowable callee.
+                        Suspension inside a callee is read by _sig_may_suspend from reach.jl's
+                        graph; _inert_op leaves out a _SUSPEND_ON operation on an IOBuffer, an
+                        IOContext of one, DevNull or a SpinLock, while its callees are still read.
                         A sweep has nowhere to name WHICH argument is shared, so it reads argument
                         1: a `!` method therefore gets :info (its name declares that write), unless
                         the scan read a write to a constant global, which stays :fail, and an
@@ -682,6 +685,11 @@ StrictMode/src/
                         there. An :invoke is judged by its CALL-SITE argument types, since a
                         @nospecialize method instance (print_to_string, Vararg{Any}) is wider than
                         what an error-message interpolation of an Int passes.
+                        _reach_argtype reads a compilerbarrier (and a π of one) as its operand, and
+                        a @nospecialize Base :invoke handed a user type is ENTERED at the call-site
+                        types when they select the same method (_reach_same_method) — the default
+                        show of a struct is reached that way. _reach(…; quiet) leaves a callee
+                        signature out of `found` while still following it.
                         So a route that computes with fetch(t) (inferred Any) is incomplete. A run-time dispatch is followed
                         when it matches at most _REACH_MAX_METHODS methods. `stop` cuts a hub (a pool
                         dispatcher reaches every job).

@@ -1713,8 +1713,12 @@ const _STRING_BUILDERS = (:print_to_string, :string, :sprint, :repr, :_str_sizeh
 # Builtins that call a function given as an argument, whatever it does.
 const _CALLING_BUILTINS = (:invokelatest, :_apply_iterate, :_call_latest, :invoke, :invoke_in_world)
 
+# An `IOContext` is an `AbstractPipe` and hands IO and locking to the stream it wraps.
 _inert_target(@nospecialize(T)) =
-    T isa Type && (T <: Base.Threads.SpinLock || T <: Base.GenericIOBuffer || T <: Base.DevNull)
+    T isa Type && (
+    T <: Base.Threads.SpinLock || T <: Base.GenericIOBuffer || T <: Base.DevNull ||
+        (T isa DataType && T <: IOContext && _inert_target(T.parameters[1]))
+)
 
 # `:yes`, `:maybe` or `:no` for a Base operation in `_SUSPEND_ON`, from the type of the object it acts
 # on: a concrete object it cannot block on is `:no`, an abstract one is `:maybe`.
@@ -1729,14 +1733,26 @@ end
 const _SUSPEND_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
 const _SUSPEND_LOCK = ReentrantLock()
 
-# Whether a callee can suspend, from the Base functions its call graph reaches. The graph names a
-# function, not the object it acts on, so an operation in `_SUSPEND_ON` reached there is `:maybe`.
+# Whether a callee signature is an operation in `_SUSPEND_ON` on an object it cannot block on.
+function _inert_op(@nospecialize(sig))
+    sig = Base.unwrap_unionall(sig)
+    (sig isa DataType && length(sig.parameters) >= 2) || return false
+    F = sig.parameters[1]
+    (F isa DataType && isdefined(F, :instance)) || return false
+    f = F.instance
+    return f isa Function && _sw_is_base(parentmodule(f)) && nameof(f) in _SUSPEND_ON &&
+        _inert_target(sig.parameters[2])
+end
+
+# Whether a callee can suspend, from the Base functions its call graph reaches. An operation in
+# `_SUSPEND_ON` on an object it cannot block on is not counted (its callees still are); any other
+# one reached is `:maybe`, since the graph does not say what it acts on.
 function _sig_may_suspend(@nospecialize(sig))
     key = (sig, Base.get_world_counter())
     hit = @lock _SUSPEND_LOCK get(_SUSPEND_MEMO, key, nothing)
     isnothing(hit) || return hit
     r = try
-        _reach(sig, Set{Tuple{Module, Symbol}}())
+        _reach(sig, Set{Tuple{Module, Symbol}}(); quiet = _inert_op)
     catch
         nothing
     end
