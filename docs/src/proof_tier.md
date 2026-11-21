@@ -125,17 +125,20 @@ AnalysisError
 
 ### Barriers, juliac patches, and engine divergence
 
-`ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier is exempt
-from AllocCheck's all-paths proof. The proof still runs on a call that reaches a barrier; only the
-allocation sites the barrier accounts for are dropped. A site is the barrier's when its backtrace
-passes through the barrier, when none of its frames lies outside Base and Core, or when its function
-is reached from a barrier and on no path from the call that avoids one. The last case covers a
-helper the barrier calls from several places: it is compiled once, and AllocCheck ends its
-backtrace at a frame named "multiple call sites", so the backtrace cannot name the barrier. If the
-call also reaches that helper outside the barrier, its sites are kept, as they are whenever the
-call graph outside the barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
-signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
-*categories*, and versions only — that you can send to the maintainers to fix the scan.
+`ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier
+is exempt from AllocCheck's all-paths proof. The proof still runs on a call that reaches a
+barrier. When the value-free scan finds no allocation, boxing or abstract-eltype container in
+the call apart from the barrier, the allocation sites the barrier accounts for are dropped;
+otherwise every site is kept and reported, the barrier's included, so the proof is never more
+permissive than the scan. A site is the barrier's when its backtrace passes through the barrier,
+when none of its frames lies outside Base and Core, or when its function is reached from a barrier
+and on no path from the call that avoids one. The last case covers a helper the barrier calls
+from several places: it is compiled once, and AllocCheck ends its backtrace at a frame named
+"multiple call sites", so the backtrace cannot name the barrier. If the call also reaches that
+helper outside the barrier, its sites are kept, as they are whenever the call graph outside the
+barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
+signature and capture an **IP-free** record of any disagreement — anonymized signature shape,
+signal *categories*, and versions only — that you can send to the maintainers to fix the scan.
 
 A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
 dropped. A call whose every allocation lies inside such functions gets a result of its own from the
