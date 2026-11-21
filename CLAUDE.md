@@ -665,7 +665,11 @@ StrictMode/src/
                         defects. @inbounds is covered as :inbounds, read from ci.ssaflags via
                         _IR_FLAG_INBOUNDS, since it leaves no statement to match on; a
                         @propagate_inbounds method is clean and the caller that wrote @inbounds
-                        carries the finding. Gating form: StrictModeTest.test_no_unsafe
+                        carries the finding. A Ptr TYPE handed to any call is :Ptr
+                        (fail closed: lowered code cannot tell map(Ptr{T}, xs) from a call that
+                        only looks at the type) unless the callee is in _PTR_NAMERS or the call
+                        builds a tuple of nothing but types (a signature). Gating form:
+                        StrictModeTest.test_no_unsafe
                         A Ptr TYPE counts as `:Ptr` as an operand of ANY call except those that
                         only name it (_PTR_NAMERS: apply_type, isa, typeassert, <:, sizeof,
                         getfield of the type, cglobal, the ccall glue cconvert/unsafe_convert —

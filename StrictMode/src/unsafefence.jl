@@ -85,26 +85,32 @@ end
 
 _is_ptr_type(@nospecialize(v)) = v isa Type && v <: Ptr && v !== Union{}
 
-# The calls that take a pointer type only to name it: building another type from it
+# The calls that take a pointer type only to look at it: building another type from it
 # (`Vector{Ptr{T}}`, `Union{Ptr{T}, Nothing}`), testing or asserting a type, its size, a field of
-# the type object (`Ptr.body`), `cglobal`, which is reported by its own name, and the two
-# conversions a `ccall` lowers its arguments through: `cconvert(Ptr{T}, addr)` returns the integer,
-# and `unsafe_convert` is reported by its own name. Core has its own `sizeof`, `cconvert` and
-# `unsafe_convert`, which code written with Core's names calls. Any other call handed a pointer
-# type may apply it, as `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Base.Generator(Ptr{T}, addrs)`,
-# a splat `Ptr{T}(xs...)` and a keyword call do, and lowered code carries no types to tell which,
-# so it is reported. A comparison never reaches this.
+# the type object (`Ptr.body`), promoting or intersecting it, printing it, an uninitialized or
+# zero value of it (`similar(v, Ptr{T})`, `zero(Ptr{T})`), `cglobal`, which is reported by its own
+# name, and the two conversions a `ccall` lowers its arguments through: `cconvert(Ptr{T}, addr)`
+# returns the integer, and `unsafe_convert` is reported by its own name. Core has its own `sizeof`,
+# `cconvert` and `unsafe_convert`, which code written with Core's names calls, and the compiler's
+# lattice order `⊑` compares types. Any other call handed a pointer type may apply it, as
+# `map(Ptr{T}, addrs)`, `ntuple(Ptr{T}, n)`, `Base.Generator(Ptr{T}, addrs)`, a splat
+# `Ptr{T}(xs...)` and a keyword call do, and lowered code carries no types to tell which, so it is
+# reported. A comparison never reaches this.
 const _PTR_NAMERS = (
     Core.apply_type, isa, Core.typeassert, <:, >:, sizeof, Core.sizeof, typeintersect, getfield,
-    getproperty, cglobal, Base.cconvert, Base.unsafe_convert,
+    getproperty, cglobal, Base.cconvert, Base.unsafe_convert, Base.hasintersect, promote_type,
+    isbitstype, similar, zero, string, print,
     (getglobal(Core, n) for n in (:cconvert, :unsafe_convert) if isdefined(Core, n))...,
+    (getglobal(Base.Compiler, n) for n in (:⊑,) if isdefined(Base.Compiler, n))...,
 )
 
 # Whether a call hands a pointer type to a function that may apply it. `Ptr{T}[]` names the type
-# for an empty vector, and `Ptr{T}[a, b]` converts each element to it.
+# for an empty vector, and `Ptr{T}[a, b]` converts each element to it. A tuple of nothing but types
+# is a signature, `which(f, (Ptr{T}, Int))`; one holding any other value is reported.
 function _ptr_applied(@nospecialize(callee), args::Vector{Any}, resolve)
     any(g -> g === callee, _PTR_NAMERS) && return false
     callee === getindex && length(args) == 2 && return false
+    callee === Core.tuple && all(a -> resolve(a) isa Type, args[2:end]) && return false
     return any(a -> _is_ptr_type(resolve(a)), args[2:end])
 end
 
@@ -399,16 +405,20 @@ kept in a local to every module it is assigned, typed or not: `B = Base; B.unsaf
 instead of passing. Comparing a value with
 one (`f === unsafe_load`) is not. The C allocator is matched by identity, so a package's own
 function named `free` is not `Libc.free`. A pointer type is reported as an operand of any call
-other than one that only names it, since lowered code carries no types to tell a call that applies
-it (`map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`, `Base.Generator(Ptr{T}, addrs)`,
-`addr |> Ptr{T}`, a splat, a keyword call, a tuple that is applied later) from one that does not.
-The calls that only name it are building another type (`Vector{Ptr{T}}`, `Ref{Ptr{Cvoid}}`,
-`Union{Ptr{T}, Nothing}`), `isa`, a type assertion, `<:`, `>:`, a comparison, `sizeof`,
-`typeintersect`, a field of the type object, `cglobal`, the `ccall` conversions `cconvert` and
-`unsafe_convert`, and the empty typed literal `Ptr{T}[]`; `Ptr{T}[addr]` converts `addr` and is
-reported. Taking a `Ptr` argument builds no pointer and is not reported, and neither is arithmetic
-on one (`p + 8`): only arithmetic on a pointer constant such as `C_NULL` is, since the scan cannot
-tell a pointer argument from an integer in lowered code.
+other than one that only looks at the type, since lowered code carries no types to tell a call
+that applies it (`map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`,
+`Base.Generator(Ptr{T}, addrs)`, `addr |> Ptr{T}`, a splat, a keyword call, `Any[Ptr{T}]`) from one
+that does not. The calls that only look at it are building another type (`Vector{Ptr{T}}`,
+`Ref{Ptr{Cvoid}}`, `Union{Ptr{T}, Nothing}`), `isa`, a type assertion, `<:`, `>:`, a comparison,
+`sizeof`, `isbitstype`, `typeintersect`, `Base.hasintersect`, `promote_type`, `similar(v, Ptr{T})`,
+`zero(Ptr{T})`, `string`, `print`, a field of the type object, `cglobal`, the `ccall` conversions
+`cconvert` and `unsafe_convert`, a tuple of nothing but types (`which(f, (Ptr{T}, Int))`), and the
+empty typed literal `Ptr{T}[]`; `Ptr{T}[addr]` converts `addr` and is reported, and so is a tuple
+holding any other value, `(Ptr{T}, addr)`, which may be applied later. A tuple of types is not
+followed to where it is used, so `t = (Ptr{T}, Int); t[1](addr)` is missed.
+Taking a `Ptr` argument builds no pointer and is not reported, and neither is arithmetic on one
+(`p + 8`): only arithmetic on a pointer constant such as `C_NULL` is, since the scan cannot tell a
+pointer argument from an integer in lowered code.
 A conversion to a pointer type is reported whatever is converted: the scan reads lowered code,
 which carries no types, so `convert(Ptr{Cvoid}, p)` on a pointer reads like one on an address.
 

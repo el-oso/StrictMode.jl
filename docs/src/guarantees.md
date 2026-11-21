@@ -999,7 +999,8 @@ It looks for `ccall`, `@cfunction`, `pointer`, any function whose name begins wi
 pointer intrinsics (`pointerref`, `pointerset`), `llvmcall`, `cglobal`, the C allocator
 (`Libc.malloc`, `Libc.free`), a pointer made from an integer (`Ptr{T}(addr)`, `C_NULL + addr`, and `Ptr{T}` handed to
 any call that may apply it: `map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`;
-only calls that merely name the type, such as `Vector{Ptr{T}}` and `isa`, are exempt), and a `memoryrefnew`
+only calls that merely look at the type, such as `Vector{Ptr{T}}`, `isa`, `promote_type`, `string`
+and a tuple of types used as a signature, are exempt), and a `memoryrefnew`
 or `getfield` whose bounds check is a literal `false`. A function counts wherever the method names
 it: `map(unsafe_load, ps)`, `unsafe_load.(ps)`, a splat, a keyword call and a local alias are
 reported like the plain call. [`unsafe_report`](@ref) lists each construct with the name `allow`

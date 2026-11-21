@@ -535,3 +535,29 @@ end
     @test only(fs).func == "strlen"
     @test occursin("`ccall`", only(fs).reason) && !occursin("`Ptr`", only(fs).reason)
 end
+
+@testitem "unsafe_report clears a call that only looks at a pointer type" begin
+    using StrictMode
+
+    module FencePtrLooked
+    promoted(T) = promote_type(T, Ptr{Cvoid})
+    similar_to(v) = similar(v, Ptr{Cvoid})
+    null() = zero(Ptr{Cvoid})
+    shown(io) = print(io, Ptr{Cvoid})
+    named() = string(Ptr{Cvoid})
+    bits() = isbitstype(Ptr{Cvoid})
+    signature() = (Ptr{Float64}, Ptr{Float64}, Int)
+    found(f) = which(f, (Ptr{Cvoid},))
+    meets(T) = Base.hasintersect(T, Ptr{Cvoid})
+    end
+    @test isempty(unsafe_report(FencePtrLooked))
+
+    # A tuple holding anything but types can be applied later.
+    module FencePtrHeld
+    held(a) = (Ptr{Cvoid}, a)
+    end
+    @test only(unsafe_report(FencePtrHeld)).func == "held"
+
+    # StrictMode's own precompile workload names a pointer signature as a tuple of types.
+    @test !any(f -> f.func == "_run_workload", unsafe_report(StrictMode))
+end
