@@ -494,14 +494,16 @@ end
     top(x::Int) = mid(x) + 1
     plain_alloc(n::Int) = (a = Float64[]; push!(a, n); a)
     f = only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,)))
-    # Whether `yield` reaches an allocation depends on Base's implementation of it: where the scan finds
-    # none, there is no scheduler finding to name, and the call passes.
-    if StrictMode._failed(f)
-        @test f.code === :SM0017
-        @test occursin("blocks in the task scheduler", f.reason)
-        @test occursin("join_pool", f.reason) || occursin("yield", f.reason)
-        @test occursin("register_alloc_barrier!", f.suggestion) && occursin("@strict_exempt", f.suggestion)
-    end
+    # `yield` can allocate (a task queue grows, a work queue is created on first use), however many
+    # scheduler calls down Base's inlining leaves that allocation.
+    @test StrictMode._failed(f)
+    @test f.code === :SM0017
+    @test occursin("blocks in the task scheduler", f.reason)
+    @test occursin("join_pool", f.reason) || occursin("yield", f.reason)
+    @test occursin("register_alloc_barrier!", f.suggestion) && occursin("@strict_exempt", f.suggestion)
+    # scheduler code that allocates nothing passes: a `SpinLock` only spins
+    spin(l::Threads.SpinLock) = (lock(l); unlock(l); nothing)
+    @test !StrictMode._failed(only(StrictMode.findings(spin, (Threads.SpinLock,); guarantees = (:noalloc,))))
     @test occursin("scheduler", StrictMode.explain(:SM0017))
     # an allocation that is not in the scheduler stays an ordinary :noalloc finding
     g = only(StrictMode.findings(plain_alloc, (Int,); guarantees = (:noalloc,)))

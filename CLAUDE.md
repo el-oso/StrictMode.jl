@@ -169,7 +169,13 @@ StrictMode/src/
                         stops at the first allocation and reads Base only to _FAST_ALLOC_DEPTH, so a wait
                         met first says nothing about an allocation three Base calls down. That walk
                         follows Base to the end outside the scheduler's code, and a walk that cannot
-                        finish leaves the finding an ordinary SM0002.
+                        finish leaves the finding an ordinary SM0002. The verdict itself follows the
+                        scheduler's code to the end, like the package's own (_followed_to_end): how
+                        many calls down a wait allocates depends on what Base inlines (yield's queue
+                        growth is one Base level deeper on 1.12 than on 1.13, measured), so a fixed
+                        depth passed `yield()` on one release and failed it on the other. An origin
+                        below a scheduler call is the scheduler's (_origin_in_scheduler) unless the
+                        path from it passes through the package's code.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an

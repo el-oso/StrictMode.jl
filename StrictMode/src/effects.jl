@@ -414,10 +414,14 @@ const _SCHEDULER_FILES = ("task.jl", "condition.jl", "lock.jl", "locks-mt.jl", "
 _in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && mi.def.module === Base &&
     basename(string(mi.def.file)) in _SCHEDULER_FILES
 
-# A callee the scan follows below the Base levels: one defined outside Base and Core, or a Base
-# method handed the package's code or types to run (a closure given to `map`).
-function _enters_user_code(mi::Core.MethodInstance)
+# A callee the scan follows below the Base levels: one defined outside Base and Core, a Base method
+# handed the package's code or types to run (a closure given to `map`), or Base's task, lock and
+# condition code. Whether a wait allocates is decided several scheduler calls down (a task queue that
+# grows, a work queue made on first use), and how many depends on what Base inlines, which differs
+# between Julia releases: read to a fixed depth, the same `yield()` allocates on one and not another.
+function _followed_to_end(mi::Core.MethodInstance)
     mi.def isa Method || return false
+    _in_scheduler(mi) && return true
     root = Base.moduleroot(mi.def.module)
     return !(root === Base || root === Core) || _carries_user_type(mi.specTypes)
 end
@@ -1011,7 +1015,7 @@ function _signal_origin(
             # below it only boxing is looked for.
             cm = m !== :boxing && !isnothing(_mi_exempt_name(mi)) ? :boxing : m
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
-            user = _enters_user_code(mi)
+            user = _followed_to_end(mi)
             (depth > 0 || (depth < 0 && user)) || continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
             push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, cm))
@@ -1071,7 +1075,7 @@ function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbo
     x = first(o)
     # A wait is the nearest only because the walk meets it first: when the call also allocates
     # outside the scheduler, that allocation is the one to name.
-    if _sig_in_scheduler(x.signature)
+    if _origin_in_scheduler(x)
         y = try
             _nonscheduler_origin(f, types)
         catch
@@ -1095,6 +1099,28 @@ function _sig_in_scheduler(@nospecialize(sig))
     isnothing(m) && return false
     meth = m.method
     return meth.module === Base && basename(string(meth.file)) in _SCHEDULER_FILES
+end
+
+# Whether an origin `_signal_origin` found is the scheduler's: in its code, or in Base code its code
+# reached. The package's code a scheduler call runs (the function given to `lock`) is the package's,
+# and so is everything below it.
+function _origin_in_scheduler(o)
+    _sig_in_scheduler(o.signature) && return true
+    chain = Any[o.path..., o.signature]
+    k = findlast(_sig_in_scheduler, chain)
+    isnothing(k) && return false
+    return !any(_sig_runs_user_code, @view chain[(k + 1):end])
+end
+
+function _sig_runs_user_code(@nospecialize(sig))
+    m = try
+        Base._which(sig; raise = false)
+    catch
+        nothing
+    end
+    isnothing(m) && return true
+    root = Base.moduleroot(m.method.module)
+    return !(root === Base || root === Core) || _carries_user_type(sig)
 end
 
 # The nearest allocation or boxing the call reaches outside Base's task, lock and condition code:
@@ -1142,7 +1168,7 @@ end
 function _scheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     origins = _signal_origin(f, types; mode = :alloc)
     isempty(origins) && return nothing
-    all(o -> _sig_in_scheduler(o.signature), origins) || return nothing
+    all(_origin_in_scheduler, origins) || return nothing
     isnothing(_nonscheduler_origin(f, types)) || return nothing
     o = first(origins)
     via = join((first(string(p), 70) for p in last(o.path, 3)), " -> ")
@@ -1595,8 +1621,9 @@ function _scan_ci(
                         # The package's own code is followed to the end of its call graph (bounded by
                         # `_SCAN_BODY_BUDGET`): `depth` counts levels of Base only, since an allocation
                         # reached through a chain of the package's own helpers is as real as one in the
-                        # first. Below the last Base level `depth` is -1, which follows user code alone.
-                        user = _enters_user_code(mi)
+                        # first; so is the scheduler (`_followed_to_end`). Below the last Base level `depth` is -1,
+                        # which follows those alone.
+                        user = _followed_to_end(mi)
                         follows = depth > 0 || (depth < 0 && user)
                         # A callee can still change the answer while `undecided`: `:alloc` is decided by the
                         # first allocation or boxing, `:boxing` by the first boxing, and `:full` also needs the
