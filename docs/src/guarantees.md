@@ -1207,7 +1207,9 @@ Two limits, both real.
 `T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
 that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `map(unsafe_trust, us)`,
-`getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs, and so are the
+`getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. On untyped values a constant
+field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
+`getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs, and so are the
 calls that copy out an `isbits` payload's bits without raising: `reinterpret(T, [u])`,
 `write(io, Ref(u))`, `write(io, [u])`. Another generic method that copies what it is given, such as
 `Serialization.serialize`, is not seen. Printing,

@@ -217,7 +217,7 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
         # Comparing a value with a payload-reading function, or testing membership in a collection
         # of them, applies it to nothing.
         if !(callee in (===, !==, ==, !=, isequal, in, ∉))
-            _handed_on_reads!(certain, erased, ci, st, callee, args)
+            _handed_on_reads!(certain, erased, ci, st, callee, args, overridden)
         end
         # A call that copies out the bits of what it is given reads a payload it can reach:
         # `reinterpret(T, u)` (which raises at run time, like `u.x`), `reinterpret(T, [u])`,
@@ -254,8 +254,13 @@ end
 # hatch reads a payload wherever it is applied, since its one method takes an `Untrusted`. The
 # other two read one only when an `Untrusted` reaches them, so they count by what the call's
 # operands can hold: a site when one holds an `Untrusted`, an erased site when a type cannot rule
-# one out, and nothing when every type rules it out.
-function _handed_on_reads!(certain, erased, ci, @nospecialize(st), @nospecialize(callee), args)
+# one out, and nothing when every type rules it out. When the function itself is an operand and the
+# field it is applied with is a constant (`getfield.(xs, :a)`, `getproperty.(xs, :x)`), an erased
+# site is judged by the field rules a direct call is judged by.
+function _handed_on_reads!(
+        certain, erased, ci, @nospecialize(st), @nospecialize(callee), args,
+        overridden::Tuple{Bool, Bool}
+    )
     op = _call_operand(st)
     isnothing(op) && return nothing
     # A direct call of a payload-reading function is judged as a call, where this is called.
@@ -268,10 +273,37 @@ function _handed_on_reads!(certain, erased, ci, @nospecialize(st), @nospecialize
         return nothing
     end
     nm = nameof(first(carried))
-    reach = foldl(_max_reach, (_untrusted_reach(T) for T in Ts); init = :none)
+    # A callable this body built from the function itself, such as the `Broadcasted` that
+    # `getfield.(xs, :a)` makes and then materializes, was judged with the operands it was built
+    # from; only the operands it meets here are new.
+    reach = :none
+    for (a, T) in zip(ops, Ts)
+        _built_from(ci, a, carried) || (reach = _max_reach(reach, _untrusted_reach(T)))
+    end
     reach === :certain && push!(certain, nm)
-    reach === :maybe && push!(erased, nm)
+    reach === :maybe && !_handed_on_cleared(ci, ops, first(carried), overridden) && push!(erased, nm)
     return nothing
+end
+
+# Whether `a` is the value of a call in this body that had one of the functions `Fs` itself as an
+# operand.
+function _built_from(ci, @nospecialize(a), Fs)
+    a isa Core.SSAValue || return false
+    _, args = _call_callee_and_args(ci, ci.code[a.id])
+    return any(b -> any(F -> _unopt_arg_type(ci, b) === typeof(F), Fs), args)
+end
+
+# Whether `F`, an operand among `ops`, is applied to the operands after it with a constant field
+# in a way that cannot read the payload. A callable holding `F`, such as `Base.Fix2(getfield, :x)`,
+# carries the field where the operands do not show it, and is never cleared.
+function _handed_on_cleared(ci, ops, @nospecialize(F), overridden::Tuple{Bool, Bool})
+    k = findfirst(a -> _unopt_arg_type(ci, a) === typeof(F), ops)
+    isnothing(k) && return false
+    applied = ops[(k + 1):end]
+    length(applied) >= 2 || return false
+    fld = applied[2]
+    (fld isa QuoteNode || fld isa Symbol || fld isa Int) || return false
+    return !_erased_read(F, applied, overridden)
 end
 
 # The callee operand of a call statement as written, or `nothing` for a statement that is no call.
@@ -508,7 +540,11 @@ callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `ge
 handed on is a read wherever it goes, since its one method takes an `Untrusted`. `getfield` and
 `getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,
 array or `Ref` of them, and a read that cannot be ruled out when an operand's type does not rule
-one out (an `Any`, an abstract type, a struct with such a field). Registering `f` with
+one out (an `Any`, an abstract type, a struct with such a field). Handed on with a constant field,
+as in `getfield.(xs, :a)`, they are judged by the same field rules as a direct call, so
+`getfield.(xs, :a)` and `getproperty.(xs, :x)` on untyped values are not reported while
+`getfield.(xs, :x)` and `getfield.(xs, 1)` are; a callable holding the field, such as
+`Base.Fix2(getproperty, :a)`, is still a read that cannot be ruled out. Registering `f` with
 [`trust_boundary!`](@ref) permits all of them in that one method. A function with keywords keeps its code in a body function of its own; the
 positional and `Core.kwcall` methods are judged by that body, and a registered boundary's body is
 the boundary.

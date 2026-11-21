@@ -625,3 +625,31 @@ end
     @test status(clean_array, (UI, Vector{Int})).status === :pass
     @test status(clean_write, (UI, Int)).status === :pass
 end
+
+@testitem "a field read handed on by name is judged by that name" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    # Field `:a` and a two-argument `getproperty` raise on an `Untrusted`, whatever the name, so
+    # neither can hand out the payload.
+    gp_a(xs::Vector{Any}) = getproperty.(xs, :a)
+    gp_x(xs::Vector{Any}) = getproperty.(xs, :x)
+    gf_a(xs::Vector{Any}) = getfield.(xs, :a)
+    @test_throws "no readable fields" gp_a(Any[Untrusted(1)])
+    @test_throws "no readable fields" gp_x(Any[Untrusted(1)])
+    @test_throws FieldError gf_a(Any[Untrusted(1)])
+    for f in (gp_a, gp_x, gf_a)
+        @test status(f, (Vector{Any},)).status === :pass
+    end
+    # The payload field, by name or by index, still cannot be ruled out.
+    gf_x(xs::Vector{Any}) = getfield.(xs, :x)
+    gf_1(xs::Vector{Any}) = getfield.(xs, 1)
+    gp_x_order(xs::Vector{Any}) = getproperty.(xs, :x, :not_atomic)
+    @test gf_x(Any[Untrusted(42)]) == [42]
+    @test gf_1(Any[Untrusted(42)]) == [42]
+    for f in (gf_x, gf_1, gp_x_order)
+        r = status(f, (Vector{Any},))
+        @test StrictMode._failed(r)
+        @test occursin("may read an `Untrusted` payload", r.reason)
+    end
+end
