@@ -122,10 +122,11 @@ Each finding is one object (here pretty-printed):
 exempt from `:noalloc` by a declaration in their own module that account for every allocation,
 as `{"function": …, "reason": …}`.
 
-`guarantee` is one of `typestable | noalloc | noboxing | inlined | owned | vectorized |
-no_scalar_loops | no_spill | trim_compatible | trusted`; the
-advisory passes also emit `dispatch` (on by default), `coverage`, `inline_suggestion` and
-`static_ownership`. `status` is one of
+`guarantee` is one of `typestable | noalloc | noboxing | owned | inlined | vectorized |
+no_scalar_loops | no_spill | trim_compatible | trusted | noescape | no_threadid_state |
+concurrency_safe` (the members of `StrictMode._GUARANTEES`); the advisory passes also emit
+`dispatch` (on by default), `coverage`, `inline_suggestion` and `static_ownership`, and an
+advisory pass that errored on a signature emits `advisory` with status `info`. `status` is one of
 `fail | pass | info`:
 
 | status | meaning | counts as a failure? |
