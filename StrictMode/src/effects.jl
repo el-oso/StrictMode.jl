@@ -656,6 +656,10 @@ A throw that a catch handles is not an error path when the catch can return: eve
 body has the handler as a successor, so the message it builds and the exception it boxes count, and so
 does the handler. A throw raised inside a callee the try body calls counts too: the callee, and
 everything it calls, is read with no statement skipped as an error path.
+
+A handler that begins `err isa T || rethrow()` returns only for a `T`: a throw whose exception type is
+known, concrete and not a `T` ends in that rethrow, so the path to it is an error path, in the try body
+and in the callees below it.
 """
 ignore_throw() = _IGNORE_THROW[]
 
@@ -691,22 +695,36 @@ end
 # body is a few thousand statements and this runs for every body a walk reads.
 #
 # A throw that a catch handles is not an error path: every statement in a try region also has the
-# region's handler as a successor, so it is alive when the handler can return.
-function _deadend_mask(code::Vector{Any})
+# region's handler as a successor, so it is alive when the handler can return. A handler that
+# returns only for a type `T` (`_handler_filter`) is a successor only of the statements that may
+# throw something other than an exception known to be no `T` (`_rethrown`).
+#
+# `caught` is the context the body runs in (`_join_caught`): with a type `T`, a statement that may
+# throw, or the `unreachable` after a throw, is alive unless what it throws is known to be no `T`.
+# `ci` and `sig` give the statement types and flags those tests read; without them every handler
+# is taken to return whatever is thrown.
+function _deadend_mask(code::Vector{Any}, ci = nothing, @nospecialize(sig) = nothing, caught = false)
     n = length(code)
     iszero(n) && return falses(0)
     alive = falses(n)
     handlers = _try_handlers(code)
+    filters = isnothing(handlers) || isnothing(ci) ? nothing : Dict{Int, Any}()
+    filter_of(d) = isnothing(filters) ? nothing : get!(() -> _handler_filter(code, d), filters, d)
+    thrown = Dict{Int, Union{Nothing, Vector{Any}}}()
+    rethrown(i, T) = !isnothing(ci) && _rethrown(ci, sig, i, T, thrown)
+    via(i, d) = (T = filter_of(d); isnothing(T) || (_maythrow(ci, i) && !rethrown(i, T)))
     changed = true
     while changed
         changed = false
         for i in n:-1:1
             alive[i] && continue
             st = code[i]
-            up = if !isnothing(handlers) && any(d -> alive[d], handlers[i])
+            up = if !isnothing(handlers) && any(d -> alive[d] && via(i, d), handlers[i])
+                true
+            elseif caught isa Type && _maythrow(ci, i) && !rethrown(i, caught)
                 true
             elseif st isa Core.ReturnNode
-                isdefined(st, :val)
+                isdefined(st, :val) || (caught isa Type && !(i > 1 && rethrown(i - 1, caught)))
             elseif st isa Core.GotoNode
                 1 <= st.label <= n && alive[st.label]
             elseif st isa Core.GotoIfNot
@@ -824,17 +842,129 @@ end
 # those from which no path returns normally. A body scanned in a caught context (`caught`) is called
 # from a try region whose handler can return, so a throw anywhere in it ends in that handler and no
 # statement of it is an error path.
-_skip_mask(code::Vector{Any}, caught::Bool = false) =
-    ignore_throw() && !caught ? _deadend_mask(code) .| _unreachable_mask(code) : _unreachable_mask(code)
+_skip_mask(code::Vector{Any}, caught = false, ci = nothing, @nospecialize(sig) = nothing) =
+    ignore_throw() && caught !== true ? _deadend_mask(code, ci, sig, caught) .| _unreachable_mask(code) :
+    _unreachable_mask(code)
 
 # The statements of a try region whose handler is not an error path (`dead`): a call there whose
 # callee throws continues at a handler that can return, so the callee is scanned in a caught context.
 # `nothing` for a body with no such region.
 function _caught_region_mask(code::Vector{Any}, dead::BitVector)
+    ctx = _caught_contexts(code, dead)
+    isnothing(ctx) && return nothing
+    return BitVector(c !== false for c in ctx)
+end
+
+# The caught context of each statement's callees (`_join_caught`): `false` outside a try region whose
+# handler can return, else what its handlers return for. `nothing` for a body with no such region.
+# Without `ci`, every handler is taken to return whatever is thrown.
+function _caught_contexts(code::Vector{Any}, dead::BitVector, ci = nothing)
     handlers = _try_handlers(code)
     isnothing(handlers) && return nothing
-    mask = BitVector(any(d -> !dead[d], handlers[i]) for i in eachindex(code))
-    return any(mask) ? mask : nothing
+    filters = Dict{Int, Any}()
+    ctx = Any[false for _ in eachindex(code)]
+    for i in eachindex(code), d in handlers[i]
+        dead[d] && continue
+        T = isnothing(ci) ? nothing : get!(() -> _handler_filter(code, d), filters, d)
+        ctx[i] = _join_caught(ctx[i], isnothing(T) ? true : T)
+    end
+    return any(c -> c !== false, ctx) ? ctx : nothing
+end
+
+# A caught context says what happens to an exception a body throws: `false`, nothing catches it, so
+# under `ignore_throw()` its path is an error path; `true`, a handler that can return catches
+# anything; a type `T`, a handler returns for a `T` and rethrows anything else (`_handler_filter`), so
+# the path to a throw known to be no `T` is still an error path. Two contexts join to what either
+# returns for.
+_join_caught(a, b) = (a === true || b === true) ? true : a === false ? b : b === false ? a : Union{a, b}
+
+# The exception type the handler at `d` returns for, when it begins `catch err; err isa T || rethrow()`:
+# its first test is `isa` of the caught exception against a constant type, and the branch where the
+# test fails only rethrows. `nothing` for any other handler, which is taken to return whatever is
+# thrown.
+function _handler_filter(code::Vector{Any}, d::Int)
+    n = length(code)
+    i = _skip_nothing(code, d)
+    (i <= n && Meta.isexpr(code[i], :the_exception)) || return nothing
+    e = Core.SSAValue(i)
+    i = _skip_nothing(code, i + 1)
+    i < n || return nothing
+    st = code[i]
+    (Meta.isexpr(st, :call) && length(st.args) == 3 && _static_callee(nothing, st.args[1]) === Core.isa &&
+        st.args[2] == e) || return nothing
+    a = st.args[3]
+    T = a isa Type ? a : _static_callee(nothing, a)
+    T isa Type || return nothing
+    br = code[i + 1]
+    (br isa Core.GotoIfNot && br.cond == Core.SSAValue(i)) || return nothing
+    return _only_rethrows(code, br.dest, e) ? T : nothing
+end
+
+function _skip_nothing(code::Vector{Any}, i::Int)
+    while i <= length(code) && code[i] === nothing
+        i += 1
+    end
+    return i
+end
+
+# Whether the statements from `j` rethrow the caught exception `e` and stop: `rethrow()` or
+# `throw(e)`, then `unreachable`.
+function _only_rethrows(code::Vector{Any}, j::Int, e::Core.SSAValue)
+    j = _skip_nothing(code, j)
+    j < length(code) || return false
+    st = code[j]
+    ok = if Meta.isexpr(st, :invoke)
+        mi = _invoke_mi(st.args[1])
+        !isnothing(mi) && mi.def isa Method && mi.def.name === :rethrow && mi.def.module === Base &&
+            length(st.args) == 2
+    elseif Meta.isexpr(st, :call)
+        c = _static_callee(nothing, st.args[1])
+        (c === Core.throw && length(st.args) == 2 && st.args[2] == e) || (c === Base.rethrow && length(st.args) == 1)
+    else
+        false
+    end
+    ok || return false
+    r = code[_skip_nothing(code, j + 1)]
+    return r isa Core.ReturnNode && !isdefined(r, :val)
+end
+
+# Whether statement `i` may throw: the optimizer did not prove it cannot. Without the flags, it may.
+const _IR_FLAG_NOTHROW = Base.Compiler.IR_FLAG_NOTHROW
+_maythrow(ci, i::Int) = isnothing(ci) || iszero(ci.ssaflags[i] & _IR_FLAG_NOTHROW)
+
+# Whether statement `i` throws only exceptions known to be no `T`: each type it can throw is known
+# (`_thrown_types`) and none is a `T`. `memo` keeps the thrown types by statement.
+function _rethrown(ci, @nospecialize(sig), i::Int, @nospecialize(T), memo::Dict{Int, Union{Nothing, Vector{Any}}})
+    ts = get!(() -> _thrown_types(ci, sig, i), memo, i)
+    return !isnothing(ts) && all(E -> !(E <: T), ts)
+end
+
+# The types the statement `i` can throw when it always throws and every one is known and concrete:
+# `throw(x)` with `x` of a concrete type, or a call into a body whose every throw is one (a few
+# levels deep, as `throw_boundserror` is one). `nothing` otherwise.
+function _thrown_types(ci, @nospecialize(sig), i::Int, level::Int = 0)
+    st = ci.code[i]
+    if Meta.isexpr(st, :call) && length(st.args) == 2 && _static_callee(ci, st.args[1]) === Core.throw
+        E = _unwrap_lattice(_stmt_arg_type(ci, sig, st.args[2]))
+        return E isa DataType && isconcretetype(E) ? Any[E] : nothing
+    elseif Meta.isexpr(st, :invoke) && ci.ssavaluetypes[i] === Union{} && level < 4
+        mi = _invoke_mi(st.args[1])
+        isnothing(mi) && return nothing
+        body = _typed_body(mi.specTypes)
+        isnothing(body) && return nothing
+        out = Any[]
+        for j in eachindex(body.code)
+            r = body.code[j]
+            r isa Core.ReturnNode || continue
+            isdefined(r, :val) && return nothing
+            j > 1 || return nothing
+            ts = _thrown_types(body, mi.specTypes, j - 1, level + 1)
+            isnothing(ts) && return nothing
+            append!(out, ts)
+        end
+        return isempty(out) ? nothing : out
+    end
+    return nothing
 end
 
 # Session memo for the per-signature scan: the callee recursion re-visits shared helpers (Base
@@ -845,7 +975,7 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol, Any}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 # A body already on this walk contributes nothing a second time, so a result computed below such a
@@ -857,7 +987,7 @@ _cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)
 # A body is scanned once per context and mode: what it allocates on its throw paths counts only in a
 # caught context (`_skip_mask`), and a body below an exempt callee is also read for boxing alone, so
 # the walk records and memoizes each separately.
-function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, caught::Bool = false)
+function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, caught = false)
     visit = (sig, mode, caught)
     if visit in seen
         _cut_counter()[] += 1
@@ -874,7 +1004,7 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any},
     before = cuts[]
     r = _signals_by_type_uncached(sig, depth, seen, mode, caught)
     cuts[] == before || return r
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol, Bool}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol, Any}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
@@ -1033,13 +1163,13 @@ function _signal_origin(
                 hs, dyn, whole = _handed_code(mi.specTypes)
                 for h in hs
                     haskey(parent, h) || (parent[h] = mi.specTypes)
-                    push!(queue, (h, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, m))
+                    push!(queue, (h, user ? depth : (depth > 1 ? depth - 1 : -1), c, m))
                 end
                 (dyn || !whole) || continue
                 whole && (cm = :boxing)
             end
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, cm))
+            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c, cm))
         end
     end
     return out
@@ -1051,9 +1181,9 @@ end
 # Every warning walks the call graph below its call, and the calls of one package share most of that
 # graph, so a body is scanned once per world and context and not once per warning.
 # Emptied with the other scan memos.
-const _ORIGIN_MEMO = IdDict{Any, Dict{Tuple{Symbol, Bool}, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
+const _ORIGIN_MEMO = IdDict{Any, Dict{Tuple{Symbol, Any}, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
 
-function _origin_node(@nospecialize(s), mode::Symbol, caught::Bool = false)
+function _origin_node(@nospecialize(s), mode::Symbol, caught = false)
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK begin
         bymode = get(_ORIGIN_MEMO, s, nothing)
@@ -1068,19 +1198,19 @@ function _origin_node(@nospecialize(s), mode::Symbol, caught::Bool = false)
         own = Base.IdSet{Any}()
         push!(own, s)
         _scan_ci(ci, s, 0, own, mode, false, trace; caught)
-        dead = _skip_mask(ci.code, caught)
-        region = caught || !ignore_throw() ? nothing : _caught_region_mask(ci.code, dead)
+        dead = _skip_mask(ci.code, caught, ci, s)
+        region = caught === true || !ignore_throw() ? nothing : _caught_contexts(ci.code, dead, ci)
         for (j, st) in enumerate(ci.code)
             (Meta.isexpr(st, :invoke) && !dead[j]) || continue
             a1 = st.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
             _mi_is_strictmode(mi) && continue
-            push!(callees, (mi, caught || (!isnothing(region) && region[j]), j))
+            push!(callees, (mi, isnothing(region) ? caught : _join_caught(caught, region[j]), j))
         end
     end
     @lock _SIGNAL_MEMO_LOCK begin
-        get!(Dict{Tuple{Symbol, Bool}, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[(mode, caught)] = (world, trace, callees)
+        get!(Dict{Tuple{Symbol, Any}, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[(mode, caught)] = (world, trace, callees)
     end
     return trace, callees
 end
@@ -1188,7 +1318,7 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true))
             (sched && !arg) && continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, c::Bool, !arg && _in_scheduler(mi)))
+            push!(queue, (mi.specTypes, c, !arg && _in_scheduler(mi)))
         end
     end
     return nothing
@@ -1216,7 +1346,7 @@ function _barrier_stops(@nospecialize(f), @nospecialize(types::Tuple))
     return unique(stops)
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught::Bool)
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught)
     ci = _typed_body(sig)
     isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
     return _scan_ci(ci, sig, depth, seen, mode; caught)
@@ -1682,7 +1812,7 @@ end
 
 function _scan_ci(
         ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
-        trace::Union{Nothing, Vector{Any}} = nothing; caught::Bool = false
+        trace::Union{Nothing, Vector{Any}} = nothing; caught = false
     )
     alloc = false
     boxing = false
@@ -1703,10 +1833,10 @@ function _scan_ci(
     # Corpus-measured (PureBLAS + PureIPM, 120 specializations): 57 frames reach no such statement.
     escmemo = Ref{Union{Nothing, Bool}}(nothing)
     newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
-    dead = _skip_mask(ci.code, caught)
+    dead = _skip_mask(ci.code, caught, ci, sig)
     # A callee called from a try region whose handler can return is scanned in a caught context.
-    region = caught || !ignore_throw() ? nothing : _caught_region_mask(ci.code, dead)
-    callee_caught(i) = caught || (!isnothing(region) && region[i])
+    region = caught === true || !ignore_throw() ? nothing : _caught_contexts(ci.code, dead, ci)
+    callee_caught(i) = isnothing(region) ? caught : _join_caught(caught, region[i])
     # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
     # Both branches are asserted, like `newsdead` above. Without it the memo's `Union{Nothing, …}`
     # is the closure's return type: the `isnothing` check narrows the FIRST load of the `Ref`, and

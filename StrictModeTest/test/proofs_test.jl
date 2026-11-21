@@ -1086,6 +1086,90 @@ end
     @test StrictMode._failed(only(StrictMode.findings(E.calls_boxer, (Int,); guarantees = (:noboxing,))))
 end
 
+@testitem "a throw a catch rethrows by its type is an error path" begin
+    using StrictMode, StrictModeTest, Test
+
+    module TypedCatch
+    const NEG = ArgumentError("negative")
+    # Throws an `ArgumentError` it does not build, or nothing.
+    @noinline argcheck(i::Int) = (i < 0 && throw(NEG); i)
+    # Builds the message of the `ArgumentError` it throws.
+    @noinline argmsg(i::Int) = (i < 0 && throw(ArgumentError(string("negative: ", i))); i)
+    # An out-of-bounds index builds a `BoundsError` inside `throw_boundserror`.
+    @noinline bin!(v::Vector{Int}, i::Int) = (v[i] += 1; nothing)
+    const FLAG = Ref(false)
+    # The handler returns for an `ArgumentError` and rethrows anything else, so the `BoundsError`
+    # path ends in a rethrow, called or inlined.
+    @noinline function rethrows_bounds(v::Vector{Int}, i::Int)
+        try
+            argcheck(i)
+            bin!(v, i)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function rethrows_bounds_inline(v::Vector{Int}, i::Int)
+        try
+            argcheck(i)
+            v[i] += 1
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    # Failing controls: the thrown `ArgumentError` is one the handler returns for, and a handler
+    # that rethrows depending on a value returns for a `BoundsError` too.
+    @noinline function keeps_argument(v::Vector{Int}, i::Int)
+        try
+            argmsg(i)
+            bin!(v, i)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    @noinline function rethrows_on_value(v::Vector{Int}, i::Int)
+        try
+            argcheck(i)
+            bin!(v, i)
+        catch err
+            FLAG[] || rethrow()
+            return false
+        end
+        return true
+    end
+    end
+    T = TypedCatch
+    tt = (Vector{Int}, Int)
+    for f in (T.rethrows_bounds, T.rethrows_bounds_inline, T.keeps_argument, T.rethrows_on_value)
+        for i in (1, -1, 3)
+            try
+                f([1], i)
+            catch
+            end
+        end
+    end
+    proof(f, g) = only(StrictModeTest._proof_findings(f, tt, (g,)))
+    scan(f, g) = only(StrictMode.findings(f, tt; guarantees = (g,)))
+    for g in (:noalloc, :noboxing)
+        for f in (T.rethrows_bounds, T.rethrows_bounds_inline)
+            @test !StrictMode._failed(scan(f, g))
+            @test !StrictMode._failed(proof(f, g))
+        end
+        for f in (T.keeps_argument, T.rethrows_on_value)
+            @test StrictMode._failed(scan(f, g))
+            @test StrictMode._failed(proof(f, g))
+        end
+    end
+    for f in (T.rethrows_bounds, T.rethrows_bounds_inline, T.keeps_argument, T.rethrows_on_value)
+        @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
+    end
+end
+
 @testitem "reading the caught exception is not an allocation" begin
     using StrictMode, StrictModeTest, Test
 

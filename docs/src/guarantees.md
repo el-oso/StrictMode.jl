@@ -218,6 +218,16 @@ calls, since any throw below it ends in that handler. Both tiers count what the 
 the scan keeps a separate verdict for each body read in that context, and the proof keeps a site whose
 frames outside the caught call lie on no error path.
 
+A handler that returns only for one type of exception is read as such when the typed IR shows it:
+`catch err; err isa T || rethrow(); …`, whose first test is `isa` of the caught exception against a
+constant type and whose other branch only rethrows. A throw whose exception type is known and
+concrete and is not a `T` ends in that rethrow, so the path to it is an error path again, in the try
+body and in every callee below it: the `BoundsError` of an out-of-bounds index under
+`err isa ArgumentError || rethrow()` does not count. A throw of a `T`, or of a type the IR does not
+name, still counts, and so does any statement on the way that may itself throw, since what it throws
+may be a `T`. A handler that decides by anything else, such as a value, is taken to return whatever is
+thrown. Both tiers read handlers this way.
+
 **A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
 follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the
 same value twice: `ldiv!(U, b)` for a triangular `U` solves in place by calling `_ldiv!(b, U, b)`, which

@@ -162,14 +162,16 @@ const _THROW_ONLY_RUNTIME = (
 # inside it do on their own error paths ends in that handler; one on a handler statement keeps it only
 # when no group inside lies on an error path, since a throw raised in a callee the handler calls is not
 # caught by that try. A backtrace AllocCheck cut short ("multiple call sites") is judged on the groups
-# it has.
+# it has. A try region whose handler returns only for a type `T` (`StrictMode._handler_filter`) keeps
+# the site only when no group inside it is on the way to a throw known to be no `T`: each group inside
+# is judged in that caught context (`StrictMode._join_caught`), as the scan reads those bodies.
 function _caught_sites(extra)
     interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
-    bodies = IdDict{Core.MethodInstance, Any}()
+    bodies = Dict{Tuple{Core.MethodInstance, Any}, Any}()
     return filter(extra) do a
         a isa AllocCheck.AllocatingRuntimeCall && a.name in _THROW_ONLY_RUNTIME && return false
         hasproperty(a, :backtrace) || return false
-        classes = Symbol[]
+        groups = Tuple{Core.MethodInstance, Vector{Base.StackTraces.StackFrame}, Any}[]
         group = Base.StackTraces.StackFrame[]
         callee = nothing
         for fr in a.backtrace
@@ -177,42 +179,51 @@ function _caught_sites(extra)
             fr.inlined && continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || break
-            push!(classes, _location_class(get!(() -> _body_classes(interp, mi), bodies, mi), group, callee))
+            push!(groups, (mi, copy(group), callee))
             empty!(group)
             callee = mi
         end
+        ctx = false
         inhandler = false
-        for c in Iterators.reverse(classes)
-            c === :dead && return false
-            c === :caught && return true
-            inhandler |= c === :handler
+        for (mi, g, c) in Iterators.reverse(groups)
+            cls, rctx = _location_class(get!(() -> _body_classes(interp, mi, ctx), bodies, (mi, ctx)), g, c)
+            cls === :dead && return false
+            if cls === :caught
+                ctx = StrictMode._join_caught(ctx, rctx)
+                ctx === true && return true
+            elseif ctx === false
+                inhandler |= cls === :handler
+            end
         end
-        return inhandler
+        return ctx !== false || inhandler
     end
 end
 
 # Each statement of `mi`'s optimized body as `:dead` (an error path under `ignore_throw()`),
 # `:caught` (in a try region whose handler can return), `:handler` (a statement of a handler, reached
 # only through a catch, that is not an error path) or `:live`, with the line of each inlining level,
-# outermost first, and the specialization of each `:invoke`. `nothing` for a body that cannot be read.
-function _body_classes(interp, mi::Core.MethodInstance)
+# outermost first, the specialization of each `:invoke`, and the caught context a `:caught` statement's
+# handlers give (`StrictMode._caught_contexts`). `ctx` is the caught context the body runs in.
+# `nothing` for a body that cannot be read.
+function _body_classes(interp, mi::Core.MethodInstance, ctx = false)
     src = try
         Base.Compiler.typeinf_code(interp, mi, true)
     catch
         nothing
     end
     src isa Core.CodeInfo || return nothing
-    dead = StrictMode._deadend_mask(src.code)
-    region = StrictMode._caught_region_mask(src.code, dead)
+    dead = StrictMode._deadend_mask(src.code, src, mi.specTypes, ctx)
+    region = StrictMode._caught_contexts(src.code, dead, src)
     handler = isnothing(StrictMode._try_handlers(src.code)) ? falses(length(src.code)) : _catch_only_mask(src.code)
     classes = [
-        dead[i] ? :dead : !isnothing(region) && region[i] ? :caught : handler[i] ? :handler : :live
+        dead[i] ? :dead : !isnothing(region) && region[i] !== false ? :caught : handler[i] ? :handler : :live
             for i in eachindex(src.code)
     ]
+    ctxs = isnothing(region) ? Any[false for _ in eachindex(src.code)] : region
     invoked = [
         Meta.isexpr(st, :invoke) ? StrictMode._invoke_mi(st.args[1]) : nothing for st in src.code
     ]
-    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked)
+    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs)
 end
 
 # The live statements a caught throw reaches: those in a try region whose handler can return, and
@@ -237,22 +248,23 @@ _stmt_lines(src::Core.CodeInfo, mi::Core.MethodInstance, pc::Int) =
 # `:handler`, then `:live`. A group that matches no statement is `:live`: it says nothing either way.
 # For a group that called `callee` (the next group in), only the statements that invoke it are read
 # when one matches: lines alone cannot tell a call in a try body from one in its handler written on
-# the same line.
+# the same line. The class comes with the caught context of the `:caught` statements matched, joined.
 const _CLASS_RANK = Dict(:dead => 0, :live => 1, :handler => 2, :caught => 3)
 
 function _location_class(body, group::Vector{Base.StackTraces.StackFrame}, callee = nothing)
-    isnothing(body) && return :live
-    classes, stacks, invoked = body
+    isnothing(body) && return (:live, false)
+    classes, stacks, invoked, ctxs = body
     if !isnothing(callee)
-        best, cls = _location_class(classes, stacks, group, i -> invoked[i] === callee)
-        best > 0 && return cls
+        best, cls, ctx = _location_class(classes, stacks, ctxs, group, i -> invoked[i] === callee)
+        best > 0 && return (cls, ctx)
     end
-    return last(_location_class(classes, stacks, group, Returns(true)))
+    _, cls, ctx = _location_class(classes, stacks, ctxs, group, Returns(true))
+    return (cls, ctx)
 end
 
-function _location_class(classes, stacks, group, keep)
+function _location_class(classes, stacks, ctxs, group, keep)
     want = [fr.line for fr in Iterators.reverse(group)]
-    best, cls = 0, :live
+    best, cls, ctx = 0, :live, false
     for i in eachindex(classes)
         keep(i) || continue
         s = stacks[i]
@@ -260,12 +272,13 @@ function _location_class(classes, stacks, group, keep)
         (0 < k <= length(want) && k >= best && s == view(want, 1:k)) || continue
         c = classes[i]
         if k > best
-            best, cls = k, c
+            best, cls, ctx = k, c, false
         elseif _CLASS_RANK[c] > _CLASS_RANK[cls]
             cls = c
         end
+        c === :caught && (ctx = StrictMode._join_caught(ctx, ctxs[i]))
     end
-    return best, cls
+    return best, cls, ctx
 end
 
 function _is_call_through(@nospecialize(fr))
@@ -387,12 +400,12 @@ function _native_walk(@nospecialize(f), @nospecialize(types))
     caught = false
     entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
     parent = IdDict{Any, Any}(entry => nothing)
-    visited = Set{Tuple{Core.MethodInstance, Bool}}([(entry, false)])
-    work = Tuple{Core.MethodInstance, Bool}[(entry, false)]
+    visited = Set{Tuple{Core.MethodInstance, Any}}([(entry, false)])
+    work = Tuple{Core.MethodInstance, Any}[(entry, false)]
     while !isempty(work)
         mi, incaught = pop!(work)
         steps, c = _walk_body(interp, world, mi, incaught)
-        caught |= c | incaught
+        caught |= c | (incaught !== false)
         for step in steps
             if step isa Tuple
                 callee, ctx = step
@@ -422,30 +435,37 @@ end
 # What the walk reads from one optimized body: in statement order, each `:invoke` as its
 # specialization and whether it is called in a caught context, and the callee name of each dynamic
 # call (a `Symbol`); and whether a statement read is one a caught throw reaches (`_caught_mask`). In a
-# caught context (`incaught`) no statement is an error path, and every callee is read in one too.
-function _walk_body(interp, world::UInt, mi::Core.MethodInstance, incaught::Bool = false)
-    return _kept(incaught ? _WALK_CAUGHT_MEMO : _WALK_MEMO, mi, world, Returns(nothing)) do
-        src = Base.Compiler.typeinf_code(interp, mi, true)
-        src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
-        skip = StrictMode.ignore_throw() && !incaught
-        dead = skip ? StrictMode._deadend_mask(src.code) : falses(length(src.code))
-        caught = skip && any(_caught_mask(src.code, dead))
-        region = skip ? StrictMode._caught_region_mask(src.code, dead) : nothing
-        steps = Any[]
-        for (i, st) in pairs(src.code)
-            dead[i] && continue
-            if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
-                callee = StrictMode._invoke_mi(st.args[1])
-                isnothing(callee) || push!(steps, (callee, incaught || (!isnothing(region) && region[i])))
-            elseif Meta.isexpr(st, :call)
-                ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
-                ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
-                c = StrictMode._static_callee(src, st.args[1])
-                push!(steps, c isa Function ? nameof(c) : Symbol(ft))
-            end
+# caught context (`incaught`, `StrictMode._join_caught`) that returns whatever is thrown no statement
+# is an error path; in one that returns only for a type, the way to a throw known to be no such type
+# still is. Each callee is read in the context of its call. A body read in a type's context is not
+# kept: such a context is rare, and the memos hold the other two.
+function _walk_body(interp, world::UInt, mi::Core.MethodInstance, incaught = false)
+    read() = _walk_body_read(interp, mi, incaught)
+    incaught isa Type && return read()
+    return _kept(read, incaught ? _WALK_CAUGHT_MEMO : _WALK_MEMO, mi, world, Returns(nothing))
+end
+
+function _walk_body_read(interp, mi::Core.MethodInstance, incaught)
+    src = Base.Compiler.typeinf_code(interp, mi, true)
+    src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
+    skip = StrictMode.ignore_throw() && incaught !== true
+    dead = skip ? StrictMode._deadend_mask(src.code, src, mi.specTypes, incaught) : falses(length(src.code))
+    caught = skip && any(_caught_mask(src.code, dead))
+    region = skip ? StrictMode._caught_contexts(src.code, dead, src) : nothing
+    steps = Any[]
+    for (i, st) in pairs(src.code)
+        dead[i] && continue
+        if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
+            callee = StrictMode._invoke_mi(st.args[1])
+            isnothing(callee) || push!(steps, (callee, isnothing(region) ? incaught : StrictMode._join_caught(incaught, region[i])))
+        elseif Meta.isexpr(st, :call)
+            ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
+            ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
+            c = StrictMode._static_callee(src, st.args[1])
+            push!(steps, c isa Function ? nameof(c) : Symbol(ft))
         end
-        (steps, caught)
     end
+    return (steps, caught)
 end
 
 # Statements reached only through a `catch`: not reachable from the first statement without taking an

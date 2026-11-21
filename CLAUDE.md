@@ -219,10 +219,19 @@ StrictMode/src/
                         and for a dynamic call, neither of which is undefined behavior (measured),
                         so a caller may act on true and must treat false as unknown.
                         CAUGHT CONTEXT: a callee :invoked from a try region whose handler can
-                        return (_caught_region_mask) is scanned with _skip_mask(code, true), the
+                        return (_caught_contexts) is scanned with _skip_mask(code, true), the
                         unreachable mask alone, and so is everything below it; _signals_by_type
                         keys seen and _SIGNAL_MEMO on the context, and _signal_origin/_origin_node
-                        carry it, so a body has one verdict per context. A callee exempt from
+                        carry it, so a body has one verdict per context. A context is false, true,
+                        or a TYPE T (_join_caught): a handler `err isa T || rethrow()`
+                        (_handler_filter, read from the IR pattern the_exception / isa / goto if
+                        not / rethrow + unreachable) returns only for a T, and _deadend_mask then
+                        keeps a statement alive through it only when the statement may throw (the
+                        optimizer's IR_FLAG_NOTHROW is unset) and is not a throw whose types are
+                        all known, concrete and no T (_rethrown/_thrown_types, which follow an
+                        always-throwing :invoke like throw_boundserror a few levels). A callee in a
+                        T context reads its own throws the same way. StrictModeTest's
+                        _body_classes/_caught_sites/_walk_body use the same functions. A callee exempt from
                         :noalloc has its allocation AND its boxing excused in :alloc/:full mode (a
                         box is an allocation); :boxing mode, which :noboxing reads, excuses nothing.
                         What the caller HANDED it is the caller's: _handed_code lists the callables
@@ -910,7 +919,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         frame groups (one per compiled body) include a TRY-REGION one with no dead
                         group OUTSIDE it (groups inside it are a callee the try body called), or a
                         HANDLER-statement one with no dead group anywhere (a callee the handler
-                        calls is outside the try, so its own throw is an error path). Groups are
+                        calls is outside the try, so its own throw is an error path). A try-region
+                        group whose handlers return only for a type (_handler_filter) does not end
+                        the walk: the groups inside it are classified in that caught context
+                        (_body_classes(interp, mi, ctx)), and a dead one drops the site. Groups are
                         matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode
                         (a raw getdebugidx line can index a further line table) and, for a group
                         that called a callee, by the :invoke of that callee: a try-body call and a
