@@ -294,16 +294,17 @@ scan reads: the paths that return, including a throw that a returning catch hand
 that nothing catches is not read at all while `ignore_throw()` is on, the default, inside an exempt
 function or not.
 
-Two things are not excused. Code the exempt function was handed by its caller is the caller's: a
-function, closure or callable struct passed as an argument, in a field of one or as an array's
-elements, whether the exempt function calls it or inlines it. What it allocates or boxes fails the
-caller, in both tiers, at any depth of nesting. When an argument's type cannot list the callables it
-holds, because an abstract type appears anywhere in it (a `Function` or `Any` argument, a
-`Vector{Function}`, a field declared `Any` or another abstract type), the exemption excuses nothing
-in that call: what the exempt function and its callees allocate or box fails the caller, in both
-tiers, since any of it may be running a callable the caller handed in. A `Task` has fields declared
-`Any`, so this includes a `ReentrantLock`, a `Threads.Condition` or a `Channel`, which hold tasks.
-A type argument (`Type{T}`) is not a callable here. And the exemption names
+Two things are not excused. Code the exempt function was handed by its caller and calls is the
+caller's: a function, closure or callable struct passed as an argument, or loaded from one (a field,
+an array element, an item it iterates over, at any depth), whether the exempt function calls it,
+inlines it or passes it to a callee that calls it. What that code allocates or boxes fails the
+caller, in both tiers. A value the exempt function only uses is not called: a lock, a
+`Threads.Condition`, a `Channel` or a stream it holds still leaves the exemption in place, though a
+`Task` inside them has fields declared `Any`, and so does a closure the exempt function defines
+itself around one of them. When a handed value reaches a call whose target is decided at run time (a
+`Function` or `Any` argument it calls, a `Vector{Function}` it iterates and calls), or a body the
+check cannot read, the exemption excuses nothing in that call: what the exempt function and its
+callees allocate or box fails the caller, in both tiers. And the exemption names
 `:noalloc` only: under `:noboxing` the exempt function's boxing still fails the caller, and the
 warning names where it is.
 

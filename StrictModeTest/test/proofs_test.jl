@@ -753,6 +753,68 @@ end
     @strict_exempt :noalloc reason = "runs a hook" withanyf
     const ANYHOOK = AnyHook(b -> sum(zeros(length(b))))
     cb_anyfield(n::Int) = withanyf(ANYHOOK, n)
+    # Callables in an abstract-eltype container that the exempt function iterates and calls.
+    @noinline withabsvec(hs::Vector{AbsCb}, n::Int) = (
+        b = grow!(n); for h in hs
+            h(b)
+        end; b[1]
+    )
+    @strict_exempt :noalloc reason = "runs hooks" withabsvec
+    const ABSVEC = AbsCb[CbImpl()]
+    cb_absvec(n::Int) = withabsvec(ABSVEC, n)
+    # A handed closure calling a function the exempt function also calls itself. AllocCheck ends the
+    # backtrace of that function's sites at a frame shared by several callers, so the proof reads
+    # the call graph to see that the closure reaches it.
+    @noinline mk2(n) = zeros(n)
+    @noinline withmk(f::F, n) where {F} = (mk2(n); f(n))
+    @strict_exempt :noalloc reason = "shares a helper" withmk
+    cb_shared(n::Int) = withmk(k -> sum(mk2(k)), n)
+    # A field declared `Any` that the exempt function reads but never calls.
+    @noinline withanynocall(h::AnyHook, n::Int) = (b = grow!(n); h.f === nothing ? 0.0 : b[1])
+    @strict_exempt :noalloc reason = "pool" withanynocall
+    anyfield_nocall(n::Int) = withanynocall(ANYHOOK, n)
+    # A lock, a condition and a channel (each holds tasks, whose fields are declared `Any`), which
+    # the exempt function locks, notifies and fills but calls nothing loaded from. The `do` block
+    # is a closure the exempt function defines, so it is the exempt function's own code.
+    struct LPool
+        l::ReentrantLock
+        c::Threads.Condition
+        ch::Channel{Int}
+        v::Vector{Float64}
+    end
+    const LP = LPool(ReentrantLock(), Threads.Condition(), Channel{Int}(4), Float64[])
+    @noinline function lgrow!(p::LPool, n::Int)
+        lock(p.l)
+        try
+            length(p.v) < n && append!(p.v, zeros(n - length(p.v)))
+        finally
+            unlock(p.l)
+        end
+        lock(p.c) do
+            notify(p.c)
+        end
+        put!(p.ch, n)
+        take!(p.ch)
+        return p.v
+    end
+    @strict_exempt :noalloc reason = "pool" lgrow!
+    lockuser(n::Int) = lgrow!(LP, n)[1]
+    # An exempt function writing to the stream a struct holds (the stream's lock may wait inside
+    # it), run by a closure its non-exempt caller builds around the struct.
+    struct TWriter
+        io::IOStream
+    end
+    @noinline function twrite(w::TWriter, x::Float64)
+        b = grow!(4)
+        write(w.io, x)
+        return b[1]
+    end
+    @strict_exempt :noalloc reason = "writes a frame" twrite
+    @noinline drive(f::F, n::Int) where {F} = (s = 0.0; for i in 1:n
+            s += f(i)
+        end; s)
+    const TW = TWriter(open(tempname(), "w"))
+    tw_caller(w::TWriter, n::Int) = drive(i -> twrite(w, Float64(i)), n)
     # Plain data nested five levels deep holds no callable.
     @noinline withdata(d, n::Int) = (b = grow!(n); b[1] + d[1][1][1][1][1])
     @strict_exempt :noalloc reason = "pool" withdata
@@ -763,13 +825,14 @@ end
     E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_box(3); E.cb_clean(3); E.plain(3)
     E.cb_struct2(3); E.cb_vec(3); E.cb_hooks(3); E.cb_field(3); E.cb_any(3)
     E.cb_deep3(3); E.cb_deep3box(3); E.cb_deep5(3); E.cb_absfield(3); E.cb_anyfield(3); E.data_deep(3)
+    E.cb_absvec(3); E.cb_shared(3); E.anyfield_nocall(3); E.lockuser(3); E.tw_caller(E.TW, 2)
     proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
 
     # An allocation made by the caller's own closure, run inside the exempt function, is the
     # caller's: an ordinary failure, which no option accepts.
     for f in (
             E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
-            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec, E.cb_shared,
         )
         r = proof(f; allow_exempt = true)
         @test r.status === :fail
@@ -785,6 +848,23 @@ end
     @test clean.status === :info && clean.code === :SM0018
     data = proof(E.data_deep; allow_exempt = true)
     @test data.status === :info && data.code === :SM0018
+    # A lock, a condition, a channel or a stream the exempt function only uses is its own code.
+    for f in (E.anyfield_nocall, E.lockuser)
+        r = proof(f; allow_exempt = true)
+        @test r.status === :info && r.code === :SM0018
+    end
+    tw = only(StrictModeTest.proof_findings(E.tw_caller, (E.TWriter, Int); guarantees = (:noalloc,), allow_exempt = true))
+    @test !StrictMode._failed(tw)
+    @test tw.status === :pass || tw.code === :SM0018
+    # The two tiers agree on every one of these calls.
+    for f in (
+            E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec,
+            E.cb_clean, E.plain, E.data_deep, E.anyfield_nocall, E.lockuser,
+        )
+        @test isempty(divergence_report(f, (Int,); guarantees = (:noalloc,)))
+    end
+    @test isempty(divergence_report(E.tw_caller, (E.TWriter, Int); guarantees = (:noalloc,)))
 end
 
 @testitem "the proof honors a callable barrier registered as its type" begin

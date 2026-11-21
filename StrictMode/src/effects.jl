@@ -1179,22 +1179,19 @@ function _signal_origin(
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
             user = _followed_to_end(mi)
             (depth > 0 || (depth < 0 && user)) || continue
-            cm = m
             # Below a callee exempt from `:noalloc`, the scan's `:noalloc` verdict counts only the
-            # callables it was handed, or all of its code when the walk of those cannot finish or
-            # an argument holds callables its type cannot list.
+            # handed-in code it calls, or all of its code when that walk is incomplete.
             if m !== :boxing && !isnothing(_mi_exempt_name(mi))
                 haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-                hs, dyn, whole = _handed_code(mi.specTypes)
+                hs, whole = _handed_code(mi.specTypes)
                 for h in hs
                     haskey(parent, h) || (parent[h] = mi.specTypes)
                     push!(queue, (h, user ? depth : (depth > 1 ? depth - 1 : -1), c, m))
                 end
-                (dyn || !whole) || continue
-                whole && (cm = :boxing)
+                whole && continue
             end
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c, cm))
+            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c, m))
         end
     end
     return out
@@ -1634,9 +1631,8 @@ end
 # The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
 # number of call methods), or one of those held in a field or as an array's elements, at any depth.
 # A type that is not concrete anywhere in that walk (an abstract argument, field or element type,
-# `Any` included) is recorded as itself: the values it may hold, and so the callables, cannot be
-# listed from the type, and a caller treats such an entry as code it cannot excuse. A type argument
-# (`Type{T}`, `DataType`) is not a callable here.
+# `Any` included) is recorded as itself, since the values it may hold, and so the callables, cannot
+# be listed from the type. A type argument (`Type{T}`, `DataType`) is not a callable here.
 function _callable_types!(out::Vector{Any}, @nospecialize(T), seen::Base.IdSet{Any} = Base.IdSet{Any}())
     # A signature's `Vararg` tail carries its element type, and a type variable its upper bound.
     T isa Core.TypeofVararg && return _callable_types!(out, isdefined(T, :T) ? T.T : Any, seen)
@@ -1671,35 +1667,58 @@ function _callable_types!(out::Vector{Any}, @nospecialize(T), seen::Base.IdSet{A
     return out
 end
 
-# What an exempt function `sig` runs on its caller's behalf: the code of the callables it was handed
-# (`_callable_types!` over its arguments). Returns the signatures of those callables wherever they
-# are called below it, invoked or inlined, so they can be read as the caller's code; whether it holds
-# a value whose callables its type cannot list (an abstract type anywhere in an argument, `Any` and
-# `Function` included), whose calls are then dynamic and whose bodies cannot be read; and whether
-# the walk finished. Such a value also ends the walk unfinished, so that nothing below the exempt
-# function is excused: any of its code may be running what the caller handed it. The walk enters
-# only the callees the callables are passed on to, so it is short unless they are handed deep.
-const _HANDED_MEMO = IdDict{Any, Tuple{UInt, Vector{Any}, Bool, Bool}}()
+# What an exempt function `sig` runs on its caller's behalf: the code it calls that its caller handed
+# in. A value is HANDED when it is an argument or is loaded from one (a field, an element, an
+# iteration's item, at any depth: `getfield`, `memoryrefget` and the like in the IR). A value the
+# exempt code BUILDS around one (a closure or struct it constructs) only HOLDS it, and loading from
+# that gives a handed value again. A call whose function is a handed value runs the caller's code,
+# and its signature is returned so that it is read as the caller's own callee; so is a callable the
+# arguments name that was inlined, read from the inlining edges. A callee passed a handed or holding
+# value, or whose function holds one, is walked the same way, since it may call what it was given; a
+# callee passed neither is the exempt function's own code. A value whose type can carry no callable
+# (`_callable_types!` finds none) is not followed: a non-concrete field the code never calls, such as
+# the `Any` fields of the task a lock holds, does not stop the exemption.
+# Returns `(found, complete)`. The walk is incomplete, and the exemption then excuses nothing, when a
+# body cannot be read, the body budget runs out, or a handed or holding value reaches a call that is
+# not resolved (a dynamic call, or a builtin that calls a function, such as `_apply_iterate`), whose
+# target cannot be read.
+const _HANDED_MEMO = IdDict{Any, Tuple{UInt, Vector{Any}, Bool}}()
+
+const _HOLDS = 0x01
+const _HANDED = 0x02
+
+# The builtins whose result is loaded from their first argument.
+const _LOAD_BUILTINS = (
+    :getfield, :memoryrefget, :memoryrefnew, :_svec_ref, :swapfield!, :modifyfield!,
+    :replacefield!, :memoryrefswap!, :memoryrefmodify!, :memoryrefreplace!,
+)
 
 function _handed_code(@nospecialize(sig))
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK get(_HANDED_MEMO, sig, nothing)
-    (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3], hit[4]
-    types = _handed_types(sig)
+    (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3]
     found = Any[]
-    dynamic = any(T -> !isconcretetype(T), types)
-    complete = !dynamic
-    if complete && !isempty(types)
-        seen = Base.IdSet{Any}()
-        queue = Any[sig]
-        while !isempty(queue)
-            s = pop!(queue)
-            s in seen && continue
+    complete = true
+    s0 = Base.unwrap_unionall(sig)
+    if s0 isa DataType
+        carries = IdDict{Any, Bool}()
+        handed = collect(Any, _handed_params(s0))
+        ps = s0.parameters
+        mask = UInt8[
+            (i > 1 && any(P -> P === ps[i], handed) && _carries_callable!(carries, ps[i])) ? _HANDED : 0x00
+                for i in eachindex(ps)
+        ]
+        types = filter(isconcretetype, _handed_types(sig))
+        queue = Any[(sig, mask)]
+        seen = Set{Any}()
+        while !isempty(queue) && any(!iszero, mask)
+            s, m = pop!(queue)
+            (s, m) in seen && continue
             if length(seen) >= _SCAN_BODY_BUDGET[]
                 complete = false
                 break
             end
-            push!(seen, s)
+            push!(seen, (s, m))
             ci = _typed_body(s)
             if !isnothing(ci) && !_has_inlining_info(ci)
                 src = try
@@ -1709,27 +1728,123 @@ function _handed_code(@nospecialize(sig))
                 end
                 ci = isempty(src) ? nothing : first(src[1])
             end
-            if isnothing(ci)
+            if isnothing(ci) || !_handed_body!(found, queue, ci, s, m, types, carries)
                 complete = false
                 break
             end
-            _handed_inlined!(found, ci.debuginfo, types, 0)
-            for st in ci.code
-                Meta.isexpr(st, :invoke) || continue
-                a1 = st.args[1]
-                mi = a1 isa Core.CodeInstance ? a1.def : a1
-                mi isa Core.MethodInstance || continue
-                ps = (Base.unwrap_unionall(mi.specTypes)::DataType).parameters
-                if any(T -> T === ps[1], types)
-                    any(x -> x === mi.specTypes, found) || push!(found, mi.specTypes)
-                elseif any(T -> any(U -> U === T, types), _handed_types(mi.specTypes))
-                    push!(queue, mi.specTypes)
+        end
+    end
+    @lock _SIGNAL_MEMO_LOCK (_HANDED_MEMO[sig] = (world, found, complete))
+    return found, complete
+end
+
+# Whether `P` is a type with one instance that is, or holds, one of the callable `types`.
+_holds_handed_type(@nospecialize(P), types) = P isa DataType && Base.issingletontype(P) &&
+    any(T -> any(U -> U === T, types), _callable_types!(Any[], P))
+
+# Whether a value of type `T` may be or hold a callable.
+function _carries_callable!(memo::IdDict{Any, Bool}, @nospecialize(T))
+    T = _unwrap_lattice(T)
+    T isa Type || T isa Core.TypeofVararg || return true
+    return get!(() -> !isempty(_callable_types!(Any[], T)), memo, T)
+end
+
+# One body of `_handed_code`'s walk, with `m` the kind of each argument: records the calls of handed
+# values in `found` and queues the callees passed a handed or holding value. `false` when such a
+# value reaches a call whose target cannot be read.
+function _handed_body!(found, queue, ci, @nospecialize(s), m::Vector{UInt8}, types, carries)
+    code = ci.code
+    kinds = zeros(UInt8, length(code))
+    dead = _skip_mask(code, false, ci, s)
+    va = !isempty(m) && Base.unwrap_unionall(s).parameters[end] isa Core.TypeofVararg
+    kind(a) = a isa Core.SSAValue ? kinds[a.id] :
+        a isa Core.Argument ? (a.n <= length(m) ? m[a.n] : (va ? m[end] : 0x00)) : 0x00
+    opkind(args) = isempty(args) ? 0x00 : maximum(kind, args)
+    # Phi nodes read values defined later in a loop, so the kinds are propagated to a fixed point.
+    changed = true
+    while changed
+        changed = false
+        for i in eachindex(code)
+            dead[i] && continue
+            st = code[i]
+            k = if st isa Core.PhiNode
+                opkind(Any[st.values[j] for j in eachindex(st.values) if isassigned(st.values, j)])
+            elseif st isa Core.PiNode
+                kind(st.val)
+            elseif st isa Core.UpsilonNode
+                isdefined(st, :val) ? kind(st.val) : 0x00
+            elseif st isa Core.PhiCNode
+                opkind(st.values)
+            elseif Meta.isexpr(st, :invoke)
+                opkind(@view st.args[2:end])
+            elseif Meta.isexpr(st, :call)
+                bn = _builtin_name(st.args[1])
+                if !isnothing(bn) && bn in _LOAD_BUILTINS
+                    length(st.args) >= 2 && kind(st.args[2]) > 0 ? _HANDED : 0x00
+                else
+                    opkind(st.args)
                 end
+            elseif Meta.isexpr(st, :new) || Meta.isexpr(st, :splatnew)
+                opkind(@view st.args[2:end]) > 0 ? _HOLDS : 0x00
+            elseif Meta.isexpr(st, :foreigncall)
+                length(st.args) >= 6 && opkind(@view st.args[6:end]) > 0 ? _HANDED : 0x00
+            elseif st isa Expr
+                opkind(st.args)
+            else
+                0x00
+            end
+            (k > 0 && _carries_callable!(carries, ci.ssavaluetypes[i])) || continue
+            if k > kinds[i]
+                kinds[i] = k
+                changed = true
             end
         end
     end
-    @lock _SIGNAL_MEMO_LOCK (_HANDED_MEMO[sig] = (world, found, dynamic, complete))
-    return found, dynamic, complete
+    local_types = copy(types)
+    for i in eachindex(code)
+        T = _unwrap_lattice(ci.ssavaluetypes[i])
+        kinds[i] === _HANDED && T isa DataType && isconcretetype(T) && !any(U -> U === T, local_types) &&
+            push!(local_types, T)
+    end
+    _handed_inlined!(found, ci.debuginfo, local_types, 0)
+    for i in eachindex(code)
+        dead[i] && continue
+        st = code[i]
+        if Meta.isexpr(st, :invoke)
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            mi isa Core.MethodInstance || return false
+            ks = UInt8[kind(a) for a in @view st.args[2:end]]
+            # A handed value of a type with one instance may be folded to a constant, which no load
+            # names: it is recognized by its type.
+            ps = (Base.unwrap_unionall(mi.specTypes)::DataType).parameters
+            for j in eachindex(ks)
+                j <= length(ps) && iszero(ks[j]) && _holds_handed_type(ps[j], local_types) && (ks[j] = _HANDED)
+            end
+            if ks[1] === _HANDED
+                any(x -> x === mi.specTypes, found) || push!(found, mi.specTypes)
+            elseif any(!iszero, ks)
+                push!(queue, (mi.specTypes, ks))
+            end
+        elseif Meta.isexpr(st, :call)
+            opkind(st.args) > 0 || continue
+            bn = _builtin_name(st.args[1])
+            (isnothing(bn) || haskey(_CALLING_BUILTIN_ARGS, bn)) && return false
+        elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task && length(st.args) >= 6
+            # A task runs the function it is created with.
+            f = st.args[6]
+            k = kind(f)
+            k > 0 || continue
+            T = _unwrap_lattice(_stmt_arg_type(ci, s, f))
+            (T isa DataType && isconcretetype(T)) || return false
+            if k === _HANDED
+                any(x -> x === Tuple{T}, found) || push!(found, Tuple{T})
+            else
+                push!(queue, (Tuple{T}, UInt8[k]))
+            end
+        end
+    end
+    return true
 end
 
 function _handed_types(@nospecialize(sig))
@@ -2026,24 +2141,19 @@ function _scan_ci(
                             # recorded, so the caller is reported as reaching it rather than as
                             # clean. `:boxing`, which `:noboxing` reads, excuses nothing, and the
                             # callee's dictionary lookups still count. Code the callee was handed
-                            # by its caller is the caller's (`_handed_code`): each such callable is
-                            # read as the caller's own callee. A walk that cannot finish excuses
-                            # nothing, and neither does an argument whose callables its type
-                            # cannot list.
+                            # by its caller and that it calls is the caller's (`_handed_code`): each
+                            # such call is read as the caller's own callee. A walk that is incomplete
+                            # excuses nothing.
                             exname = (mode !== :boxing && (a2 || b2)) ? _mi_exempt_name(mi) : nothing
                             if isnothing(exname)
                                 a2 && (alloc = true)
                             else
                                 isnothing(exempt) && (exempt = exname)
-                                hs, dyn, whole = _handed_code(mi.specTypes)
-                                if !whole
-                                    a2 && (alloc = true)
-                                elseif !dyn
-                                    b2 = false
-                                end
+                                hs, whole = _handed_code(mi.specTypes)
+                                whole ? (b2 = false) : (a2 && (alloc = true))
                                 # The walk above ends at the callee's first allocation, so a boxing
                                 # after it is read by a walk of its own.
-                                if (!whole || dyn) && !b2
+                                if !whole && !b2
                                     _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, seen, :boxing, callee_caught(i))
                                     tr3 && (truncated = true)
                                     isnothing(barrier_box) && (barrier_box = bb3)

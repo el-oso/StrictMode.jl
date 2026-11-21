@@ -239,16 +239,19 @@ StrictMode/src/
                         _body_classes/_caught_sites/_walk_body use the same functions. A callee exempt from
                         :noalloc has its allocation AND its boxing excused in :alloc/:full mode (a
                         box is an allocation); :boxing mode, which :noboxing reads, excuses nothing.
-                        What the caller HANDED it is the caller's: _handed_code lists the callables
-                        its arguments carry (_callable_types!, shared with StrictModeTest's
-                        _runs_handed_in) wherever they are invoked or inlined below it (read from
-                        inlining edges), and each is scanned as the caller's own callee, its entry
-                        removed from seen first since the exempt walk already visited it.
-                        _callable_types! walks fields and eltypes to any depth (a seen set stops a
-                        recursive type) and records every NON-CONCRETE type it meets (Any fields
-                        included, so a Task and anything holding one); such an entry, or a walk
-                        that cannot finish, makes _handed_code incomplete and excuses NOTHING below
-                        the exempt callee: its allocation and boxing count (a second walk in
+                        What the caller HANDED it and it CALLS is the caller's: _handed_code walks
+                        the exempt body and the callees it passes a handed value to (optimized IR,
+                        two taint levels: HANDED = an argument or anything loaded from one by
+                        getfield/memoryrefget/etc.; HOLDS = a :new the exempt code built around one,
+                        so its own do-block closure stays its own code), and returns the :invoke
+                        sigs whose FUNCTION is handed, plus inlined callables named by the argument
+                        types (inlining edges) and singleton callables folded to constants (matched
+                        by type). Each is scanned as the caller's own callee, its entry removed
+                        from seen first. A value whose type can carry no callable (_callable_types!
+                        empty) is not followed, so the Any fields of a lock's Task cost nothing
+                        unless something calls them. A handed value reaching a dynamic call or a
+                        calling builtin, an unreadable body, or the budget makes the walk
+                        incomplete and excuses NOTHING below the exempt callee (a second walk in
                         :boxing mode; seen is keyed on (sig, mode, caught) so it is not cut).
                         _signal_origin mirrors this.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
@@ -889,15 +892,17 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         the Revise watcher); `allow_exempt = true` is threaded into
                         _proof_findings and makes it :info. divergence_report reads it beside the
                         scan own exempt note as agreement. A site is the exempt function's only
-                        if no frame between it and the allocation runs a callable the exempt
-                        function was HANDED (_runs_handed_in: matched on the argument's type for a
-                        frame with a specialization, on its method names for an inlined one);
-                        otherwise an exempt wrapper would launder its caller's closure. The
-                        callables are found in arguments, their fields and array elements
-                        (_callable_types!), and an argument holding a NON-CONCRETE type anywhere
-                        (Function, Any, an abstract field or eltype) makes every site at or below
-                        the exempt frame the caller's, as in the scan. One site without an
-                        exempt frame, or an exempt
+                        if no frame between it and the allocation belongs to a handed-in call the
+                        exempt code makes (_runs_handed_in reads StrictMode._handed_code on the
+                        exempt frame's signature, matched on the callee type for a frame with a
+                        specialization, on its method names for an inlined one; an incomplete
+                        reading makes every site below the frame the caller's, as in the scan);
+                        otherwise an exempt wrapper would launder its caller's closure. A site
+                        with NO exempt frame (a backtrace ended at "multiple call sites") is the
+                        exempt function's when the call reaches its specialization only through
+                        an exempt callee with a complete reading and not through the handed code
+                        (_only_through_exempt, over the same :invoke graph as the barrier filter).
+                        Any other site without an exempt frame, or an exempt
                         callee that was inlined and so has no frame, is a plain failure; the match
                         is StrictMode._mi_exemption, on the method module and name, with
                         declared_in_module = true: an exemption declared with NO module covers

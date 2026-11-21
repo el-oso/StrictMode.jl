@@ -693,24 +693,33 @@ _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : 
 # callee that was inlined has no frame with a specialization of its own, so its site reads as the
 # caller's and the result is an ordinary failure.
 # A site reached through a function or closure the exempt function was handed is the caller's too
-# (`_runs_handed_in`).
-function _exempt_only(allocs)
+# (`_runs_handed_in`). A site whose backtrace has no exempt frame, as when AllocCheck ends it at a
+# function compiled once for several callers, is the exempt function's when the call `sig` reaches
+# its specialization only through that exempt callee (`_only_through_exempt`).
+function _exempt_only(allocs, @nospecialize(sig))
     isempty(allocs) && return nothing
     by = Pair{String, String}[]
+    inside = nothing
     for a in allocs
         hasproperty(a, :backtrace) || return nothing
         e = nothing
+        framed = false
         for (k, fr) in enumerate(a.backtrace)
             fr isa Base.StackTraces.StackFrame || continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || continue
             e = StrictMode._mi_exemption(mi; declared_in_module = true)
             isnothing(e) && continue
+            framed = true
             # The exemption covers the exempt function's own code and what that calls. A function
             # or closure it was HANDED is the caller's code, and what that allocates is the
             # caller's allocation, whichever frame ran it. An exempt frame further out may still
             # account for the site, so the walk goes on.
             _runs_handed_in(a, k, mi) ? (e = nothing) : break
+        end
+        if isnothing(e) && !framed
+            isnothing(inside) && (inside = something(_only_through_exempt(sig), IdDict{Core.MethodInstance, Any}()))
+            e = get(inside, _site_mi(a), nothing)
         end
         isnothing(e) && return nothing
         p = String(e.func) => e.reason
@@ -719,23 +728,19 @@ function _exempt_only(allocs)
     return Tuple(by)
 end
 
-# Whether the allocation site `a` runs a callable that the exempt function at backtrace frame `k`
-# received as an argument, directly, inside a struct or inside an array. A frame that kept its
-# specialization is matched on the callable's type; an inlined one has only a name, and is matched
-# on the names of the callable's methods. Every site in or below the exempt frame counts when an
-# argument holds a value whose callables its type cannot list (an abstract type anywhere in it: a
-# `Function` or `Any` argument, a `Vector{Function}`, a field declared `Function`, `Any` or another
-# abstract type): any of that code may be running it, and a dynamic call's target is not analyzed.
+# Whether the allocation site `a`, under the exempt function at backtrace frame `k`, runs code that
+# function's caller handed in: a frame inside it belongs to a call the exempt code makes of a value
+# loaded from one of its arguments (`StrictMode._handed_code`, the scan's own reading of the same
+# signature). A frame that kept its specialization is matched on the called value's type; an inlined
+# one has only a name, and is matched on the names of that type's methods. When that reading is
+# incomplete (a body it could not read, or a handed value reaching a call whose target is not
+# resolved), every site in or below the exempt frame counts, as in the scan.
 function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
     bt = a.backtrace
-    types = Any[]
-    ps = (mi.specTypes::DataType).parameters
-    for i in 2:length(ps)
-        StrictMode._callable_types!(types, ps[i])
-    end
-    isempty(types) && return false
-    any(T -> !isconcretetype(T), types) && return true
-    k > 1 || return false
+    found, complete = StrictMode._handed_code(mi.specTypes)
+    complete || return true
+    (isempty(found) || k <= 1) && return false
+    types = Any[(Base.unwrap_unionall(h)::DataType).parameters[1] for h in found]
     names = Set{Symbol}()
     for T in types
         isconcretetype(T) || continue
@@ -792,6 +797,40 @@ function _only_through_barrier(@nospecialize(sig))
     return Base.IdSet{Core.MethodInstance}(mi for mi in inside if !(mi in outside))
 end
 
+# The specializations the call `sig` reaches only by entering a callee exempt from `:noalloc` whose
+# handed-in code is read in full (`StrictMode._handed_code`), each mapped to that callee's exemption.
+# The code it calls that its caller handed in, and all that this reaches, is the caller's, and so is
+# not in the result. `nothing` when the graph could not be read in full.
+function _only_through_exempt(@nospecialize(sig))
+    root = StrictMode._sig_instance(sig, Base.get_world_counter())
+    root isa Core.MethodInstance || return nothing
+    excuses(mi) = !isnothing(StrictMode._mi_exemption(mi; declared_in_module = true)) &&
+        StrictMode._handed_code(mi.specTypes)[2]
+    outside, stops, complete = _invoke_reach(Core.MethodInstance[root], true; isstop = excuses)
+    (complete && !isempty(stops)) || return nothing
+    handed = Core.MethodInstance[]
+    for ex in stops, h in first(StrictMode._handed_code(ex.specTypes))
+        mi = StrictMode._sig_instance(h, Base.get_world_counter())
+        mi isa Core.MethodInstance || return nothing
+        push!(handed, mi)
+    end
+    if !isempty(handed)
+        theirs, _, done = _invoke_reach(handed, false)
+        done || return nothing
+        union!(outside, theirs)
+    end
+    out = IdDict{Core.MethodInstance, Any}()
+    for ex in stops
+        e = StrictMode._mi_exemption(ex; declared_in_module = true)
+        reached, _, done = _invoke_reach(Core.MethodInstance[ex], true; isstop = mi -> any(x -> x === mi, handed))
+        done || return nothing
+        for mi in reached
+            mi in outside || haskey(out, mi) || (out[mi] = e)
+        end
+    end
+    return out
+end
+
 # The specializations reached from `roots` along the `:invoke` edges of their optimized bodies,
 # which are the static calls AllocCheck compiles and follows. AllocCheck compiles the specialization
 # for the inferred types where Julia invokes the compilation signature (`_native_dispatches`); where
@@ -800,8 +839,8 @@ end
 # behind it. With `stop`, a barrier is recorded rather than entered. Returns `(reached, barriers, complete)`;
 # `complete` is false when a body could not be read, when a call could still be compiled statically
 # without an `:invoke` (`Core.invoke` and its kin, a `@cfunction`, an opaque closure), or when the
-# walk reached `_BARRIER_WALK_MAX` bodies.
-function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool)
+# walk reached `_BARRIER_WALK_MAX` bodies. `isstop` names what counts as a barrier.
+function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = StrictMode._mi_is_barrier)
     reached = Base.IdSet{Core.MethodInstance}(roots)
     barriers = Base.IdSet{Core.MethodInstance}()
     queue = copy(roots)
@@ -820,7 +859,7 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool)
                 if isnothing(callee)
                     complete = false
                 elseif !(callee in reached || callee in barriers)
-                    if stop && StrictMode._mi_is_barrier(callee)
+                    if stop && isstop(callee)
                         push!(barriers, callee)
                     else
                         push!(reached, callee)
@@ -1623,12 +1662,12 @@ function _proof_findings(
                             cause = :scheduler
                         )
                     )
-                elseif !isnothing(_exempt_only(allocs))
+                elseif !isnothing(_exempt_only(allocs, StrictMode._sigtype(f, types)))
                     # Every site lies inside a function exempt from `:noalloc`. That is not a
                     # proof of no allocation, so it is a FAILURE with its own code: counted by
                     # `nfailures`, failed by every gate, not a pass to any reader of the status.
                     # A caller that accepts the exemptions by name gets the note in its place.
-                    by = _exempt_only(allocs)
+                    by = _exempt_only(allocs, StrictMode._sigtype(f, types))
                     push!(
                         out, StrictMode.StrictFinding(
                             md, fn, sg, g, allow_exempt ? :info : :fail, file, line,
