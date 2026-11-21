@@ -895,6 +895,9 @@ end
             return zeros(n)
         end
     end
+    # A callee the handler calls runs on that normal return as well.
+    @noinline make_zeros(n::Int) = zeros(n)
+    @noinline handler_callee(n::Int) = try thrower(n) catch; make_zeros(n) end
     # Passing controls: a handler that allocates and then rethrows is an error path, and so is
     # everything a try with a normal exit does not reach.
     const SINK = Ref{Any}(nothing)
@@ -916,11 +919,13 @@ end
     tt = (Int,)
     proof(f) = only(StrictModeTest._proof_findings(f, tt, (:noalloc,)))
     scan(f) = only(findings(f, tt; guarantees = (:noalloc,)))
-    handler_only(3)
-    @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(handler_only, tt))
-    @test StrictMode._failed(proof(handler_only))
-    @test StrictMode._failed(scan(handler_only))
-    @test isempty(StrictModeTest.divergence_report(handler_only, tt; guarantees = (:noalloc,)))
+    handler_only(3); handler_callee(3)
+    for f in (handler_only, handler_callee)
+        @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(f, tt))
+        @test StrictMode._failed(proof(f))
+        @test StrictMode._failed(scan(f))
+        @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
+    end
     for f in (handler_rethrows, normal_exit)
         @test isempty(StrictModeTest._raw_allocs(f, tt))
         @test !StrictMode._failed(proof(f))
@@ -993,12 +998,16 @@ end
     @noinline rethrows_callee(n::Int) = (try n < 0 && thrower(n) catch; rethrow() end; n)
     @noinline outside_try(n::Int) = (try n += 1 catch end; n < 0 && thrower(n); n)
     @noinline normal_exit(n::Int) = (try n += 1 catch end; n)
+    # A callee the handler calls is outside the try: its own throw is uncaught, an error path.
+    @noinline maybe_throws(n::Int) = (n < 0 && thrower(n); n)
+    @noinline mightthrow(n::Int) = n > 100 ? throw(nothing) : n
+    @noinline handler_calls(n::Int) = try mightthrow(n) catch; maybe_throws(n) end
     caught = ((caught_callee, (Int,)), (caught_inlined, (Int,)), (caught_deep, (Int,)),
         (caught_index, (Vector{Int}, Int)))
     clean = ((uncaught_callee, (Int,)), (rethrows_callee, (Int,)), (outside_try, (Int,)),
-        (normal_exit, (Int,)))
+        (normal_exit, (Int,)), (handler_calls, (Int,)))
     caught_callee(1); caught_inlined(1); caught_deep(1); caught_index([1], 2)
-    uncaught_callee(1); rethrows_callee(1); outside_try(1); normal_exit(1)
+    uncaught_callee(1); rethrows_callee(1); outside_try(1); normal_exit(1); handler_calls(1); handler_calls(200)
     proof(f, tt) = only(StrictModeTest._proof_findings(f, tt, (:noalloc,)))
     for (f, tt) in caught
         @test any(a -> !(a isa StrictModeTest.AllocCheck.DynamicDispatch), StrictModeTest._raw_allocs(f, tt))
@@ -1008,6 +1017,7 @@ end
     for (f, tt) in clean
         @test isempty(StrictModeTest._raw_allocs(f, tt))
         @test !StrictMode._failed(proof(f, tt))
+        @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
     end
     @test isempty(StrictModeTest._raw_allocs(middle, (Int,)))
 end

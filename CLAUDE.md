@@ -871,10 +871,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         _catch_only_mask finds, or a callee read in a caught context: _walk_body
                         keeps those in _WALK_CAUGHT_MEMO and skips nothing), _check_allocs runs AllocCheck again
                         with ignore_throw = false and _caught_sites keeps the extra sites whose
-                        frame groups (one per compiled body) include a caught one with no dead group
-                        OUTSIDE it (groups inside it are a callee the try body called),
+                        frame groups (one per compiled body) include a TRY-REGION one with no dead
+                        group OUTSIDE it (groups inside it are a callee the try body called), or a
+                        HANDLER-statement one with no dead group anywhere (a callee the handler
+                        calls is outside the try, so its own throw is an error path). Groups are
                         matched to statements by the inlining lines of Base.IRShow.buildLineInfoNode
-                        (a raw getdebugidx line can index a further line table). The second
+                        (a raw getdebugidx line can index a further line table) and, for a group
+                        that called a callee, by the :invoke of that callee: a try-body call and a
+                        handler call on one line have the same lines. The second
                         run is the cost: ~20 s on a @strict-guarded signature, measured.
                         _kept/_Stamp keep two reads for the session: the sites of a signature
                         (_SITES_MEMO) and what the walk

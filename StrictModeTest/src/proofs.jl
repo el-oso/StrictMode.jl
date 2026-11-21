@@ -157,10 +157,12 @@ const _THROW_ONLY_RUNTIME = (
 # Of the sites AllocCheck reports only without `ignore_throw`, those on a path that returns normally
 # because a catch handles its throw, in the try body, in a callee it calls, or in the handler. A
 # backtrace is read as one group of frames per compiled body, innermost first, each ending at the
-# body's own frame. A site is kept when some group lies on a statement a caught throw reaches
-# (`_location_class`) and no group outside it lies on an error path of its body: what the groups
-# inside it do on their own error paths ends in the handler. A backtrace AllocCheck cut short
-# ("multiple call sites") is judged on the groups it has.
+# body's own frame, and judged outermost first (`_location_class`): a group on an error path of its
+# body drops the site; one in a try region whose handler can return keeps it, since what the groups
+# inside it do on their own error paths ends in that handler; one on a handler statement keeps it only
+# when no group inside lies on an error path, since a throw raised in a callee the handler calls is not
+# caught by that try. A backtrace AllocCheck cut short ("multiple call sites") is judged on the groups
+# it has.
 function _caught_sites(extra)
     interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
     bodies = IdDict{Core.MethodInstance, Any}()
@@ -169,25 +171,30 @@ function _caught_sites(extra)
         hasproperty(a, :backtrace) || return false
         classes = Symbol[]
         group = Base.StackTraces.StackFrame[]
+        callee = nothing
         for fr in a.backtrace
             push!(group, fr)
             fr.inlined && continue
             mi = _frame_mi(fr)
             mi isa Core.MethodInstance || break
-            push!(classes, _location_class(get!(() -> _body_classes(interp, mi), bodies, mi), group))
+            push!(classes, _location_class(get!(() -> _body_classes(interp, mi), bodies, mi), group, callee))
             empty!(group)
+            callee = mi
         end
+        inhandler = false
         for c in Iterators.reverse(classes)
             c === :dead && return false
             c === :caught && return true
+            inhandler |= c === :handler
         end
-        return false
+        return inhandler
     end
 end
 
 # Each statement of `mi`'s optimized body as `:dead` (an error path under `ignore_throw()`),
-# `:caught` (reached by a caught throw on a call that returns, `_caught_mask`) or `:live`, with the
-# line of each inlining level, outermost first. `nothing` for a body that cannot be read.
+# `:caught` (in a try region whose handler can return), `:handler` (a statement of a handler, reached
+# only through a catch, that is not an error path) or `:live`, with the line of each inlining level,
+# outermost first, and the specialization of each `:invoke`. `nothing` for a body that cannot be read.
 function _body_classes(interp, mi::Core.MethodInstance)
     src = try
         Base.Compiler.typeinf_code(interp, mi, true)
@@ -196,9 +203,16 @@ function _body_classes(interp, mi::Core.MethodInstance)
     end
     src isa Core.CodeInfo || return nothing
     dead = StrictMode._deadend_mask(src.code)
-    caught = _caught_mask(src.code, dead)
-    classes = [dead[i] ? :dead : caught[i] ? :caught : :live for i in eachindex(src.code)]
-    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)])
+    region = StrictMode._caught_region_mask(src.code, dead)
+    handler = isnothing(StrictMode._try_handlers(src.code)) ? falses(length(src.code)) : _catch_only_mask(src.code)
+    classes = [
+        dead[i] ? :dead : !isnothing(region) && region[i] ? :caught : handler[i] ? :handler : :live
+            for i in eachindex(src.code)
+    ]
+    invoked = [
+        Meta.isexpr(st, :invoke) ? StrictMode._invoke_mi(st.args[1]) : nothing for st in src.code
+    ]
+    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked)
 end
 
 # The live statements a caught throw reaches: those in a try region whose handler can return, and
@@ -220,24 +234,38 @@ _stmt_lines(src::Core.CodeInfo, mi::Core.MethodInstance, pc::Int) =
 
 # The class of the statements an AllocCheck frame group points at: those whose inlining lines are
 # the longest prefix of the group's, outermost first. Among equally long matches `:caught` wins, then
-# `:live`. A group that matches no statement is `:live`: it says nothing either way.
-function _location_class(body, group::Vector{Base.StackTraces.StackFrame})
+# `:handler`, then `:live`. A group that matches no statement is `:live`: it says nothing either way.
+# For a group that called `callee` (the next group in), only the statements that invoke it are read
+# when one matches: lines alone cannot tell a call in a try body from one in its handler written on
+# the same line.
+const _CLASS_RANK = Dict(:dead => 0, :live => 1, :handler => 2, :caught => 3)
+
+function _location_class(body, group::Vector{Base.StackTraces.StackFrame}, callee = nothing)
     isnothing(body) && return :live
-    classes, stacks = body
+    classes, stacks, invoked = body
+    if !isnothing(callee)
+        best, cls = _location_class(classes, stacks, group, i -> invoked[i] === callee)
+        best > 0 && return cls
+    end
+    return last(_location_class(classes, stacks, group, Returns(true)))
+end
+
+function _location_class(classes, stacks, group, keep)
     want = [fr.line for fr in Iterators.reverse(group)]
     best, cls = 0, :live
     for i in eachindex(classes)
+        keep(i) || continue
         s = stacks[i]
         k = length(s)
         (0 < k <= length(want) && k >= best && s == view(want, 1:k)) || continue
         c = classes[i]
         if k > best
             best, cls = k, c
-        elseif c === :caught || (c === :live && cls === :dead)
+        elseif _CLASS_RANK[c] > _CLASS_RANK[cls]
             cls = c
         end
     end
-    return cls
+    return best, cls
 end
 
 function _is_call_through(@nospecialize(fr))
