@@ -203,7 +203,11 @@ end
     struct LooseBag
         v::AbstractVector
     end
-    loose_sum(l::LooseBag) = (s = 0.0; for a in l.v; s += a; end; s)
+    loose_sum(l::LooseBag) = (
+        s = 0.0; for a in l.v
+            s += a
+        end; s
+    )
     @test status(loose_sum, (LooseBag,)).status === :pass
     # A lone read of the first field of an untyped value is still one that cannot be ruled out.
     first_field(v::Vector{Any}) = (x = getfield(v[1], 1); x)
@@ -561,6 +565,42 @@ end
     # Control: outside a `try` the field-2 read raises on an `Untrusted` before the payload is used.
     straight(p) = (a = getfield(p, 1); getfield(p, 2); a)
     @test status(straight, (Any,)).status === :pass
+    # A handler that rethrows on every path lets the field-2 raise through, as does a `finally`.
+    function rethrown(p)
+        try
+            a = getfield(p, 1)
+            getfield(p, 2)
+            return a
+        catch e
+            rethrow()
+        end
+    end
+    function fin(p)
+        a = 0
+        try
+            a = getfield(p, 1)
+            getfield(p, 2)
+        finally
+        end
+        return a
+    end
+    @test_throws BoundsError rethrown(Untrusted(42))
+    @test_throws BoundsError fin(Untrusted(42))
+    @test status(rethrown, (Any,)).status === :pass
+    @test status(fin, (Any,)).status === :pass
+    # A handler that rethrows on one path and returns on the other still swallows.
+    function sometimes(p, q::Bool)
+        a = 0
+        try
+            a = getfield(p, 1)
+            getfield(p, 2)
+        catch e
+            q && rethrow()
+        end
+        return a
+    end
+    @test sometimes(Untrusted(42), false) == 42
+    @test StrictMode._failed(status(sometimes, (Any, Bool)))
 end
 
 @testitem "getfield handed to another call as a value is a read" begin
