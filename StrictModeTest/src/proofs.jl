@@ -478,8 +478,8 @@ function _raw_allocs(@nospecialize(f), @nospecialize(types))
     # attributed to the guard frame or to the kernel, and the guard branch builds diagnostic strings
     # through exactly such shared helpers. Saying so is the difference between a verdict a reader
     # can act on and one that blames the kernel for StrictMode's own code.
-    if length(kept) < length(all) && any(_is_unattributed, kept)
-        n = count(_is_unattributed, kept)
+    n = _guard_unattributed(all, kept)
+    if n > 0
         @warn "StrictModeTest: `$(StrictMode._func_name(f))` contains a StrictMode guard, and " *
             "AllocCheck could not attribute $n of its $(length(kept)) remaining allocation(s) to " *
             "a single call site. Those may belong to the guard rather than to the code it guards. " *
@@ -494,6 +494,11 @@ end
 const _NONALLOCATING_RUNTIME = (:jl_hrtime,)
 _nonallocating_runtime_call(@nospecialize(a)) =
     a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) in _NONALLOCATING_RUNTIME
+
+# How many of the `kept` sites AllocCheck could not attribute, counted only when `all` holds a site of
+# the guard frame. Other filters drop sites too (`_nonallocating_runtime_call`), and a body without a
+# guard has no guard to blame for what it cannot attribute.
+_guard_unattributed(all, kept) = any(_is_guard_alloc, all) ? count(_is_unattributed, kept) : 0
 
 # Does this instance's attribution stop at AllocCheck's shared-call-site marker?
 _is_unattributed(@nospecialize(inst)) =

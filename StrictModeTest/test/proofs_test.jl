@@ -112,6 +112,9 @@ end
     kept29 = StrictModeTest._raw_allocs(guarded29, (Vector{Float64}, Vector{Float64}))
     @test !isempty(kept29)
     @test all(StrictModeTest._is_unattributed, kept29)
+    # ... which is what the proof's warning about a guard counts
+    all29 = StrictModeTest._raw_allocs_unfiltered(guarded29, (Vector{Float64}, Vector{Float64}))
+    @test StrictModeTest._guard_unattributed(all29, kept29) == length(kept29)
     @test_throws StrictMode.StrictViolation (@test_noalloc guarded29(a, b))
     # What does hold on every version: the inner kernel is provably clean on its own, which is the
     # verdict to reach for while a guarded signature cannot be attributed.
@@ -288,6 +291,18 @@ end
     for f in (plain, ul)
         @test proof(f, (ReentrantLock,), :noalloc).code === scan(f, (ReentrantLock,), :noalloc).code === :SM0017
     end
+end
+
+@testitem "the proof warns about a guard only for a body that has one" begin
+    using StrictMode, StrictModeTest
+    # A wait has no guard, and its unattributed sites are Base's: AllocCheck stops at a shared call
+    # site in the scheduler. The proof drops other sites (a clock read), which is not a guard either.
+    waits() = (yield(); nothing)
+    all = StrictModeTest._raw_allocs_unfiltered(waits, ())
+    kept = StrictModeTest._raw_allocs(waits, ())
+    @test !any(StrictModeTest._is_guard_alloc, all)
+    @test any(StrictModeTest._is_unattributed, kept)
+    @test StrictModeTest._guard_unattributed(all, kept) == 0
 end
 
 @testitem "a C varargs call is not reported as dispatch" begin

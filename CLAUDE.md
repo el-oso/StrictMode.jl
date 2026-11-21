@@ -841,7 +841,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         load unless StrictMode.checks_enabled() (otherwise every @assert_* is a
                         bare call, nothing registers, and test_registered() sweeps an empty
                         registry and passes), then announces the proof tier.
-  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), a callable object known
+  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _raw_allocs warns that
+                        unattributed sites may be the guard's only when a site of the guard frame was
+                        dropped (_guard_unattributed): a wait has unattributed sites and no guard. A
+                        callable object known
                         by its type alone (StrictMode._Callable) is proved through _check_allocs
                         (AllocCheck on StrictMode._call_through, the wrapper frame then dropped
                         from every backtrace: same sites as an instance), _jet_target (JET by the
