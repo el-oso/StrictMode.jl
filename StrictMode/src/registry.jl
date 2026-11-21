@@ -658,26 +658,28 @@ end
 # overrides each entry's own setting when given. `StrictModeTest.test_registered` re-runs exactly
 # this list against the proofs, so both tiers agree on what "registered" means.
 #
-# `modules` scopes the sweep by the defining module of each registered function. The registry is
-# process-global and keyed on `(f, types)` with no module of its own, so a dependency loaded from
-# source in the same session — a Revise/`dev` setup — contributes its own declarations to it. Left
-# unscoped, one package's gate then judges another package's kernels. `_registry_breakdown` makes
-# that visible even when nobody scopes.
+# `modules` scopes the sweep by the module that wrote the method each declaration reaches, the
+# module a finding is named after, so a declaration on `Base.getproperty` for a package type belongs
+# to that package. The registry is process-global and keyed on `(f, types)` with no module of its
+# own, so a dependency loaded from source in the same session — a Revise/`dev` setup — contributes
+# its own declarations to it. Left unscoped, one package's gate then judges another package's
+# kernels. `_registry_breakdown` makes that visible even when nobody scopes.
 function _registry_items(guarantees = nothing; modules = nothing)
     isnothing(guarantees) || _check_guarantees(guarantees)
     names = isnothing(modules) ? nothing : Set{Symbol}(m isa Module ? nameof(m) : Symbol(m) for m in modules)
     return Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
             for ((f, types), meta) in declarations()
-            if !_is_exempt(f) && (isnothing(names) || _mod_sym(f) in names)
+            if !_is_exempt(f) && (isnothing(names) || _mod_sym(f, types) in names)
     ]
 end
 
 # `module => count` over the registry, for a driver to report what it is about to sweep.
 function _registry_breakdown(items)
     counts = Dict{Symbol, Int}()
-    for (f, _, _) in items
-        counts[_mod_sym(f)] = get(counts, _mod_sym(f), 0) + 1
+    for (f, types, _) in items
+        md = _mod_sym(f, types)
+        counts[md] = get(counts, md, 0) + 1
     end
     return sort!(collect(counts); by = first)
 end
@@ -712,7 +714,7 @@ function _registered_findings_in(analyze, mod::Module; guarantees = nothing)
     items = Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
             for ((f, types), meta) in declarations()
-            if _mod_sym(f) === nameof(mod) && !_is_exempt(f)   # cold / @strict_exempt → skip
+            if _mod_sym(f, types) === nameof(mod) && !_is_exempt(f)   # cold / @strict_exempt → skip
     ]
     # Through `_map_findings`, so a signature whose analysis throws becomes a failing finding
     # naming the error rather than vanishing. This feeds `_auto_check_module` — the `@strict module`
@@ -809,7 +811,7 @@ function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
     for p in declarations()
         key = getfield(p, :first)
         f = getfield(key, 1)
-        _mod_sym(f) === nameof(mod) && (declared[_decl_key(f, getfield(key, 2))] = getfield(p, :second).guarantees)
+        _mod_sym(f, getfield(key, 2)) === nameof(mod) && (declared[_decl_key(f, getfield(key, 2))] = getfield(p, :second).guarantees)
     end
     items = Any[]
     ms, _ = module_methods(mod; only, exempt)

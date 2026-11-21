@@ -452,3 +452,29 @@ end
     items = StrictMode._compiled_items(U; guarantees = (:typestable,))
     @test length(items) == 3
 end
+
+@testitem "a declaration on another module's function is scoped by the module that wrote the method" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module DeclForeign
+    struct Foo
+        x::Int
+    end
+    Base.getproperty(f::Foo, s::Symbol) = s === :y ? Any[1][1] : getfield(f, s)
+    bar(x::Int) = x > 0 ? x : "neg"
+    end
+    D = DeclForeign
+    StrictMode.register_strict!(Base.getproperty, (D.Foo, Symbol); guarantees = (:typestable,))
+    StrictMode.register_strict!(D.bar, (Int,); guarantees = (:typestable,))
+    fs = audit(D)
+    @test StrictMode._failed(only(f for f in fs if f.func == "getproperty"))
+    @test StrictMode._failed(only(f for f in fs if f.func == "bar"))
+    @test Set(nameof(first(i)) for i in StrictMode._registry_items(; modules = [D])) == Set([:getproperty, :bar])
+    # A module that wrote neither method is not handed them.
+    @test isempty(StrictMode._registry_items(; modules = [Base]))
+    @test StrictMode._registry_breakdown(StrictMode._registry_items()) == [:DeclForeign => 2]
+    load = StrictMode._module_load_items(D, (:noalloc,))
+    @test only(i[3] for i in load if first(i) === Base.getproperty) == (:typestable,)
+    StrictMode.clear_declarations!()
+    Base.delete_method(which(getproperty, (D.Foo, Symbol)))
+end

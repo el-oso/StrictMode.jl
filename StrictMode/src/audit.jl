@@ -45,7 +45,8 @@ and use its `test_*` drivers, which run the proofs.
 
 `target`:
 - `:registered` — the mark-once registry, the "check what I promised" scope.
-- a `Module` — by default, the registered functions declared in that module. Pass `sweep = true` to
+- a `Module` — by default, the registered signatures whose method that module wrote, including one
+  on a function another module owns (`Base.getproperty` for its own type). Pass `sweep = true` to
   also sweep everything the module has actually compiled. That's
   noisier, so scope it with `only` / `exempt`.
 

@@ -122,9 +122,10 @@ override.
 
 The registry is process-global and keyed on `(f, types)` with no module of its own, so a dependency
 loaded from source in the same session (a Revise or `dev` setup) contributes its declarations too —
-and your gate would then judge its kernels. `modules = [MyPkg]` scopes the sweep by each registered
-function's defining module. Unscoped, the reported count is broken down per module so an unexpected
-one is visible rather than silent.
+and your gate would then judge its kernels. `modules = [MyPkg]` scopes the sweep by the module that
+wrote the method each declaration reaches, which is the module its findings name: a declaration on
+`Base.getproperty` for one of your types is yours. Unscoped, the reported count is broken down per
+module so an unexpected one is visible rather than silent.
 
 It reports how many signatures it proved, because the registry is populated at *declaration* time
 and an implausibly small count is the signal that something did not register. A declaration made in

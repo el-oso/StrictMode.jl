@@ -402,6 +402,9 @@ StrictMode/src/
                         (_exempt_in, asked per method by _is_exempt(f, m)). A submodule's or an
                         extension's methods are in the census but only in THAT module's sweep, so
                         a method gets one row, under the exemptions of the module that wrote it;
+                        the registered scope (_registry_items modules=, _registered_findings_in,
+                        _module_load_items) is the module that WROTE the declared method,
+                        _mod_sym(f, types), the module its rows name, not the function's owner;
                         _coverage_all_findings
                         is default-deny over it, _coverage_findings the narrower public-function
                         form; _is_parametric_def keeps a `where` definition out of the registry.

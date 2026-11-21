@@ -44,8 +44,9 @@ julia --project -e 'using MyPkg, StrictMode; print(format_findings(audit(MyPkg);
 julia --project=test -e 'using MyPkg, StrictMode, StrictModeTest; test_compiled(MyPkg)'
 ```
 
-- `target` is `:registered` (the mark-once registry — "check what I promised") or a `Module` (its
-  *declared* functions by default; add `sweep = true` to also sweep everything it compiled).
+- `target` is `:registered` (the mark-once registry — "check what I promised") or a `Module` (the
+  *declared* signatures whose method it wrote by default, a method it adds to `Base.getproperty`
+  among them; add `sweep = true` to also sweep everything it compiled).
 - A whole-module sweep can be noisy when hot and cold code mix — scope it with `only` / `exempt`
   (functions or name `Symbol`s), e.g. `audit(MyPkg; sweep = true, exempt = [:_plan_helper])`.
 - `format_findings(fs; format)` renders `:json`, `:jsonlines`, `:github`, or `:text`.
