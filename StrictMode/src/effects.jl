@@ -711,7 +711,10 @@ function _deadend_mask(code::Vector{Any}, ci = nothing, @nospecialize(sig) = not
     filters = isnothing(handlers) || isnothing(ci) ? nothing : Dict{Int, Any}()
     filter_of(d) = isnothing(filters) ? nothing : get!(() -> _handler_filter(code, d), filters, d)
     thrown = Dict{Int, Union{Nothing, Vector{Any}}}()
-    rethrown(i, T) = !isnothing(ci) && _rethrown(ci, sig, i, T, thrown)
+    # Held in a `RefValue{Any}`: a closure capturing `sig` itself is a new type for every signature,
+    # and each one compiles its own `any` below.
+    sigref = Base.RefValue{Any}(sig)
+    rethrown(i, T) = !isnothing(ci) && _rethrown(ci, sigref[], i, T, thrown)
     via(i, d) = (T = filter_of(d); isnothing(T) || (_maythrow(ci, i) && !rethrown(i, T)))
     changed = true
     while changed
