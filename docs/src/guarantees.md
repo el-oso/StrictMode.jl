@@ -268,9 +268,21 @@ the growth path forever. Excuse it visibly with
 warming the call and checking that a second identical call allocates nothing.
 
 The value-free scan reports a caller whose only allocations are inside such exempt functions as an
-`:info` note naming one of them. The exemption excuses allocation only: boxing or dynamic dispatch
-anywhere inside the exempt function, including on a throw path that a returning catch handles,
-still fails the caller, and the warning names where it is.
+`:info` note naming one of them; the allocation proof reports it as SM0018, a failure unless the
+gate is given `allow_exempt = true`. Under `:noalloc` a box is an allocation, so the exemption also
+excuses boxing and dynamic dispatch inside the exempt function and what it calls, on every path the
+scan reads: the paths that return, including a throw that a returning catch handles. A throw path
+that nothing catches is not read at all while `ignore_throw()` is on, the default, inside an exempt
+function or not.
+
+Two things are not excused. Code the exempt function was handed by its caller is the caller's: a
+function, closure or callable struct passed as an argument, in a field of one or as an array's
+elements, whether the exempt function calls it or inlines it. What it allocates or boxes fails the
+caller, in both tiers. When the handed callable's type is known only at run time (a `Function` or
+`Any` argument, a `Vector{Function}`), it is called by dispatch and its body cannot be read, so the
+scan counts the exempt function's boxing, and the proof its dynamic calls. And the exemption names
+`:noalloc` only: under `:noboxing` the exempt function's boxing still fails the caller, and the
+warning names where it is.
 
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 

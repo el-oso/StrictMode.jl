@@ -662,7 +662,7 @@ function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
     types = Any[]
     ps = (mi.specTypes::DataType).parameters
     for i in 2:length(ps)
-        _callable_types!(types, ps[i], 0, false)
+        StrictMode._callable_types!(types, ps[i], 0, false)
     end
     isempty(types) && return false
     a isa AllocCheck.DynamicDispatch && !_c_varargs_call(a) &&
@@ -690,41 +690,6 @@ function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
         end
     end
     return false
-end
-
-# The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
-# number of call methods), or one of those held in a field or as an array's elements. An abstract
-# type that can hold a function is recorded as itself. A FIELD declared `Any` is not: nearly every
-# runtime struct has one (`Task`'s result and storage), and counting it would make every dynamic
-# call in an exempt function that takes such a struct the caller's.
-function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int, field::Bool)
-    if T isa Union
-        for U in Base.uniontypes(T)
-            _callable_types!(out, U, depth, field)
-        end
-        return out
-    end
-    if !isconcretetype(T)
-        (field && T === Any) || typeintersect(T, Function) === Union{} || push!(out, T)
-        T isa DataType && T <: AbstractArray && depth < 2 &&
-            _callable_types!(out, eltype(T), depth + 1, false)
-        return out
-    end
-    if T <: Function
-        push!(out, T)
-    elseif T <: AbstractArray
-        depth < 2 && _callable_types!(out, eltype(T), depth + 1, false)
-        return out
-    elseif !(T <: Union{Number, AbstractString, Symbol, Type})
-        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
-        (ms isa Vector && !isempty(ms)) && push!(out, T)
-    end
-    if depth < 2 && !(T <: Union{AbstractString, Number})
-        for F in fieldtypes(T)
-            _callable_types!(out, F, depth + 1, true)
-        end
-    end
-    return out
 end
 
 _through_barrier(@nospecialize(a)) = any(a.backtrace) do fr

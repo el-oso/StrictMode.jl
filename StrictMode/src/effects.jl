@@ -1022,12 +1022,22 @@ function _signal_origin(
                 isnothing(stops) || push!(stops, mi.specTypes)
                 continue
             end
-            # A callee exempt from `:noalloc` has its allocation excused and its boxing counted, so
-            # below it only boxing is looked for.
-            cm = m !== :boxing && !isnothing(_mi_exempt_name(mi)) ? :boxing : m
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
             user = _followed_to_end(mi)
             (depth > 0 || (depth < 0 && user)) || continue
+            cm = m
+            # Below a callee exempt from `:noalloc`, the scan's `:noalloc` verdict counts only the
+            # callables it was handed, and its boxing when one of them is called by dispatch.
+            if m !== :boxing && !isnothing(_mi_exempt_name(mi))
+                haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
+                hs, dyn, whole = _handed_code(mi.specTypes)
+                for h in hs
+                    haskey(parent, h) || (parent[h] = mi.specTypes)
+                    push!(queue, (h, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, m))
+                end
+                (dyn || !whole) || continue
+                whole && (cm = :boxing)
+            end
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
             push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c::Bool, cm))
         end
@@ -1445,6 +1455,127 @@ function _calls_argument(@nospecialize(caller), @nospecialize(callee))
     return any(P -> P === F, Iterators.drop(caller.parameters, 1))
 end
 
+# The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
+# number of call methods), or one of those held in a field or as an array's elements. An abstract
+# type that can hold a function is recorded as itself. A FIELD declared `Any` is not: nearly every
+# runtime struct has one (`Task`'s result and storage), and counting it would make every dynamic
+# call in an exempt function that takes such a struct the caller's.
+function _callable_types!(out::Vector{Any}, @nospecialize(T), depth::Int, field::Bool)
+    if T isa Union
+        for U in Base.uniontypes(T)
+            _callable_types!(out, U, depth, field)
+        end
+        return out
+    end
+    if !isconcretetype(T)
+        (field && T === Any) || typeintersect(T, Function) === Union{} || push!(out, T)
+        T isa DataType && T <: AbstractArray && depth < 2 &&
+            _callable_types!(out, eltype(T), depth + 1, false)
+        return out
+    end
+    if T <: Function
+        push!(out, T)
+    elseif T <: AbstractArray
+        depth < 2 && _callable_types!(out, eltype(T), depth + 1, false)
+        return out
+    elseif !(T <: Union{Number, AbstractString, Symbol, Type})
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+        (ms isa Vector && !isempty(ms)) && push!(out, T)
+    end
+    if depth < 2 && !(T <: Union{AbstractString, Number})
+        for F in fieldtypes(T)
+            _callable_types!(out, F, depth + 1, true)
+        end
+    end
+    return out
+end
+
+# What an exempt function `sig` runs on its caller's behalf: the code of the callables it was handed
+# (`_callable_types!` over its arguments). Returns the signatures of those callables wherever they
+# are called below it, invoked or inlined, so they can be read as the caller's code; whether it holds
+# a callable whose type is known only at run time, whose calls are then dynamic and whose bodies
+# cannot be read; and whether the walk finished. The walk enters only the callees the callables
+# are passed on to, so it is short unless they are handed deep.
+const _HANDED_MEMO = IdDict{Any, Tuple{UInt, Vector{Any}, Bool, Bool}}()
+
+function _handed_code(@nospecialize(sig))
+    world = Base.get_world_counter()
+    hit = @lock _SIGNAL_MEMO_LOCK get(_HANDED_MEMO, sig, nothing)
+    (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3], hit[4]
+    types = _handed_types(sig)
+    found = Any[]
+    complete = true
+    if !isempty(types)
+        seen = Base.IdSet{Any}()
+        queue = Any[sig]
+        while !isempty(queue)
+            s = pop!(queue)
+            s in seen && continue
+            if length(seen) >= _SCAN_BODY_BUDGET[]
+                complete = false
+                break
+            end
+            push!(seen, s)
+            ci = _typed_body(s)
+            if !isnothing(ci) && !_has_inlining_info(ci)
+                src = try
+                    _code_typed_by_type(s; optimize = true, debuginfo = :source)
+                catch
+                    Any[]
+                end
+                ci = isempty(src) ? nothing : first(src[1])
+            end
+            if isnothing(ci)
+                complete = false
+                break
+            end
+            _handed_inlined!(found, ci.debuginfo, types, 0)
+            for st in ci.code
+                Meta.isexpr(st, :invoke) || continue
+                a1 = st.args[1]
+                mi = a1 isa Core.CodeInstance ? a1.def : a1
+                mi isa Core.MethodInstance || continue
+                ps = (Base.unwrap_unionall(mi.specTypes)::DataType).parameters
+                if any(T -> T === ps[1], types)
+                    any(x -> x === mi.specTypes, found) || push!(found, mi.specTypes)
+                elseif any(T -> any(U -> U === T, types), _handed_types(mi.specTypes))
+                    push!(queue, mi.specTypes)
+                end
+            end
+        end
+    end
+    dynamic = any(T -> !isconcretetype(T), types)
+    @lock _SIGNAL_MEMO_LOCK (_HANDED_MEMO[sig] = (world, found, dynamic, complete))
+    return found, dynamic, complete
+end
+
+function _handed_types(@nospecialize(sig))
+    types = Any[]
+    s = Base.unwrap_unionall(sig)
+    s isa DataType || return types
+    for P in Iterators.drop(s.parameters, 1)
+        _callable_types!(types, P, 0, false)
+    end
+    return types
+end
+
+# The specializations of `types` inlined into a body, read from the record of its inlined calls.
+# Below one of them is the callable's own code, which reading its signature covers.
+function _handed_inlined!(found::Vector{Any}, di, types::Vector{Any}, level::Int)
+    (di isa Core.DebugInfo && level < 64) || return found
+    for e in di.edges
+        e isa Core.DebugInfo || continue
+        mi = e.def
+        if mi isa Core.MethodInstance && (P = Base.unwrap_unionall(mi.specTypes); P isa DataType) &&
+                any(T -> T === P.parameters[1], types)
+            any(x -> x === mi.specTypes, found) || push!(found, mi.specTypes)
+        else
+            _handed_inlined!(found, e, types, level + 1)
+        end
+    end
+    return found
+end
+
 # The type a `:new` constructs. Optimized IR may name it with a `GlobalRef` (`%new(Base.ComplexF64, …)`)
 # instead of holding the `DataType`.
 _new_type(ci, st::Expr) = (a = st.args[1]; a isa Type ? a : _static_callee(ci, a))
@@ -1706,21 +1837,39 @@ function _scan_ci(
                             isnothing(barrier_box) && (barrier_box = bb2)
                             # A callee exempted from `:noalloc` has its allocation excused here
                             # too — it is the same allocation, already excused where it is made —
-                            # and the excusal is recorded, so the caller is reported as reaching it
-                            # rather than as clean. Only allocation is excused: the callee's boxing
-                            # and dictionary lookups still count against the caller.
-                            exname = a2 ? _mi_exempt_name(mi) : nothing
+                            # and so has its boxing, since a box is an allocation. The excusal is
+                            # recorded, so the caller is reported as reaching it rather than as
+                            # clean. `:boxing`, which `:noboxing` reads, excuses nothing, and the
+                            # callee's dictionary lookups still count. Code the callee was handed
+                            # by its caller is the caller's (`_handed_code`): each such callable is
+                            # read as the caller's own callee, and a callable whose type is known
+                            # only at run time is called by dispatch, so then the callee's boxing
+                            # counts. A walk that cannot finish excuses nothing.
+                            exname = (mode !== :boxing && (a2 || b2)) ? _mi_exempt_name(mi) : nothing
                             if isnothing(exname)
                                 a2 && (alloc = true)
                             else
                                 isnothing(exempt) && (exempt = exname)
+                                hs, dyn, whole = _handed_code(mi.specTypes)
+                                if !whole
+                                    a2 && (alloc = true)
+                                elseif !dyn
+                                    b2 = false
+                                end
                                 # The walk above ends at the callee's first allocation, so a boxing
-                                # after it is read by a walk of its own: the boxing is not excused,
-                                # wherever in the callee it lies.
-                                if !b2 && mode !== :boxing
+                                # after it is read by a walk of its own.
+                                if (!whole || dyn) && !b2
                                     _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, seen, :boxing, callee_caught(i))
                                     tr3 && (truncated = true)
                                     isnothing(barrier_box) && (barrier_box = bb3)
+                                end
+                                for h in hs
+                                    # Already read once inside the exempt callee, where it was excused.
+                                    delete!(seen, (h, mode, callee_caught(i)))
+                                    ha, hb, _, _, _, _, _, _, _, htr = _signals_by_type(h, sub, seen, mode, callee_caught(i))
+                                    htr && (truncated = true)
+                                    ha && (alloc = true)
+                                    hb && (boxing = true)
                                 end
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)

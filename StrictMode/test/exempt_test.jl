@@ -279,12 +279,15 @@ end
     @noinline xbox_note!(n::Int) = BOXES[1] + n
     StrictMode._exempt!(:xgrow_note!; guarantees = (:noalloc,), reason = "grows to a high-water mark")
     StrictMode._exempt!(:xbox_note!; guarantees = (:noalloc,), reason = "boxes")
+    @noinline xbox_typed!(n::Int) = (BOXES[1] + n)::Int
+    StrictMode._exempt!(:xbox_typed!; guarantees = (:noalloc,), reason = "boxes")
     only_grows(n::Int) = (b = xgrow_note!(n); b[1])
     also_allocs(n::Int) = (b = xgrow_note!(n); sum(zeros(n)) + b[1])
     calls_boxer(n::Int) = xbox_note!(n) + 1
+    calls_typed_boxer(n::Int) = xbox_typed!(n) + 1
     end
     E = ExemptCallers
-    E.only_grows(4); E.also_allocs(4); E.calls_boxer(1)
+    E.only_grows(4); E.also_allocs(4); E.calls_boxer(1); E.calls_typed_boxer(1)
     noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
 
     r = noalloc(E.only_grows)
@@ -294,7 +297,14 @@ end
 
     # Its own allocation is not excused by reaching an exempt one.
     @test StrictMode._failed(noalloc(E.also_allocs))
-    # `:noalloc` excuses the callee's allocation, not its boxing.
+    noboxing(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noboxing,)))
+    # `:noboxing` is not excused by a `:noalloc` exemption.
+    @test StrictMode._failed(noboxing(E.calls_boxer))
+    @test StrictMode._failed(noboxing(E.calls_typed_boxer))
+    # Under `:noalloc` a box is an allocation, so the callee's boxing is excused…
+    r = noalloc(E.calls_typed_boxer)
+    @test r.status === :info && occursin("xbox_typed!", r.reason)
+    # …and the caller's own is not: it adds 1 to the callee's `Any` result by dispatch.
     @test StrictMode._failed(noalloc(E.calls_boxer))
 
     logs = Test.collect_test_logs() do
@@ -350,7 +360,7 @@ end
     noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
     reaches_box(fn, name) = any(
         o -> occursin(name, string(o.signature)) || any(p -> occursin(name, string(p)), o.path),
-        StrictMode._signal_origin(fn, (Int,); mode = :alloc)
+        StrictMode._signal_origin(fn, (Int,); mode = :boxing)
     )
 
     for (fn, callee) in ((E.caught_caller, "xcaught_note!"), (E.plain_caller, "xplain_note!"))
@@ -361,13 +371,82 @@ end
     end
     # Its own allocation is not excused by reaching an exempt one.
     @test StrictMode._failed(noalloc(E.own_caller))
-    # The exemption excuses allocation, not boxing, wherever in the callee the boxing lies, and the
-    # walk that names an origin finds it there.
+    # Under `:noalloc` the exemption excuses the callee's boxing too, wherever in the callee it lies.
+    # Under `:noboxing` it excuses nothing, and the walk that names an origin finds the boxing there.
+    noboxing(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noboxing,)))
     for (fn, callee) in ((E.boxed_caller, "xcaught_box!"), (E.late_caller, "xgrow_then_box!"))
-        @test StrictMode._failed(noalloc(fn))
+        r = noalloc(fn)
+        @test r.status === :info && occursin(callee, r.reason)
+        @test StrictMode._failed(noboxing(fn))
         @test reaches_box(fn, callee)
     end
     @test reaches_box(E.late_caller, "xlate_box")
+end
+
+@testitem "an exempt function does not excuse a callable it was handed, in the scan" begin
+    using StrictMode, Test
+    # The same fixture as StrictModeTest's proof item, so the two tiers can be compared.
+    module ExemptHanded
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function xh_grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" xh_grow!
+    @noinline xh_withbuf(f::F, n) where {F} = f(xh_grow!(n))
+    @strict_exempt :noalloc reason = "borrows the pool" xh_withbuf
+    @noinline mk(n) = zeros(n)
+    const BOXES = Any[1.0]
+    cb(n::Int) = xh_withbuf(b -> sum(mk(n)) + b[1], n)
+    cb_inline(n::Int) = xh_withbuf(b -> sum(zeros(n)) + b[1], n)
+    named_cb(b) = sum(zeros(length(b))) + b[1]
+    cb_named(n::Int) = xh_withbuf(named_cb, n)
+    cb_box(n::Int) = xh_withbuf(b -> (BOXES[1] + b[1])::Float64, n)
+    struct Cb2
+        n::Int
+    end
+    (c::Cb2)(b::Vector{Float64}) = sum(zeros(c.n)) + b[1]
+    (c::Cb2)(b::Vector{Float64}, k::Int) = b[k]
+    cb_struct2(n::Int) = xh_withbuf(Cb2(n), n)
+    @noinline xh_withbufs(fs::Vector{F}, n) where {F} = fs[1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "vec" xh_withbufs
+    const FS = [b -> sum(zeros(length(b))) + b[1]]
+    cb_vec(n::Int) = xh_withbufs(FS, n)
+    @noinline xh_withhooks(hooks::Vector{Function}, n::Int) = (
+        b = xh_grow!(n); for h in hooks
+            h(b)
+        end; b[1]
+    )
+    @strict_exempt :noalloc reason = "runs hooks" xh_withhooks
+    const HOOKS = Function[b -> sum(zeros(length(b)))]
+    cb_hooks(n::Int) = xh_withhooks(HOOKS, n)
+    struct Hook
+        f::Function
+    end
+    @noinline xh_withhook(h::Hook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withhook
+    const HOOK = Hook(b -> sum(zeros(length(b))))
+    cb_field(n::Int) = xh_withhook(HOOK, n)
+    @noinline xh_withany(@nospecialize(f), n::Int) = (b = xh_grow!(n); f(b); b[1])
+    @strict_exempt :noalloc reason = "nospecialize" xh_withany
+    const ANYCB = Ref{Any}(b -> sum(zeros(length(b))))
+    cb_any(n::Int) = xh_withany(ANYCB[], n)
+    # The callback allocates and boxes nothing: every site is the exempt functions' own code.
+    cb_clean(n::Int) = xh_withbuf(b -> b[1], n)
+    plain(n::Int) = (b = xh_grow!(n); b[1])
+    end
+    E = ExemptHanded
+    noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
+    for fn in (E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
+        fn(3)
+        @test StrictMode._failed(noalloc(fn))
+    end
+    for fn in (E.cb_clean, E.plain)
+        fn(3)
+        r = noalloc(fn)
+        @test r.status === :info && !StrictMode._failed(r)
+    end
 end
 
 @testitem "an allocation barrier excuses allocation only; its other causes are reported at it" begin

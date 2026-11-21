@@ -680,6 +680,8 @@ end
     cb_inline(n::Int) = withbuf(b -> sum(zeros(n)) + b[1], n)
     named_cb(b) = sum(zeros(length(b))) + b[1]
     cb_named(n::Int) = withbuf(named_cb, n)
+    const BOXES = Any[1.0]
+    cb_box(n::Int) = withbuf(b -> (BOXES[1] + b[1])::Float64, n)
     # The callback allocates nothing of its own: every site is the exempt functions' own code.
     cb_clean(n::Int) = withbuf(b -> b[1], n)
     plain(n::Int) = (b = grow!(n); b[1])
@@ -717,13 +719,13 @@ end
     cb_any(n::Int) = withany(ANYCB[], n)
     end
     E = ExemptCallback
-    E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_clean(3); E.plain(3)
+    E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_box(3); E.cb_clean(3); E.plain(3)
     E.cb_struct2(3); E.cb_vec(3); E.cb_hooks(3); E.cb_field(3); E.cb_any(3)
     proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
 
     # An allocation made by the caller's own closure, run inside the exempt function, is the
     # caller's: an ordinary failure, which no option accepts.
-    for f in (E.cb, E.cb_inline, E.cb_named, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
+    for f in (E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any)
         r = proof(f; allow_exempt = true)
         @test r.status === :fail
         @test r.code !== :SM0018
@@ -1059,4 +1061,27 @@ end
         @test isempty(StrictModeTest.divergence_report(f, tt; guarantees = (:noalloc,)))
     end
     @test isempty(StrictModeTest._raw_allocs(middle, (Int,)))
+end
+
+@testitem "an exempt callee's boxing is excused under :noalloc only" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ExemptBoxProof
+    using StrictMode
+    const BOXES = Any[1]
+    @noinline pb_box!(n::Int) = (BOXES[1] + n)::Int
+    @strict_exempt :noalloc reason = "boxes" pb_box!
+    calls_boxer(n::Int) = pb_box!(n) + 1
+    end
+    E = ExemptBoxProof
+    E.calls_boxer(1)
+    proof(g) = only(StrictModeTest.proof_findings(E.calls_boxer, (Int,); guarantees = (g,)))
+    r = proof(:noalloc)
+    @test r.status === :fail && r.code === :SM0018
+    @test r.exempt_by == ("pb_box!" => "boxes",)
+    @test StrictMode._failed(proof(:noboxing))
+    # The scan gives the same answer: a note naming the exempt callee, and a :noboxing failure.
+    s = only(StrictMode.findings(E.calls_boxer, (Int,); guarantees = (:noalloc,)))
+    @test s.status === :info && occursin("pb_box!", s.reason)
+    @test StrictMode._failed(only(StrictMode.findings(E.calls_boxer, (Int,); guarantees = (:noboxing,))))
 end

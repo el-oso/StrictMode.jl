@@ -223,10 +223,16 @@ StrictMode/src/
                         unreachable mask alone, and so is everything below it; _signals_by_type
                         keys seen and _SIGNAL_MEMO on the context, and _signal_origin/_origin_node
                         carry it, so a body has one verdict per context. A callee exempt from
-                        :noalloc has its allocation excused and its boxing counted: when its own
-                        walk stopped at an allocation, _scan_ci reads it again in :boxing mode
-                        (seen is keyed on (sig, mode, caught) so that second walk is not cut), and
-                        _signal_origin follows it in :boxing mode rather than skipping it.
+                        :noalloc has its allocation AND its boxing excused in :alloc/:full mode (a
+                        box is an allocation); :boxing mode, which :noboxing reads, excuses nothing.
+                        What the caller HANDED it is the caller's: _handed_code lists the callables
+                        its arguments carry (_callable_types!, shared with StrictModeTest's
+                        _runs_handed_in) wherever they are invoked or inlined below it (read from
+                        inlining edges), and each is scanned as the caller's own callee, its entry
+                        removed from seen first since the exempt walk already visited it. A
+                        callable typed only at run time, or a walk that cannot finish, counts the
+                        exempt callee's boxing (a second walk in :boxing mode; seen is keyed on
+                        (sig, mode, caught) so it is not cut). _signal_origin mirrors this.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch
