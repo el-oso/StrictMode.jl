@@ -175,14 +175,27 @@ StrictMode/src/
                         growth is one Base level deeper on 1.12 than on 1.13, measured), so a fixed
                         depth passed `yield()` on one release and failed it on the other. Scheduler
                         code is matched by file in any module under Base (_method_in_scheduler), so
-                        Base.Partr's task queue and Threads' locks count. In :alloc mode a scheduler
-                        body's own boxing does not end its walk, since its caller drops that boxing:
-                        `schedule` boxes before it queues, and stopping there passed unlock(l). An origin
-                        below a scheduler call is the scheduler's (_origin_in_scheduler) unless that
-                        call names one of the package's types (`lock(f, l)`, _names_user_type) or the
-                        path from it passes through the package's code. The proof's _scheduler_site
-                        ends its frame walk the same way, at an inlined frame whose file is not one of
-                        Base's image-relative "./" files, since an inlined frame has no method instance.
+                        Base.Partr's task queue and Threads' locks count. A scheduler body drops its
+                        own boxing itself (_stmt_in_scheduler with `frame`), so that boxing never ends
+                        an :alloc walk before the allocation below it (`schedule` boxes before it
+                        queues; stopping there passed unlock(l)). A CALLABLE THE SCHEDULER WAS HANDED
+                        (the f of lock(f, l)) is its caller's code whoever defined its type
+                        (_calls_argument: the callee's function type IS one of the scheduler call's
+                        argument types), so its allocation is SM0002 and its boxing counts, inlined or
+                        not; a wait it makes is the scheduler's again. Telling an inlined callable's
+                        statements from the scheduler's needs debug-info edges, which a compiled body
+                        does not keep: _typed_body re-reads such a body with debuginfo = :source
+                        (_runs_handed_callable), and without edges every statement counts as the
+                        caller's. The re-read keeps the scan's answer the same before and after
+                        the proof compiles the call (measured to differ without it). An origin below a scheduler call is the
+                        scheduler's (_origin_in_scheduler) unless it is in such a callable or the path
+                        from it passes through the package's code; _nonscheduler_origin reads a
+                        scheduler body for the callable's statements and callees only. The proof's
+                        _scheduler_site ends its frame walk the same way: where a non-inlined scheduler
+                        frame's next frame calls one of its arguments (by method instance, or for an
+                        inlined frame by matching its name against the argument type's methods), and
+                        at an inlined frame whose file is not one of Base's image-relative "./" files,
+                        which still decides a user closure inside a `lock` that itself inlined.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
                         not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an

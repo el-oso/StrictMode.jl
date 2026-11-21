@@ -269,6 +269,25 @@ end
     h = only(StrictModeTest._proof_findings(alloc_under_lock, (ReentrantLock, Int), (:noalloc,)))
     @test StrictMode._failed(h) && h.code === :SM0002
     @test only(StrictMode.findings(alloc_under_lock, (ReentrantLock, Int); guarantees = (:noalloc,))).code === :SM0002
+    # so is one in a callable whose type is Base's, and boxing there is the caller's boxing
+    proof(f, T, g) = only(StrictModeTest._proof_findings(f, T, (g,)))
+    scan(f, T, g) = only(StrictMode.findings(f, T; guarantees = (g,)))
+    fix_under_lock(l::ReentrantLock, n::Int) = lock(Base.Fix1(zeros, n), l)
+    sort_under_lock(l::ReentrantLock, v::Vector{Float64}) = lock(Base.Fix1(sort!, v), l)
+    for (f, T) in ((fix_under_lock, (ReentrantLock, Int)), (sort_under_lock, (ReentrantLock, Vector{Float64})))
+        p = proof(f, T, :noalloc)
+        @test StrictMode._failed(p) && p.code === :SM0002
+        @test scan(f, T, :noalloc).code === :SM0002
+    end
+    box_under_lock(l::ReentrantLock, v::Vector{Any}, x::Int) = (lock(() -> push!(v, x), l); nothing)
+    BT = (ReentrantLock, Vector{Any}, Int)
+    @test StrictMode._failed(proof(box_under_lock, BT, :noboxing)) && StrictMode._failed(scan(box_under_lock, BT, :noboxing))
+    # the lock's own machinery is the scheduler's in both tiers
+    plain(l::ReentrantLock) = (lock(l); unlock(l); nothing)
+    ul(l::ReentrantLock) = (unlock(l); nothing)
+    for f in (plain, ul)
+        @test proof(f, (ReentrantLock,), :noalloc).code === scan(f, (ReentrantLock,), :noalloc).code === :SM0017
+    end
 end
 
 @testitem "a C varargs call is not reported as dispatch" begin

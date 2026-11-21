@@ -840,10 +840,13 @@ end
 
 # An allocation site that lies in Base's task, lock or condition code: on the way from the allocation out
 # to the nearest frame of the package's own code, the calls pass through that code. This is what a wait,
-# a yield or a lock does, and what the value-free scan reports as its own kind.
+# a yield or a lock does, and what the value-free scan reports as its own kind. A callable the
+# scheduler was handed (the function given to `lock(f, l)`) is its caller's code whoever defined its
+# type, so the walk ends where a scheduler frame calls one of its own arguments (`_calls_argument`).
 function _scheduler_site(@nospecialize(a))
     hasproperty(a, :backtrace) || return false
     sched = false
+    prev = nothing
     for fr in a.backtrace
         mi = _frame_mi(fr)
         if mi isa Core.MethodInstance && mi.def isa Method &&
@@ -857,9 +860,31 @@ function _scheduler_site(@nospecialize(a))
                 !startswith(string(fr.file), "./")
             break
         end
-        fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES && (sched = true)
+        if fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES
+            mi isa Core.MethodInstance && !isnothing(prev) && _calls_argument(mi, prev) && break
+            sched = true
+        end
+        prev = fr
     end
     return sched
+end
+
+# Whether frame `inner`, just inside scheduler frame `mi`, is a call of one of `mi`'s arguments. An
+# inlined frame has no method instance, only its function's name, which is matched against the methods
+# of each argument type.
+function _calls_argument(mi::Core.MethodInstance, @nospecialize(inner))
+    imi = _frame_mi(inner)
+    imi isa Core.MethodInstance && return StrictMode._calls_argument(mi.specTypes, imi.specTypes)
+    inner isa Base.StackTraces.StackFrame || return false
+    sig = Base.unwrap_unionall(mi.specTypes)
+    sig isa DataType || return false
+    world = Base.get_world_counter()
+    for P in Iterators.drop(sig.parameters, 1)
+        (P isa DataType && isconcretetype(P)) || continue
+        ms = Base._methods_by_ftype(Tuple{P, Vararg{Any}}, -1, world)
+        ms isa Vector && any(m -> m.method.name === inner.func, ms) && return true
+    end
+    return false
 end
 
 # First source location among allocation sites (any / boxing-only), pulled from the backtraces.

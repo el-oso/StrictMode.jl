@@ -543,6 +543,33 @@ end
     @test !StrictMode._failed(only(StrictMode.findings(spin, (Threads.SpinLock,); guarantees = (:noalloc,))))
 end
 
+@testitem "the function given to lock is the caller's code, whoever defined it" begin
+    using StrictMode
+    noalloc(f, T) = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+    noboxing(f, T) = only(StrictMode.findings(f, T; guarantees = (:noboxing,)))
+    R = ReentrantLock
+    # an allocation in the callable is the caller's, whether the callable's type is Base's or a closure
+    fix_under_lock(l::ReentrantLock, n::Int) = lock(Base.Fix1(zeros, n), l)
+    closure_under_lock(l::ReentrantLock, n::Int) = lock(() -> zeros(n), l)
+    for f in (fix_under_lock, closure_under_lock)
+        r = noalloc(f, (R, Int))
+        @test StrictMode._failed(r) && r.code === :SM0002
+    end
+    # so is one several Base calls down from the callable
+    sort_under_lock(l::ReentrantLock, v::Vector{Float64}) = lock(Base.Fix1(sort!, v), l)
+    r = noalloc(sort_under_lock, (R, Vector{Float64}))
+    @test StrictMode._failed(r) && r.code === :SM0002
+    # boxing in the callable is the caller's boxing
+    box_under_lock(l::ReentrantLock, v::Vector{Any}, x::Int) = (lock(() -> push!(v, x), l); nothing)
+    @test StrictMode._failed(noboxing(box_under_lock, (R, Vector{Any}, Int)))
+    # the lock's own wait is the scheduler's, and so is a wait the callable makes
+    plain(l::ReentrantLock) = (lock(l); unlock(l); nothing)
+    wait_under_lock(l::ReentrantLock, c::Threads.Condition) = lock(Base.Fix1(wait, c), l)
+    @test noalloc(plain, (R,)).code === :SM0017
+    @test noalloc(wait_under_lock, (R, Threads.Condition)).code === :SM0017
+    @test !StrictMode._failed(noboxing(plain, (R,)))
+end
+
 @testitem "a wait is SM0017 only when the call reaches no allocation outside the scheduler" begin
     using StrictMode
     @noinline join_pool() = yield()
@@ -628,9 +655,10 @@ end
         i for (i, st) in pairs(ci.code)
             if st isa Expr && StrictMode._boxing_store(ci, sig, st, StrictMode._static_callee(ci, st.args[1]))
     ]
-    @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, i), stores)
+    @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, sig, i), stores)
     @test !StrictMode._failed(only(findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
     @test !StrictMode._failed(only(proof_findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
-    ci = StrictMode._typed_body(Tuple{typeof(store3!), Base.RefValue{Any}, Float64})
-    @test !any(i -> StrictMode._stmt_in_scheduler(ci, i), eachindex(ci.code))
+    sig3 = Tuple{typeof(store3!), Base.RefValue{Any}, Float64}
+    ci = StrictMode._typed_body(sig3)
+    @test !any(i -> StrictMode._stmt_in_scheduler(ci, sig3, i), eachindex(ci.code))
 end

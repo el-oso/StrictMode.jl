@@ -907,6 +907,17 @@ function _typed_body(@nospecialize(sig))
         end
         ci = isempty(cts) ? nothing : first(cts[1])
     end
+    # A compiled body keeps no record of what was inlined into each statement, and a scheduler body that
+    # runs a callable it was handed needs one to tell that callable's statements from its own
+    # (`_stmt_in_scheduler`), so it is read again with them.
+    if !isnothing(ci) && !_has_inlining_info(ci) && _runs_handed_callable(sig)
+        src = try
+            _code_typed_by_type(sig; optimize = true, debuginfo = :source)
+        catch
+            Any[]
+        end
+        isempty(src) || (ci = first(src[1]))
+    end
     rec = (isnothing(ci) || isnothing(mi)) ? nothing : _record_of(mi, world)
     @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (_ReadStamp(world, mi, rec), ci))
     return ci
@@ -1025,7 +1036,8 @@ function _signal_origin(
 end
 
 # One body of the walk above: the statements of its own that set `mode`'s signal, and the callees it
-# invokes off its throw paths, each with whether it is called in a caught context (`_skip_mask`).
+# invokes off its throw paths, each with whether it is called in a caught context (`_skip_mask`) and
+# the statement that calls it.
 # Every warning walks the call graph below its call, and the calls of one package share most of that
 # graph, so a body is scanned once per world and context and not once per warning.
 # Emptied with the other scan memos.
@@ -1054,7 +1066,7 @@ function _origin_node(@nospecialize(s), mode::Symbol, caught::Bool = false)
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
             _mi_is_strictmode(mi) && continue
-            push!(callees, (mi, caught || (!isnothing(region) && region[j])))
+            push!(callees, (mi, caught || (!isnothing(region) && region[j]), j))
         end
     end
     @lock _SIGNAL_MEMO_LOCK begin
@@ -1100,24 +1112,20 @@ function _sig_in_scheduler(@nospecialize(sig))
 end
 
 # Whether an origin `_signal_origin` found is the scheduler's: in its code, or in Base code its code
-# reached. The package's code a scheduler call runs (the function given to `lock`) is the package's,
-# and so is everything below it, inlined into the scheduler call or not.
+# reached. A callable the scheduler was handed (the function given to `lock`) is its caller's code
+# whoever defined its type, and so is everything below it, inlined into the scheduler call or not;
+# a wait that callable makes is the scheduler's again.
 function _origin_in_scheduler(o)
     chain = Any[o.path..., o.signature]
     k = findlast(_sig_in_scheduler, chain)
     isnothing(k) && return false
-    return !_names_user_type(chain[k]) && !any(_sig_runs_user_code, @view chain[(k + 1):end])
-end
-
-# Whether a signature names a concrete type defined outside Base and Core, at any parameter depth (the
-# closure `lock(f, l)` is called with). An abstract parameter (`yieldto(::Task, ::Any)`) names none.
-function _names_user_type(@nospecialize(T), depth::Int = 0)
-    depth > 8 && return true
-    T = Base.unwrap_unionall(T)
-    T isa Union && return _names_user_type(T.a, depth + 1) || _names_user_type(T.b, depth + 1)
-    T isa DataType || return false
-    isconcretetype(T) && !_sw_is_base(parentmodule(T)) && return true
-    return any(p -> p isa Type && _names_user_type(p, depth + 1), T.parameters)
+    if k < length(chain)
+        _calls_argument(chain[k], chain[k + 1]) && return false
+        return !any(_sig_runs_user_code, @view chain[(k + 1):end])
+    end
+    ci = _typed_body(chain[k])
+    isnothing(ci) && return false
+    return all(st -> _stmt_in_scheduler(ci, chain[k], st[1], true), o.statements)
 end
 
 function _sig_runs_user_code(@nospecialize(sig))
@@ -1138,18 +1146,23 @@ end
 # Base is followed to the end here, not to the scan's depth. The scan's verdict needs only one
 # allocation and stops at the first; the claim that a call does nothing but wait is about all of
 # them, and an allocation three Base calls down (`copyto!` to `unalias` to `unaliascopy`) is past
-# the depth the verdict reads to. What the scheduler's own code calls is the scheduler's.
+# the depth the verdict reads to. What the scheduler's own code calls is the scheduler's, except a
+# callable it was handed (`_calls_argument`): a scheduler body is read for that code alone, and its
+# callees only when they are that callable or are called from it inlined, since following the rest
+# reads the whole scheduler.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     parent = IdDict{Any, Any}()
-    queue = Any[(_sigtype(f, types), false)]
+    queue = Any[(_sigtype(f, types), false, false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
-        s, caught = popfirst!(queue)
-        (s, caught) in seen && continue
+        s, caught, sched = popfirst!(queue)
+        (s, caught, sched) in seen && continue
         length(seen) < _SCAN_BODY_BUDGET[] || return missing
-        push!(seen, (s, caught))
-        isnothing(_typed_body(s)) && return missing
+        push!(seen, (s, caught, sched))
+        ci = _typed_body(s)
+        isnothing(ci) && return missing
         trace, callees = _origin_node(s, :alloc, caught)
+        sched && (trace = filter(st -> !_stmt_in_scheduler(ci, s, st[1], true), trace))
         if !isempty(trace)
             path = Any[]
             c = s
@@ -1159,11 +1172,13 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             end
             return (; signature = s, path, statements = trace)
         end
-        for (mi, c) in callees
+        for (mi, c, j) in callees
             mi = mi::Core.MethodInstance
-            (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi)) || _in_scheduler(mi)) && continue
+            (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi))) && continue
+            arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true))
+            (sched && !arg) && continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, c::Bool))
+            push!(queue, (mi.specTypes, c::Bool, !arg && _in_scheduler(mi)))
         end
     end
     return nothing
@@ -1365,12 +1380,17 @@ function _boxing_store(ci, @nospecialize(sig), st::Expr, @nospecialize(callee) =
     return false
 end
 
-# Is statement `pc` inlined from Base's task, lock or condition code, with none of the package's own
-# code inlined inside that? The proof tier asks the same of an allocation site's frames
-# (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
-function _stmt_in_scheduler(ci, pc::Int)
+# Is statement `pc` of the body of `sig` the scheduler's: inlined from Base's task, lock or condition
+# code (or in such a body, `frame`), with neither the package's code nor a callable the scheduler was
+# handed (`_calls_argument`) inlined inside that? The proof tier asks the same of an allocation site's
+# frames (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
+function _stmt_in_scheduler(ci, @nospecialize(sig), pc::Int, frame::Bool = false)
+    # Without the record of what was inlined, a body that may run a handed callable cannot be split:
+    # every statement is counted as the caller's.
+    (frame && !_has_inlining_info(ci) && _runs_handed_callable(sig)) && return false
     di = ci.debuginfo
-    sched = false
+    sched = frame
+    encl = sig
     for _ in 1:64
         di isa Core.DebugInfo || break
         t = try
@@ -1382,15 +1402,47 @@ function _stmt_in_scheduler(ci, pc::Int)
         (1 <= eidx <= length(di.edges)) || break
         e = di.edges[eidx]
         e isa Core.DebugInfo || break
-        m = e.def isa Core.MethodInstance ? e.def.def : e.def
-        if m isa Method
+        mi = e.def isa Core.MethodInstance ? e.def : nothing
+        m = isnothing(mi) ? e.def : mi.def
+        if sched && !isnothing(mi) && !isnothing(encl) && _calls_argument(encl, mi.specTypes)
+            sched = false
+        elseif m isa Method
             root = Base.moduleroot(m.module)
-            sched = (root === Base || root === Core) && (sched || basename(string(m.file)) in _SCHEDULER_FILES)
+            sched = (root === Base || root === Core) && (sched || _method_in_scheduler(m))
         end
+        encl = isnothing(mi) ? nothing : mi.specTypes
         di = e
         pc = Int(t[3])
     end
     return sched
+end
+
+# Whether a body records the calls inlined into its statements.
+_has_inlining_info(ci) = ci.debuginfo isa Core.DebugInfo && !isempty(ci.debuginfo.edges)
+
+# Whether `sig` is a scheduler body handed a callable it may run: an argument whose type has a call
+# method, as the function given to `lock(f, l)` has.
+function _runs_handed_callable(@nospecialize(sig))
+    _sig_in_scheduler(sig) || return false
+    sig = Base.unwrap_unionall(sig)
+    sig isa DataType || return false
+    world = Base.get_world_counter()
+    return any(Iterators.drop(sig.parameters, 1)) do P
+        P isa DataType && isconcretetype(P) || return false
+        ms = Base._methods_by_ftype(Tuple{P, Vararg{Any}}, -1, world)
+        return ms isa Vector && !isempty(ms)
+    end
+end
+
+# Whether `callee` is a call of one of `caller`'s own arguments: the function given to `lock(f, l)`,
+# which is its caller's code whoever defined its type. Only the function position counts, since the
+# lock itself is an argument too and is handed on to the scheduler's own calls.
+function _calls_argument(@nospecialize(caller), @nospecialize(callee))
+    caller = Base.unwrap_unionall(caller)
+    callee = Base.unwrap_unionall(callee)
+    (caller isa DataType && callee isa DataType && !isempty(callee.parameters)) || return false
+    F = callee.parameters[1]
+    return any(P -> P === F, Iterators.drop(caller.parameters, 1))
 end
 
 # The type a `:new` constructs. Optimized IR may name it with a `GlobalRef` (`%new(Base.ComplexF64, …)`)
@@ -1532,17 +1584,19 @@ function _scan_ci(
     # only possible act is to throw on `uses[i]`.
     usememo = Ref{Union{Nothing, _SSAUses}}(nothing)
     ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci))::_SSAUses : usememo[]::_SSAUses
-    # Whether this body is the scheduler's: its caller drops its boxing, so that boxing cannot decide
-    # `:alloc` and the walk goes on to the allocation below it (`schedule` boxes before it queues).
+    # Whether this body is Base's task, lock or condition code. Boxing there is the scheduler's own, off
+    # the call's hot path, and is not counted, except in code the scheduler was handed to run: the
+    # function given to `lock(f, l)` is its caller's, inlined or called (`_calls_argument`).
     schedmemo = Ref{Union{Nothing, Bool}}(nothing)
     insched() = isnothing(schedmemo[]) ? (schedmemo[] = _sig_in_scheduler(sig))::Bool : schedmemo[]::Bool
+    schedstmt(i) = _stmt_in_scheduler(ci, sig, i, insched())
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if top && abscontainer === nothing && _abstract_container(T)
             abscontainer = eltype(T)
         end
         if !boxing && (Meta.isexpr(st, :new) || Meta.isexpr(st, :foreigncall)) && !dead[i] &&
-                _boxing_store(ci, sig, st) && !_stmt_in_scheduler(ci, i)
+                _boxing_store(ci, sig, st) && !schedstmt(i)
             boxing = true
             isnothing(trace) || push!(trace, (i, st, :boxing))
         end
@@ -1638,10 +1692,10 @@ function _scan_ci(
                         user = _followed_to_end(mi)
                         follows = depth > 0 || (depth < 0 && user)
                         # A callee can still change the answer while `undecided`: `:alloc` is decided by the
-                        # first allocation or boxing (an allocation alone in the scheduler's code), `:boxing`
-                        # by the first boxing, and `:full` also needs the dictionary lookup.
+                        # first allocation or boxing, `:boxing` by the first boxing, and `:full` also needs the
+                        # dictionary lookup.
                         undecided = mode === :full ? (!alloc || !boxing || !dictlookup) :
-                            mode === :alloc ? (!alloc && (!boxing || insched())) : !boxing
+                            mode === :alloc ? (!alloc && !boxing) : !boxing
                         if follows && undecided && length(seen) > _SCAN_BODY_BUDGET[]
                             truncated = true
                         elseif follows && undecided
@@ -1670,7 +1724,8 @@ function _scan_ci(
                                 end
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
-                            (b2 && !_in_scheduler(mi)) && (boxing = true)
+                            (b2 && (!insched() || _in_scheduler(mi) || _calls_argument(sig, mi.specTypes) || !schedstmt(i))) &&
+                                (boxing = true)
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
                             up2 && (unionphi = true)
@@ -1692,7 +1747,7 @@ function _scan_ci(
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if !boxing && !dead[i] && (callee === Core.setfield! || callee === Core.memoryrefset! || callee === Core.setglobal!) &&
-                    _boxing_store(ci, sig, st, callee) && !_stmt_in_scheduler(ci, i)
+                    _boxing_store(ci, sig, st, callee) && !schedstmt(i)
                 boxing = true
                 isnothing(trace) || push!(trace, (i, st, :boxing))
             end
@@ -1705,7 +1760,7 @@ function _scan_ci(
                 # A splat the optimizer could not unroll (`max(v...)` over a `Vector`): the callee is
                 # looked up at run time for an argument list built at run time, whatever type
                 # inference gives the result.
-                if !dead[i]
+                if !dead[i] && !(insched() && schedstmt(i))
                     boxing = true
                     isnothing(trace) || push!(trace, (i, st, :boxing))
                 end
@@ -1722,9 +1777,11 @@ function _scan_ci(
                 # `Core.getfield(t, i, ...)`, and that genuinely needs boxing (the field's type
                 # varies by which runtime index is read) — that IS the founding runtime-tuple-
                 # index trap `@unroll` exists for, and must keep flagging as boxing.
-                boxing = true
-                isnothing(trace) || push!(trace, (i, st, :boxing))
-            elseif !boxing
+                if !(insched() && schedstmt(i))
+                    boxing = true
+                    isnothing(trace) || push!(trace, (i, st, :boxing))
+                end
+            elseif !boxing && !(insched() && schedstmt(i))
                 # Concrete result but a boxy argument on a non-builtin call = runtime dispatch
                 # that inference resolved only by return type (e.g. `Vec{32,UInt8}(::Tuple{Vararg})`).
                 if !(callee isa Core.Builtin || callee isa Core.IntrinsicFunction)
