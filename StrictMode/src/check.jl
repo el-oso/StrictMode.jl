@@ -20,13 +20,16 @@ function _sig_string(@nospecialize(types::Tuple))
     @lock _SIGNAL_MEMO_LOCK (_SIG_STRING_MEMO[key] = (world, s))
     return s
 end
-# A callable object is named by its type, as `only` and `exempt` match it: printing the value would
-# show its fields.
+# A callable object is named by its type, with the type's parameters and without its module
+# (`Boxed{Int64}`): one method serves every `Boxed{T}`, and each instantiation is its own row, so
+# the name keeps their `key`s apart. Printing the value would show its fields. `only` and `exempt`
+# match it by `nameof` alone (`Boxed`).
 _func_name(@nospecialize(f)) = try
-    string(f isa Function || f isa Type ? nameof(f) : nameof(_ftype(f)))
+    f isa Function || f isa Type ? string(nameof(f)) : _type_label(_ftype(f))
 catch
     string(f)
 end
+_type_label(@nospecialize(T)) = sprint(show, T; context = :module => parentmodule(T))
 _mod_sym(@nospecialize(f)) = try
     nameof(parentmodule(f isa Function || f isa Type || f isa Module ? f : _ftype(f)))
 catch
@@ -291,7 +294,8 @@ end
 The same analysis for a signature type `Tuple{F, types...}`, where `F` is the type of the callable.
 This form needs no instance of `F`, so it reaches a callable object's method — `(r::Reader)(x)` — from
 its type alone: `findings(Tuple{Reader, Int})` reads what `findings(Reader(1), (Int,))` reads. A
-callable object is named by its type in the findings.
+callable object is named by its type in the findings, with the type's parameters and without its
+module: `Boxed{Int64}`.
 """
 function findings(@nospecialize(sig::Type{<:Tuple}); guarantees = (:typestable, :noalloc))
     (sig isa DataType && !isempty(sig.parameters)) || throw(

@@ -441,7 +441,9 @@ StrictMode/src/
                         as the callee, and every reader of f goes through _ftype/_sigtype/_which,
                         _return_types/_infer_effects and _print_code_by_type (scheduling.jl), which
                         reach Base by the signature for it. _func_name names a callable by its type
-                        (the cache key carries that type too: one method serves every Boxed{T})
+                        WITH its parameters and without its module ("Boxed{Int64}"), so each
+                        instantiation has its own key(); only/exempt still match nameof ("Boxed").
+                        The cache key carries that type too: one method serves every Boxed{T}
   findings.jl         — StrictFinding struct (carries `tier`: :report vs :proof, `code`, and
                         `policy`: the macro line that required the guarantee),
                         format_findings,

@@ -220,8 +220,10 @@ method is listed twice. The coverage gate below still counts them as the package
 A callable object's method, `(r::Reader)(x)`, is swept too, once for each concrete type it compiled
 for: `Reader`, and `Boxed{Int}` and `Boxed{Float64}` separately for `(b::Boxed)(x)`. The sweep has
 no instance of the object, and needs none: it checks the signature `Tuple{Reader, typeof(x)}`, as
-[`findings`](@ref) does. Its findings, `only`, `exempt` and `@strict_exempt` all name it by its type,
-`Reader` or `Boxed`. An `only` or `exempt` that is a predicate function is not asked about a
+[`findings`](@ref) does. Its findings name it by its type with the type's parameters, `Reader`,
+`Boxed{Int64}` and `Boxed{Float64}`, so each instantiation has its own [`StrictMode.key`](@ref) and
+a comparison of two runs keeps them apart. `only`, `exempt` and `@strict_exempt` name it by the
+type's name alone, `Reader` or `Boxed`, which matches every instantiation. An `only` or `exempt` that is a predicate function is not asked about a
 callable object with no instance, which stays in the sweep. A capturing closure is part of the
 function it is written in, and is not swept on its own.
 

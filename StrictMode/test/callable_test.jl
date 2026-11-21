@@ -5,7 +5,11 @@
     struct Bits
         k::Int
     end
-    (b::Bits)(x::Vector{Float64}) = (s = 0.0; for v in x; s += v * b.k; end; s)
+    (b::Bits)(x::Vector{Float64}) = (
+        s = 0.0; for v in x
+            s += v * b.k
+        end; s
+    )
     mutable struct Mut
         k::Any
     end
@@ -108,8 +112,8 @@ end
     @test length(rows("Clean")) == 2
     @test !any(StrictMode._failed, rows("Clean"))
     # Two instantiations of one method: two rows, with their own verdicts.
-    boxed = [f for f in fs if f.func == "Boxed" && f.guarantee === :typestable]
-    @test sort([f.status for f in boxed]) == [:fail, :pass]
+    boxed = [f for f in fs if startswith(f.func, "Boxed") && f.guarantee === :typestable]
+    @test sort([(f.func, f.status) for f in boxed]) == [("Boxed{Any}", :fail), ("Boxed{Int64}", :pass)]
     @test isempty(rows("Cold"))
     @test sort([(f.guarantee, f.status) for f in rows("Narrow")]) == [(:noalloc, :info), (:typestable, :pass)]
     # The advisories walk the same specializations.
@@ -133,4 +137,41 @@ end
     finally
         delete!(StrictMode.STRICT_REGISTRY, (only(k for k in keys(StrictMode.STRICT_REGISTRY) if k[1] isa S.Vec)))
     end
+end
+
+@testitem "a callable object's rows are named with its type parameters" begin
+    using StrictMode
+    module ParamRows
+    using StrictMode
+    struct Boxed{T}
+        v::Vector{T}
+    end
+    (b::Boxed)(n::Int) = fill(b.v[1], n)
+    end
+    P = ParamRows
+    P.Boxed([1])(1); P.Boxed(Any[1])(1)
+
+    fs = audit(P; sweep = true, dispatch_suggest = false)
+    boxed = [f for f in fs if startswith(f.func, "Boxed") && f.guarantee === :noalloc]
+    @test sort([f.func for f in boxed]) == ["Boxed{Any}", "Boxed{Int64}"]
+    @test length(unique(StrictMode.key.(boxed))) == 2
+    @test all(f -> f.mod === :ParamRows, boxed)
+    # The instance and signature forms name the row the same way.
+    @test all(x -> x.func == "Boxed{Int64}", findings(P.Boxed([1]), (Int,)))
+    @test all(x -> x.func == "Boxed{Any}", findings(Tuple{P.Boxed{Any}, Int}))
+
+    # Both instantiations fail `:noalloc`; a run that has only one of them failing is a different
+    # set of failures, not the same one.
+    int = filter(f -> f.func == "Boxed{Int64}", boxed)
+    any_ = filter(f -> f.func == "Boxed{Any}", boxed)
+    @test all(StrictMode._failed, vcat(int, any_))
+    d = findings_diff(int, any_)
+    @test length(d.introduced) == 1 && length(d.fixed) == 1 && isempty(d.unchanged) && isempty(d.changed)
+
+    # `only` and `exempt` by name still match every instantiation.
+    scoped = audit(P; sweep = true, only = (:Boxed,), dispatch_suggest = false)
+    @test Set(f.func for f in scoped if f.guarantee === :noalloc) == Set(["Boxed{Int64}", "Boxed{Any}"])
+    @test !any(f -> startswith(f.func, "Boxed"), audit(P; sweep = true, exempt = (:Boxed,), dispatch_suggest = false))
+    @test Set(f.func for f in audit(P; sweep = true, only = r"^Box", dispatch_suggest = false) if f.guarantee === :noalloc) ==
+        Set(["Boxed{Int64}", "Boxed{Any}"])
 end
