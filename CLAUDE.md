@@ -590,15 +590,17 @@ StrictMode/src/
                         operation anywhere the task reaches — judged over the whole reach, not per
                         loop, because the correct shape nests its spin inside the loop that
                         blocks. A loop with neither is not reported: it may block in a foreign
-                        call. _sw_reach follows :invoke into callees outside Base (a worker loop is
-                        usually a named function) and into a Base callee only when it carries a
-                        user function (a comprehension's Generator); Base is otherwise judged by
-                        name and argument types and NOT entered, because yield itself parks through
-                        wait. A Base callee handed any other user value, or an argument typed
-                        abstractly (reach.jl's _reach_carries_user/_reach_open at the call-site
-                        types), may run that value's methods (show from repr) and is COUNTED as
-                        unfollowed, not entered: entering cost 25x on a worker passing user
-                        structs to repr/sort!/Dict (1.3 ms -> 32 ms, 44 bodies), measured.
+                        call. _sw_reach follows :invoke with reach.jl's policy: into callees
+                        outside Base (a worker loop is usually a named function), and into a Base
+                        callee whose signature names a type defined outside Base
+                        (_reach_follows — a closure, or a user value whose show repr runs), or
+                        at the CALL-SITE types when a @nospecialize method is handed one and those
+                        types select the same method (_reach_same_method). Base is otherwise
+                        judged by name and argument types and NOT entered, because yield itself
+                        parks through wait. An argument typed abstractly (_reach_open), and an
+                        `invoke` of a less specific Base method, are COUNTED as unfollowed.
+                        Entering costs 25x on a worker passing user structs to repr/sort!/Dict
+                        (1.3 ms -> 33 ms per report, warm), measured.
                         `lock` is not a blocking operation (a SpinLock spins) and take! on an
                         IO is not either. A task is created BOUND (Task(f), @async); only
                         Threads.@spawn's `sticky = false` write, matched on the task's own SSA

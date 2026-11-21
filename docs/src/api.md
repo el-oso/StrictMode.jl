@@ -173,7 +173,9 @@ concurrent tasks. `@assert_no_threadid_state` fails on mutable state indexed by
 `Threads.threadid()` that is still in use after a point where the task can be suspended: only there
 can the task move threads, or another run on its thread and reach the same state. `pool_balance_report` is the companion diagnostic for
 thread-pool balance questions. `spin_wait_report` reads how the tasks a call spawns wait, and
-reports a migratable one that spins without ever blocking.
+reports a migratable one that spins without ever blocking. It enters a Base call handed a user
+value, so a `show` that spins behind `repr` is read; an argument typed `Any` is counted as not
+followed.
 
 ```@docs
 @assert_concurrency_safe

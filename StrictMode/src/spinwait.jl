@@ -16,10 +16,11 @@
 # A bound task cannot wake a spare thread.
 #
 # The scan follows `:invoke` into callees outside Base, so a worker loop written as a named
-# function is read. A callee in Base is judged by its name and argument types and entered only
-# when it carries a user function: `yield` itself parks through `wait`, and entering it would read
-# every spin as blocking. A Base callee handed any other user value, or an argument typed
-# abstractly, may run a method of that value (`show` from `repr`) and is counted as not followed.
+# function is read. A callee in Base is judged by its name and argument types, and entered only
+# when its signature names a type defined outside Base — a user function, or a user value whose
+# methods it may run (`show` from `repr`): `yield` itself parks through `wait`, and entering Base
+# everywhere would read every spin as blocking. A Base callee handed an argument typed abstractly,
+# or an `invoke` of a method its call-site types do not select, is counted as not followed.
 #
 # Whatever the scan could not read is counted and shown — a task whose closure type is unknown, a
 # dynamic call, a callee past the body limit — because an unread task is not a task that parks.
@@ -101,15 +102,6 @@ function _sw_is_base(m::Module)
     return root === Base || root === Core
 end
 
-# Whether a type is, or carries as a parameter, a function defined outside Base — a closure handed
-# to `map`, `foreach` or a comprehension's `Generator`.
-function _sw_carries_user_function(@nospecialize(T))
-    T = Base.unwrap_unionall(T)
-    T isa DataType || return false
-    T <: Function && !_sw_is_base(parentmodule(T)) && return true
-    return any(_sw_carries_user_function, T.parameters)
-end
-
 # Whether a signature can reach code outside Base: a type defined outside Base, at any parameter depth,
 # whose methods a Base function may call (`show` from `string`, `getindex` from `sum`), or an abstract
 # type, which may be one.
@@ -125,11 +117,6 @@ function _carries_user_type(@nospecialize(T), depth::Int = 0)
         return p isa Type && _carries_user_type(p, depth + 1)
     end
 end
-
-# A callee outside Base is entered. One in Base is entered only when it was handed user code to
-# run, since that is the one way a Base method reaches back into the analyzed package.
-_sw_follows(mi::Core.MethodInstance) =
-    !_sw_is_base(mi.def.module) || _sw_carries_user_function(mi.specTypes)
 
 # The value a call's callee slot names, when it is a constant.
 function _sw_callee_value(@nospecialize(a))
@@ -239,15 +226,21 @@ function _sw_scan!(r::_SwReach, ci::Core.CodeInfo, @nospecialize(sig), queue::Ve
                 continue
             end
             _sw_record!(r, mi.def.name, mi.specTypes) === :other || continue
-            if _sw_follows(mi)
+            # The same follow policy as `reach_report`: a Base callee handed a value of a type
+            # defined outside Base can run that value's methods (`show` from `repr`), so it is
+            # entered. A `@nospecialize` method compiles for `Any` whatever it is handed, so it is
+            # read at the call-site types when those select the same method.
+            if _reach_follows(mi)
                 push!(queue, mi.specTypes)
             else
-                # A Base callee handed a user value, or an argument typed abstractly that may hold
-                # one, can run that value's methods (`show` from `repr`). It is not entered, since
-                # reading Base's bodies for every user value multiplies the bodies read, so it is
-                # counted.
                 site = _reach_invoke_types(ci, sig, st, mi)
-                (_reach_carries_user(site) || _reach_open(site)) && (r.unfollowed += 1)
+                if _reach_carries_user(site) && _reach_same_method(site, mi.def)
+                    push!(queue, site)
+                elseif _reach_carries_user(site) || _reach_open(site)
+                    # An argument typed abstractly, or an `invoke` of a method the site's types do
+                    # not select (reading the site would read the other method), is counted.
+                    r.unfollowed += 1
+                end
             end
         elseif st.head === :call
             v = _sw_callee_value(st.args[1])
@@ -333,8 +326,8 @@ a blocking `wait`.
 A task is reported when a waiting operation is read in a loop and no blocking operation — `wait`,
 `sleep`, `take!`, `fetch`, `acquire`, iterating or `put!`-ing a channel — is read anywhere the task
 reaches. So a pool that spins before it parks passes, and so does a loop that only blocks. The
-scan reads the task's closure and the callees outside Base it invokes, and the tasks those spawn
-in turn.
+scan reads the task's closure, the callees outside Base it invokes, the Base callees handed a
+user function or value, and the tasks those spawn in turn.
 
 Tasks that stay bound to a thread are counted in `bound` and not judged: `Task(f)` and `@async`
 create a bound task, and `Threads.@spawn` releases it.
@@ -342,10 +335,10 @@ create a bound task, and `Threads.@spawn` releases it.
 Advisory, with these limits:
 
 - A blocking call inside a call that was not followed reads as absent. Those calls are counted in
-  each finding and in the report's `unfollowed`. They include every Base call handed a value of
-  a type defined outside Base, or an argument typed abstractly (`Any`), other than a user function:
-  Base may run that value's methods, `show` from `repr` or `string`, and the scan does not enter
-  Base to see whether it does.
+  each finding and in the report's `unfollowed`. A Base call handed a value of a type defined
+  outside Base is entered, since Base may run that value's methods (`show` from `repr`); one
+  handed an argument typed abstractly (`Any`), whose methods are not known from the IR, is
+  counted, and so is an `invoke` of a less specific Base method.
 - A task whose closure type is not concrete at the spawn site is listed in `unread`.
 - A loop that yields between units of work, without waiting for anything, is reported as well.
 - The tasks of `Threads.@threads` are created inside Base and are not found.

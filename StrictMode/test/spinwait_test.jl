@@ -235,6 +235,10 @@ end
     struct Parks end
     @noinline park() = wait(Threads.Event())
     Base.show(io::IO, ::Parks) = (park(); print(io, "Parks"))
+    # Base's default `show` of `Out` prints its field, whose `show` spins; `Out`'s own parks.
+    struct Out; x::Spin; end
+    Base.show(io::IO, ::Out) = (park(); print(io, "Out"))
+    @noinline dflt(io::IOBuffer, o::Out) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
 
     direct() = fetch(Threads.@spawn spinwait())
     # Blocks properly, and hands Base nothing of its own.
@@ -245,6 +249,8 @@ end
     viaany(r::Base.RefValue{Any}) = fetch(Threads.@spawn string("a", r[]))
     # A `show` that parks, reached the same way as `viashow`.
     viashow_parks(s::Parks) = fetch(Threads.@spawn repr(s))
+    # `invoke` runs Base's default `show`, which the call-site types do not select.
+    viainvoke(o::Out) = fetch(Threads.@spawn dflt(IOBuffer(), o))
     end
 
     clean(r) = isempty(r.findings) && isempty(r.unread) && iszero(r.unfollowed)
@@ -253,12 +259,15 @@ end
 
     @test clean(StrictMode.spin_wait_report(SpinShow.blocks, ()))
 
-    # Base is not entered for a user value, so the call is counted and the report is not clean,
-    # whether the value's type is concrete at the call or not.
-    for (f, T) in (
-            (SpinShow.viashow, (SpinShow.Spin,)), (SpinShow.viaany, (Base.RefValue{Any},)),
-            (SpinShow.viashow_parks, (SpinShow.Parks,)),
-        )
+    # Base is entered when it is handed a user value whose type the call site names, so the user
+    # `show` it runs is read: one that spins is a finding, one that parks is clean.
+    @test :yield in only(StrictMode.spin_wait_report(SpinShow.viashow, (SpinShow.Spin,)).findings).polls
+    @test clean(StrictMode.spin_wait_report(SpinShow.viashow_parks, (SpinShow.Parks,)))
+
+    # A value typed `Any` at the Base call, and an `invoke` of a method the site does not select,
+    # are counted rather than read, so the report is not clean. Reading the `invoke` at the site's
+    # types would read `Out`'s own `show`, which parks, and report the call as clean.
+    for (f, T) in ((SpinShow.viaany, (Base.RefValue{Any},)), (SpinShow.viainvoke, (SpinShow.Out,)))
         r = StrictMode.spin_wait_report(f, T)
         @test isempty(r.findings)
         @test r.unfollowed > 0
