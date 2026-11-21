@@ -643,14 +643,17 @@ inference types as `<:Untrusted`, directly or through `invoke`, and any call to 
 `write` or `unsafe_write` handed an `Untrusted` or a tuple, array or `Ref` of them past its first
 operand: `reinterpret(T, u)`, `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])` copy
 out the bits of an `isbits` payload. Handed an operand whose type cannot rule one out (`Any`,
-`Vector{Any}`), those three are reads that cannot be ruled out, and the reason names that type. An
-abstract type that is no tuple, array or `Ref` and has no type parameter that can hold an
-`Untrusted` (`Real`, `Integer`, `AbstractString`, `IO`) rules one out, so a struct subtype of one
-of those with an `Untrusted` field, passed under the abstract type, is not seen. It is also any of
-`getfield`, `getproperty` and `unsafe_trust` handed to another call as a value, bare or held by a
-callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
-`getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. `unsafe_trust`
-handed on is a read wherever it goes, since its one method takes an `Untrusted`. `getfield` and
+`Vector{Any}`), those three are reads that cannot be ruled out, and the reason names that type.
+Every abstract type is one of those, `Real`, `Integer`, `AbstractString` and `IO` included, since
+any package can subtype it with a struct holding an `Untrusted`: `write(io, x::Real)` and
+`reinterpret(UInt64, x::Integer)` are reported. A concrete type is judged by its fields, so
+`write(io, x::Float64)` is not reported and a struct with a field of type `Any` or `Untrusted` is.
+It is also any of `getfield`, `getproperty` and `unsafe_trust` handed to another call as a value,
+bare or held by a callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
+`getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. Comparing one
+of the three with a value (`===`, `==`, `isequal`) or testing membership (`in`, `∉`) applies it to
+nothing and is not a read. `unsafe_trust` handed to any other call is a read, since its one method
+takes an `Untrusted`; that includes building the tuple in `f in (unsafe_trust, g)`. `getfield` and
 `getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,
 array or `Ref` of them, and a read that cannot be ruled out when an operand's type does not rule
 one out (an `Any`, an abstract type, a struct with such a field). Handed on with a constant field,
@@ -665,8 +668,11 @@ the boundary.
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized
 typed IR, with no execution, backend, or timing — and it **gates**, because it observes a call on a
 type inference has already fixed rather than guessing at a cost. A value inference could not type is handled by what the
-call can do: `getfield` and `unsafe_trust` on it are reported as reads that cannot be ruled out,
-and warn; `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
+call can do: `unsafe_trust` on it, and `getfield` of the field `:x` or of index 1 (`Untrusted` has
+one field), are reported as reads that cannot be ruled out, and warn. `getfield` of another field
+is not, and neither is a read of field 1 of what `iterate` returned, nor of a value the same
+straight-line code also reads another field of, unless the payload read sits in a `try` whose
+catch can return or reads a local the payload was copied into. `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
 name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the field, so it is
 reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
 from then on `p.x`, `p.v` or a property of any name read from an untyped value is reported like
