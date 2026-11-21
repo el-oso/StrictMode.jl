@@ -572,6 +572,10 @@ at load (a generic declaration infers to `Any`); declare its instantiations with
 [`@strict_function`](@ref)'s `signatures = [...]`, or gate on them from the test environment with
 `StrictModeTest.test_coverage`.
 
+A callable object with fields, `(c::Reader)(x)`, is not checked here: it has no instance at load.
+The module sweeps (`audit(mod; sweep = true)`, `test_compiled`) and the proofs check it from its
+compiled specializations. A singleton callable has an instance and is checked like a function.
+
 An unknown guarantee name is an error here, not a no-op: a misspelled guarantee that was accepted
 would check nothing while reading as though it checked something.
 

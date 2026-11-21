@@ -91,6 +91,12 @@ not count. An exemption narrowed to a signature with `types = (...)` counts, as 
 instantiation does. `@strict module … end` wraps the whole module and has no such position, and
 `check = false` records a policy without checking.
 
+A policy does not check a callable object's method at load. A callable object with fields,
+`(c::Reader)(x)`, has no instance when the module loads, so there is nothing to call it on; the
+module sweeps (`audit(mod; sweep = true)`, `test_compiled`) and the proofs check it from its
+compiled specializations instead. A singleton callable, `struct Op end; (::Op)(x::Int)`, has an
+instance and is checked at load like a function.
+
 ### Declaring a narrower set, rather than excusing a guarantee
 
 An exemption is for a method that sits under a policy claiming something it cannot deliver. When

@@ -213,3 +213,22 @@ end
     ms, _ = StrictMode.module_methods(P; exempt = f -> f === P.Boxed)
     @test !any(m -> StrictMode._method_function(m) <: P.Boxed, ms)
 end
+
+@testitem "@strict_policy does not check a callable object at load; a sweep does" begin
+    using StrictMode
+    load(src) = Core.eval(@__MODULE__, Meta.parse(src))
+    unstable(head) = "$head(x::Int) = x > 0 ? 1 : \"s\""
+
+    # Control: the same body as a function is checked at load, and fails.
+    @test_throws StrictMode.StrictViolation load("module PolFn; using StrictMode; $(unstable("f")); @strict_policy :typestable; end")
+    # A singleton callable has an instance, so it is checked at load like a function.
+    @test_throws StrictMode.StrictViolation load("module PolOp; using StrictMode; struct Op end; $(unstable("(::Op)")); @strict_policy :typestable; end")
+    # A callable object with fields has no instance at load: the policy does not check it.
+    M = load("module PolObj; using StrictMode; struct C; k::Int; end; $(unstable("(c::C)")); ok(x::Int) = x + 1; @strict_policy :typestable; end")
+    @test M isa Module
+    # The sweep checks it from what has compiled.
+    M.C(1)(1)
+    fs = [f for f in audit(M; sweep = true, dispatch_suggest = false) if f.func == "C" && f.guarantee === :typestable]
+    @test length(fs) == 1
+    @test StrictMode._failed(only(fs))
+end

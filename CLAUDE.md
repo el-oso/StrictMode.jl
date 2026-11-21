@@ -364,7 +364,10 @@ StrictMode/src/
                         (one exemption or several; `types = (...)` narrowing still
                         counts), one declared with `signatures = [...]`, a constructor, a
                         macro and a callable object's method are all accounted for): written
-                        first it would load cleanly over a module it never read. `check = false` does not raise
+                        first it would load cleanly over a module it never read. `check = false` does not raise.
+                        A callable object WITH FIELDS is never checked at load (no instance —
+                        _module_load_items skips it); sweeps and proofs cover it. A singleton
+                        callable has an instance and is checked like a function
   contracts.jl        — @strict_contract, @verify_strict (pairs a TypeContracts interface with
                         StrictMode performance guarantees. A @verify_strict line is an
                         example call or a SIGNATURE line, `f(::T1, ::T2; k::K)`: _signature_parts
