@@ -23,8 +23,13 @@ end
 # A callable object is named by its type, with the type's parameters and without its module
 # (`Boxed{Int64}`): one method serves every `Boxed{T}`, and each instantiation is its own row, so
 # the name keeps their `key`s apart. Printing the value would show its fields. `only` and `exempt`
-# match it by `nameof` alone (`Boxed`).
+# match it by `nameof` alone (`Boxed`). The keyword body of a constructor or a callable object, which
+# Julia names `_`, is named after the callable it belongs to (`_kwbody_owner`).
 _func_name(@nospecialize(f)) = try
+    if f isa Function && _demangle(nameof(f)) === :_
+        owner = _kwbody_owner(typeof(f))
+        isnothing(owner) || return _func_name(something(owner))
+    end
     f isa Function || f isa Type ? string(nameof(f)) : _type_label(_ftype(f))
 catch
     string(f)

@@ -390,7 +390,11 @@ StrictMode/src/
                         spelling every listing agrees on. An omitted keyword is simply absent:
                         the sorter tests isdefined and substitutes the default)
   registry.jl         — @strict_function registry, register_strict!, watch/unwatch, _demangle
-                        (kwsorter name stripping), and the ITEM BUILDERS both tiers share:
+                        (kwsorter name stripping), _kwbody_owner (the keyword body of a constructor
+                        or callable object, which Julia names `_`, answers to that callable in
+                        _callable_name, _func_name and _method_label: read from the lowered code of
+                        the module's kwcall methods, indexed per module and world), and the ITEM
+                        BUILDERS both tiers share:
                         _registry_items/_compiled_items/_map_findings/_run_and_report. The
                         reporting drivers _findings_all/_findings_compiled are here too;
                         StrictModeTest's test_registered/test_compiled reuse the same item lists.
@@ -1103,7 +1107,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
   rendering the same is how a crashed backend reported success for every method in a sweep. Tests
   should assert `StrictMode._failed(f)` rather than `f.status === :fail`, which pins a symbol
   instead of the intent.
-- `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly.
+- `_demangle(sym)` in `registry.jl` strips `#foo#NN` kwsorter mangling so `only`/`exempt` match keyword-argument functions correctly. A keyword body Julia names `_` (a constructor's or a callable object's) is named by `_kwbody_owner` instead, after the callable it implements.
 - `ignore_throw() = true` is the default and lives in StrictMode (`effects.jl`) — throw-path allocations don't count, and BOTH tiers honor it, so the scan and AllocCheck answer the same question.
 - **A compiled-output guarantee reads compiled output or fails.** `_llvm_ir`/`_native_asm` return
   `""` when the printer raises AND for a signature that is not concrete: `code_llvm` prints the

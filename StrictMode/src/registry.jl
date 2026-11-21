@@ -1056,11 +1056,88 @@ end
 
 # The name a callable answers to. A function has one; a callable object — an instance of a struct
 # with a call method, which a sweep meets in the method table like any function — has no `nameof`,
-# and is named by its type, as it is in a stack trace.
-_callable_name(@nospecialize(f)) = f isa Function ? nameof(f) :
+# and is named by its type, as it is in a stack trace. A keyword body answers to the callable it
+# implements (`_kwbody_owner`).
+_callable_name(@nospecialize(f)) = f isa Function ? _function_name(f) :
     _is_closure_type(f) ? _closure_owner(f) :
     f isa Type ? _type_name(f) :                        # a constructor answers to its type's name
     nameof(_ftype(f))
+
+function _function_name(@nospecialize(f::Function))
+    owner = _kwbody_owner(typeof(f))
+    return isnothing(owner) ? nameof(f) : _callable_name(something(owner))
+end
+
+# A keyword method `f(x; k)` lowers to a body function, which the `Core.kwcall` method for `f`
+# calls. A function's body is named after it (`#f#8`), but the body of a constructor or of a
+# callable object is named `_` (`#_#4`), a name no `only` entry or exemption can spell. So a body
+# answers to the callable whose `kwcall` method calls it: the type a constructor builds, the
+# callable's type, or the function. `nothing` when `B` is not a keyword body, `Some(owner)`
+# otherwise.
+function _kwbody_owner(@nospecialize(B::Type))
+    (B isa DataType && isdefined(B, :instance) && occursin(r"^#.+#\d+$", String(nameof(B)))) ||
+        return nothing
+    return get(_kwbody_index(parentmodule(B)), B, nothing)
+end
+
+# Every keyword body a module's `kwcall` methods call, keyed on the body's type. It reads the
+# method table, so it is rebuilt once a method has been defined since.
+const _KWBODY_INDEX = Dict{Module, Tuple{UInt, IdDict{Any, Any}}}()
+const _KWBODY_LOCK = ReentrantLock()
+
+function _kwbody_index(mod::Module)
+    world = Base.get_world_counter()
+    return lock(_KWBODY_LOCK) do
+        hit = get(_KWBODY_INDEX, mod, nothing)
+        !isnothing(hit) && first(hit) == world && return last(hit)
+        idx = IdDict{Any, Any}()
+        Base.visit(Core.methodtable) do m
+            (m isa Method && m.module === mod) || return nothing
+            sig = Base.unwrap_unionall(m.sig)
+            (sig isa DataType && length(sig.parameters) >= 3 && sig.parameters[1] === typeof(Core.kwcall)) ||
+                return nothing
+            body = _kwcall_body(m)
+            isnothing(body) && return nothing
+            self = Base.unwrap_unionall(sig.parameters[3])
+            self isa DataType || return nothing
+            idx[typeof(body)] = Some{Any}(
+                self <: Type ? self.parameters[1] : isdefined(self, :instance) ? self.instance : self
+            )
+            return nothing
+        end
+        _KWBODY_INDEX[mod] = (world, idx)
+        return idx
+    end
+end
+
+# The body function a `kwcall` method returns the call of, or `nothing` when its lowered code does
+# not end in one. The callee is a global for a function's body and a quoted instance for an inner
+# constructor's; a splatted call wraps it in `Core._apply_iterate`.
+function _kwcall_body(m::Method)
+    ci = try
+        Base.uncompressed_ast(m)
+    catch
+        return nothing
+    end
+    resolve(x) = x isa Core.SSAValue ? resolve(ci.code[x.id]) :
+        x isa QuoteNode ? x.value :
+        x isa GlobalRef ? (isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : nothing) : x
+    ret = ci.code[end]
+    (ret isa Core.ReturnNode && isdefined(ret, :val) && ret.val isa Core.SSAValue) || return nothing
+    call = ci.code[ret.val.id]
+    (call isa Expr && call.head === :call && !isempty(call.args)) || return nothing
+    callee = resolve(call.args[1])
+    callee === Core._apply_iterate && length(call.args) >= 3 && (callee = resolve(call.args[3]))
+    return callee isa Function && !(callee isa Core.Builtin) ? callee : nothing
+end
+
+# The name a method answers to: its function's, with a keyword body named after its owner.
+function _method_label(m::Method)
+    n = _demangle(m.name)
+    n === :_ || return n
+    F = _method_function(m)
+    return !isnothing(F) && isdefined(F, :instance) ? _demangle(_callable_name(F.instance)) : n
+end
 
 _type_name(T::Type) = (U = Base.unwrap_unionall(T); U isa DataType ? nameof(U) : Symbol(string(T)))
 
@@ -1099,7 +1176,7 @@ function _module_function_names(mod::Module)
     Base.visit(Core.methodtable) do m
         m isa Method || return nothing
         any(s -> _in_module_tree(m.module, s), scope) || return nothing
-        push!(out, _demangle(m.name))
+        push!(out, _method_label(m))
         F = try
             _method_function(m)
         catch
@@ -1107,7 +1184,7 @@ function _module_function_names(mod::Module)
         end
         if F isa DataType
             _is_closure_type(F) ? push!(out, _closure_owner(F)) :
-                isdefined(F, :instance) && F.instance isa Function && push!(out, _demangle(nameof(F.instance)))
+                isdefined(F, :instance) && F.instance isa Function && push!(out, _demangle(_callable_name(F.instance)))
         end
         return nothing
     end
@@ -1384,7 +1461,7 @@ end
 
 # One `:coverage` failure, naming the method and the signature it was reached with.
 function _coverage_finding(mod::Module, m::Method, sig::AbstractString)
-    fname = string(_demangle(m.name))
+    fname = string(_method_label(m))
     return StrictFinding(
         nameof(mod), fname, sig, :coverage, :fail, string(m.file), Int(m.line),
         "`$fname$sig` has no registered StrictMode guarantee",
@@ -1425,7 +1502,7 @@ function _coverage_all_findings(mod::Module; only = nothing, exempt = ())
         # Nothing has compiled, so there is no signature to name: the only claim available is that
         # some declaration speaks for the method at all.
         _method_declared(m, keys_) && continue
-        fname = string(_demangle(m.name))
+        fname = string(_method_label(m))
         # The argument types, rendered as every other finding renders them. A method's `sig` also
         # carries the function's own type as its first parameter, which a reader does not need.
         sig = try

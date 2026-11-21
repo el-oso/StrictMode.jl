@@ -478,3 +478,44 @@ end
     StrictMode.clear_declarations!()
     Base.delete_method(which(getproperty, (D.Foo, Symbol)))
 end
+
+@testitem "a keyword body answers to the constructor or callable it belongs to" begin
+    using StrictMode
+    module KwBodies
+    using StrictMode
+    struct Tracker{T}                        # its inner constructor's keyword body has no name
+        a::Vector{T}
+        Tracker{T}(x; c = 1) where {T} = new{T}(T[x + c])
+    end
+    Tracker(x::T; c = 1) where {T} = Tracker{T}(x; c)
+    struct Scaled                            # a callable object with a keyword method
+        k::Int
+    end
+    (s::Scaled)(x; by = 2) = [s.k * x * by]
+    struct Unit end                          # a singleton callable with a keyword method
+    (::Unit)(x; by = 2) = [x * by]
+    struct Plain                             # its keyword body is held to the guarantee
+        k::Int
+    end
+    (p::Plain)(x; by = 2) = [p.k * x * by]
+    @strict_exempt :noalloc Tracker
+    @strict_exempt :noalloc Scaled
+    @strict_exempt :noalloc Unit
+    end
+    K = KwBodies
+    K.Tracker(1.0); K.Tracker{Float32}(1; c = 2); K.Scaled(1)(2; by = 3); K.Unit()(2); K.Plain(1)(2)
+    fs = audit(K; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    # Every row is named after something an exemption can name, and the exempted ones are exempt.
+    @test !any(f -> f.func == "_" || startswith(f.func, "#_#"), fs)
+    for name in ("Tracker", "Scaled", "Unit")
+        rows = [f for f in fs if f.func == name || startswith(f.func, "#$name#")]
+        @test !isempty(rows)
+        @test all(f -> f.status === :info && startswith(f.reason, "exempt"), rows)
+    end
+    plain = [f for f in fs if f.func == "Plain"]
+    @test !isempty(plain) && all(StrictMode._failed, plain)
+    # `only` and `exempt` reach the same bodies by the same names.
+    sweep(; kw...) = audit(K; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false, kw...)
+    @test isempty(sweep(; exempt = (:Plain,), only = (:Plain,)))
+    @test all(f -> f.func == "Plain", sweep(; only = (:Plain,)))
+end
