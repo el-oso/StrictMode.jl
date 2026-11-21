@@ -1203,9 +1203,12 @@ Two limits, both real.
 **The type does most of the work on its own.** An `Untrusted{T}` matches no method written for
 `T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
-that. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs. Base methods
-written for every value still read the fields: `dump(frame)` prints the payload, and `==`,
-`isequal` and `hash` compare and hash it — `Untrusted(1) == Untrusted(1)` is `true`.
+that. A `reinterpret` of an `Untrusted` is reported too, since it raises when it runs. Printing,
+`dump` included, shows `<redacted>` in place of the payload. `==`, `isequal` and `hash` raise
+rather than compare or hash it, and so do the same calls on a container holding one, so an
+`Untrusted` cannot be a `Dict` or `Set` key. `===` is a builtin that cannot be overridden: it,
+`objectid` and `IdDict` still read the bits, so for an `isbits` payload
+`Untrusted(1) === Untrusted(1)` is `true`.
 
 **Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header`
 really checks what it read, or that it copied instead of handing back the caller's buffer. Both

@@ -26,10 +26,12 @@ for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a 
 instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. The one deliberate way out
 is [`unsafe_trust`](@ref).
 
-`show`, `print`, `string` and `repr` print the type and `<redacted>` in place of the payload, so a
-log line cannot leak it. `dump(u)`, `==`, `isequal` and `hash` are Base's defaults, which read the
-fields directly: `dump` prints the payload, `Untrusted(1) == Untrusted(1)` is `true`, and the hash
-of an `isbits` payload depends on its value.
+`show`, `print`, `string`, `repr` and `dump` print the type and `<redacted>` in place of the
+payload, so a log line cannot leak it. `==`, `isequal` and `hash` raise, as `u.x` does, since
+comparing or hashing reads the payload; so do the same calls on a container holding an `Untrusted`
+(`[u] == [v]`), and an `Untrusted` cannot be a `Dict` or `Set` key. `===` is a builtin and cannot be
+overridden: it, `objectid` and `IdDict` compare or hash the bits, so for an `isbits` payload
+`Untrusted(1) === Untrusted(1)` is `true`.
 
 Wrapping is free: `Untrusted{T}` has the same layout as `T` and allocates nothing. Wrapping twice
 returns the same value, so an edge that wraps defensively costs nothing.
@@ -62,8 +64,17 @@ Base.getproperty(::Untrusted, name::Symbol) = _untrusted_read_error(".$name")
 # would hand out an `isbits` payload. Base's other `reinterpret` methods take an array or a float.
 Base.reinterpret(::Type, ::Untrusted) = _untrusted_read_error("reinterpret")
 
-# Printing is how a payload reaches a log, so the type is shown and the payload is not.
+# Comparing and hashing read the payload — `hash` of an `isbits` payload depends on its value — so
+# they raise as a field read does. A container compares and hashes its elements with these, so
+# `[u] == [v]` and `Dict(u => 1)` raise too. `===` is a builtin and still compares the bits.
+Base.:(==)(::Untrusted, ::Untrusted) = _untrusted_read_error("==")
+Base.isequal(::Untrusted, ::Untrusted) = _untrusted_read_error("isequal")
+Base.hash(::Untrusted, ::UInt) = _untrusted_read_error("hash")
+
+# Printing is how a payload reaches a log, so the type is shown and the payload is not. `dump`
+# recurses through this four-argument method, so a payload nested in another value is hidden too.
 Base.show(io::IO, u::Untrusted) = print(io, typeof(u), "(<redacted>)")
+Base.dump(io::IOContext, u::Untrusted, ::Int, _) = show(io, u)
 
 """
     unsafe_trust(u::Untrusted)

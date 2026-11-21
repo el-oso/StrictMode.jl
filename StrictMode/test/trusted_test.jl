@@ -491,3 +491,51 @@ end
     fc = only(findings(clean, (Untrusted{UInt32}, Float32); guarantees = (:trusted,)))
     @test !StrictMode._failed(fc)
 end
+
+@testitem "Untrusted does not compare, hash or dump its payload" begin
+    using StrictMode
+    u = Untrusted(UInt32(0xdeadbeef))
+    w = Untrusted(UInt32(0xdeadbeef))
+
+    # Comparing or hashing reads the payload, so each raises as a field read does.
+    @test_throws "`Untrusted` data has no readable fields (tried `==`)" u == w
+    @test_throws "(tried `==`)" u != w
+    @test_throws "(tried `isequal`)" isequal(u, w)
+    @test_throws "(tried `hash`)" hash(u)
+    @test_throws "(tried `hash`)" hash(u, UInt(1))
+    # A container compares and hashes its elements with the same functions.
+    @test_throws "(tried `==`)" [u] == [w]
+    @test_throws "(tried `isequal`)" isequal([u], [w])
+    @test_throws "(tried `hash`)" hash([u])
+    @test_throws "(tried `==`)" (u, 1) == (w, 1)
+    @test_throws "(tried `hash`)" Dict(u => 1)
+    @test_throws "(tried `hash`)" Set([u])
+    # Controls: the payload type itself still compares and hashes.
+    @test UInt32(0xdeadbeef) == UInt32(0xdeadbeef)
+    @test hash([UInt32(1)]) == hash([UInt32(1)])
+    # `===` is a builtin and compares bits; it cannot be overridden.
+    @test u === w
+    @test u !== Untrusted(UInt32(1))
+
+    # `dump` redacts the payload, at the top level and inside another value.
+    s = sprint(dump, u)
+    @test occursin("Untrusted{UInt32}", s) && occursin("redacted", s)
+    @test !occursin("deadbeef", s) && !occursin(string(0xdeadbeef), s)
+    s = sprint(dump, (; a = 1, b = Untrusted(UInt8[0x42, 0x43])))
+    @test occursin("b: Untrusted{Vector{UInt8}}(<redacted>)", s)
+    @test !occursin("0x42", s) && !occursin("66", s)
+    @test occursin("deadbeef", sprint(dump, (; b = UInt32(0xdeadbeef))))   # control
+
+    # These methods read no payload, so neither check reports them. A method that always raises
+    # gets the always-throws note (SM0208) in place of a pass.
+    for (f, tt) in (
+            (==, (Untrusted{UInt32}, Untrusted{UInt32})),
+            (isequal, (Untrusted{UInt32}, Untrusted{UInt32})),
+            (hash, (Untrusted{UInt32}, UInt)),
+            (dump, (IOContext{IOBuffer}, Untrusted{UInt32}, Int, String)),
+        )
+        fi = only(findings(f, tt; guarantees = (:trusted,)))
+        @test fi.status === :pass || fi.code === :SM0208
+    end
+    @test isempty(unsafe_report(StrictMode; only = [:(==), :isequal, :hash, :dump]))
+end
