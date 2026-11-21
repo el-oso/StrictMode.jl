@@ -411,8 +411,8 @@ const _SCAN_BODY_BUDGET = Ref(1000)
 # Base's task, lock and condition code. Its run-time dispatch is the scheduler's own, off the call's
 # hot path, and AllocCheck reports none there, so a callee reached only through it is not boxing.
 const _SCHEDULER_FILES = ("task.jl", "condition.jl", "lock.jl", "locks-mt.jl", "partr.jl")
-_in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && mi.def.module === Base &&
-    basename(string(mi.def.file)) in _SCHEDULER_FILES
+_method_in_scheduler(m::Method) = Base.moduleroot(m.module) === Base && basename(string(m.file)) in _SCHEDULER_FILES
+_in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && _method_in_scheduler(mi.def)
 
 # A callee the scan follows below the Base levels: one defined outside Base and Core, a Base method
 # handed the package's code or types to run (a closure given to `map`), or Base's task, lock and
@@ -1096,9 +1096,7 @@ function _sig_in_scheduler(@nospecialize(sig))
     catch
         nothing
     end
-    isnothing(m) && return false
-    meth = m.method
-    return meth.module === Base && basename(string(meth.file)) in _SCHEDULER_FILES
+    return !isnothing(m) && _method_in_scheduler(m.method)
 end
 
 # Whether an origin `_signal_origin` found is the scheduler's: in its code, or in Base code its code
@@ -1534,6 +1532,10 @@ function _scan_ci(
     # only possible act is to throw on `uses[i]`.
     usememo = Ref{Union{Nothing, _SSAUses}}(nothing)
     ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci))::_SSAUses : usememo[]::_SSAUses
+    # Whether this body is the scheduler's: its caller drops its boxing, so that boxing cannot decide
+    # `:alloc` and the walk goes on to the allocation below it (`schedule` boxes before it queues).
+    schedmemo = Ref{Union{Nothing, Bool}}(nothing)
+    insched() = isnothing(schedmemo[]) ? (schedmemo[] = _sig_in_scheduler(sig))::Bool : schedmemo[]::Bool
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if top && abscontainer === nothing && _abstract_container(T)
@@ -1636,10 +1638,10 @@ function _scan_ci(
                         user = _followed_to_end(mi)
                         follows = depth > 0 || (depth < 0 && user)
                         # A callee can still change the answer while `undecided`: `:alloc` is decided by the
-                        # first allocation or boxing, `:boxing` by the first boxing, and `:full` also needs the
-                        # dictionary lookup.
+                        # first allocation or boxing (an allocation alone in the scheduler's code), `:boxing`
+                        # by the first boxing, and `:full` also needs the dictionary lookup.
                         undecided = mode === :full ? (!alloc || !boxing || !dictlookup) :
-                            mode === :alloc ? (!alloc && !boxing) : !boxing
+                            mode === :alloc ? (!alloc && (!boxing || insched())) : !boxing
                         if follows && undecided && length(seen) > _SCAN_BODY_BUDGET[]
                             truncated = true
                         elseif follows && undecided

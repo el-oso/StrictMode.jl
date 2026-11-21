@@ -522,6 +522,27 @@ end
     end
 end
 
+@testitem "unlocking a ReentrantLock is a scheduler finding in every scan mode" begin
+    using StrictMode
+    # `unlock` wakes a waiter: `schedule` stores the task's result through an abstract field before
+    # it queues the task, and the queue can grow (`Base.Partr`).
+    ul(l::ReentrantLock) = (unlock(l); nothing)
+    trl(l::ReentrantLock) = (trylock(l) && unlock(l); nothing)
+    T = (ReentrantLock,)
+    for f in (ul, trl)
+        @test StrictMode._alloc_signals(f, T; mode = :alloc).alloc
+        @test StrictMode._alloc_signals(f, T; mode = :full).alloc
+        r = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+        @test StrictMode._failed(r) && r.code === :SM0017
+    end
+    # below the Base depth (`depth = -1`) the scheduler is still followed, `Base.Partr` included:
+    # `enq_work` allocates only in `Partr.multiq_insert` on some releases
+    @test StrictMode._alloc_signals(Base.enq_work, (Task,); mode = :alloc, depth = -1).alloc
+    # a lock that only spins still passes
+    spin(l::Threads.SpinLock) = (lock(l); unlock(l); nothing)
+    @test !StrictMode._failed(only(StrictMode.findings(spin, (Threads.SpinLock,); guarantees = (:noalloc,))))
+end
+
 @testitem "a wait is SM0017 only when the call reaches no allocation outside the scheduler" begin
     using StrictMode
     @noinline join_pool() = yield()

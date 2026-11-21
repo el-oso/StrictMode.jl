@@ -173,7 +173,11 @@ StrictMode/src/
                         scheduler's code to the end, like the package's own (_followed_to_end): how
                         many calls down a wait allocates depends on what Base inlines (yield's queue
                         growth is one Base level deeper on 1.12 than on 1.13, measured), so a fixed
-                        depth passed `yield()` on one release and failed it on the other. An origin
+                        depth passed `yield()` on one release and failed it on the other. Scheduler
+                        code is matched by file in any module under Base (_method_in_scheduler), so
+                        Base.Partr's task queue and Threads' locks count. In :alloc mode a scheduler
+                        body's own boxing does not end its walk, since its caller drops that boxing:
+                        `schedule` boxes before it queues, and stopping there passed unlock(l). An origin
                         below a scheduler call is the scheduler's (_origin_in_scheduler) unless that
                         call names one of the package's types (`lock(f, l)`, _names_user_type) or the
                         path from it passes through the package's code. The proof's _scheduler_site
