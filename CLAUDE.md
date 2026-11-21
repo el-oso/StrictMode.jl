@@ -318,8 +318,13 @@ StrictMode/src/
                         A getfield/getproperty handed on with a constant field uses the direct
                         path's field rules (_handed_on_cleared). A Core.tuple holding one whose only
                         uses are _COMPARISONS operands (===, ==, isequal, in, ∉; slot and SSA copies
-                        followed) applies nothing (_only_compared); returned, indexed or passed on,
-                        it is a read. A read inside a try is kept
+                        followed) is no read by itself (_only_compared); returned, indexed or passed
+                        on, it is a read. A comparison other than the === builtin handing one on is
+                        a read unless _compare_applies follows every method it can reach (Base's
+                        too, unoptimized IR, the operand tracked through copies, field reads, splats
+                        and calls) and none applies it; over 8 methods, 8 calls deep, a method that
+                        can return it (tracked as :returns), an unread
+                        method or an unfollowed builtin counts as applying it. A read inside a try is kept
                         when its catch can finish without raising (_may_return) or any statement
                         reachable from the handler reads a slot or SSA value the payload flows into
                         between the payload read and the raising field read (copies, field reads

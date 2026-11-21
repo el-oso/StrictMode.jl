@@ -454,6 +454,75 @@ end
     @test status(invoked_clean, (Vector{UInt8},)).status === :pass
 end
 
+@testitem "a comparison handing on the escape hatch is followed into its method" begin
+    using StrictMode
+
+    const U8 = Untrusted{Vector{UInt8}}
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    struct Sneaky
+        u::U8
+    end
+    s = Sneaky(Untrusted(UInt8[1, 2]))
+    is_reader(f) = f in (unsafe_trust, getfield)
+    is_hatch(f) = f == unsafe_trust
+    same_readers(fs) = fs == (unsafe_trust, getfield)
+    for f in (is_reader, is_hatch, same_readers)
+        @test status(f, (Any,)).status === :pass
+    end
+    # A method of `==` that applies the function it is compared with reads the payload, and the
+    # comparison that reaches it hands the escape hatch on.
+    Base.:(==)(t::Tuple, s::Sneaky) = length(t[1](s.u)) == 2
+    Base.:(==)(g::typeof(unsafe_trust), s::Sneaky) = length(g(s.u)) == 2
+    Base.:(==)(s::Sneaky, g::typeof(unsafe_trust)) = length(g(s.u)) == 2
+    sneaky(s::Sneaky) = (unsafe_trust, getfield) == s
+    bare(s::Sneaky) = unsafe_trust == s
+    inside(s::Sneaky) = s in (unsafe_trust, getfield)
+    @test sneaky(s) && bare(s) && inside(s)
+    for (f, T) in (
+            (sneaky, (Sneaky,)), (bare, (Sneaky,)), (inside, (Sneaky,)), (is_reader, (Any,)),
+            (is_hatch, (Any,)), (same_readers, (Any,)),
+        )
+        r = Base.invokelatest(status, f, T)
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    Base.delete_method(which(==, (Tuple, Sneaky)))
+    Base.delete_method(which(==, (typeof(unsafe_trust), Sneaky)))
+    Base.delete_method(which(==, (Sneaky, typeof(unsafe_trust))))
+    for f in (is_reader, is_hatch, same_readers)
+        @test Base.invokelatest(status, f, (Any,)).status === :pass
+    end
+    # A comparison whose result can be the function it was given hands that function back.
+    struct Leaky
+        flag::Bool
+    end
+    Base.:(==)(l::Leaky, g::typeof(unsafe_trust)) = l.flag ? g : false
+    escaped(u::U8, l) = (r = (l == unsafe_trust); r isa Bool ? 0 : length(Base.inferencebarrier(r)(u)))
+    @test escaped(s.u, Leaky(true)) == 2
+    for (f, T) in ((escaped, (U8, Any)), (is_hatch, (Any,)))
+        r = Base.invokelatest(status, f, T)
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    Base.delete_method(which(==, (Leaky, typeof(unsafe_trust))))
+    @test Base.invokelatest(status, is_hatch, (Any,)).status === :pass
+    # A recursive call that returns the function is read as returning it, and what its caller then
+    # does with the result is followed.
+    struct Deep
+        n::Int
+        u::U8
+    end
+    @noinline peel(t, d::Deep) =
+        iszero(d.n) ? t : (x = peel(t, Deep(d.n - 1, d.u)); isone(d.n) ? (length(x[1](d.u)); t) : x)
+    Base.:(==)(t::Tuple, d::Deep) = (peel(t, d); true)
+    deep(d::Deep) = (unsafe_trust, getfield) == d
+    @test deep(Deep(1, s.u))
+    r = Base.invokelatest(status, deep, (Deep,))
+    @test StrictMode._failed(r)
+    @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    Base.delete_method(which(==, (Tuple, Deep)))
+end
+
 @testitem "a keyword function is judged by its body, and a boundary's body is the boundary" begin
     using StrictMode
 

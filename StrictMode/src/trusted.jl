@@ -231,9 +231,11 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             append!(held, sub[3])
             continue
         end
-        # Comparing a value with a payload-reading function, or testing membership in a collection
-        # of them, applies it to nothing, and so does building a tuple used only that way.
-        if !(callee in _COMPARISONS) && !(callee === Core.tuple && _only_compared(ci, i, st))
+        # A comparison or membership test hands a payload-reading function on unless the methods it
+        # calls are followed and none applies it; building a tuple used only in such calls is not
+        # handing it on by itself.
+        if !(callee in _COMPARISONS && !_compare_applies(ci, callee, args)) &&
+                !(callee === Core.tuple && _only_compared(ci, i, st))
             _handed_on_reads!(certain, erased, ci, st, callee, args, overridden)
         end
         # A call that copies out the bits of what it is given reads a payload it can reach:
@@ -300,6 +302,171 @@ function _only_compared(ci, i::Int, @nospecialize(st))
         (callee in _COMPARISONS && !_mentions(_call_operand(s), held)) || return false
     end
     return true
+end
+
+# Whether the comparison `callee(args...)` can apply a payload-reading function one of its operands
+# holds, or hand it back to the caller. `===` is a builtin and does neither; every other comparison
+# is an ordinary function that any package can add a method to, so the methods the call can reach
+# are followed.
+function _compare_applies(ci, @nospecialize(callee), args)
+    callee === (===) && return false
+    Ts = Any[_unopt_arg_type(ci, a) for a in args]
+    tracked = [k + 1 for (k, T) in pairs(Ts) if any(F -> _carries_function(T, F), _DEREF_FUNCS)]
+    isempty(tracked) && return false
+    sig = Core.apply_type(Tuple, Core.Typeof(callee), Ts...)
+    # A recursive call is first read as returning nothing; when one of those readings turns out to
+    # return the value, the whole reading is repeated with that call answering `:returns`.
+    assume = Set{Any}()
+    while true
+        scan = _ApplyScan(Dict{Any, Symbol}(), assume, Set{Any}())
+        r = _may_apply(sig, tracked, scan, 0)
+        (r === :applies || isempty(scan.contradicted)) && return r !== :none
+        union!(assume, scan.contradicted)
+    end
+    return
+end
+
+# `seen` holds each call followed so far: its answer, or `:reading` while its methods are being
+# read and `:reread` once a call within them met it again. A call in `assume` met again while it is
+# being read answers `:returns`, any other `:none`; `contradicted` collects the calls that answered
+# `:none` that way and then returned the value.
+struct _ApplyScan
+    seen::Dict{Any, Symbol}
+    assume::Set{Any}
+    contradicted::Set{Any}
+end
+
+# Calls deeper than this, or reaching more methods than this, are not followed, and count as
+# applying what they are given.
+const _APPLY_DEPTH = 8
+const _APPLY_METHODS = 8
+
+# Builtins that apply none of their operands: `===`, `isa`, `typeof`, `nfields` and `isdefined` return
+# a fact about them, and the others return a value holding them, which is followed in turn.
+const _INERT_BUILTINS = (===, isa, typeof, nfields, Core.isdefined)
+const _HOLDING_BUILTINS = (Core.getfield, Core.tuple, Core.typeassert, Core.ifelse)
+
+# What a call of signature `sig` (the callee's type first) can do with a value it is given at one
+# of the positions `tracked`, or a value read out of or built from one: `:applies` when some method
+# it reaches can call it, hand it to a builtin that does not only read it, or hand it to a call that
+# does either; `:returns` when, short of that, a method can return it; `:none` otherwise. Every
+# method is read from unoptimized typed IR. A call that cannot be resolved to at most
+# `_APPLY_METHODS` methods, a method whose code cannot be read, and a call deeper than
+# `_APPLY_DEPTH` are `:applies`. A call met again while it is being read answers as `_ApplyScan`
+# describes.
+function _may_apply(@nospecialize(sig), tracked::Vector{Int}, scan::_ApplyScan, depth::Int)
+    depth > _APPLY_DEPTH && return :applies
+    key = (sig, tracked)
+    seen = scan.seen
+    if haskey(seen, key)
+        r = seen[key]
+        (r === :reading || r === :reread) || return r
+        key in scan.assume && return :returns
+        seen[key] = :reread
+        return :none
+    end
+    seen[key] = :reading
+    out = _may_apply_methods(sig, tracked, scan, depth)
+    out === :returns && seen[key] === :reread && !(key in scan.assume) && push!(scan.contradicted, key)
+    return (seen[key] = out)
+end
+
+function _may_apply_methods(@nospecialize(sig), tracked::Vector{Int}, scan::_ApplyScan, depth::Int)
+    ms = Base._methods_by_ftype(sig, _APPLY_METHODS, Base.get_world_counter())
+    (ms isa Vector && !isempty(ms)) || return :applies
+    cts = try
+        _code_typed_by_type(sig; optimize = false)
+    catch
+        return :applies
+    end
+    length(cts) == length(ms) || return :applies
+    out = :none
+    for (ci, _) in cts
+        m = ci.parent isa Core.MethodInstance ? ci.parent.def : nothing
+        m isa Method || return :applies
+        # Slot 1 is the callee; the last slot of a vararg method holds every operand from there on.
+        held = Any[Core.SlotNumber(m.isva ? min(p, Int(m.nargs)) : p) for p in tracked if m.isva || p <= m.nargs]
+        r = _applies_held(ci, held, scan, depth)
+        r === :applies && return :applies
+        r === :returns && (out = :returns)
+    end
+    return out
+end
+
+# What the body `ci` can do with the values `held` (see `_may_apply`), extended to every slot and
+# SSA value that copies one, reads a field of one, or is what a call it is handed to returns. A
+# loop may read a slot before the statement that assigns it, so this runs to a fixed point.
+function _applies_held(ci, held::Vector{Any}, scan::_ApplyScan, depth::Int)
+    returns = false
+    grown = true
+    while grown
+        grown = false
+        for (k, st) in pairs(ci.code)
+            _mentions(st, held) || continue
+            st isa Core.GotoIfNot && continue
+            st isa Core.ReturnNode && (returns = true; continue)
+            target = Meta.isexpr(st, :(=)) ? st.args[1] : nothing
+            target isa GlobalRef && return :applies
+            rhs = Meta.isexpr(st, :(=)) ? st.args[2] : st
+            holds = if rhs isa Core.SlotNumber || rhs isa Core.SSAValue || rhs isa Core.PiNode
+                true
+            elseif Meta.isexpr(rhs, :new) || Meta.isexpr(rhs, :splatnew)
+                true
+            elseif Meta.isexpr(rhs, :gc_preserve_begin)
+                false
+            elseif Meta.isexpr(rhs, :call) || Meta.isexpr(rhs, :invoke)
+                op = _call_operand(rhs)
+                _mentions(op, held) && return :applies
+                callee, args = _call_callee_and_args(ci, rhs)
+                # A callee the IR does not name is known by its type, when that is concrete.
+                FT = isnothing(callee) ? _unopt_arg_type(ci, op) : Core.Typeof(callee)
+                (isconcretetype(FT) || FT <: Type) || return :applies
+                r = if callee in _INERT_BUILTINS
+                    :none
+                elseif callee in _HOLDING_BUILTINS
+                    :returns
+                elseif callee === Core._apply_iterate
+                    _splat_applies(ci, args, held, scan, depth)
+                elseif callee isa Core.Builtin
+                    :applies
+                else
+                    Ts = Any[_unopt_arg_type(ci, a) for a in args]
+                    pos = [j + 1 for (j, a) in pairs(args) if _mentions(a, held)]
+                    _may_apply(Core.apply_type(Tuple, FT, Ts...), pos, scan, depth + 1)
+                end
+                r === :applies && return :applies
+                r === :returns
+            else
+                return :applies
+            end
+            holds || continue
+            for v in (Core.SSAValue(k), target)
+                (v isa Core.SSAValue || v isa Core.SlotNumber) && !(v in held) && (push!(held, v); grown = true)
+            end
+        end
+    end
+    return returns ? :returns : :none
+end
+
+# What `Core._apply_iterate(iterate, g, xs...)`, the call `g(xs[1]..., xs[2]..., …)`, can do with
+# `held` (see `_may_apply`). Each splatted operand must be a tuple of known length, so that the
+# positions it fills are known; one that is not is iterated by calls this does not follow, and is
+# `:applies`.
+function _splat_applies(ci, args, held::Vector{Any}, scan::_ApplyScan, depth::Int)
+    length(args) >= 2 || return :applies
+    (_mentions(args[1], held) || _mentions(args[2], held)) && return :applies
+    FT = _unopt_arg_type(ci, args[2])
+    (isconcretetype(FT) || FT <: Type) || return :applies
+    Ts = Any[]
+    pos = Int[]
+    for a in args[3:end]
+        T = _unopt_arg_type(ci, a)
+        (T isa DataType && T <: Tuple && !Base.isvatuple(T)) || return :applies
+        _mentions(a, held) && append!(pos, length(Ts) .+ (2:(length(T.parameters) + 1)))
+        append!(Ts, T.parameters)
+    end
+    isempty(pos) && return :none
+    return _may_apply(Core.apply_type(Tuple, FT, Ts...), pos, scan, depth + 1)
 end
 
 # A payload-reading function handed to a call as a value, bare or held by a callable such as
@@ -684,9 +851,15 @@ any package can subtype it with a struct holding an `Untrusted`: `write(io, x::R
 It is also any of `getfield`, `getproperty` and `unsafe_trust` handed to another call as a value,
 bare or held by a callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
 `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. Comparing one
-of the three with a value (`===`, `==`, `isequal`) or testing membership (`in`, `∉`) applies it to
-nothing and is not a read, and so is building a tuple of them whose only uses are those calls, as
-in `f in (unsafe_trust, g)`. `unsafe_trust` handed to any other call is a read, since its one
+of the three with a value (`===`, `==`, `isequal`) or testing membership (`in`, `∉`) is not a read
+when it applies nothing, and so is building a tuple of them whose only uses are those calls, as in
+`f in (unsafe_trust, g)`. `===` is a builtin and applies nothing. Every other comparison is read
+through the methods it can call, Base's included, following each call they hand the function on to:
+a method such as `==(g::typeof(unsafe_trust), s::S) = g(s.u)` makes `unsafe_trust == s` a read, and
+makes `f in (unsafe_trust, g)` one too when `f` can be an `S`. A call reaching more than eight
+methods, more than eight calls deep, or whose methods cannot be read counts as applying it, and so
+does one that can return the function it was given.
+`unsafe_trust` handed to any other call is a read, since its one
 method takes an `Untrusted`; that includes a tuple of it that is returned, stored, indexed or
 passed to another call. `getfield` and
 `getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,

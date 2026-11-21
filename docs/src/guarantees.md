@@ -1262,8 +1262,14 @@ Two limits, both real.
 `T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
 that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `map(unsafe_trust, us)`,
-`getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. Comparing with one applies
-it to nothing, so `f === unsafe_trust` and `f in (unsafe_trust, getfield)` pass; a tuple of
+`getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. Comparing with one passes
+when it applies nothing, so `f === unsafe_trust` and `f in (unsafe_trust, getfield)` pass. `===`
+is a builtin; any other comparison is followed into every method it can call, Base's included, and
+a method that applies the function it is compared with, such as
+`==(g::typeof(unsafe_trust), s::S) = g(s.u)`, makes `unsafe_trust == s`, and `f in (unsafe_trust,
+getfield)` for an `f` that can be an `S`, a read. A comparison reaching more than eight methods, or
+more than eight calls deep, counts as one, and so does one that can return the function it was
+given. A tuple of
 `unsafe_trust` that is returned, indexed or passed to any other call is reported. On untyped values a constant
 field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
 `getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, and so are the calls that copy out the bits of
