@@ -212,11 +212,9 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
             append!(erased, sub[2])
             continue
         end
-        # The escape hatch handed to another call — `map(unsafe_trust, us)`, `unsafe_trust.(us)`,
-        # `u |> unsafe_trust` — reads a payload wherever it is applied: its one method takes an
-        # `Untrusted`. Comparing a value with it applies it to nothing.
-        if !(callee in (===, !==, ==, !=, isequal)) && any(a -> _unopt_callee(ci, a) === unsafe_trust, args)
-            push!(certain, nameof(unsafe_trust))
+        # Comparing a value with a payload-reading function applies it to nothing.
+        if !(callee in (===, !==, ==, !=, isequal))
+            _handed_on_reads!(certain, erased, ci, st, callee, args)
         end
         # `reinterpret(T, u)` raises at run time, like `u.x`; reporting it here says so before then.
         if callee === reinterpret && any(a -> _is_untrusted_type(_unopt_arg_type(ci, a)), args)
@@ -242,6 +240,82 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     end
     return (certain, erased)
 end
+
+# A payload-reading function handed to a call as a value, bare or held by a callable such as
+# `Base.Fix2(getfield, :x)`, in any operand including the callee: `getfield.([u], :x)`,
+# `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. The escape
+# hatch reads a payload wherever it is applied, since its one method takes an `Untrusted`. The
+# other two read one only when an `Untrusted` reaches them, so they count by what the call's
+# operands can hold: a site when one holds an `Untrusted`, an erased site when a type cannot rule
+# one out, and nothing when every type rules it out.
+function _handed_on_reads!(certain, erased, ci, @nospecialize(st), @nospecialize(callee), args)
+    op = _call_operand(st)
+    isnothing(op) && return nothing
+    # A direct call of a payload-reading function is judged as a call, where this is called.
+    ops = callee in _DEREF_FUNCS ? collect(Any, args) : Any[op; collect(Any, args)]
+    Ts = Any[_unopt_arg_type(ci, a) for a in ops]
+    carried = [F for F in _DEREF_FUNCS if any(T -> _carries_function(T, F), Ts)]
+    isempty(carried) && return nothing
+    if unsafe_trust in carried
+        push!(certain, nameof(unsafe_trust))
+        return nothing
+    end
+    nm = nameof(first(carried))
+    reach = foldl(_max_reach, (_untrusted_reach(T) for T in Ts); init = :none)
+    reach === :certain && push!(certain, nm)
+    reach === :maybe && push!(erased, nm)
+    return nothing
+end
+
+# The callee operand of a call statement as written, or `nothing` for a statement that is no call.
+function _call_operand(@nospecialize(st))
+    Meta.isexpr(st, :(=)) && (st = st.args[2])
+    Meta.isexpr(st, :call) && return st.args[1]
+    (Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)) && return st.args[2]
+    return nothing
+end
+
+# Whether a value of type `T` is the function `F`, or a callable holding it in a type parameter.
+function _carries_function(@nospecialize(T), @nospecialize(F), depth::Int = 0)
+    T isa DataType || return false
+    T === typeof(F) && return true
+    depth < 4 || return false
+    return any(p -> _carries_function(p, F, depth + 1), T.parameters)
+end
+
+# What a value of type `T` can hold of an `Untrusted`, where a call applying a function to it can
+# reach: `:certain` when it is one, or a tuple, array or `Ref` whose elements are; `:maybe` when its
+# type does not rule one out (an `Any`, an abstract type) or a field of it can hold one;
+# `:none` when it cannot. A field holding an `Untrusted` is `:maybe`, not `:certain`, since a
+# function applied to the value itself reads that field and not the payload. A type value
+# (`Type{…}`) holds none.
+function _untrusted_reach(@nospecialize(T), depth::Int = 0)
+    T isa Type || return :maybe
+    T === Union{} && return :none
+    T isa Union && return _max_reach(_untrusted_reach(T.a, depth), _untrusted_reach(T.b, depth))
+    T <: Type && return :none
+    T <: Untrusted && return :certain
+    typeintersect(T, Untrusted) === Union{} || return :maybe
+    (isconcretetype(T) && fieldcount(T) == 0) && return :none
+    # A field of a field, eight deep, is not followed further, and is not ruled out.
+    depth < 8 || return :maybe
+    if T isa DataType && T <: Tuple
+        r = :none
+        for p in T.parameters
+            r = _max_reach(r, _untrusted_reach(Base.unwrapva(p), depth + 1))
+        end
+        return r
+    end
+    (T <: AbstractArray || T <: Ref) && return _untrusted_reach(eltype(T), depth + 1)
+    (T isa DataType && isconcretetype(T)) || return :maybe
+    for F in fieldtypes(T)
+        _untrusted_reach(F, depth + 1) === :none || return :maybe
+    end
+    return :none
+end
+
+_max_reach(a::Symbol, b::Symbol) = (a === :certain || b === :certain) ? :certain :
+    (a === :maybe || b === :maybe) ? :maybe : :none
 
 # Whether an erased call to a payload-reading function reads the `Untrusted` field. `overridden`
 # holds `_untrusted_getproperty_overridden` for two and three arguments.
@@ -416,9 +490,15 @@ Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f`
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
 The read is any call to `getfield`, `getproperty`, `reinterpret` or [`unsafe_trust`](@ref) on an
-argument that inference types as `<:Untrusted`, directly or through `invoke`, and `unsafe_trust` handed to
-another call as a value (`map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`). Registering `f` with [`trust_boundary!`](@ref) permits all of
-them in that one method. A function with keywords keeps its code in a body function of its own; the
+argument that inference types as `<:Untrusted`, directly or through `invoke`. It is also any of
+`getfield`, `getproperty` and `unsafe_trust` handed to another call as a value, bare or held by a
+callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
+`getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. `unsafe_trust`
+handed on is a read wherever it goes, since its one method takes an `Untrusted`. `getfield` and
+`getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,
+array or `Ref` of them, and a read that cannot be ruled out when an operand's type does not rule
+one out (an `Any`, an abstract type, a struct with such a field). Registering `f` with
+[`trust_boundary!`](@ref) permits all of them in that one method. A function with keywords keeps its code in a body function of its own; the
 positional and `Core.kwcall` methods are judged by that body, and a registered boundary's body is
 the boundary.
 

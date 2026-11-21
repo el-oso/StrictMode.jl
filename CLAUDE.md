@@ -259,7 +259,13 @@ StrictMode/src/
                         so a read on the other arm of a type test clears nothing), and when the operand is what
                         iterate/indexed_iterate returned. `invoke(f, T, args...)` is read as
                         f(args...), and unsafe_trust as an operand of any call but a comparison is
-                        a certain read. An erased TWO-argument `getproperty` is NOT
+                        a certain read (_handed_on_reads!: an operand whose TYPE carries it, so a
+                        Base.Fix2 holding it counts, callee position included). getfield and
+                        getproperty handed on the same way count by _untrusted_reach of the call's
+                        operands: :certain for an Untrusted or a Tuple/array/Ref of them, :maybe
+                        (erased) for an Any, an abstract type or a concrete struct with a field
+                        that is not :none — a field is never :certain, since a function applied
+                        to the struct reads that field and not the payload. An erased TWO-argument `getproperty` is NOT
                         reported while StrictMode's own method, which raises whatever the name,
                         is the only one an Untrusted reaches; once a package defines a more
                         specific getproperty for one (_untrusted_getproperty_overridden, asked

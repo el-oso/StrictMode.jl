@@ -562,3 +562,39 @@ end
     straight(p) = (a = getfield(p, 1); getfield(p, 2); a)
     @test status(straight, (Any,)).status === :pass
 end
+
+@testitem "getfield handed to another call as a value is a read" begin
+    using StrictMode
+
+    status(f, T) = only(StrictMode.findings(f, T; guarantees = (:trusted,)))
+    const UI = Untrusted{Int}
+    dotted(u::UI) = only(getfield.([u], :x))
+    dotted_ref(u::UI) = getfield.(Ref(u), :x)
+    splatted(u::UI) = getfield((u, :x)...)
+    fixed(u::UI) = Base.Fix2(getfield, :x)(u)
+    mapped(u::UI) = only(map(getfield, [u], [:x]))
+    for f in (dotted, dotted_ref, splatted, fixed, mapped)
+        @test f(Untrusted(42)) == 42
+        r = status(f, (UI,))
+        @test StrictMode._failed(r)
+        @test occursin("reads an `Untrusted` payload outside a trust boundary", r.reason)
+    end
+    @test_throws StrictViolation @assert_trusted dotted(Untrusted(42))
+    # An untyped value handed with `getfield` cannot be ruled out.
+    loose(v::Vector{Any}) = map(getfield, v, [:x])
+    r = status(loose, (Vector{Any},))
+    @test StrictMode._failed(r)
+    @test occursin("may read an `Untrusted` payload", r.reason)
+
+    # Controls: `getfield` applied to values that cannot be an `Untrusted` reads no payload.
+    struct Pt
+        a::Int
+        b::Int
+    end
+    fields(p::Pt) = getfield.(Ref(p), (:a, :b))
+    mapped_clean(ps::Vector{Pt}) = map(getfield, ps, fill(:a, length(ps)))
+    fixed_clean(p::Pt) = Base.Fix2(getfield, :a)(p)
+    @test status(fields, (Pt,)).status === :pass
+    @test status(mapped_clean, (Vector{Pt},)).status === :pass
+    @test status(fixed_clean, (Pt,)).status === :pass
+end
