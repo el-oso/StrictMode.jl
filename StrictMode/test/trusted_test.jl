@@ -649,6 +649,56 @@ end
     @test_throws BoundsError sneak_copy(Untrusted(42))
     @test SINK[] == 42
     @test StrictMode._failed(status(sneak_copy, (Any,)))
+    # So is one copied through a chain of locals, and one the handler reads on only one branch.
+    function sneak_two(p)
+        local w
+        try
+            v = getfield(p, 1)
+            u = v
+            w = u
+            getfield(p, 2)
+        catch
+            SINK[] = w
+            rethrow()
+        end
+        return nothing
+    end
+    function sneak_branch(p, b::Bool)
+        local v
+        try
+            v = getfield(p, 1)
+            getfield(p, 2)
+        catch
+            b && (SINK[] = v)
+            rethrow()
+        end
+        return nothing
+    end
+    SINK[] = nothing
+    @test_throws BoundsError sneak_two(Untrusted(42))
+    @test SINK[] == 42
+    @test StrictMode._failed(status(sneak_two, (Any,)))
+    SINK[] = nothing
+    @test_throws BoundsError sneak_branch(Untrusted(42), true)
+    @test SINK[] == 42
+    @test StrictMode._failed(status(sneak_branch, (Any, Bool)))
+    # A local assigned before the raise but never from the payload hands nothing on.
+    function counter_only(p)
+        local n
+        try
+            v = getfield(p, 1)
+            n = 0
+            getfield(p, 2)
+        catch
+            SINK[] = n
+            rethrow()
+        end
+        return nothing
+    end
+    SINK[] = nothing
+    @test_throws BoundsError counter_only(Untrusted(42))
+    @test iszero(SINK[])
+    @test status(counter_only, (Any,)).status === :pass
 end
 
 @testitem "getfield handed to another call as a value is a read" begin

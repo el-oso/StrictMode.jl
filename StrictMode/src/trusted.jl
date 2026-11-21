@@ -470,15 +470,19 @@ end
 
 # Whether the payload read at statement `i`, followed by the raising field read at `j`, lies between
 # an `enter` and the catch block it jumps to, and that block can either finish without raising or
-# read a value the payload may be held in by the time `j` raises: the SSA values and the slots
-# assigned in `i:(j - 1)`. A handler runs before it rethrows, so a catch ending in `rethrow()`, or a
-# `finally` (which lowers to one), still hands on a local it reads. Lowering places a `try` body
-# after its `enter` and before its catch; an `enter` with no catch (`catch_dest == 0`, the
+# read a value the payload may be held in by the time `j` raises: the value of statement `i`, and
+# every SSA value and slot in `i:(j - 1)` computed from one already held, so `w = v` and
+# `getfield(v, 1)` carry it on and `n = 0` does not. A slot once held stays held, though a later
+# assignment may overwrite it. A handler runs before it rethrows, so a catch ending in `rethrow()`,
+# or a `finally` (which lowers to one), still hands on a local it reads. Lowering places a `try`
+# body after its `enter` and before its catch; an `enter` with no catch (`catch_dest == 0`, the
 # scope-only form) catches nothing.
 function _in_try(ci, i::Int, j::Int)
-    held = Any[Core.SSAValue(k) for k in i:(j - 1)]
+    held = Any[Core.SSAValue(i)]
     for k in i:(j - 1)
         st = ci.code[k]
+        (k == i || _mentions(st, held)) || continue
+        push!(held, Core.SSAValue(k))
         Meta.isexpr(st, :(=)) && st.args[1] isa Core.SlotNumber && push!(held, st.args[1])
     end
     return any(1:(i - 1)) do k
@@ -518,6 +522,9 @@ function _mentions(@nospecialize(x), vals)
     (x isa Core.SlotNumber || x isa Core.SSAValue) && return x in vals
     x isa Core.ReturnNode && return isdefined(x, :val) && _mentions(x.val, vals)
     x isa Core.GotoIfNot && return _mentions(x.cond, vals)
+    x isa Core.PiNode && return _mentions(x.val, vals)
+    x isa Core.PhiNode &&
+        return any(k -> isassigned(x.values, k) && _mentions(x.values[k], vals), eachindex(x.values))
     x isa Expr || return false
     args = x.head === :(=) ? x.args[2:end] : x.args
     return any(a -> _mentions(a, vals), args)

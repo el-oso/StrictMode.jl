@@ -268,8 +268,9 @@ StrictMode/src/
                         A getfield/getproperty handed on with a constant field uses the direct
                         path's field rules (_handed_on_cleared), and a read inside a try is kept
                         when its catch can finish without raising (_may_return) or any statement
-                        reachable from the handler reads a slot or SSA value assigned between the
-                        payload read and the raising field read (_reaches_use): a handler runs
+                        reachable from the handler reads a slot or SSA value the payload flows into
+                        between the payload read and the raising field read (copies, field reads
+                        of it; an unrelated `n = 0` is not held) (_reaches_use): a handler runs
                         before it rethrows, so a finally that stores the local hands it on.
                         trust_boundary! calls clear_cache!, like every registration a verdict
                         depends on (register_scoped!, register_alloc_barrier!, _exempt!). A
