@@ -85,3 +85,50 @@ end
     @test !StrictMode._alloc_signals(refresh!, T).alloc
     @test isempty(divergence_report(refresh!, T; guarantees = (:noalloc, :noboxing)).diverged)
 end
+
+@testitem "divergence_report lists a different cause apart from a different verdict" begin
+    using StrictMode, StrictModeTest, Test
+
+    # Both engines fail every one of these on :noalloc. `diverged` stays empty for all of them;
+    # `cause_diverged` names the guarantee only when the two codes differ.
+    module Causes
+    using StrictMode
+    mutable struct W
+        io::IOStream
+        a::Vector{Float64}
+        m::Matrix{Float64}
+    end
+    @noinline wra(w::W) = (write(w.io, w.a); 0.0)
+    @noinline wrb(w::W) = (write(w.io, w.m); 0.0)
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    @noinline drive(f::F, n::Int) where {F} = (
+        s = 0.0; for i in 1:n
+            s += f(i)
+        end; s
+    )
+    # The scan excuses the exempt pool and reports what is left, the wait (SM0017); the proof
+    # keeps the pool's sites beside the wait's and reports an allocation (SM0002).
+    c_two_ex(w::W, n::Int) = drive(i -> wra(w) + wrb(w) + grow!(i)[1], n)
+    plain(n::Int) = sum(zeros(n))
+    const TW = W(open(tempname(), "w"), zeros(4), zeros(2, 2))
+    end
+    C = Causes
+    C.c_two_ex(C.TW, 2)
+    C.plain(2)
+
+    d = divergence_report(C.plain, (Int,); guarantees = (:noalloc,))
+    @test isempty(d)
+    @test isempty(d.cause_diverged)
+
+    d = divergence_report(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))
+    @test isempty(d)
+    @test d.cause_diverged == [(:noalloc, :SM0017, :SM0002)]
+    s = sprint(show, d)
+    @test occursin("different cause", s) && occursin("SM0017", s) && occursin("SM0002", s)
+    @test !occursin("c_two_ex", s) && !occursin("grow", s)
+end

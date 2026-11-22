@@ -140,6 +140,9 @@ helper outside the barrier, its sites are kept, as they are whenever the call gr
 barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape,
 signal *categories*, and versions only — that you can send to the maintainers to fix the scan.
+Its `diverged` field lists each guarantee one engine fails and the other passes, and `isempty`
+reads only that field. Its `cause_diverged` field lists each guarantee both engines fail with
+different codes, such as the scan's SM0017 against the proof's SM0002.
 
 A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
 dropped. A call whose every allocation lies inside such functions gets a result of its own from the

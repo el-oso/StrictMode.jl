@@ -1027,7 +1027,8 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         when the accessed module is a declared layer AND a different one. Paths come
                         from pathof(moduleroot(layer)), since a submodule has no pathof of its own
   src/divergence.jl   — divergence_report/StrictDivergence/save_divergence (needs BOTH engines,
-                        which is why it lives here)
+                        which is why it lives here). `diverged` is pass-vs-fail and is all isempty
+                        reads; `cause_diverged` is both-fail with different codes (SM0017 vs SM0002)
   test/               — its own suite, @testitem/TestItemRunner like StrictMode's: runtests.jl is
                         the runner, fixtures.jl the shared @testmodule, then one file per concern
                         (proofs/macros/drivers/trim/typestable/divergence). Covers the proof
