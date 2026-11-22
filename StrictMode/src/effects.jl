@@ -2131,7 +2131,11 @@ function _scan_ci(
                             truncated = true
                         elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode, callee_caught(i))
+                            # The walk below a callee exempt from `:noalloc` marks a copy of `seen`:
+                            # what it reads may be excused, so a body it reached is read again when
+                            # the caller reaches it another way.
+                            exseen = (mode !== :boxing && !isnothing(_mi_exempt_name(mi))) ? copy(seen) : seen
+                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, exseen, mode, callee_caught(i))
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)
@@ -2154,13 +2158,11 @@ function _scan_ci(
                                 # The walk above ends at the callee's first allocation, so a boxing
                                 # after it is read by a walk of its own.
                                 if !whole && !b2
-                                    _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, seen, :boxing, callee_caught(i))
+                                    _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, exseen, :boxing, callee_caught(i))
                                     tr3 && (truncated = true)
                                     isnothing(barrier_box) && (barrier_box = bb3)
                                 end
                                 for h in hs
-                                    # Already read once inside the exempt callee, where it was excused.
-                                    delete!(seen, (h, mode, callee_caught(i)))
                                     ha, hb, _, _, _, _, _, _, _, htr = _signals_by_type(h, sub, seen, mode, callee_caught(i))
                                     htr && (truncated = true)
                                     ha && (alloc = true)

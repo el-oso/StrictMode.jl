@@ -769,6 +769,14 @@ end
     @noinline withmk(f::F, n) where {F} = (mk2(n); f(n))
     @strict_exempt :noalloc reason = "shares a helper" withmk
     cb_shared(n::Int) = withmk(k -> sum(mk2(k)), n)
+    @noinline withmk2(f::F, n) where {F} = f(n)
+    @strict_exempt :noalloc reason = "no helper" withmk2
+    cb_noshare(n::Int) = withmk2(k -> sum(mk2(k)), n)
+    # The caller calling, after an exempt function, a function that exempt function also calls.
+    cb_then(n::Int) = withmk(k -> k, n) + sum(mk2(n))
+    @noinline ex1(n) = length(mk2(n))
+    @strict_exempt :noalloc reason = "x" ex1
+    plain_then(n::Int) = ex1(n) + sum(mk2(n))
     # A field declared `Any` that the exempt function reads but never calls.
     @noinline withanynocall(h::AnyHook, n::Int) = (b = grow!(n); h.f === nothing ? 0.0 : b[1])
     @strict_exempt :noalloc reason = "pool" withanynocall
@@ -825,7 +833,8 @@ end
     E.cb(3); E.cb_inline(3); E.cb_named(3); E.cb_box(3); E.cb_clean(3); E.plain(3)
     E.cb_struct2(3); E.cb_vec(3); E.cb_hooks(3); E.cb_field(3); E.cb_any(3)
     E.cb_deep3(3); E.cb_deep3box(3); E.cb_deep5(3); E.cb_absfield(3); E.cb_anyfield(3); E.data_deep(3)
-    E.cb_absvec(3); E.cb_shared(3); E.anyfield_nocall(3); E.lockuser(3); E.tw_caller(E.TW, 2)
+    E.cb_absvec(3); E.cb_shared(3); E.cb_noshare(3); E.cb_then(3); E.plain_then(3)
+    E.anyfield_nocall(3); E.lockuser(3); E.tw_caller(E.TW, 2)
     proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
 
     # An allocation made by the caller's own closure, run inside the exempt function, is the
@@ -833,6 +842,7 @@ end
     for f in (
             E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
             E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec, E.cb_shared,
+            E.cb_noshare, E.cb_then, E.plain_then,
         )
         r = proof(f; allow_exempt = true)
         @test r.status === :fail
@@ -860,6 +870,7 @@ end
     for f in (
             E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
             E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec,
+            E.cb_shared, E.cb_noshare, E.cb_then, E.plain_then,
             E.cb_clean, E.plain, E.data_deep, E.anyfield_nocall, E.lockuser,
         )
         @test isempty(divergence_report(f, (Int,); guarantees = (:noalloc,)))

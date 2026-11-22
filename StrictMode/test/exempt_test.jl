@@ -474,6 +474,20 @@ end
     @strict_exempt :noalloc reason = "runs hooks" xh_withabsvec
     const ABSVEC = AbsCb[CbImpl()]
     cb_absvec(n::Int) = xh_withabsvec(ABSVEC, n)
+    # A handed closure calling a function the exempt function also calls itself, and one calling a
+    # function only the closure calls.
+    @noinline xh_mk2(n) = zeros(n)
+    @noinline xh_withmk(f::F, n) where {F} = (xh_mk2(n); f(n))
+    @strict_exempt :noalloc reason = "shares a helper" xh_withmk
+    cb_shared(n::Int) = xh_withmk(k -> sum(xh_mk2(k)), n)
+    @noinline xh_withmk2(f::F, n) where {F} = f(n)
+    @strict_exempt :noalloc reason = "no helper" xh_withmk2
+    cb_noshare(n::Int) = xh_withmk2(k -> sum(xh_mk2(k)), n)
+    # The caller calling, after an exempt function, a function that exempt function also calls.
+    cb_then(n::Int) = xh_withmk(k -> k, n) + sum(xh_mk2(n))
+    @noinline xh_ex1(n) = length(xh_mk2(n))
+    @strict_exempt :noalloc reason = "x" xh_ex1
+    plain_then(n::Int) = xh_ex1(n) + sum(xh_mk2(n))
     # A field declared `Any` that the exempt function reads but never calls.
     @noinline xh_withanynocall(h::AnyHook, n::Int) = (b = xh_grow!(n); h.f === nothing ? 0.0 : b[1])
     @strict_exempt :noalloc reason = "pool" xh_withanynocall
@@ -530,7 +544,8 @@ end
     noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
     for fn in (
             E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
-            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec, E.cb_shared,
+            E.cb_noshare, E.cb_then, E.plain_then,
         )
         fn(3)
         @test StrictMode._failed(noalloc(fn))
