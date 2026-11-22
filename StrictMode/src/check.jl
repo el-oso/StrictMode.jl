@@ -155,7 +155,8 @@ const _GUARANTEES = (
 
 # A caller whose only cause for `g` lies inside a registered allocation barrier. The barrier excuses
 # allocation alone, so that cause is judged at the barrier, once; the caller is pointed there rather
-# than failed again, or passed as if it had been checked.
+# than failed again, or passed as if it had been checked. `:noalloc` has no such cause: under it a
+# box is an allocation, which the barrier excuses.
 _barrier_note(md, fn, sg, g::Symbol, barrier::Symbol, file, line; tier::Symbol = :report) =
     StrictFinding(
     md, fn, sg, g, :info, file, line,
@@ -388,8 +389,6 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             so = fail && isnothing(sig.abscontainer) ? _scheduler_origin(f, types) : nothing
             if !fail && sig.truncated
                 push!(out, _truncated_finding(md, fn, sg, g, sig))
-            elseif !fail && isnothing(sig.exempt) && !isnothing(sig.barrier_box)
-                push!(out, _barrier_note(md, fn, sg, g, sig.barrier_box, sig.file, sig.line))
             elseif !fail && !isnothing(sig.exempt)
                 # Its only allocation is in a callee exempted from `:noalloc`: a note, so the
                 # excusal stays visible without being reported again at every caller.

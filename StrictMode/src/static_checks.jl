@@ -59,9 +59,8 @@ function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tup
     _unread_fail(:noalloc, target, sig) && return nothing
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _alloc_message(f, types, sig, "allocates / boxes (value-free IR scan)"))
-    elseif _truncated_fail(:noalloc, target, sig)
     else
-        _barrier_info(:noalloc, target, sig.barrier_box)
+        _truncated_fail(:noalloc, target, sig)
     end
     return nothing
 end
@@ -81,9 +80,8 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
         _unread_fail(:noalloc, target, sig) && return val
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _alloc_message(f, types, sig, "allocates / boxes (value-free IR scan)"))
-        elseif _truncated_fail(:noalloc, target, sig)
         else
-            _barrier_info(:noalloc, target, sig.barrier_box)
+            _truncated_fail(:noalloc, target, sig)
         end
         return val
     end

@@ -246,14 +246,25 @@ StrictMode/src/
                         so its own do-block closure stays its own code), and returns the :invoke
                         sigs whose FUNCTION is handed, plus inlined callables named by the argument
                         types (inlining edges) and singleton callables folded to constants (matched
-                        by type). Each is scanned as the caller's own callee, its entry removed
-                        from seen first. A value whose type can carry no callable (_callable_types!
+                        by type). Each is scanned as the caller's own callee. A value whose type can carry no callable (_callable_types!
                         empty) is not followed, so the Any fields of a lock's Task cost nothing
                         unless something calls them. A handed value reaching a dynamic call or a
                         calling builtin, an unreadable body, or the budget makes the walk
-                        incomplete and excuses NOTHING below the exempt callee (a second walk in
-                        :boxing mode; seen is keyed on (sig, mode, caught) so it is not cut).
-                        _signal_origin mirrors this.
+                        incomplete and excuses NOTHING below the exempt callee.
+                        ONE RULE says what a walk reads below a callee: _callee_excusal gives
+                        :barrier (nothing below is the caller's), :exempt (only the handed-in
+                        code is) or :own (an ordinary callee, and an exempt one whose handed-in
+                        code was not read in full), and _scan_ci, _signal_origin and
+                        _nonscheduler_origin all ask it. The invariant: a body counts for a caller
+                        exactly when some path to it enters no :barrier or :exempt callee, in
+                        whatever order the walk meets the paths. So the one read made below an
+                        excused callee (_excused_signals: the exempt name a caller is pointed to,
+                        a registered barrier's boxing or dictionary lookup, the signals an
+                        excusal does not cover) marks a COPY of seen and can cut nothing the
+                        caller reaches another way. Mode :alloc reads nothing below a barrier:
+                        under :noalloc a box is an allocation, so a caller of a registered
+                        barrier that boxes passes with no note, as a caller of a once-guard does;
+                        the :info note that names the barrier is :noboxing's and :owned's.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch

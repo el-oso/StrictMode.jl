@@ -233,8 +233,10 @@ they are given `allow_exempt = true`, and a caller with one allocation of its ow
 The exemption has to be declared in the module that defines the function, as `@strict_exempt` in
 its source is: one declared with no module covers by name and excuses nothing in the proof.
 
-**A barrier excuses allocation, and nothing else.** Every other guarantee still reads `f` itself: a
-dictionary lookup or a boxed value inside `f` is reported when `f` is checked, once. A caller whose
+**A barrier excuses allocation, and nothing else.** Under `:noalloc` a box is an allocation, so a
+caller passes whatever `f` allocates or boxes. Every other guarantee still reads `f` itself: a
+dictionary lookup (`:owned`) or a boxed value (`:noboxing`) inside `f` is reported when `f` is
+checked, once. A caller whose
 only such cause lies inside `f` is neither failed again nor passed as if it had been checked: it
 gets an `:info` finding that names `f`, so the reader can follow it to the one place it is reported.
 A `:owned` failure on a `OncePerTask` accessor is the usual case: the lookup is the price of
@@ -1143,6 +1145,37 @@ function _compiled_body(mi::Core.MethodInstance, world::UInt)
     return nothing
 end
 
+# What a walk of the call graph reads below the callee `mi`. Every walk that decides or explains an
+# allocation verdict asks here (`_scan_ci`, `_signal_origin`, `_nonscheduler_origin`), so they excuse
+# the same code:
+#
+#   - `:barrier`: an allocation barrier (`_mi_is_barrier`). Nothing below it is the caller's.
+#   - `:exempt`: a callee exempt from `:noalloc` whose handed-in code was read in full
+#     (`_handed_code`). Only `handed`, the code its caller handed it and that it calls, is the
+#     caller's. `:boxing`, which `:noboxing` reads, knows no exemption.
+#   - `:own`: the callee is the caller's code. An exempt callee whose handed-in code could not be
+#     read in full is of this kind, so it excuses nothing; `handed` is what was found of it.
+#
+# The invariant: a body counts toward a caller's verdict exactly when the caller reaches it along
+# some path that enters no `:barrier` or `:exempt` callee, in whatever order the walk meets the
+# paths. A walk therefore never marks a body as visited on the strength of a read made below an
+# excused callee (`_excused_signals`).
+const _NO_HANDED = Any[]
+function _callee_excusal(mi::Core.MethodInstance, mode::Symbol)
+    _mi_is_barrier(mi) && return (; kind = :barrier, handed = _NO_HANDED, name = nothing)
+    name = mode === :boxing ? nothing : _mi_exempt_name(mi)
+    isnothing(name) && return (; kind = :own, handed = _NO_HANDED, name)
+    handed, whole = _handed_code(mi.specTypes)
+    return (; kind = whole ? :exempt : :own, handed, name)
+end
+
+# The signals of an excused callee's subtree, read for what is reported about it (the exemption or
+# barrier a caller is pointed to) and for the guarantees the excusal does not cover. It marks a
+# copy of `seen`: the caller's walk reads every body below the callee again if it reaches that body
+# another way. This is the only place a walk reads below an excused callee.
+_excused_signals(mi::Core.MethodInstance, depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught) =
+    _signals_by_type(mi.specTypes, depth, copy(seen), mode, caught)
+
 # Where the scan finds what it reports: for every body of the call graph whose own statements set the
 # signal `mode` asks about, the callees that lead to it and the statements. `_alloc_signals` says that
 # something allocates; this says which statement, in which callee, reached from where.
@@ -1172,26 +1205,21 @@ function _signal_origin(
         end
         for (mi, c) in callees
             mi = mi::Core.MethodInstance
-            if _mi_is_barrier(mi)
+            ex = _callee_excusal(mi, m)
+            if ex.kind === :barrier
                 isnothing(stops) || push!(stops, mi.specTypes)
                 continue
             end
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
             user = _followed_to_end(mi)
             (depth > 0 || (depth < 0 && user)) || continue
-            # Below a callee exempt from `:noalloc`, the scan's `:noalloc` verdict counts only the
-            # handed-in code it calls, or all of its code when that walk is incomplete.
-            if m !== :boxing && !isnothing(_mi_exempt_name(mi))
-                haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-                hs, whole = _handed_code(mi.specTypes)
-                for h in hs
-                    haskey(parent, h) || (parent[h] = mi.specTypes)
-                    push!(queue, (h, user ? depth : (depth > 1 ? depth - 1 : -1), c, m))
-                end
-                whole && continue
-            end
+            sub = user ? depth : (depth > 1 ? depth - 1 : -1)
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1), c, m))
+            for h in ex.handed
+                haskey(parent, h) || (parent[h] = mi.specTypes)
+                push!(queue, (h, sub, c, m))
+            end
+            ex.kind === :exempt || push!(queue, (mi.specTypes, sub, c, m))
         end
     end
     return out
@@ -1338,11 +1366,16 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
         end
         for (mi, c, j) in callees
             mi = mi::Core.MethodInstance
-            (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi))) && continue
+            ex = _callee_excusal(mi, :alloc)
+            ex.kind === :barrier && continue
             arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true, unsplit))
             (sched && !arg) && continue
             haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, c, !arg && _in_scheduler(mi)))
+            for h in ex.handed
+                haskey(parent, h) || (parent[h] = mi.specTypes)
+                push!(queue, (h, c, false))
+            end
+            ex.kind === :exempt || push!(queue, (mi.specTypes, c, !arg && _in_scheduler(mi)))
         end
     end
     return nothing
@@ -1991,7 +2024,8 @@ function _scan_ci(
     exempt = nothing                  # the first `@strict_exempt :noalloc` callee whose allocation was excused
     # The first registered barrier found to box, or to look up a dictionary, inside itself. A barrier
     # excuses only allocation: what else it does is judged at the barrier, once, and its callers
-    # are pointed there rather than failed again for the same cause.
+    # are pointed there rather than failed again for the same cause. Not read in mode `:alloc`,
+    # where a box is an allocation and so excused with the rest.
     barrier_dict = nothing
     barrier_box = nothing
     truncated = false                 # part of the call graph was left unread
@@ -2089,15 +2123,15 @@ function _scan_ci(
                         # as a barrier. A barrier records `barrier = true`, which grants an allocation
                         # exemption elsewhere; StrictMode's presence in a body says nothing about
                         # whether the caller's own code allocates, so it must leave no trace at all.
-                    elseif _mi_is_barrier(mi)
+                    elseif (ex = _callee_excusal(mi, mode)).kind === :barrier
                         # The callee itself IS a recognized barrier (e.g. `(::OncePerProcess)()`,
                         # or a directly-registered function) — its one-time cold-path allocation
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
+                        # Under `:alloc` that is all of it: a box is an allocation. The other modes
+                        # read a registered barrier for the causes it does not excuse.
                         barrier = true
-                        if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            # This walk marks a copy of `seen`: what it reads is excused, so a body
-                            # it reached is read again when the caller reaches it another way.
-                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, copy(seen), mode, callee_caught(i))
+                        if depth > 0 && mode !== :alloc && _is_registered_callee(first(mi.specTypes.parameters))
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _excused_signals(mi, depth - 1, seen, mode, callee_caught(i))
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
@@ -2133,43 +2167,30 @@ function _scan_ci(
                             truncated = true
                         elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
-                            # The walk below a callee exempt from `:noalloc` marks a copy of `seen`:
-                            # what it reads may be excused, so a body it reached is read again when
-                            # the caller reaches it another way.
-                            exseen = (mode !== :boxing && !isnothing(_mi_exempt_name(mi))) ? copy(seen) : seen
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, exseen, mode, callee_caught(i))
-                            tr2 && (truncated = true)
-                            isnothing(barrier_dict) && (barrier_dict = bd2)
-                            isnothing(barrier_box) && (barrier_box = bb2)
+                            cc = callee_caught(i)
                             # A callee exempted from `:noalloc` has its allocation excused here
                             # too — it is the same allocation, already excused where it is made —
                             # and so has its boxing, since a box is an allocation. The excusal is
                             # recorded, so the caller is reported as reaching it rather than as
-                            # clean. `:boxing`, which `:noboxing` reads, excuses nothing, and the
-                            # callee's dictionary lookups still count. Code the callee was handed
-                            # by its caller and that it calls is the caller's (`_handed_code`): each
-                            # such call is read as the caller's own callee. A walk that is incomplete
-                            # excuses nothing.
-                            exname = (mode !== :boxing && (a2 || b2)) ? _mi_exempt_name(mi) : nothing
-                            if isnothing(exname)
-                                a2 && (alloc = true)
+                            # clean. The callee's dictionary lookups still count. Code the callee
+                            # was handed by its caller and that it calls is the caller's: each such
+                            # call is read as the caller's own callee (`_callee_excusal`).
+                            if ex.kind === :exempt
+                                a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _excused_signals(mi, sub, seen, mode, cc)
+                                ((a2 || b2) && isnothing(exempt)) && (exempt = ex.name)
+                                a2 = b2 = false
                             else
-                                isnothing(exempt) && (exempt = exname)
-                                hs, whole = _handed_code(mi.specTypes)
-                                whole ? (b2 = false) : (a2 && (alloc = true))
-                                # The walk above ends at the callee's first allocation, so a boxing
-                                # after it is read by a walk of its own.
-                                if !whole && !b2
-                                    _, b2, _, _, _, _, _, _, bb3, tr3 = _signals_by_type(mi.specTypes, sub, exseen, :boxing, callee_caught(i))
-                                    tr3 && (truncated = true)
-                                    isnothing(barrier_box) && (barrier_box = bb3)
-                                end
-                                for h in hs
-                                    ha, hb, _, _, _, _, _, _, _, htr = _signals_by_type(h, sub, seen, mode, callee_caught(i))
-                                    htr && (truncated = true)
-                                    ha && (alloc = true)
-                                    hb && (boxing = true)
-                                end
+                                a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode, cc)
+                            end
+                            tr2 && (truncated = true)
+                            isnothing(barrier_dict) && (barrier_dict = bd2)
+                            isnothing(barrier_box) && (barrier_box = bb2)
+                            a2 && (alloc = true)
+                            for h in ex.handed
+                                ha, hb, _, _, _, _, _, _, _, htr = _signals_by_type(h, sub, seen, mode, cc)
+                                htr && (truncated = true)
+                                ha && (alloc = true)
+                                hb && (boxing = true)
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
                             (b2 && (!insched() || _in_scheduler(mi) || _calls_argument(sig, mi.specTypes) || !schedstmt(i))) &&

@@ -596,6 +596,35 @@ end
     end
 end
 
+@testitem "a registered barrier's boxing is excused under :noalloc and noted under :noboxing" begin
+    using StrictMode, Test
+    module BoxingBarrier
+    @noinline dyn(v::Vector{Any}) = v[1] + 1          # a dynamic call, and a boxed result
+    @noinline bar(v::Vector{Any}) = dyn(v)
+    entry(v::Vector{Any}) = bar(v) === nothing
+    end
+    v = Any[1]
+    BoxingBarrier.entry(v)
+    T = (Vector{Any},)
+    one(g) = only(StrictMode.findings(BoxingBarrier.entry, T; guarantees = (g,)))
+    @test StrictMode._failed(one(:noalloc))
+    @test StrictMode._failed(one(:noboxing))
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        StrictMode.register_alloc_barrier!(BoxingBarrier.bar)
+        # Under :noalloc a box is an allocation, which the barrier excuses: a pass, with no note.
+        @test one(:noalloc).status === :pass
+        @test_logs @assert_noalloc BoxingBarrier.entry(v)
+        # :noboxing is not excused: the caller is pointed to the barrier, where it is reported.
+        b = one(:noboxing)
+        @test b.status === :info && occursin("reaches `bar`", b.reason)
+        @test StrictMode._failed(only(StrictMode.findings(BoxingBarrier.bar, T; guarantees = (:noboxing,))))
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS); union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
+    end
+end
+
 @testitem "a package's :noalloc exemption covers that package's methods only" begin
     using StrictMode
     module Scoped6
