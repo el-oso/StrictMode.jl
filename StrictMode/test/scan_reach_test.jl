@@ -113,6 +113,32 @@ end
     @test StrictMode._failed(only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,))))
 end
 
+@testitem "a registered barrier does not excuse a callee its caller also calls directly" begin
+    using StrictMode
+    module BarrierThen
+    @noinline mk2(n) = zeros(n)
+    @noinline bar(n) = length(mk2(n))
+    then_bar(n::Int) = bar(n) + sum(mk2(n))
+    bar_then(n::Int) = sum(mk2(n)) + bar(n)
+    only_bar(n::Int) = bar(n) + 1
+    end
+    B = BarrierThen
+    B.then_bar(3); B.bar_then(3); B.only_bar(3)
+    try
+        register_alloc_barrier!(B.bar)
+        for f in (B.then_bar, B.bar_then)
+            @test StrictMode._failed(only(StrictMode.findings(f, (Int,); guarantees = (:noalloc,))))
+        end
+        @test !StrictMode._failed(only(StrictMode.findings(B.only_bar, (Int,); guarantees = (:noalloc,))))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, B.bar)
+        store = StrictMode._store_for(Base.moduleroot(B), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== B.bar, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end
+
 @testitem "an allocation behind a registered barrier called with keywords is excused" begin
     using StrictMode
     @noinline ws_kw(::Type{T}; extra::Int = 0) where {T} = Vector{T}(undef, 64 + extra)

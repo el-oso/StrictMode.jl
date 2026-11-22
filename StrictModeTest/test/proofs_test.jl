@@ -918,20 +918,57 @@ end
     register_alloc_barrier!(M.regrow!)
     try
         proof(f) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,)))
-        # Both calls reach the proof's barrier filter rather than the unfiltered proof.
-        for f in (M.only_barrier, M.also_direct)
-            sig = StrictMode._alloc_signals(f, (Int,))
-            @test sig.barrier && !sig.alloc
-        end
+        # Both calls reach the proof's barrier filter. The scan sees `mid`'s allocation, which is
+        # outside the barrier.
+        sig = StrictMode._alloc_signals(M.only_barrier, (Int,))
+        @test sig.barrier && !sig.alloc
+        sig = StrictMode._alloc_signals(M.also_direct, (Int,))
+        @test sig.barrier && sig.alloc
+        multi(a) = any(fr -> fr.func === Symbol("multiple call sites"), a.backtrace)
         raw = StrictModeTest._raw_allocs(M.only_barrier, (Int,))
-        @test any(a -> any(fr -> fr.func === Symbol("multiple call sites"), a.backtrace), raw)
+        @test any(multi, raw)
         @test !StrictMode._failed(proof(M.only_barrier))
         # `mid` reaches the helper without crossing the barrier, so its sites are the call's own.
         @test StrictMode._failed(proof(M.also_direct))
+        inside = StrictModeTest._only_through_barrier(StrictMode._sigtype(M.also_direct, (Int,)))
+        sites = filter(multi, StrictModeTest._raw_allocs(M.also_direct, (Int,)))
+        @test !isnothing(inside) && !isempty(sites) && !any(a -> StrictModeTest._site_mi(a) in inside, sites)
     finally
         delete!(StrictMode._ALLOC_BARRIERS, M.regrow!)
         store = StrictMode._store_for(Base.moduleroot(parentmodule(M)), StrictMode._LOCAL_BARRIERS)
         isnothing(store) || filter!(g -> g !== M.regrow!, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end
+
+@testitem "a barrier does not excuse a callee its caller also calls directly" begin
+    using StrictMode, StrictModeTest, Test
+
+    module BarrierThen
+    @noinline mk2(n) = zeros(n)
+    @noinline bar(n) = length(mk2(n))
+    then_bar(n::Int) = bar(n) + sum(mk2(n))
+    bar_then(n::Int) = sum(mk2(n)) + bar(n)
+    only_bar(n::Int) = bar(n) + 1
+    end
+    B = BarrierThen
+    B.then_bar(3); B.bar_then(3); B.only_bar(3)
+    register_alloc_barrier!(B.bar)
+    try
+        proof(f) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,)))
+        for f in (B.then_bar, B.bar_then)
+            @test StrictMode._failed(proof(f))
+        end
+        @test !StrictMode._failed(proof(B.only_bar))
+        # The two tiers agree on every one of these calls.
+        for f in (B.then_bar, B.bar_then, B.only_bar)
+            @test isempty(divergence_report(f, (Int,); guarantees = (:noalloc,)))
+        end
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, B.bar)
+        store = StrictMode._store_for(Base.moduleroot(B), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== B.bar, store)
         StrictMode._BARRIER_GEN[] += 1
         StrictMode.clear_cache!()
     end

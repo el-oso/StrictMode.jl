@@ -2095,7 +2095,9 @@ function _scan_ci(
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
                         barrier = true
                         if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen, mode, callee_caught(i))
+                            # This walk marks a copy of `seen`: what it reads is excused, so a body
+                            # it reached is read again when the caller reaches it another way.
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, copy(seen), mode, callee_caught(i))
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
