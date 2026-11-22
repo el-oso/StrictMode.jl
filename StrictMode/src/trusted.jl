@@ -109,6 +109,7 @@ const _LOCAL_TRUST = :__strict_trust_boundaries__
 # Every boundary in scope: this session's, and each loaded package's own. A boundary that takes
 # keywords keeps its code in a body function of its own, `#f#N`, which is the boundary too.
 function _is_trust_boundary(@nospecialize(f))
+    f isa _Spec && return _is_trust_boundary(_spec_callee(f))
     f in _TRUST_BOUNDARIES && return true
     bs = _registrations(_TRUST_BOUNDARIES, _LOCAL_TRUST)
     any(g -> g === f, bs) && return true

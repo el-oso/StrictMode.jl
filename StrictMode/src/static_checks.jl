@@ -216,7 +216,7 @@ function _assert_owned(
     sig = _alloc_signals(f, types; depth = depth)
     _unread_fail(:owned, target, sig; gates) && return nothing
     # The ordinary walk stopped short: follow the package's own code to the end.
-    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(_sigtype(f, types)) : :clean
+    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(_entry_key(f, types)) : :clean
     if sig.dictlookup || deep === :lookup
         _fail(
             :owned, target,
@@ -290,7 +290,7 @@ function _assert_noescape(
         target, @nospecialize(f), @nospecialize(types::Tuple);
         gates::Bool = _guarantee_gates(:noescape)
     )
-    r = _escaping_scoped(_sigtype(f, types))
+    r = _escaping_scoped(_entry_key(f, types))
     if !isempty(r.escaped)
         _fail(
             :noescape, target,

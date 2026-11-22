@@ -8,7 +8,7 @@
 
 # An advisory pass that errored on one signature, recorded rather than dropped.
 _advisory_error(@nospecialize(f), @nospecialize(types), err) = StrictFinding(
-    _mod_sym(f, types), _func_name(f), _sig_string(Tuple(types)), :advisory, :info, "", 0,
+    _mod_sym(f, types), _func_name(f), _sig_string(f, Tuple(types)), :advisory, :info, "", 0,
     "suggestions could not be computed for this signature: " * sprint(showerror, err),
     "This is an advisory pass, not a guarantee — the signature is otherwise unaffected."
 )

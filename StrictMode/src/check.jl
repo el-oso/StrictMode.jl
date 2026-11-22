@@ -20,12 +20,23 @@ function _sig_string(@nospecialize(types::Tuple))
     @lock _SIGNAL_MEMO_LOCK (_SIG_STRING_MEMO[key] = (world, s))
     return s
 end
+
+# The signature an item is reported under. A `_Spec` shares its argument types with the item of the
+# method they dispatch to, so it also names the argument types of the method that compiled it:
+# `(Vector{Float64}, Int64) via invoke of (Vector{Float64}, Integer)`. Its findings then have a
+# `key` of their own.
+function _sig_string(@nospecialize(f), @nospecialize(types::Tuple))
+    f isa _Spec || return _sig_string(types)
+    m = f.mi.def::Method
+    return _sig_string(types) * " via invoke of " * _sig_string(Tuple(Base.unwrap_unionall(m.sig).parameters[2:end]))
+end
 # A callable object is named by its type, with the type's parameters and without its module
 # (`Boxed{Int64}`): one method serves every `Boxed{T}`, and each instantiation is its own row, so
 # the name keeps their `key`s apart. Printing the value would show its fields. `only` and `exempt`
 # match it by `nameof` alone (`Boxed`). The keyword body of a constructor or a callable object, which
 # Julia names `_`, is named after the callable it belongs to (`_kwbody_owner`).
 _func_name(@nospecialize(f)) = try
+    f isa _Spec && return _func_name(_spec_callee(f))
     if f isa Function && _demangle(nameof(f)) === :_
         owner = _kwbody_owner(typeof(f))
         isnothing(owner) || return _func_name(something(owner))
@@ -36,6 +47,7 @@ catch
 end
 _type_label(@nospecialize(T)) = sprint(show, T; context = :module => parentmodule(T))
 _mod_sym(@nospecialize(f)) = try
+    f isa _Spec && return nameof((f.mi.def::Method).module)
     nameof(parentmodule(f isa Function || f isa Type || f isa Module ? f : _ftype(f)))
 catch
     :Main
@@ -191,7 +203,7 @@ function _compiled_output_finding(
         tier::Symbol = :report
     )
     g in _SHARED_GUARANTEES || return nothing
-    isnothing(_typed_body(_sigtype(f, types))) && return _unevaluated(md, fn, sg, g, _NO_BODY_WHY; tier)
+    isnothing(_typed_body(_entry_key(f, types))) && return _unevaluated(md, fn, sg, g, _NO_BODY_WHY; tier)
     if g === :owned
         _has_compiled_body(f, types) || return _unevaluated(md, fn, sg, g, _output_unread(f, types); tier)
         s = _alloc_signals(f, types; depth = _FAST_ALLOC_DEPTH[])
@@ -199,7 +211,7 @@ function _compiled_output_finding(
             return _barrier_note(md, fn, sg, g, s.barrier_dict, s.file, s.line; tier)
         # The ordinary walk stopped short: follow the package's own code to the end. A gate does not
         # pass on what it did not read, so only a walk that ran out of bodies is "not established".
-        deep = (!s.dictlookup && s.truncated) ? _owned_deep(_sigtype(f, types)) : :clean
+        deep = (!s.dictlookup && s.truncated) ? _owned_deep(_entry_key(f, types)) : :clean
         deep === :budget && return StrictFinding(
             md, fn, sg, g, tier === :proof ? :fail : :info, s.file, s.line,
             "not established: the package's own call graph below this call is larger than the walk " *
@@ -315,7 +327,7 @@ end
 function _findings_uncached(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     n = _window_open()
     try
-        return _findings_fast(f, types, guarantees, _mod_sym(f, types), _func_name(f), _sig_string(types))
+        return _findings_fast(f, types, guarantees, _mod_sym(f, types), _func_name(f), _sig_string(f, types))
     finally
         _window_close(n)
     end
@@ -338,7 +350,7 @@ end
 function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantees, md, fn, sg)
     # A verdict read from no body is not a verdict, for any guarantee: "could not check" must not
     # render as a pass. The body is memoized, and every guarantee below reads it.
-    isnothing(_typed_body(_sigtype(f, types))) &&
+    isnothing(_typed_body(_entry_key(f, types))) &&
         return StrictFinding[_unevaluated(md, fn, sg, g, _NO_BODY_WHY) for g in guarantees]
     concrete = _has_compiled_body(f, types)
     # `:noalloc` is decided by the first allocation or boxing, so its scan stops there; `:noboxing`

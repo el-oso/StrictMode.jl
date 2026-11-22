@@ -4,7 +4,8 @@
 # compiled for one caller or several, and what the helper does. A second set gives the helper's
 # caller, or the wrapper, each of the declaration and call shapes in `SHAPES`. The expected verdict of each case is
 # computed from the documented rules alone (`expected`), never from either engine, and both engines
-# and `divergence_report` are compared against it.
+# and `divergence_report` are compared against it. Where the helper is reached by `invoke`, a module
+# sweep of the helper's function is compared too (R10).
 @testmodule NoallocCorpus begin
     using StrictMode, StrictModeTest
 
@@ -193,7 +194,20 @@
     # R9 A callee is the method the call runs, however the call names it: the method `invoke` selects
     #    with a signature wider than its arguments is read, excused and counted as that method, not
     #    as the more specific one its argument types would dispatch to.
+    # R10 A module sweep checks each specialization it lists as an entry point. The helper's wider
+    #    method, compiled only through `invoke`, is one row, named `via invoke of` that method, and
+    #    its causes are the helper's own effect. The specific method, `-1.0`, passes wherever it has
+    #    a row; it has one when anything inferred a call of it, the analysis itself included.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
+
+    # What a sweep of the helper's function reports, for a case whose helper is reached by `invoke`
+    # (R10): the scan's and the proof's verdict of the `invoke` row, and of every other row.
+    function expected_sweep(k::Case)
+        (k.shape === :invoke && k.pos === :helper) || return nothing
+        c = effect_cause(k.effect)
+        v = c === :alloc ? (:fail, :SM0002) : c === :wait ? (:fail, :SM0017) : (:pass, nothing)
+        return (; scan = v, proof = v, others = :pass)
+    end
 
     function causes(k::Case)
         cs = Tuple{Symbol, Symbol}[]
@@ -239,6 +253,7 @@
         return (;
             name = k.name, scan = s, proof = p, proof_ae = pa,
             diverged = sfail != pfail, cause = sfail && p[1] === :fail && s[2] !== p[2],
+            sweep = expected_sweep(k),
         )
     end
 
@@ -254,7 +269,16 @@
             proof = verdict(only(StrictModeTest.proof_findings(M.caller, tt; guarantees = (:noalloc,))))
             proof_ae = verdict(only(StrictModeTest.proof_findings(M.caller, tt; guarantees = (:noalloc,), allow_exempt = true)))
             d = divergence_report(M.caller, tt; guarantees = (:noalloc,))
-            return (; name = k.name, scan, proof, proof_ae, diverged = !isempty(d), cause = !isempty(d.cause_diverged))
+            sweep = nothing
+            if !isnothing(expected_sweep(k))
+                sf = StrictMode._findings_compiled(M; guarantees = (:noalloc,), only = [:mid])
+                pf = StrictModeTest.proof_findings(M; guarantees = (:noalloc,), only = [:mid])
+                wide(x) = occursin(" via invoke of ", x.signature)
+                row(fs) = (r = filter(wide, fs); length(r) == 1 ? verdict(only(r)) : (:rows, length(r)))
+                others = all(x -> wide(x) || x.status === :pass, vcat(sf, pf)) ? :pass : :fail
+                sweep = (; scan = row(sf), proof = row(pf), others)
+            end
+            return (; name = k.name, scan, proof, proof_ae, diverged = !isempty(d), cause = !isempty(d.cause_diverged), sweep)
         finally
             path = M.TW.io.name[7:(end - 1)]     # "<file PATH>"
             close(M.TW.io)

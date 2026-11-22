@@ -275,8 +275,22 @@ StrictMode/src/
                         specific method answers. NEVER dispatch `mi.specTypes` of a callee again:
                         read through the key (_typed_body, _code_typed_of, _code_ircode_of,
                         _key_method), keep memo entries and visited sets under it, and take only
-                        argument types from _key_sig. _forwarded_sig (scheduling.jl) forwards only
-                        to a callee whose key is its signature.
+                        argument types from _key_sig. _forwarded_sig (scheduling.jl) takes and
+                        returns a key, and forwards only to a callee whose key is its signature.
+                        ENTRY KEYS: an ITEM's body is named the same way. _module_specializations
+                        and _method_entries (registry.jl) hand over each compiled specialization
+                        as _entry_of names it: the function when its signature dispatches to the
+                        specialization, _Spec(mi) when it dispatches elsewhere (compiled only
+                        through an invoke of a wider method). Every guarantee reads the entry
+                        through _entry_key(f, types); _ftype/_sigtype RAISE on a _Spec, so a reader
+                        that would dispatch its signature fails the item instead of judging the
+                        other method. _which/_code_typed/_return_types/_base_return_types/
+                        _infer_effects/_llvm_ir/_native_asm read a _Spec as its specialization.
+                        Backends that take (f, types) are driven through _invoke_through
+                        (inlining.jl) via _spec_call, which raises unless the wrapper's body
+                        :invokes exactly that mi; JET takes the mi itself. A _Spec is reported as
+                        `(types) via invoke of (method arg types)` (_sig_string(f, types)), so its
+                        key differs from the dispatched row's and ordinary rows are unchanged.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch

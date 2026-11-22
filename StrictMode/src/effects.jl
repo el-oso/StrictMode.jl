@@ -488,7 +488,7 @@ function _alloc_signals(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
     )
     _sync_exemptions!()   # the memo key cannot see a change to `exempt_strict()`
-    sig = _sigtype(f, types)
+    sig = _entry_key(f, types)
     key = (depth, Base.get_world_counter(), mode)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
@@ -1232,7 +1232,7 @@ function _signal_origin(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
         stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
-    top = _sigtype(f, types)
+    top = _entry_key(f, types)
     parent = IdDict{Any, Any}()
     queue = Any[(top, _FAST_ALLOC_DEPTH[], false, mode)]
     seen = Base.IdSet{Any}()
@@ -1385,7 +1385,7 @@ end
 # reads the whole scheduler.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     parent = IdDict{Any, Any}()
-    queue = Any[(_sigtype(f, types), false, false)]
+    queue = Any[(_entry_key(f, types), false, false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
         s, caught, sched = popfirst!(queue)
@@ -2366,7 +2366,7 @@ A signature with no typed body (no method matches it, or its generator raised) r
 describes no code.
 """
 function effects(@nospecialize(f), @nospecialize(types::Tuple))
-    isnothing(_typed_body(_sigtype(f, types))) &&
+    isnothing(_typed_body(_entry_key(f, types))) &&
         throw(_UnanalyzableSignature(:effects, f, types, _NO_BODY_WHY))
     return _infer_effects(f, types)
 end
@@ -2488,8 +2488,9 @@ end
 """
     _escaping_scoped(sig) -> (; escaped, undetermined)
 
-The registered scoped types that escape the frame `sig` names, and the ones whose fate this cannot
-decide. Both empty means nothing escaped, which is also the answer when no type is registered.
+The registered scoped types that escape the frame the body key `sig` names, and the ones whose
+fate this cannot decide. Both empty means nothing escaped, which is also the answer when no type
+is registered.
 
 Only a `:new` carries a verdict. The escape state of a value returned by a call comes from the
 conservative cache callback, which assumes an uncached callee escapes its arguments — so a handle
@@ -2501,7 +2502,7 @@ function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
     isempty(_scoped_types()) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
-    irs = _code_ircode_by_type(sig)
+    irs = _code_ircode_of(sig)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
     ir = first(irs)[1]
     st = EA.analyze_escapes(
@@ -2547,7 +2548,7 @@ end
 function _noescape_finding(
         @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
     )
-    r = _escaping_scoped(_sigtype(f, types))
+    r = _escaping_scoped(_entry_key(f, types))
     reason = !isempty(r.escaped) ?
         "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
         " — it is returned, stored, or captured, or handed to a function this analysis " *
@@ -2793,11 +2794,12 @@ end
 # The other readings of the compiler's inference answer under the same interpreter.
 function _return_types(@nospecialize(f), @nospecialize(types))
     world = Base.get_world_counter()
-    mi = _sig_instance(_sigtype(f, types), world)
+    mi = f isa _Spec ? f.mi : _sig_instance(_sigtype(f, types), world)
     isnothing(mi) || _infer_for_image(mi, world)
     n = _window_open()
     interp = _ScanInterpreter()
     try
+        f isa _Spec && return _return_types_of(mi, interp, interp)
         f isa _Callable || return Base.return_types(f, types; interp)
         return _return_types_by_type(_sigtype(f, types), interp, interp)
     finally
@@ -2816,8 +2818,14 @@ function _return_types_by_type(@nospecialize(tt), passed_interp, interp)
     ]
 end
 
-# `Base.return_types(f, Tuple{types...}; world)` under the default interpreter, for a `_Callable` too.
+# The inferred return type of the specialization `mi`, as `_return_types_by_type` gives a match's.
+_return_types_of(mi::Core.MethodInstance, passed_interp, interp) =
+    Any[something(Base.invoke_interp_compiler(passed_interp, :typeinf_type, interp, mi), Any)]
+
+# `Base.return_types(f, Tuple{types...}; world)` under the default interpreter, for a `_Callable` and
+# a `_Spec` too.
 function _base_return_types(@nospecialize(f), @nospecialize(types); world::UInt = Base.get_world_counter())
+    f isa _Spec && return _return_types_of(f.mi, nothing, Base.invoke_default_compiler(:_default_interp, world))
     f isa _Callable || return Base.return_types(f, Tuple{types...}; world)
     return _return_types_by_type(_sigtype(f, types), nothing, Base.invoke_default_compiler(:_default_interp, world))
 end
@@ -2826,6 +2834,11 @@ function _infer_effects(@nospecialize(f), @nospecialize(types))
     n = _window_open()
     interp = _ScanInterpreter()
     try
+        if f isa _Spec
+            # `Base.infer_effects` of the one specialization.
+            frame = Base.invoke_interp_compiler(interp, :typeinf_frame, interp, f.mi, true)
+            return frame === nothing ? _CC.Effects() : frame.result.ipo_effects
+        end
         f isa _Callable || return Base.infer_effects(f, types; interp)
         # `Base.infer_effects`, read by the signature.
         tt = _sigtype(f, types)
@@ -2884,11 +2897,54 @@ struct _Callable{F} end
 # The callee for a function type: its singleton instance when it has one, `_Callable{F}()` otherwise.
 _callee(@nospecialize(F)) = (F isa DataType && isdefined(F, :instance)) ? F.instance : _Callable{F}()
 
+# --- the body an item names ----------------------------------------------------------------------
+#
+# An item `(f, types)` is checked as the body it names, and names it by a key (`_callee_key`): the
+# signature `Tuple{typeof(f), types...}`, which names the specialization a call dispatches to. A
+# module sweep also meets specializations that no call dispatches to: `invoke(f, Tuple{wider},
+# args...)` compiles the wider method for argument types a more specific method answers. Such a
+# specialization is an item `(_Spec(mi), types)`, and its key is `mi` itself.
+#
+# The invariant: every guarantee reads an item's body through `_entry_key`, in both tiers, and a
+# `_Spec` cannot be turned into a signature. `_ftype` and `_sigtype` raise on one, so a reader that
+# would dispatch its signature, and judge the other method, fails the item instead of passing it.
+# `_which`, `_code_typed`, `_return_types`, `_base_return_types`, `_infer_effects`, `_llvm_ir` and
+# `_native_asm` read a `_Spec` as its specialization; a backend that takes a function and argument
+# types is driven through `_invoke_through`, whose body runs exactly that specialization.
+struct _Spec
+    mi::Core.MethodInstance
+end
+
+const _SPEC_BY_SIG = "a specialization reached only through `invoke` has no signature that " *
+    "dispatches to it, so it is read by its MethodInstance (`_entry_key`), never by signature"
+
+# The key of the body the item `(f, types)` names.
+_entry_key(@nospecialize(f), @nospecialize(types)) = f isa _Spec ? f.mi : _sigtype(f, types)
+
+# The function a `_Spec` belongs to, as `_callee` gives it.
+_spec_callee(s::_Spec) = _callee((s.mi.specTypes::DataType).parameters[1])
+
+# The item for the compiled specialization `mi` of `f`: `f` itself when its signature dispatches to
+# `mi`, and `_Spec(mi)` when it dispatches to another specialization.
+_entry_of(@nospecialize(f), mi::Core.MethodInstance) =
+    _sig_instance(mi.specTypes, Base.get_world_counter()) === mi ? f : _Spec(mi)
+
+# The argument types `invoke` selects the method of `s` by: the method's own, which only that method
+# answers. `_invoke_through` checks that the call it compiles is of `s.mi` before a backend reads it.
+function _spec_invoke_types(s::_Spec)
+    m = s.mi.def::Method
+    return Base.rewrap_unionall(Tuple{Base.unwrap_unionall(m.sig).parameters[2:end]...}, m.sig)
+end
+
 # The type a call to `f` dispatches on.
-_ftype(@nospecialize(f)) = f isa _Callable ? typeof(f).parameters[1] : Core.Typeof(f)
+function _ftype(@nospecialize(f))
+    f isa _Spec && throw(ArgumentError(_SPEC_BY_SIG))
+    return f isa _Callable ? typeof(f).parameters[1] : Core.Typeof(f)
+end
 
 # `which(f, types)`, where `types` is a tuple of types or a tuple type.
 function _which(@nospecialize(f), @nospecialize(types))
+    f isa _Spec && return f.mi.def::Method
     f isa _Callable || return which(f, types)
     ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
     return which(_sigtype(f, ps))
@@ -2897,6 +2953,7 @@ end
 function _code_typed(
         @nospecialize(f), @nospecialize(types); optimize::Bool = true, debuginfo::Symbol = :default
     )
+    f isa _Spec && return _code_typed_of(f.mi; optimize, debuginfo)
     ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
     return _code_typed_by_type(Core.apply_type(Tuple, _ftype(f), ps...); optimize, debuginfo)
 end

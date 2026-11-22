@@ -33,7 +33,7 @@ struct _UnanalyzableSignature <: Exception
 end
 
 _UnanalyzableSignature(g::Symbol, @nospecialize(f), @nospecialize(types::Tuple), why::AbstractString) =
-    _UnanalyzableSignature(g, _func_name(f), _sig_string(types), String(why))
+    _UnanalyzableSignature(g, _func_name(f), _sig_string(f, types), String(why))
 
 function Base.showerror(io::IO, e::_UnanalyzableSignature)
     g = e.guarantee in _GUARANTEES
@@ -1290,7 +1290,7 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
         nothing
     end
     fr = _Frame(
-        _func_name(f) * _sig_string(types),
+        _func_name(f) * _sig_string(f, types),
         m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0
     )
     # Seed the plan slot only if it can hold a reference. An `isbits` plan argument is a COPY, so
@@ -1304,7 +1304,7 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     1 <= self_arg <= length(types) || throw(
         ArgumentError(
             "concurrency_findings: self_arg = $self_arg is out of range for " *
-                "`$(_func_name(f))$(_sig_string(types))`, which takes $(length(types)) argument(s)"
+                "`$(_func_name(f))$(_sig_string(f, types))`, which takes $(length(types)) argument(s)"
         )
     )
     return _plan_writes(ci, fr, types[self_arg], self_arg, max_depth)
@@ -1548,7 +1548,7 @@ function _threadid_scan(@nospecialize(f), @nospecialize(types::Tuple))
         _which(f, types)
     catch nothing end
     fr = _Frame(
-        _func_name(f) * _sig_string(types),
+        _func_name(f) * _sig_string(f, types),
         m isa Method ? string(m.file) : "", m isa Method ? Int(m.line) : 0
     )
     tid = BitSet()          # threadid-derived scalar values
@@ -2155,7 +2155,7 @@ end
 # the boundary: its type is the one argument whose singleton instance answers to the demangled name.
 function _self_arg_position(@nospecialize(f), @nospecialize(types::Tuple))
     nm = try
-        nameof(f)
+        nameof(f isa _Spec ? _spec_callee(f) : f)
     catch
         return 1
     end

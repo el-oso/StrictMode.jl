@@ -170,7 +170,7 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     isempty(cis) && return nothing
     ci = first(cis)[1]
     ci isa Core.CodeInfo || return nothing
-    sig = _sigtype(f, types)
+    sig = _key_sig(_entry_key(f, types))
     # Declarations first, method counts second. A widened global or field makes every downstream call
     # match a huge method set, so reporting the count would name a symptom of the declaration.
     # A captured variable beats everything else: `Core.Box` makes every read of that local `Any`, so
@@ -357,7 +357,7 @@ function _site(@nospecialize(f), @nospecialize(types), callee, detail)
         nothing
     end
     return DispatchSite(
-        _func_name(f), _sig_string(types), callee, detail,
+        _func_name(f), _sig_string(f, types), callee, detail,
         isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line)
     )
 end
@@ -404,7 +404,7 @@ function _dispatch_sites(@nospecialize(f), @nospecialize(types::Tuple), limit::I
     end
     isempty(cis) && return (dynamic, cliff)
     ci = first(cis)[1]
-    sig = _sigtype(f, types)
+    sig = _key_sig(_entry_key(f, types))
     for st in ci.code
         st isa Expr || continue
         split = _split_site(ci, sig, st)
@@ -508,7 +508,7 @@ function dispatch_suggestions(@nospecialize(f), @nospecialize(types::Tuple))
     # specializations), so the naming and the `which` lookup wait until there is a finding to carry
     # them rather than being paid per specialization.
     (isempty(dyn) && isempty(cl)) && return out
-    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, types)
     m = try
         _which(f, types)
     catch

@@ -15,7 +15,12 @@ function _trim_sigs(items)
     sigs = Tuple{Any, Vector{Any}}[]
     for (f, types, guarantees) in items
         (:trim_compatible in guarantees) || continue
-        push!(sigs, (f, _argtypes(Tuple{types...})))
+        g, gtypes = try
+            _backend_call(f, types)
+        catch
+            continue       # `_trim_validate` raises for it on its own
+        end
+        push!(sigs, (g, _argtypes(gtypes)))
     end
     return sigs
 end
@@ -308,7 +313,7 @@ function test_exemptions(mod::Module; only = nothing)
         _name_hit(only, e.func) || continue
         for (f, tt) in _exempt_signatures(mod, e)
             gs = isnothing(e.guarantees) ? StrictMode._DEFAULT_POLICY : e.guarantees
-            sg = StrictMode._sig_string(tt)
+            sg = StrictMode._sig_string(f, tt)
             fs = try
                 proof_findings(f, tt; guarantees = gs)
             catch err
@@ -363,9 +368,7 @@ function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
             continue
         end
         if isnothing(e.types)
-            for tt in StrictMode._method_signatures(m)
-                push!(out, (f, Tuple(tt)))
-            end
+            append!(out, StrictMode._method_entries(m, f))
         else
             push!(out, (f, e.types))
         end
@@ -380,7 +383,7 @@ function _call_findings(mod::Module; only = nothing, exempt = ())
     out = StrictMode.StrictFinding[]
     for (f, tt, _) in StrictMode._compiled_items(mod; guarantees = (:typestable,), only, exempt)
         types = Tuple(tt)
-        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f, types)
+        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(f, types), StrictMode._mod_sym(f, types)
         reps = _call_reports("test_calls", f, types, mod)
         if isempty(reps)
             push!(out, StrictMode._mkfinding(md, fn, sg, :calls, false, "", "", 0; tier = :proof))
@@ -388,7 +391,7 @@ function _call_findings(mod::Module; only = nothing, exempt = ())
         end
         for rep in reps
             m = try
-                first(methods(f, types))
+                StrictMode._which(f, types)
             catch
                 nothing
             end

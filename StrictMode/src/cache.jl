@@ -41,7 +41,7 @@ function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     end
     overridden = :trusted in guarantees ?
         (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3)) : nothing
-    return (objectid(m), objectid(_ftype(f)), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
+    return (objectid(m), objectid(f isa _Spec ? f.mi : _ftype(f)), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
 end
 
 # What a cached verdict depends on, beyond its key: the compiled code the analysis read. A verdict
@@ -66,7 +66,7 @@ function _watch_instances(@nospecialize(f), @nospecialize(types::Tuple))
     # Only the instance compiled for THIS signature. A method's other specializations are other
     # verdicts, and one of them going stale says nothing about this one — watching them all turned
     # a 14 ms warm re-audit into 489 ms by invalidating entries that were still good.
-    want = _sigtype(f, types)
+    want = _key_sig(_entry_key(f, types))
     for mi in Base.specializations(m)
         isnothing(mi) && continue
         mi isa Core.MethodInstance || continue

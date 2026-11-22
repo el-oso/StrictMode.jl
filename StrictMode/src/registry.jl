@@ -222,7 +222,9 @@ the mutation does not survive the declaring package's next cached load.
 # made on an instance answers for the sweep's row of that type. Hashing the
 # `(f, types)` tuple itself compiles a method of `hash` for every distinct tuple type, which is one
 # compilation per signature a module check looks up: 7.8 ms each, 0.6 s for a module of 80 methods.
-_decl_key(@nospecialize(f), @nospecialize(types)) = (objectid(_ftype(f)), objectid(Tuple(types)))
+# A declaration names a signature, so it names no `_Spec`, whose key matches none.
+_decl_key(@nospecialize(f), @nospecialize(types)) =
+    (objectid(f isa _Spec ? f.mi : _ftype(f)), objectid(Tuple(types)))
 
 function _declaration_index(decls)
     index = Dict{Tuple{UInt, UInt}, Any}()
@@ -518,7 +520,7 @@ function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f
     isnothing(mod) && return true
     root = mod
     owner = try
-        parentmodule(f isa Type ? f : _ftype(f))
+        parentmodule(f isa Type ? f : f isa _Spec ? _ftype(_spec_callee(f)) : _ftype(f))
     catch
         nothing
     end
@@ -569,7 +571,7 @@ exempt_strict() = STRICT_EXEMPT
 # method it never checked, which is the same "could not check" == "is fine" conflation that made a
 # crashed backend report `:pass`. Emit a failing finding naming the method and the error instead.
 function _errored_findings(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
-    fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f, types)
+    fn, sg, md = _func_name(f), _sig_string(f, types), _mod_sym(f, types)
     why = "analysis errored for this signature: " * sprint(showerror, err)
     return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in gs]
 end
@@ -636,7 +638,7 @@ end
 function _split_exempt(@nospecialize(f), @nospecialize(types), gs)
     live = Symbol[]
     notes = StrictFinding[]
-    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(Tuple(types))
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, Tuple(types))
     for g in gs
         e = _matching_exemption(f, types, g)
         if isnothing(e)
@@ -1058,7 +1060,8 @@ end
 # with a call method, which a sweep meets in the method table like any function — has no `nameof`,
 # and is named by its type, as it is in a stack trace. A keyword body answers to the callable it
 # implements (`_kwbody_owner`).
-_callable_name(@nospecialize(f)) = f isa Function ? _function_name(f) :
+_callable_name(@nospecialize(f)) = f isa _Spec ? _callable_name(_spec_callee(f)) :
+    f isa Function ? _function_name(f) :
     _is_closure_type(f) ? _closure_owner(f) :
     f isa Type ? _type_name(f) :                        # a constructor answers to its type's name
     nameof(_ftype(f))
@@ -1368,6 +1371,9 @@ end
 # would list the same method. The compiled sweep,
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
+#
+# Each specialization is handed over as the item that names it (`_entry_of`): one compiled only
+# through an `invoke` of a wider method is a `_Spec`, since its argument types dispatch to another.
 function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
     _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
@@ -1391,7 +1397,7 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
                     continue
                 end
                 Base.isdispatchtuple(Tuple{tt...}) || continue
-                f!(f, tt)
+                f!(_entry_of(f, mi), tt)
             end
         end
     end
@@ -1407,7 +1413,7 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
         for mi in _specializations(mth)
             sig = mi.specTypes
             (sig isa DataType && Base.isdispatchtuple(sig)) || continue
-            f!(_callee(sig.parameters[1]), Tuple(sig.parameters[2:end]))
+            f!(_entry_of(_callee(sig.parameters[1]), mi), Tuple(sig.parameters[2:end]))
         end
     end
     return nothing
@@ -1460,6 +1466,19 @@ function _method_signatures(m::Method)
         end
         Base.isdispatchtuple(Tuple{tt...}) || continue
         tt in out || push!(out, tt)
+    end
+    return out
+end
+
+# The items `(f, types)` for the specializations `_method_signatures` lists, each named as
+# `_entry_of` names it, so that a reader of `m`'s code reads `m` and not the method its argument
+# types dispatch to.
+function _method_entries(m::Method, @nospecialize(f))
+    out = Tuple{Any, Tuple}[]
+    for mi in _specializations(m)
+        sig = mi.specTypes
+        (sig isa DataType && Base.isdispatchtuple(sig)) || continue
+        push!(out, (_entry_of(f, mi), Tuple(sig.parameters[2:end])))
     end
     return out
 end

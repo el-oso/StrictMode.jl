@@ -240,7 +240,7 @@ function mca_report(
     # to estimate, whether or not the tool is installed.
     raw_asm = _report_text(_native_asm_att, :mca_report, f, types)
     _require_mca()
-    target = _func_name(f) * _sig_string(types)
+    target = _func_name(f) * _sig_string(f, types)
     resolved_mcpu, fellback = _resolve_mcpu(mcpu)
     asm = _sanitize_asm_for_mca(raw_asm)
     span = region === :innermost_loop ? _innermost_loop_span(asm) : nothing

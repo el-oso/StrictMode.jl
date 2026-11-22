@@ -16,10 +16,13 @@
 # pure read (`_FORWARDER_PURE`). Work that inlines makes no call — a loop of intrinsics, a store
 # into a global — so counting calls alone read such a body as a forwarder and checked its callee
 # instead. A body that does any real work, and a wrapper a user wrote, is read as itself.
+#
+# `sig` is a body key (`_entry_key`), and so is the result: the key itself when it is not a
+# forwarder, and the signature its forwarder calls otherwise.
 function _forwarded_sig(@nospecialize(sig))
     for _ in 1:8                       # a chain of trailing defaults forwards once per default
         cts = try
-            _code_typed_by_type(sig; optimize = true)
+            _code_typed_of(sig; optimize = true)
         catch
             return sig
         end
@@ -46,7 +49,7 @@ function _forwarded_sig(@nospecialize(sig))
         # names, is not one a forwarder calls, and reading its signature would read that other method.
         _callee_key(mi) === target || return sig
         callee = target.parameters[1]
-        callee === sig.parameters[1] || _is_kwbody_of(callee, sig) || return sig
+        callee === _key_sig(sig).parameters[1] || _is_kwbody_of(callee, sig) || return sig
         sig = target
     end
     return sig
@@ -66,25 +69,21 @@ function _forwarder_trivial(@nospecialize(s))
     return (c.mod === Core || c.mod === Base) && c.name in _FORWARDER_PURE
 end
 
-# Whether `callee` is the keyword body (`#f#N`) of the method `sig` dispatches to, recognized by its
-# name. `Base.bodyfunction` is not used: it returns the last function a method calls, so on a body
+# Whether `callee` is the keyword body (`#f#N`) of the method the body key `sig` names, recognized by
+# its name. `Base.bodyfunction` is not used: it returns the last function a method calls, so on a body
 # method it names an ordinary callee, and following that reads the callee with the caller's own
 # values arriving as arguments — the escape analysis then sees a handle passed in rather than made.
 function _is_kwbody_of(@nospecialize(callee), @nospecialize(sig))
     (callee isa DataType && isdefined(callee, :instance)) || return false
     cn = nameof(callee.instance)
     startswith(string(cn), "#") || return false
-    m = try
-        Base.which(sig)
-    catch
-        return false
-    end
+    m = _key_method(sig)
     return m isa Method && _demangle(cn) === m.name
 end
 
 # The function and argument types a check should read for the call `f(types...)`.
 function _forwarded_call(@nospecialize(f), @nospecialize(types::Tuple))
-    sig = _sigtype(f, types)
+    sig = _entry_key(f, types)
     fsig = _forwarded_sig(sig)
     fsig === sig && return (f, types)
     ft = fsig.parameters[1]
@@ -201,7 +200,7 @@ end
 # --- @assert_effects (via Base.infer_effects) -------------------------------------------------
 
 function _assert_effects(target, @nospecialize(f), @nospecialize(types::Tuple), required)
-    isnothing(_typed_body(_sigtype(f, types))) && return _fail(:effects, target, _NO_BODY_WHY)
+    isnothing(_typed_body(_entry_key(f, types))) && return _fail(:effects, target, _NO_BODY_WHY)
     eff = effects(f, types)
     missing_eff = Symbol[s for s in required if !effect_holds(eff, s)]
     isempty(missing_eff) || _fail(
@@ -307,7 +306,7 @@ end
 # still the code the call runs.
 function _has_compiled_body(@nospecialize(f), @nospecialize(types::Tuple))
     return try
-        Base.isdispatchtuple(_sigtype(f, types))
+        Base.isdispatchtuple(_key_sig(_entry_key(f, types)))
     catch
         false
     end
@@ -328,21 +327,24 @@ _output_unread(@nospecialize(f), @nospecialize(types::Tuple)) =
         InteractiveUtils.code_native(io, tt; debuginfo = :none) :
         InteractiveUtils.code_llvm(io, tt; debuginfo = :none, optimize = true)
 else
-    function _print_code_by_type(io::IO, @nospecialize(tt), native::Bool)
-        world = Base.get_world_counter()
-        mi = Base.specialize_method(Base._which(tt; world))
-        src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
-        src isa Core.CodeInfo || error("failed to infer source for $mi")
-        params = Base.CodegenParams(;
-            debug_info_kind = Cint(0), debug_info_level = Cint(2), safepoint_on_entry = false, gcstack_arg = false
-        )
-        IU = InteractiveUtils
-        print(
-            io, native ? IU._dump_function_native_assembly(mi, src, false, :intel, :none, false, false, params) :
-                IU._dump_function_llvm(mi, src, false, true, false, true, :none, params)
-        )
-        return nothing
-    end
+    _print_code_by_type(io::IO, @nospecialize(tt), native::Bool) =
+        _print_code_of(io, Base.specialize_method(Base._which(tt; world = Base.get_world_counter())), native)
+end
+
+# `code_llvm` or `code_native` of the specialization `mi`, with the same settings.
+function _print_code_of(io::IO, mi::Core.MethodInstance, native::Bool)
+    world = Base.get_world_counter()
+    src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
+    src isa Core.CodeInfo || error("failed to infer source for $mi")
+    params = Base.CodegenParams(;
+        debug_info_kind = Cint(0), debug_info_level = Cint(2), safepoint_on_entry = false, gcstack_arg = false
+    )
+    IU = InteractiveUtils
+    print(
+        io, native ? IU._dump_function_native_assembly(mi, src, false, :intel, :none, false, false, params) :
+            IU._dump_function_llvm(mi, src, false, true, false, true, :none, params)
+    )
+    return nothing
 end
 
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
@@ -350,7 +352,8 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), false) :
+        f isa _Spec ? _print_code_of(io, f.mi, false) :
+            f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), false) :
             InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
     catch
         return ""
@@ -363,7 +366,8 @@ function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), true) :
+        f isa _Spec ? _print_code_of(io, f.mi, true) :
+            f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), true) :
             InteractiveUtils.code_native(io, f, types; debuginfo = :none)
     catch
         return ""
@@ -493,7 +497,7 @@ function kernel_report(
         working_set_bytes::Union{Nothing, Int} = nothing
     )
     return _kernel_report(
-        _func_name(f) * _sig_string(types), _report_text(_llvm_ir, :kernel_report, f, types),
+        _func_name(f) * _sig_string(f, types), _report_text(_llvm_ir, :kernel_report, f, types),
         working_set_bytes
     )
 end
@@ -917,7 +921,7 @@ describes assembly that was read.
 """
 function register_report(@nospecialize(f), @nospecialize(types::Tuple))
     c = _zmm_counts(_report_text(_native_asm, :register_report, f, types))
-    return RegisterReport(_func_name(f) * _sig_string(types), c.used, c.total, c.spills)
+    return RegisterReport(_func_name(f) * _sig_string(f, types), c.used, c.total, c.spills)
 end
 
 # --- @assert_no_spill: vector-register spill diagnostic as a hard gate --------------------------
@@ -1030,7 +1034,7 @@ function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
     why = _spill_arch_unread()
     isnothing(why) || throw(_UnanalyzableSignature(:spill_report, f, types, why))
     return _spill_report(
-        _func_name(f) * _sig_string(types), _report_text(_native_asm, :spill_report, f, types)
+        _func_name(f) * _sig_string(f, types), _report_text(_native_asm, :spill_report, f, types)
     )
 end
 
@@ -1100,7 +1104,7 @@ function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple),
     isnothing(why) || return _fail(:no_spill, target, why)
     asm = _native_asm(f, types)
     isempty(asm) && return _fail(:no_spill, target, _output_unread(f, types))
-    r = _spill_report(_func_name(f) * _sig_string(types), asm)
+    r = _spill_report(_func_name(f) * _sig_string(f, types), asm)
     n = _spill_count(r, scope)
     iszero(n) && return nothing
     where_ = scope === :function ? "" : scope === :loops ? " inside a loop" : " inside an innermost loop"

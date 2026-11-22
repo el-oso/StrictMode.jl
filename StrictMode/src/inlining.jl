@@ -20,6 +20,29 @@ _inline_wrapper(f::F) where {F} = (args...) -> f(args...)
 # The wrapper for a callable known by its type: the callable is its first argument.
 _call_through(c::C, args::Vararg{Any, N}) where {C, N} = c(args...)
 
+# The wrapper for a `_Spec`: the call `invoke` makes to the method `S` selects, which runs the
+# specialization for the argument types. `_invoke_call` is the call an inlining question asks
+# about. `_invoke_through` keeps the specialization a compiled function of its own, as an entry
+# point is, for a backend that takes a function and argument types (`_spec_call`).
+_invoke_call(::Type{S}, f::F, args::Vararg{Any, N}) where {S, F, N} = invoke(f, S, args...)
+_invoke_through(::Type{S}, f::F, args::Vararg{Any, N}) where {S, F, N} = @noinline invoke(f, S, args...)
+
+# The function and argument types that run the specialization of `s` through `_invoke_through`,
+# for a backend that takes those. Raises unless the wrapper's compiled body calls exactly `s.mi`:
+# a backend handed anything else would judge another method.
+function _spec_call(s::_Spec, @nospecialize(types::Tuple))
+    F = (s.mi.specTypes::DataType).parameters[1]
+    tt = (Type{_spec_invoke_types(s)}, F, types...)
+    cts = _code_typed_by_type(Tuple{typeof(_invoke_through), tt...}; optimize = true)
+    reached = !isempty(cts) && any(first(only(cts)).code) do st
+        Meta.isexpr(st, :invoke) || return false
+        a1 = st.args[1]
+        (a1 isa Core.CodeInstance ? a1.def : a1) === s.mi
+    end
+    reached || throw(ArgumentError("`invoke` with the argument types of `$(s.mi.def)` does not run $(s.mi)"))
+    return (_invoke_through, tt)
+end
+
 const _INLINED_UNREAD = "whether the call is inlined could not be read: the signature is not " *
     "concrete, no single method matches it, or the calling wrapper has no typed body"
 
@@ -28,6 +51,9 @@ const _INLINED_UNREAD = "whether the call is inlined could not be read: the sign
 # keyword body, which a keyword call reaches through `Core.kwcall` and a positional call through its
 # forwarder. The forwarders are small and inline, so a surviving `:invoke` of any of the three is
 # the call not inlined.
+#
+# A `_Spec` is asked about the call that runs it, `invoke` with its method's argument types, once
+# `_spec_call` has confirmed that this call runs it.
 function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     f isa Union{Core.Builtin, Core.IntrinsicFunction} && return false
     _has_compiled_body(f, types) || return nothing
@@ -42,8 +68,13 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
     catch
         m
     end
-    owner = f === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : _ftype(f)
-    cts = f isa _Callable ? _code_typed(_call_through, (_ftype(f), types...); optimize = true) :
+    f isa _Spec && _spec_call(f, types)
+    fc = f isa _Spec ? _spec_callee(f) : f
+    ft = (_key_sig(_entry_key(f, types))::DataType).parameters[1]
+    owner = fc === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : ft
+    cts = f isa _Spec ?
+        _code_typed(_invoke_call, (Type{_spec_invoke_types(f)}, ft, types...); optimize = true) :
+        f isa _Callable ? _code_typed(_call_through, (_ftype(f), types...); optimize = true) :
         _code_typed(_inline_wrapper(f), types; optimize = true)
     isempty(cts) && return nothing
     for stmt in first(cts).first.code
@@ -236,7 +267,7 @@ function inline_suggestions(
         @nospecialize(f), @nospecialize(types::Tuple);
         include_base::Bool = false, only_flagged::Bool = false,
     )
-    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, types)
     callees = _noninlined_callees(f, types)
     sort!(callees; by = c -> (_callee_priority(c), -c.count))
     out = StrictFinding[]

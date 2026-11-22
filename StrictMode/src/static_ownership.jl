@@ -118,7 +118,7 @@ end
 
 function _interprocedural_typekey_lookup(@nospecialize(f), @nospecialize(types::Tuple),
         code::IdDict{Any, Any} = IdDict{Any, Any}())
-    sig = _sigtype(f, types)
+    sig = _entry_key(f, types)
     return _typekey_lookup_by_sig(sig, _FAST_ALLOC_DEPTH[], Base.IdSet{Any}(), code)
 end
 
@@ -169,7 +169,7 @@ audit(MyPkg; static_ownership_suggest = true)
 """
 function static_ownership_suggestions(@nospecialize(f), @nospecialize(types::Tuple);
         _code::IdDict{Any, Any} = IdDict{Any, Any}())
-    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, types)
     finding = _static_ownership_finding(f, types, md, fn, sg, _code)
     return finding.status === :info ? StrictFinding[finding] : StrictFinding[]
 end

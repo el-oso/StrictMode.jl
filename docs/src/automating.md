@@ -220,6 +220,13 @@ methods it defines on a function another module owns, such as its `Base.getprope
 or `Base.:*` methods. Only the method the module wrote is swept, not the function's other methods.
 `only` and `exempt` name such a method by the function's name, as they do the module's own.
 
+Each specialization is checked as the method that compiled it. `invoke(f, Tuple{Any, Integer}, x, n)`
+compiles the method `f(x, n::Integer)` for `(Int64, Int64)` even when a more specific `f(x, n::Int)`
+answers a call with those types. The sweep then has two rows for the same argument types, and the
+one for the wider method is reported under the signature
+`(Int64, Int64) via invoke of (Any, Integer)`, so each has its own [`key`](@ref). Both tiers read
+that row's body from the specialization itself, never by dispatching its argument types.
+
 A submodule or a package extension is a module of its own: sweep it by name
 (`audit(MyPkg.Sub; sweep = true)`, `test_compiled(Base.get_extension(MyPkg, :MyPkgExt))`), and
 its own `@strict_exempt` declarations apply. Its methods never appear in the parent's sweep, so no

@@ -101,16 +101,16 @@ function resource_leak_report(mod::Module; only = nothing, exempt = ())
     end
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
-        sigs = _method_signatures(m)
-        isempty(sigs) && continue
         f = try
             _method_function(m).instance
         catch
             continue
         end
+        entries = _method_entries(m, f)
+        isempty(entries) && continue
         shapes = Set{String}()
-        for tt in sigs
-            union!(shapes, _resource_escapes(f, Tuple(tt)))
+        for (e, tt) in entries
+            union!(shapes, _resource_escapes(e, tt))
         end
         isempty(shapes) && continue
         push!(
