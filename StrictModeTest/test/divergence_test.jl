@@ -111,8 +111,7 @@ end
             s += f(i)
         end; s
     )
-    # The scan excuses the exempt pool and reports what is left, the wait (SM0017); the proof
-    # keeps the pool's sites beside the wait's and reports an allocation (SM0002).
+    # Both engines set the exempt pool aside and report what is left, the wait.
     c_two_ex(w::W, n::Int) = drive(i -> wra(w) + wrb(w) + grow!(i)[1], n)
     plain(n::Int) = sum(zeros(n))
     const TW = W(open(tempname(), "w"), zeros(4), zeros(2, 2))
@@ -127,7 +126,16 @@ end
 
     d = divergence_report(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))
     @test isempty(d)
-    @test d.cause_diverged == [(:noalloc, :SM0017, :SM0002)]
+    @test isempty(d.cause_diverged)
+    @test only(StrictMode.findings(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))).code === :SM0017
+    @test only(StrictModeTest.proof_findings(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))).code === :SM0017
+
+    # A report whose engines both fail with different codes says so, and stays empty.
+    d = StrictModeTest.StrictDivergence(
+        d.diverged, [(:noalloc, :SM0017, :SM0002)], d.signature, d.return_category,
+        d.scan_signals, d.proof_signals, d.versions,
+    )
+    @test isempty(d)
     s = sprint(show, d)
     @test occursin("different cause", s) && occursin("SM0017", s) && occursin("SM0002", s)
     @test !occursin("c_two_ex", s) && !occursin("grow", s)

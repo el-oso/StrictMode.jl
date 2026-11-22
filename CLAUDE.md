@@ -894,7 +894,11 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         by its type alone (StrictMode._Callable) is proved through _check_allocs
                         (AllocCheck on StrictMode._call_through, the wrapper frame then dropped
                         from every backtrace: same sites as an instance), _jet_target (JET by the
-                        signature) and StrictMode._base_return_types; _exempt_only (a call
+                        signature) and StrictMode._base_return_types; _exempt_split (the sites
+                        inside functions exempt from :noalloc are set aside FIRST, as the scan
+                        sets them aside, and the call's own sites pick the code: own sites that
+                        all wait are SM0017, any other own site is SM0002, with allow_exempt or
+                        without; a call with no site of its own and
                         whose EVERY allocation site has a frame whose method is exempt from
                         :noalloc is its own result: SM0018, with StrictFinding.exempt_by listing
                         each exempt function and its reason. Its status is :fail FROM THE PROOF,
@@ -920,10 +924,18 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         by name everywhere, names no method, and excuses no proof site, though
                         the scan still notes it), _opt_reports (JET,
                         wrapped in AnalysisError). _checked_allocs drops a barrier's sites: a
-                        backtrace through the barrier, no frame outside Base/Core, or a function
+                        backtrace through the barrier, or a function
                         reached ONLY through a barrier (_only_through_barrier, over the :invoke
                         graph of optimized IR — a helper called from several places is compiled
-                        once and its backtrace ends at "multiple call sites"). A graph that cannot
+                        once and its backtrace ends at "multiple call sites"). Each edge of that
+                        graph (_invoke_reach) leads to the specialization AllocCheck compiles, the
+                        one for the argument types inferred at the statement (_compiled_callee),
+                        not to the compilation signature Julia's :invoke names: a site's
+                        specialization is otherwise in no set and a guarded helper that builds a
+                        string fails (print_to_string(::String, ::Vararg{Any}) on 1.13). An edge
+                        whose specialization cannot be determined makes the graph incomplete. A
+                        site is taken from the call only when the graph names its specialization
+                        inside the excused callee; a graph that cannot
                         be read in full keeps the site. The filter runs on every site, from
                         either AllocCheck run, whenever the call reaches a barrier; only when it
                         leaves NO site and the scan finds alloc/boxing/abscontainer is the
@@ -1044,7 +1056,14 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         the runner, fixtures.jl the shared @testmodule, then one file per concern
                         (proofs/macros/drivers/trim/typestable/divergence). Covers the proof
                         primitives StrictMode cannot test, because StrictMode does not depend on
-                        those packages at all
+                        those packages at all.
+                        corpus_test.jl is the :noalloc CORPUS: 590 generated modules (wrapper ×
+                        reach × repeat × compiled-for-one-or-several × effect), each with the
+                        verdict and code EXPECTED of the scan, the proof, the proof under
+                        allow_exempt and divergence_report, computed from the documented rules
+                        alone (`expected`) and never from an engine. A change to an excusal rule
+                        is made in `expected` first; a new way of reaching or guarding code is a
+                        new part of the generator, not one more hand-written fixture
 StrictMode/test/
   runtests.jl         — TestItemRunner @run_package_tests; `using StrictModeTest` supplies the proofs
   Project.toml        — no [preferences.StrictMode] block: checks_enabled defaults to true, and this

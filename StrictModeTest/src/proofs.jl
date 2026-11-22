@@ -673,7 +673,7 @@ end
 # `Condition` and `Threads.Event`; finalizers are code registered elsewhere, and they run at other GC
 # points too. A Base slow path that allocates for its own sake (a contended lock) is still judged.
 # An `@strict_exempt` callee is NOT dropped here: `@test_noalloc` proves no allocation on any path.
-# A call whose every site is inside one is reported as that (`_exempt_only`, SM0018), which is a
+# A call whose every site is inside one is reported as that (`_exempt_split`, SM0018), which is a
 # failure unless the caller passes `allow_exempt = true`; a pool that grows on first use is
 # gated on what it does once warm by `@test_steady_state`.
 function _not_own_excused(@nospecialize(f), allocs)
@@ -687,8 +687,10 @@ end
 
 _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)
 
-# The exempt functions that account for every allocation site, each with the reason its exemption
-# gave, or `nothing` when one site has no exempt frame. A site is an exempt function's when its
+# The allocation sites split by owner: `(own, by)`, the sites that are the call's own, and the exempt
+# functions that account for the rest, each with the reason its exemption gave. A site is taken from
+# the call only when the call graph places it in an exempt function; any other site is the call's.
+# A site is an exempt function's when its
 # backtrace passes through a frame whose METHOD an exemption covers for `:noalloc`: matched on the
 # method's module and name, so a function of the same name elsewhere excuses nothing. Only an
 # exemption declared in a module names a method. One declared with no module, from a session,
@@ -699,12 +701,15 @@ _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : 
 # (`_runs_handed_in`). A site whose backtrace has no exempt frame, as when AllocCheck ends it at a
 # function compiled once for several callers, is the exempt function's when the call `sig` reaches
 # its specialization only through that exempt callee (`_only_through_exempt`).
-function _exempt_only(allocs, @nospecialize(sig))
-    isempty(allocs) && return nothing
+function _exempt_split(allocs, @nospecialize(sig))
     by = Pair{String, String}[]
+    own = empty(allocs)
     inside = nothing
     for a in allocs
-        hasproperty(a, :backtrace) || return nothing
+        if !hasproperty(a, :backtrace)
+            push!(own, a)
+            continue
+        end
         e = nothing
         framed = false
         for (k, fr) in enumerate(a.backtrace)
@@ -724,11 +729,14 @@ function _exempt_only(allocs, @nospecialize(sig))
             isnothing(inside) && (inside = something(_only_through_exempt(sig), IdDict{Core.MethodInstance, Any}()))
             e = get(inside, _site_mi(a), nothing)
         end
-        isnothing(e) && return nothing
-        p = String(e.func) => e.reason
-        p in by || push!(by, p)
+        if isnothing(e)
+            push!(own, a)
+        else
+            p = String(e.func) => e.reason
+            p in by || push!(by, p)
+        end
     end
-    return Tuple(by)
+    return own, Tuple(by)
 end
 
 # Whether the allocation site `a`, under the exempt function at backtrace frame `k`, runs code that
@@ -835,12 +843,13 @@ function _only_through_exempt(@nospecialize(sig))
 end
 
 # The specializations reached from `roots` along the `:invoke` edges of their optimized bodies,
-# which are the static calls AllocCheck compiles and follows. AllocCheck compiles the specialization
-# for the inferred types where Julia invokes the compilation signature (`_native_dispatches`); where
-# the two differ, the site's specialization is not in the walk and the site is kept. A call left to
+# which are the static calls AllocCheck compiles and follows. Each edge leads to the specialization
+# AllocCheck compiles for it (`_compiled_callee`), so a site's specialization (`_site_mi`) is one
+# the walk names. A call left to
 # run-time dispatch is not such an edge: AllocCheck reports the dispatch itself and compiles nothing
 # behind it. With `stop`, a barrier is recorded rather than entered. Returns `(reached, barriers, complete)`;
-# `complete` is false when a body could not be read, when a call could still be compiled statically
+# `complete` is false when a body could not be read, when the specialization an edge leads to could
+# not be determined, when a call could still be compiled statically
 # without an `:invoke` (`Core.invoke` and its kin, a `@cfunction`, an opaque closure), or when the
 # walk reached `_BARRIER_WALK_MAX` bodies. `isstop` names what counts as a barrier.
 function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = StrictMode._mi_is_barrier)
@@ -850,7 +859,8 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
     complete = true
     while !isempty(queue)
         length(reached) > _BARRIER_WALK_MAX && return (reached, barriers, false)
-        ci = StrictMode._typed_body(pop!(queue).specTypes)
+        mi = pop!(queue)
+        ci = _reach_body(mi)
         if !(ci isa Core.CodeInfo)
             complete = false
             continue
@@ -859,6 +869,7 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
             st isa Expr || continue
             if st.head === :invoke || st.head === :invoke_modify
                 callee = StrictMode._invoke_mi(st.args[1])
+                isnothing(callee) || (callee = _compiled_callee(ci, mi, st, callee))
                 if isnothing(callee)
                     complete = false
                 elseif !(callee in reached || callee in barriers)
@@ -878,6 +889,46 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
         end
     end
     return (reached, barriers, complete)
+end
+
+# The optimized body of the specialization `mi`, or `nothing` when the body its signature dispatches
+# to is another method's (a method reached by `invoke` with a wider signature).
+function _reach_body(mi::Core.MethodInstance)
+    own = StrictMode._sig_instance(mi.specTypes, Base.get_world_counter())
+    (own isa Core.MethodInstance && own.def === mi.def) || return nothing
+    return StrictMode._typed_body(mi.specTypes)
+end
+
+# The specialization AllocCheck compiles for the `:invoke` statement `st` in the body `ci` of
+# `caller`, or `nothing` when it cannot be determined. Julia's own optimizer names the callee's
+# compilation signature there, which widens an argument the method does not specialize on;
+# AllocCheck's names the specialization for the argument types inferred at the statement
+# (`_native_dispatches`), and that one holds the sites.
+function _compiled_callee(ci, caller::Core.MethodInstance, st::Expr, callee::Core.MethodInstance)
+    # A specialization for concrete types is the only one its call can lead to.
+    Base.isdispatchtuple(callee.specTypes) && return callee
+    m = callee.def
+    (m isa Method && st.head === :invoke) || return nothing
+    ats = Any[]
+    for a in Iterators.drop(st.args, 1)
+        T = if Meta.isexpr(a, :static_parameter)
+            v = caller.sparam_vals[a.args[1]::Int]
+            v isa TypeVar ? nothing : Core.Typeof(v)
+        elseif a isa Expr
+            nothing
+        else
+            Base.Compiler.widenconst(StrictMode._stmt_arg_type(ci, caller.specTypes, a))
+        end
+        T isa Type || return nothing
+        push!(ats, T)
+    end
+    tt = Core.apply_type(Tuple, ats...)
+    tt == callee.specTypes && return callee
+    tt <: callee.specTypes || return nothing
+    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), tt, m.sig)::Core.SimpleVector
+    env[1] === Union{} && return nothing
+    spec = Base.specialize_method(m, env[1], env[2]::Core.SimpleVector)
+    return spec isa Core.MethodInstance ? spec : nothing
 end
 
 # The name of the first barrier frame any site passes through, for the note.
@@ -1645,12 +1696,19 @@ function _proof_findings(
             if isnothing(allocs)
                 push!(out, _unproven(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
             else
-                file, line = _first_loc(allocs, false)
-                if !isempty(allocs) && all(_scheduler_site, allocs)
+                # The sites inside functions exempt from `:noalloc` are set aside first, as the scan
+                # sets them aside, and the call's own sites decide the result: none of its own is
+                # the exempt-only result, own sites that all wait are a wait, anything else is an
+                # allocation.
+                own, by = _exempt_split(allocs, StrictMode._sigtype(f, types))
+                file, line = _first_loc(isempty(own) ? allocs : own, false)
+                nexempt = length(allocs) - length(own)
+                if !isempty(own) && all(_scheduler_site, own)
                     push!(
                         out, _mkproof(
                             md, fn, sg, g, true,
-                            "blocks in the task scheduler: AllocCheck reports $(length(allocs)) site(s), all in " *
+                            "blocks in the task scheduler: AllocCheck reports $(length(own)) site(s)" *
+                                (nexempt > 0 ? " outside functions exempt from :noalloc" : "") * ", all in " *
                                 "Base's task, lock and condition code (first: $(basename(file)):$line). It " *
                                 "waits for another task, so it can allocate.",
                             file, line,
@@ -1659,12 +1717,11 @@ function _proof_findings(
                             cause = :scheduler
                         )
                     )
-                elseif !isnothing(_exempt_only(allocs, StrictMode._sigtype(f, types)))
+                elseif isempty(own) && !isempty(allocs)
                     # Every site lies inside a function exempt from `:noalloc`. That is not a
                     # proof of no allocation, so it is a FAILURE with its own code: counted by
                     # `nfailures`, failed by every gate, not a pass to any reader of the status.
                     # A caller that accepts the exemptions by name gets the note in its place.
-                    by = _exempt_only(allocs, StrictMode._sigtype(f, types))
                     push!(
                         out, StrictMode.StrictFinding(
                             md, fn, sg, g, allow_exempt ? :info : :fail, file, line,

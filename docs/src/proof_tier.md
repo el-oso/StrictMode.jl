@@ -135,7 +135,8 @@ A site is the barrier's when its backtrace passes through the barrier, or when i
 reached from a barrier and on no path from the call that avoids one. The second case covers a
 helper the barrier calls from several places, and the lock and task internals of a once-guard: it
 is compiled once, and AllocCheck ends its backtrace at a frame named "multiple call sites", so the
-backtrace cannot name the barrier. If the call also reaches that
+backtrace cannot name the barrier. The call graph is read as AllocCheck compiles it: a call leads
+to the specialization for the argument types inferred there. If the call also reaches that
 helper outside the barrier, its sites are kept, as they are whenever the call graph outside the
 barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape,
@@ -153,7 +154,9 @@ the entry as failing. `allow_exempt = true`, on any of those and on `proof_findi
 module) and `proof_audit`, accepts the exemptions for that check; the result is then a note
 (`:info`, same code, same `exempt_by`), which is still not a pass. One allocation outside an exempt function makes it an ordinary failure either way,
 and so does an exempt callee that was inlined, since its allocation then belongs to the caller's
-own code. The exemption is matched on the method, so a function of the same name in another
+own code. The sites outside the exempt functions decide which failure, as they do in the scan:
+SM0017 when every one of them is a wait in Base's task, lock and condition code, SM0002
+otherwise. The exemption is matched on the method, so a function of the same name in another
 module excuses nothing.
 
 An exemption covers the exempt function's own code and what that calls. A function or closure the
