@@ -18,9 +18,8 @@ The result of [`divergence_report`](@ref): an IP-free record of where the scan a
 - `diverged` lists `(guarantee, scan_failed, proof_failed)` for each guarantee one engine fails and
   the other does not. `isempty(d)` is `isempty(d.diverged)`: it reads only this field.
 - `cause_diverged` lists `(guarantee, scan_code, proof_code)` for each guarantee both engines fail
-  with different diagnostic codes, such as the scan's SM0207 (it could not read the whole call tree,
-  as below an `invoke` with a signature wider than its arguments) against the proof's SM0002 (the
-  call allocates). The verdicts agree there, so it does not make `d` non-empty; the two engines name
+  with different diagnostic codes, such as the scan's SM0207 (it could not read the whole call tree)
+  against the proof's SM0002 (the call allocates). The verdicts agree there, so it does not make `d` non-empty; the two engines name
   different causes for the same failure.
 
 Safe to send to the StrictMode maintainers — contains no source, no user type names, and no field

@@ -38,9 +38,7 @@ keep a program from reading the wrong memory, racing, or failing on a branch no 
 ### How much a verdict is worth
 
 A check that could not finish never passes. A scan that read only part of the code reports SM0207,
-"not established". That includes a call of a method through `invoke` with a signature wider than its
-arguments: the scan reads a body by the signature that dispatches to it, and there that is another
-method. An analysis that errored reports the error as a failure. A scan that could not
+"not established". An analysis that errored reports the error as a failure. A scan that could not
 follow a callee reports that callee as undecided.
 
 A signature that always throws or never returns does not pass either. Its inferred return type is

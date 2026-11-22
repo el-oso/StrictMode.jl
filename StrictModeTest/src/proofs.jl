@@ -642,12 +642,13 @@ function _c_varargs_call(@nospecialize(inst))
     for fr in inst.backtrace
         mi = _frame_mi(fr)
         mi isa Core.MethodInstance || continue
-        ci = StrictMode._typed_body(mi.specTypes)
+        key = StrictMode._callee_key(mi)
+        ci = StrictMode._typed_body(key)
         isnothing(ci) && return false
         any(st -> Meta.isexpr(st, :foreigncall) && st.args[4] isa Int && st.args[4] > 0, ci.code) || return false
         own = Base.IdSet{Any}()
-        push!(own, mi.specTypes)
-        return !StrictMode._scan_ci(ci, mi.specTypes, 0, own, :boxing)[2]
+        push!(own, key)
+        return !StrictMode._scan_ci(ci, key, 0, own, :boxing)[2]
     end
     return false
 end
@@ -798,11 +799,10 @@ end
 # resolved), every site in or below the exempt frame counts, as in the scan.
 function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
     bt = a.backtrace
-    StrictMode._names_other_method(mi) && return true
-    found, complete = StrictMode._handed_code(mi.specTypes)
+    found, complete = StrictMode._handed_code(StrictMode._callee_key(mi))
     complete || return true
     (isempty(found) || k <= 1) && return false
-    types = Any[(Base.unwrap_unionall(h)::DataType).parameters[1] for h in found]
+    types = Any[(Base.unwrap_unionall(StrictMode._key_sig(h))::DataType).parameters[1] for h in found]
     names = Set{Symbol}()
     for T in types
         isconcretetype(T) || continue
@@ -869,12 +869,12 @@ function _only_through_exempt(@nospecialize(sig), nodes = Base.IdSet{Core.Method
     root = StrictMode._sig_instance(sig, Base.get_world_counter())
     root isa Core.MethodInstance || return nothing
     excuses(mi) = !isnothing(StrictMode._mi_exemption(mi; declared_in_module = true)) &&
-        !StrictMode._names_other_method(mi) && StrictMode._handed_code(mi.specTypes)[2]
+        StrictMode._handed_code(StrictMode._callee_key(mi))[2]
     outside, stops, complete = _invoke_reach(Core.MethodInstance[root], true; isstop = excuses)
     (complete && !isempty(stops)) || return nothing
     handed = Core.MethodInstance[]
-    for ex in stops, h in first(StrictMode._handed_code(ex.specTypes))
-        mi = StrictMode._sig_instance(h, Base.get_world_counter())
+    for ex in stops, h in first(StrictMode._handed_code(StrictMode._callee_key(ex)))
+        mi = StrictMode._key_instance(h, Base.get_world_counter())
         mi isa Core.MethodInstance || return nothing
         push!(handed, mi)
     end
@@ -951,17 +951,9 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
     return (reached, barriers, complete)
 end
 
-# The optimized body of the specialization `mi`, or `nothing` when it cannot be read. A signature
-# that dispatches to no single method leaves it unread. One that dispatches to another method, as
-# for a method reached by `invoke` with a wider signature, is read from the specialization itself.
-function _reach_body(mi::Core.MethodInstance)
-    world = Base.get_world_counter()
-    own = StrictMode._sig_instance(mi.specTypes, world)
-    own isa Core.MethodInstance || return nothing
-    own.def === mi.def && return StrictMode._typed_body(mi.specTypes)
-    src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
-    return src isa Core.CodeInfo ? src : nothing
-end
+# The optimized body of the specialization `mi`, or `nothing` when it cannot be read: the scan's
+# own read of the same specialization (`StrictMode._callee_key`).
+_reach_body(mi::Core.MethodInstance) = StrictMode._typed_body(StrictMode._callee_key(mi))
 
 # The specialization AllocCheck compiles for the `:invoke` statement `st` in the body `ci` of
 # `caller`, or `nothing` when it cannot be determined. Julia's own optimizer names the callee's
@@ -1114,7 +1106,7 @@ function _bail_frame_dispatches(@nospecialize(rep))
     mi isa Core.MethodInstance || return out
     where = mi.def isa Method ? string(mi.def.module, ".", mi.def.name) : string(mi)
     cis = try
-        Base.code_typed_by_type(mi.specTypes; optimize = true)
+        StrictMode._code_typed_of(StrictMode._callee_key(mi); optimize = true)
     catch
         # Unread is not clean: JET reported nothing from this frame's body either.
         return push!(out, "$where: its body could not be read")

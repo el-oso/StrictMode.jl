@@ -141,38 +141,65 @@ end
     @test !occursin("c_two_ex", s) && !occursin("grow", s)
 end
 
-@testitem "a call the scan cannot read and the proof can is a different cause" begin
+@testitem "the scan and the proof read the same method below a wider invoke" begin
     using StrictMode, StrictModeTest, Test
 
-    # `invoke` runs the `Integer` method on an `Int`. The scan reads a body by the signature that
-    # dispatches to it, and `(W, Int)` dispatches to the other method, so it reports the call tree
-    # as unread (SM0207). AllocCheck compiles the method `invoke` names and finds its allocation
-    # (SM0002). Both fail, for causes only one of them can see.
+    # `invoke` runs the `Integer` method on an `Int`, though `(W, Int)` dispatches to the other
+    # method. Both engines read the method that runs, so they agree whichever of the two allocates.
     module WiderInvoke
     @noinline wide(w, n::Integer) = sum(zeros(n))
     @noinline wide(w, n::Int) = -1.0
     alloc_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
-    @noinline clean(w, n::Integer) = Float64(n)
-    @noinline clean(w, n::Int) = -1.0
+    @noinline clean(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline clean(w, n::Int) = sum(zeros(n))
     clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
     end
     M = WiderInvoke
     T = (Vector{Float64}, Int)
     M.alloc_invoke([1.0], 2); M.clean_invoke([1.0], 2)
 
-    @test only(StrictMode.findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0207
+    @test only(StrictMode.findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0002
     @test only(StrictModeTest.proof_findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0002
     d = divergence_report(M.alloc_invoke, T; guarantees = (:noalloc,))
-    @test isempty(d)
-    @test isempty(d.diverged)
-    @test d.cause_diverged == [(:noalloc, :SM0207, :SM0002)]
-    s = sprint(show, d)
-    @test occursin("different cause", s) && occursin("SM0207", s) && occursin("SM0002", s)
+    @test isempty(d) && isempty(d.diverged) && isempty(d.cause_diverged)
 
-    # Where the invoked method allocates nothing, the proof passes and the scan still cannot say:
-    # that is a different verdict, not a different cause.
+    @test only(StrictMode.findings(M.clean_invoke, T; guarantees = (:noalloc,))).status === :pass
     @test !StrictMode._failed(only(StrictModeTest.proof_findings(M.clean_invoke, T; guarantees = (:noalloc,))))
     d = divergence_report(M.clean_invoke, T; guarantees = (:noalloc,))
-    @test d.diverged == [(:noalloc, true, false)]
-    @test isempty(d.cause_diverged)
+    @test isempty(d) && isempty(d.diverged) && isempty(d.cause_diverged)
+end
+
+@testitem "a scan that ran out of bodies and a proof that found an allocation are a different cause" begin
+    using StrictMode, StrictModeTest, Test
+
+    # The allocation sits below more of the package's own callees than the scan's body budget
+    # allows, so the scan reports the call tree as unread (SM0207). AllocCheck compiles all of it
+    # and finds the allocation (SM0002). Both fail, for causes only one of them can see.
+    module LongChain
+    @noinline c6(n::Int) = sum(zeros(n))
+    @noinline c5(n::Int) = c6(n) + 1.0
+    @noinline c4(n::Int) = c5(n) + 1.0
+    @noinline c3(n::Int) = c4(n) + 1.0
+    @noinline c2(n::Int) = c3(n) + 1.0
+    @noinline c1(n::Int) = c2(n) + 1.0
+    top(n::Int) = c1(n) + 1.0
+    end
+    M = LongChain
+    M.top(2)
+    budget = StrictMode._SCAN_BODY_BUDGET[]
+    try
+        StrictMode._SCAN_BODY_BUDGET[] = 3
+        StrictMode.clear_cache!()
+        @test only(StrictMode.findings(M.top, (Int,); guarantees = (:noalloc,))).code === :SM0207
+        @test only(StrictModeTest.proof_findings(M.top, (Int,); guarantees = (:noalloc,))).code === :SM0002
+        d = divergence_report(M.top, (Int,); guarantees = (:noalloc,))
+        @test isempty(d)
+        @test isempty(d.diverged)
+        @test d.cause_diverged == [(:noalloc, :SM0207, :SM0002)]
+        s = sprint(show, d)
+        @test occursin("different cause", s) && occursin("SM0207", s) && occursin("SM0002", s)
+    finally
+        StrictMode._SCAN_BODY_BUDGET[] = budget
+        StrictMode.clear_cache!()
+    end
 end

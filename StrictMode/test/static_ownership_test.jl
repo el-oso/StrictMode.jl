@@ -147,3 +147,17 @@ end
     js = format_findings(fs; format = :json)
     @test occursin("\"status\":\"info\"", js)
 end
+
+@testitem "static_ownership_suggestions reads the method a wider invoke runs" begin
+    using StrictMode
+    const _SO_WIDE = IdDict{DataType, Vector{Float64}}()
+    @noinline _so_keyed(::Type{T}, n::Integer) where {T} = get(_SO_WIDE, T, Float64[])::Vector{Float64}
+    @noinline _so_keyed(::Type{T}, n::Int) where {T} = Float64[]
+    @noinline _so_plain(::Type{T}, n::Integer) where {T} = Float64[n]
+    @noinline _so_plain(::Type{T}, n::Int) where {T} = get(_SO_WIDE, T, Float64[])::Vector{Float64}
+    # `invoke` runs the `Integer` method on an `Int`; the call's own types dispatch to the other one.
+    _so_wide_keyed(::Type{T}) where {T} = length(invoke(_so_keyed, Tuple{Type{T}, Integer}, T, 1))
+    _so_wide_plain(::Type{T}) where {T} = length(invoke(_so_plain, Tuple{Type{T}, Integer}, T, 1))
+    @test !isempty(static_ownership_suggestions(_so_wide_keyed, (Type{Float64},)))
+    @test isempty(static_ownership_suggestions(_so_wide_plain, (Type{Float64},)))
+end

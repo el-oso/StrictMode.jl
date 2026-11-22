@@ -1628,3 +1628,67 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "an exempt function or a barrier reached by a wider invoke excuses the same in both tiers" begin
+    using StrictMode, StrictModeTest, Test
+    # `invoke` runs the `Integer` method on an `Int`, though the callee's signature dispatches to
+    # the `Int` method. The exemption and the barrier are judged on the method that runs.
+    module WideProofs
+    using StrictMode
+    @noinline ex(w, n::Integer) = sum(zeros(n))
+    @noinline ex(w, n::Int) = -1.0
+    @strict_exempt :noalloc reason = "test" ex
+    in_exempt(w::Vector{Float64}, n::Int) = invoke(ex, Tuple{Vector{Float64}, Integer}, w, n)
+    @noinline quiet(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline quiet(w, n::Int) = sum(zeros(n))
+    @strict_exempt :noalloc reason = "test" quiet
+    quiet_exempt(w::Vector{Float64}, n::Int) = invoke(quiet, Tuple{Vector{Float64}, Integer}, w, n)
+    # Code handed to the exempt function and called by it stays the caller's.
+    @noinline runs(g::G, w, n::Integer) where {G} = g(w, n)
+    @noinline runs(g::G, w, n::Int) where {G} = -1.0
+    @strict_exempt :noalloc reason = "test" runs
+    @noinline mine(w, n) = sum(zeros(n))
+    handed(w::Vector{Float64}, n::Int) = invoke(runs, Tuple{typeof(mine), Vector{Float64}, Integer}, mine, w, n)
+    @noinline bar(w, n::Integer) = sum(zeros(n))
+    @noinline bar(w, n::Int) = -1.0
+    in_barrier(w::Vector{Float64}, n::Int) = invoke(bar, Tuple{Vector{Float64}, Integer}, w, n)
+    # The barrier method that runs allocates nothing of its own; the caller's allocation is its own.
+    @noinline bar2(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline bar2(w, n::Int) = sum(zeros(n))
+    past_barrier(w::Vector{Float64}, n::Int) = invoke(bar2, Tuple{Vector{Float64}, Integer}, w, n) + sum(zeros(n))
+    end
+    M = WideProofs
+    T = (Vector{Float64}, Int)
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        register_alloc_barrier!(M.bar)
+        register_alloc_barrier!(M.bar2)
+        for f in (M.in_exempt, M.quiet_exempt, M.handed, M.in_barrier, M.past_barrier)
+            f([1.0], 2)
+        end
+        verdict(r) = r.status === :pass ? (:pass, nothing) : (r.status, r.code)
+        scan(f) = verdict(only(StrictMode.findings(f, T; guarantees = (:noalloc,))))
+        proof(f; kw...) = verdict(only(StrictModeTest.proof_findings(f, T; guarantees = (:noalloc,), kw...)))
+        agree(f) = (d = divergence_report(f, T; guarantees = (:noalloc,)); isempty(d) && isempty(d.cause_diverged))
+
+        @test scan(M.in_exempt) == (:info, :SM0002)
+        @test proof(M.in_exempt) == (:fail, :SM0018)
+        @test proof(M.in_exempt; allow_exempt = true) == (:info, :SM0018)
+        for f in (M.quiet_exempt, M.in_barrier)
+            @test scan(f) == (:pass, nothing)
+            @test proof(f) == (:pass, nothing)
+        end
+        for f in (M.handed, M.past_barrier)
+            @test scan(f) == (:fail, :SM0002)
+            @test proof(f) == (:fail, :SM0002)
+            @test proof(f; allow_exempt = true) == (:fail, :SM0002)
+        end
+        for f in (M.in_exempt, M.quiet_exempt, M.handed, M.in_barrier, M.past_barrier)
+            @test agree(f)
+        end
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
+    end
+end

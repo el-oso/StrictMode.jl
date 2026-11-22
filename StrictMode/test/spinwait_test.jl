@@ -275,3 +275,35 @@ end
         @test !occursin("no spin-wait loop", sprint(show, r))
     end
 end
+
+@testitem "spin_wait_report reads the method a wider invoke runs" begin
+    using StrictMode
+    module WideSpin
+    mutable struct P
+        @atomic gen::Int
+        ev::Threads.Event
+    end
+    @noinline function spins(p::P, n::Integer)
+        while iszero(@atomic p.gen)
+            yield()
+        end
+        return nothing
+    end
+    @noinline spins(p::P, n::Int) = (wait(p.ev); nothing)
+    @noinline parks(p::P, n::Integer) = (wait(p.ev); nothing)
+    @noinline function parks(p::P, n::Int)
+        while iszero(@atomic p.gen)
+            yield()
+        end
+        return nothing
+    end
+    # `invoke` runs the `Integer` method on an `Int`; `(P, Int)` dispatches to the other one.
+    start_spinning(p::P, n::Int) = Threads.@spawn invoke(spins, Tuple{P, Integer}, p, n)
+    start_parking(p::P, n::Int) = Threads.@spawn invoke(parks, Tuple{P, Integer}, p, n)
+    end
+    M = WideSpin
+    r = spin_wait_report(M.start_spinning, (M.P, Int))
+    @test length(r.findings) == 1 && r.unfollowed == 0
+    r = spin_wait_report(M.start_parking, (M.P, Int))
+    @test isempty(r.findings) && r.unfollowed == 0
+end

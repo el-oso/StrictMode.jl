@@ -215,24 +215,18 @@ function _invoke_mi(@nospecialize(a1))
     return mi isa Core.MethodInstance ? mi : nothing
 end
 
-# Typed IR for an `:invoke` target's MethodInstance (via its concrete singleton + arg types).
+# Typed IR of the body an `:invoke` of `mi` runs (`_callee_key`), for a callee that is a singleton
+# function.
 function _mi_codeinfo(mi::Core.MethodInstance)
     params = (mi.specTypes::DataType).parameters
     (isempty(params) || !isdefined(params[1], :instance)) && return nothing
-    f = params[1].instance
-    argts = Tuple(params[2:end])
-    cts = try
-        _code_typed(f, argts; optimize = true)
-    catch
-        return nothing
-    end
-    return isempty(cts) ? nothing : cts[1].first
+    return _mi_codeinfo_by_type(mi)
 end
 
 # The same for a callee that need not be a singleton function: a constructor, a callable object.
 function _mi_codeinfo_by_type(mi::Core.MethodInstance)
     cts = try
-        _code_typed_by_type(mi.specTypes; optimize = true)
+        _code_typed_of(_callee_key(mi); optimize = true)
     catch
         return nothing
     end
@@ -1305,7 +1299,6 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
     # `memoryrefnew` on a buffer the method allocated itself then reads as plan-reachable: measured
     # on a method whose first argument is an `Int` and whose only stores go into its own fresh
     # arrays, which reported a write to the plan.
-    out = _ConcViol[]
     # A position the call does not have names no argument, and an empty result would read as
     # "that argument is not written".
     1 <= self_arg <= length(types) || throw(
@@ -1314,10 +1307,16 @@ function concurrency_findings(@nospecialize(f), @nospecialize(types::Tuple); sel
                 "`$(_func_name(f))$(_sig_string(types))`, which takes $(length(types)) argument(s)"
         )
     )
-    _may_ref(types[self_arg]) || return out
+    return _plan_writes(ci, fr, types[self_arg], self_arg, max_depth)
+end
+
+# The violations in the body `ci`, whose argument `self_arg` has type `T` and is the plan.
+function _plan_writes(ci, fr::_Frame, @nospecialize(T), self_arg::Int, max_depth::Int)
+    out = _ConcViol[]
+    _may_ref(T) || return out
     # A lock or a channel is written by every task that uses it; that is what it is for. It is not
     # seeded, and the scan still runs for the writes to constant globals the body makes.
-    targs = _is_lock_type(types[self_arg]) ? Set{Int}() :
+    targs = _is_lock_type(T) ? Set{Int}() :
         Set{Int}((self_arg + 1,))   # user arg `self_arg` ↔ Core.Argument(self_arg+1)
     _taint_scan_ci(ci, targs, String[], fr, 0, max_depth, Dict{Any, Any}(), out, Set{String}())
     return out
@@ -1743,8 +1742,8 @@ function _suspends_on_args(ps)
     return on
 end
 
-# Callee signature and world => :yes, :maybe or :no. The world is part of the key because the reach
-# follows run-time dispatch, which a method defined anywhere can change.
+# Callee key (`_callee_key`) and world => :yes, :maybe or :no. The world is part of the key because
+# the reach follows run-time dispatch, which a method defined anywhere can change.
 const _SUSPEND_MEMO = Dict{Tuple{Any, UInt}, Symbol}()
 const _SUSPEND_LOCK = ReentrantLock()
 
@@ -1818,7 +1817,7 @@ function _stmt_suspends(@nospecialize(st), code::Vector{Any}, argtype = _ -> Any
             # exempt: it is the caller's own code.
             _mi_is_barrier(mi) && return :no
         end
-        return _sig_may_suspend(mi.specTypes)
+        return _sig_may_suspend(_callee_key(mi))
     elseif Meta.isexpr(st, :call)
         v = _sw_callee_value(st.args[1])
         if v isa Core.Builtin || v isa Core.IntrinsicFunction
@@ -1939,8 +1938,14 @@ end
 function _callee_writes_arg(mi::Core.MethodInstance, k::Int)
     ps = mi.specTypes.parameters
     (!isempty(ps) && ps[1] isa DataType && isdefined(ps[1], :instance)) || return false
+    (1 <= k < length(ps) && mi.def isa Method) || return false
+    # The body the call runs, which is not the one its signature dispatches to when the callee was
+    # named by `invoke` with a wider signature.
+    ci = _mi_codeinfo(mi)
+    isnothing(ci) && return false
     vs = try
-        concurrency_findings(ps[1].instance, Tuple(ps[2:end]); self_arg = k, max_depth = 3)
+        fr = _Frame(_func_name(ps[1].instance) * _sig_string(Tuple(ps[2:end])), string(mi.def.file), Int(mi.def.line))
+        _plan_writes(ci, fr, ps[k + 1], k, 3)
     catch
         return false
     end
@@ -1952,7 +1957,7 @@ end
 # caller's store into the returned value writes the argument.
 function _returns_argument(mi::Core.MethodInstance, k::Int)
     cts = try
-        _code_typed_by_type(mi.specTypes; optimize = true)
+        _code_typed_of(_callee_key(mi); optimize = true)
     catch
         return false
     end

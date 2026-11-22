@@ -190,25 +190,17 @@
     # R7 A helper the caller also calls itself is the caller's there.
     # R8 Any counted allocation is SM0002; counted causes that are all waits are SM0017; with no
     #    counted cause, exempt ones are R3.
-    # R9 A method reached by `invoke` with a signature wider than its arguments is unreadable to the
-    #    scan, which reads a body by the signature that dispatches to it. Where the scan meets such a
-    #    call, outside a barrier, and finds no counted cause elsewhere, it fails with the call tree
-    #    unread (SM0207). The proof reads the method. An exempt function reached that way excuses
-    #    nothing in either engine, since the code it was handed cannot be read.
+    # R9 A callee is the method the call runs, however the call names it: the method `invoke` selects
+    #    with a signature wider than its arguments is read, excused and counted as that method, not
+    #    as the more specific one its argument types would dispatch to.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
-
-    # R9: the wrapper is an exempt function reached by a wider `invoke`.
-    unread_exempt(k::Case) = k.shape === :invoke && k.pos === :wrapper && k.wrapper === :exempt
-    # R9: the scan meets a wider `invoke` outside a barrier.
-    scan_unread(k::Case) = unread_exempt(k) ||
-        (k.shape === :invoke && k.pos === :helper && k.wrapper in (:none, :exempt))
 
     function causes(k::Case)
         cs = Tuple{Symbol, Symbol}[]
         ec = effect_cause(k.effect)
         add!(c, ctx) = isnothing(c) || push!(cs, (c, ctx))
         w, r = k.wrapper, k.reach
-        ctxw = w === :none || unread_exempt(k) ? :caller : w === :exempt ? :exempt : :guarded
+        ctxw = w === :none ? :caller : w === :exempt ? :exempt : :guarded
         if r === :direct
             add!(ec, :caller)
         elseif r === :handed
@@ -240,11 +232,6 @@
             (:info, :SM0002), (:fail, :SM0018), (:info, :SM0018)
         else
             (:pass, nothing), (:pass, nothing), (:pass, nothing)
-        end
-        if scan_unread(k)
-            # What the scan still reads is the helper the caller calls itself.
-            seen = k.repeat === :once ? nothing : effect_cause(k.effect)
-            s = seen === :alloc ? (:fail, :SM0002) : seen === :wait ? (:fail, :SM0017) : (:fail, :SM0207)
         end
         # The scan's note and the proof's SM0018 name the same exempt callee, so they agree.
         sfail = s[1] === :fail

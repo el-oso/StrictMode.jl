@@ -694,28 +694,85 @@ end
     @test !any(i -> StrictMode._stmt_in_scheduler(ci, sig3, i), eachindex(ci.code))
 end
 
-@testitem "a method reached by a wider invoke is never read as the method its signature names" begin
+@testitem "a method reached by a wider invoke is read as the method the call runs" begin
     using StrictMode
-    # `invoke` runs the `Integer` method on an `Int`. The signature `(W, Int)` dispatches to the other
-    # method, which allocates nothing, and the scan reads a body by its signature.
+    # `invoke` runs the `Integer` method on an `Int`, though the signature `(W, Int)` dispatches to
+    # the other method. Each fixture pairs the two so that reading the wrong one flips the verdict.
     @noinline wide(w, n::Integer) = sum(zeros(n))
     @noinline wide(w, n::Int) = -1.0
     via_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
     by_dispatch(w::Vector{Float64}, n::Int) = wide(w, n)
-    @noinline clean(w, n::Integer) = Float64(n)
-    @noinline clean(w, n::Int) = -1.0
+    @noinline clean(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline clean(w, n::Int) = sum(zeros(n))
     clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
+    clean_dispatch(w::Vector{Float64}, n::Int) = clean(w, n)
+    @noinline boxes(w, n::Integer) = (Base.donotdelete(Any[w, n]); 0.0)
+    @noinline boxes(w, n::Int) = -1.0
+    box_invoke(w::Vector{Float64}, n::Int) = invoke(boxes, Tuple{Vector{Float64}, Integer}, w, n)
     T = (Vector{Float64}, Int)
+    one(f, g) = only(StrictMode.findings(f, T; guarantees = (g,)))
 
     @test via_invoke([1.0], 3) == 0.0 && by_dispatch([1.0], 3) == -1.0
+    @test clean_invoke([1.0], 3) == 0.0 && clean_dispatch([1.0], 3) == 0.0
+    # The allocating method is invoked: the allocation is found, and named as one.
+    @test StrictMode._failed(one(via_invoke, :noalloc)) && one(via_invoke, :noalloc).code === :SM0002
+    @test occursin("wide", StrictMode._origin_note(via_invoke, T))
+    @test !StrictMode._failed(one(by_dispatch, :noalloc))
+    @test !StrictMode._failed(one(via_invoke, :noboxing))      # it allocates and boxes nothing
+    # The clean method is invoked: the call passes, though the method its signature names allocates.
     for g in (:noalloc, :noboxing)
-        @test !StrictMode._failed(only(StrictMode.findings(by_dispatch, T; guarantees = (g,))))
-        # The scan cannot read the invoked method, so it does not pass a call of it, whatever the
-        # method does.
-        for f in (via_invoke, clean_invoke)
-            r = only(StrictMode.findings(f, T; guarantees = (g,)))
-            @test StrictMode._failed(r)
-            @test r.code === :SM0207
-        end
+        @test one(clean_invoke, g).status === :pass
+    end
+    @test StrictMode._failed(one(clean_dispatch, :noalloc))
+    @test StrictMode._failed(one(box_invoke, :noboxing)) && one(box_invoke, :noboxing).code === :SM0003
+
+    # The key of such a callee is the specialization itself; of any other, its signature.
+    body(f) = StrictMode._typed_body(Tuple{typeof(f), T...})
+    mi(f) = StrictMode._invoke_mi(only(st for st in body(f).code if Meta.isexpr(st, :invoke)).args[1])
+    @test StrictMode._callee_key(mi(via_invoke)) isa Core.MethodInstance
+    @test StrictMode._callee_key(mi(clean_dispatch)) === mi(clean_dispatch).specTypes
+    @test StrictMode._key_method(StrictMode._callee_key(mi(via_invoke))) === which(wide, (Vector{Float64}, Integer))
+end
+
+@testitem "an exempt function or a barrier reached by a wider invoke excuses what it guards in the scan" begin
+    using StrictMode
+    module WideExcused
+    using StrictMode
+    @noinline ex(w, n::Integer) = sum(zeros(n))
+    @noinline ex(w, n::Int) = -1.0
+    @strict_exempt :noalloc reason = "test" ex
+    in_exempt(w::Vector{Float64}, n::Int) = invoke(ex, Tuple{Vector{Float64}, Integer}, w, n)
+    # The exempt method that runs allocates nothing; the one its signature names does.
+    @noinline quiet(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline quiet(w, n::Int) = sum(zeros(n))
+    @strict_exempt :noalloc reason = "test" quiet
+    quiet_exempt(w::Vector{Float64}, n::Int) = invoke(quiet, Tuple{Vector{Float64}, Integer}, w, n)
+    # Code handed to the exempt function and called by it stays the caller's.
+    @noinline runs(g::G, w, n::Integer) where {G} = g(w, n)
+    @noinline runs(g::G, w, n::Int) where {G} = -1.0
+    @strict_exempt :noalloc reason = "test" runs
+    @noinline mine(w, n) = sum(zeros(n))
+    handed(w::Vector{Float64}, n::Int) = invoke(runs, Tuple{typeof(mine), Vector{Float64}, Integer}, mine, w, n)
+    @noinline bar(w, n::Integer) = sum(zeros(n))
+    @noinline bar(w, n::Int) = -1.0
+    in_barrier(w::Vector{Float64}, n::Int) = invoke(bar, Tuple{Vector{Float64}, Integer}, w, n)
+    end
+    M = WideExcused
+    T = (Vector{Float64}, Int)
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        register_alloc_barrier!(M.bar)
+        one(f) = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+        @test M.in_exempt([1.0], 2) == 0.0 && M.handed([1.0], 2) == 0.0 && M.in_barrier([1.0], 2) == 0.0
+        r = one(M.in_exempt)
+        @test r.status === :info && occursin("ex", r.reason)
+        @test one(M.quiet_exempt).status === :pass
+        r = one(M.handed)
+        @test StrictMode._failed(r) && r.code === :SM0002
+        @test one(M.in_barrier).status === :pass
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
     end
 end

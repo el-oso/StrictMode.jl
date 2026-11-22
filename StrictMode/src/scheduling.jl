@@ -42,6 +42,9 @@ function _forwarded_sig(@nospecialize(sig))
         mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
         mi isa Core.MethodInstance || return sig
         target = mi.specTypes
+        # A callee whose signature dispatches to another method, as an `invoke` of a wider method
+        # names, is not one a forwarder calls, and reading its signature would read that other method.
+        _callee_key(mi) === target || return sig
         callee = target.parameters[1]
         callee === sig.parameters[1] || _is_kwbody_of(callee, sig) || return sig
         sig = target

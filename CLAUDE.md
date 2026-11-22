@@ -265,13 +265,18 @@ StrictMode/src/
                         under :noalloc a box is an allocation, so a caller of a registered
                         barrier that boxes passes with no note, as a caller of a once-guard does;
                         the :info note that names the barrier is :noboxing's and :owned's.
-                        A WIDER INVOKE is unread: every walk reads a body by the signature that
-                        dispatches to it (_typed_body), and `invoke(f, Tuple{wider}, args...)`
-                        names a specialization whose signature dispatches to ANOTHER method
-                        (_names_other_method). _scan_ci does not follow that callee and marks the
-                        result truncated (SM0207), so the call never passes on the strength of the
-                        other method's body. The proof reads it (_reach_body, by specialization),
-                        which makes this a real cause_diverged case: SM0207 against SM0002.
+                        BODY KEYS: every walk that follows a callee, here and in concurrency.jl,
+                        spinwait.jl, reach.jl, static_ownership.jl and the proofs, names a body by
+                        a KEY that names exactly one specialization: a signature (the
+                        specialization it dispatches to; an entry point is one) or a
+                        MethodInstance. _callee_key(mi) gives the key of a callee found in a body:
+                        its signature when that dispatches to mi, mi itself otherwise, as for the
+                        method `invoke(f, Tuple{wider}, args...)` runs, whose signature a more
+                        specific method answers. NEVER dispatch `mi.specTypes` of a callee again:
+                        read through the key (_typed_body, _code_typed_of, _code_ircode_of,
+                        _key_method), keep memo entries and visited sets under it, and take only
+                        argument types from _key_sig. _forwarded_sig (scheduling.jl) forwards only
+                        to a callee whose key is its signature.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch
@@ -942,10 +947,10 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         string fails (print_to_string(::String, ::Vararg{Any}) on 1.13). An edge
                         whose specialization cannot be determined makes the graph incomplete. Each
                         edge ALSO leads to the specialization the statement names, the one the
-                        native walk reports a dispatch in. A body whose signature dispatches to
-                        another method (a wider invoke) is read from the specialization itself
-                        (_reach_body); an exempt function reached that way excuses nothing, since
-                        its handed-in code is read by signature. OFF-GRAPH SITES: the graph is
+                        native walk reports a dispatch in. Each body is the scan's own read of
+                        that specialization (_reach_body, through StrictMode._callee_key), so a
+                        method reached by a wider invoke is read, excused and counted as itself in
+                        both tiers. OFF-GRAPH SITES: the graph is
                         this package's reconstruction of what AllocCheck compiled, so a site
                         whose specialization (_site_mi) the graph does not name (_off_graph)
                         shows the two disagree. Such a site is kept as the call's own and the

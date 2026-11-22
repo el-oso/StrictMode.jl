@@ -1794,3 +1794,49 @@ end
     @test only(StrictMode.findings(Invokes.h, (IOBuffer, Invokes.Outer);
         guarantees = (:no_threadid_state,))).status !== :pass
 end
+
+@testitem "a write in a method reached by a wider invoke is the caller's" begin
+    using StrictMode
+    # `invoke` runs the `Integer` method on an `Int`; the signature `(Vector{Int}, Int)` dispatches
+    # to the other one. The method that runs is the one read.
+    module WideWrites
+    @noinline put_d(b::Vector{Int}, n::Integer) = (b[1] = n; nothing)
+    @noinline put_d(b::Vector{Int}, n::Int) = nothing
+    @noinline put_c(b::Vector{Int}, n::Integer) = nothing
+    @noinline put_c(b::Vector{Int}, n::Int) = (b[1] = n; nothing)
+    writes(b::Vector{Int}, n::Int) = invoke(put_d, Tuple{Vector{Int}, Integer}, b, n)
+    reads(b::Vector{Int}, n::Int) = invoke(put_c, Tuple{Vector{Int}, Integer}, b, n)
+    direct(b::Vector{Int}, n::Int) = put_c(b, n)
+    end
+    M = WideWrites
+    T = (Vector{Int}, Int)
+    M.writes([0], 1); M.reads([0], 1); M.direct([0], 1)
+    certain(f) = any(v -> v.certain, StrictMode.concurrency_findings(f, T))
+    @test certain(M.writes)
+    @test isempty(StrictMode.concurrency_findings(M.reads, T))
+    @test certain(M.direct)
+end
+
+@testitem "per-thread state handed to a method reached by a wider invoke is read in that method" begin
+    using StrictMode
+    module WideTid
+    using Base.Threads: threadid
+    const VB = [zeros(8) for _ in 1:64]
+    # Suspends while it holds the per-thread buffer, then writes it.
+    @noinline held_d(v::Vector{Float64}, n::Integer) = (yield(); v[1] += 1; nothing)
+    @noinline held_d(v::Vector{Float64}, n::Int) = (v[2]; nothing)
+    @noinline held_c(v::Vector{Float64}, n::Integer) = (v[2]; nothing)
+    @noinline held_c(v::Vector{Float64}, n::Int) = (yield(); v[1] += 1; nothing)
+    holds() = (invoke(held_d, Tuple{Vector{Float64}, Integer}, VB[threadid()], 1); nothing)
+    releases() = (invoke(held_c, Tuple{Vector{Float64}, Integer}, VB[threadid()], 1); nothing)
+    direct() = (held_c(VB[threadid()], 1); nothing)
+    end
+    M = WideTid
+    M.holds(); M.releases(); M.direct()
+    tid(f) = only(StrictMode.findings(f, (); guarantees = (:no_threadid_state,))).status
+    @test tid(M.holds) === :info
+    @test tid(M.releases) === :pass
+    @test tid(M.direct) === :info
+    @test !isempty(StrictMode.threadid_state_findings(M.holds, ()))
+    @test isempty(StrictMode.threadid_state_findings(M.releases, ()))
+end

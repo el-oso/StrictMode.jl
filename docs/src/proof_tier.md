@@ -146,10 +146,8 @@ signature and capture an **IP-free** record of any disagreement — anonymized s
 signal *categories*, and versions only — that you can send to the maintainers to fix the scan.
 Its `diverged` field lists each guarantee one engine fails and the other passes, and `isempty`
 reads only that field. Its `cause_diverged` field lists each guarantee both engines fail with
-different codes. One case is a method reached by `invoke` with a signature wider than its arguments. The scan reads a body by the
-signature that dispatches to it, which there is another method's, so it reports the call tree as
-unread (SM0207) whatever the invoked method does. The proof compiles the invoked method, and reports
-SM0002 when it allocates.
+different codes. One case is a call tree larger than the scan reads: the scan reports it as unread
+(SM0207), and the proof compiles all of it and reports SM0002 when it allocates.
 
 A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
 dropped. A call whose every allocation lies inside such functions gets a result of its own from the

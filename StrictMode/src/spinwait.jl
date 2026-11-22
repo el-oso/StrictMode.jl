@@ -231,7 +231,7 @@ function _sw_scan!(r::_SwReach, ci::Core.CodeInfo, @nospecialize(sig), queue::Ve
             # entered. A `@nospecialize` method compiles for `Any` whatever it is handed, so it is
             # read at the call-site types when those select the same method.
             if _reach_follows(mi)
-                push!(queue, mi.specTypes)
+                push!(queue, _callee_key(mi))
             else
                 site = _reach_invoke_types(ci, sig, st, mi)
                 if _reach_carries_user(site) && _reach_same_method(site, mi.def)
@@ -279,7 +279,7 @@ function _sw_reach(@nospecialize(sig))
             continue
         end
         cts = try
-            _code_typed_by_type(s; optimize = true)
+            _code_typed_of(s; optimize = true)
         catch
             Any[]
         end
@@ -289,7 +289,7 @@ function _sw_reach(@nospecialize(sig))
             ci isa Core.CodeInfo || continue
             read = true
             r.bodies += 1
-            _sw_scan!(r, ci, s, queue)
+            _sw_scan!(r, ci, _key_sig(s), queue)
         end
         read || (r.unfollowed += 1)
     end

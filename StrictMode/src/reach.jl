@@ -261,7 +261,7 @@ function _reach_scan!(
             r.quiet(site) || _reach_record!(r, key, depth, false)
             if key in stop
             elseif _reach_follows(mi)
-                push!(queue, (mi.specTypes, depth))
+                push!(queue, (_callee_key(mi), depth))
             elseif _reach_carries_user(site) && _reach_same_method(site, mi.def)
                 # A Base method compiled for `Any` (`@nospecialize`) is handed a user value.
                 push!(queue, (site, depth))
@@ -289,7 +289,8 @@ function _reach_scan!(
     return r
 end
 
-# Breadth first, so a function's depth is its nearest occurrence.
+# Breadth first, so a function's depth is its nearest occurrence. `sig` and the queue's entries are
+# body keys (`_callee_key`).
 function _reach(@nospecialize(sig), stop; quiet = Returns(false))
     r = _Reach(Dict{Tuple{Module, Symbol}, ReachedFunction}(), 0, 0, 0, quiet)
     seen = Set{Any}()
@@ -303,7 +304,7 @@ function _reach(@nospecialize(sig), stop; quiet = Returns(false))
             continue
         end
         cts = try
-            _code_typed_by_type(s; optimize = true, debuginfo = :source)
+            _code_typed_of(s; optimize = true, debuginfo = :source)
         catch
             Any[]
         end
@@ -313,7 +314,7 @@ function _reach(@nospecialize(sig), stop; quiet = Returns(false))
             ci isa Core.CodeInfo || continue
             read = true
             r.bodies += 1
-            _reach_scan!(r, ci, s, d + 1, stop, queue)
+            _reach_scan!(r, ci, _key_sig(s), d + 1, stop, queue)
         end
         read || (r.unread += 1)
     end

@@ -281,3 +281,21 @@ end
     r = StrictMode.reach_report(dflt, (IOBuffer, Out))
     @test StrictMode.reaches(r, hot) || !StrictMode.complete(r)
 end
+
+@testitem "reach_report reads the method a wider invoke runs" begin
+    using StrictMode
+    const SINK = Ref{Any}(nothing)
+    @noinline hot(x) = (SINK[] = x; 2x)
+    @noinline to_hot(x::Int, n::Integer) = hot(x)
+    @noinline to_hot(x::Int, n::Int) = x
+    @noinline past_hot(x::Int, n::Integer) = x + n
+    @noinline past_hot(x::Int, n::Int) = hot(x)
+    # `invoke` runs the `Integer` method on an `Int`; `(Int, Int)` dispatches to the other one.
+    reaches_it(x::Int, n::Int) = invoke(to_hot, Tuple{Int, Integer}, x, n)
+    misses_it(x::Int, n::Int) = invoke(past_hot, Tuple{Int, Integer}, x, n)
+    @test reaches_it(1, 1) == 2 && misses_it(1, 1) == 2
+    r = StrictMode.reach_report(reaches_it, (Int, Int))
+    @test StrictMode.reaches(r, hot) && StrictMode.complete(r)
+    r = StrictMode.reach_report(misses_it, (Int, Int))
+    @test !StrictMode.reaches(r, hot) && StrictMode.complete(r)
+end
