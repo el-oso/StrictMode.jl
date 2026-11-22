@@ -354,8 +354,8 @@ _name_hit(spec, name::Symbol) =
     spec isa Function ? spec(name) :
     name in Set{Symbol}(x isa Symbol ? x : nameof(x) for x in spec)
 
-# The signatures an exemption should be judged on: the one it names, or every concrete signature the
-# function has compiled.
+# The signatures an exemption should be judged on: the one it names, once, for the method that
+# signature selects, or every concrete signature the function has compiled.
 function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
     out = Tuple{Any, Tuple}[]
     ms, _ = StrictMode.module_methods(mod; include_exempt = true)   # the subject IS the exempt code
@@ -369,7 +369,7 @@ function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
         end
         if isnothing(e.types)
             append!(out, StrictMode._method_entries(m, f))
-        else
+        elseif StrictMode._exemption_method(e, m.sig) === m
             push!(out, (f, e.types))
         end
     end

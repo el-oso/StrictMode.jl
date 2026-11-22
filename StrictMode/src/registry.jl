@@ -463,14 +463,38 @@ end
 # you opt the rare cold helper out, rather than opting the hot code in.
 const STRICT_EXEMPT = Exemption[]
 
-# Whether `e` covers this function, signature and guarantee. A field left `nothing` matches
+# Whether `e` covers the item `(f, types)` for guarantee `g`. A field left `nothing` matches
 # anything, so the common whole-function form keeps its meaning while a narrow one binds tightly.
-# `types` may also be one `Method`, which matches any signature.
-function _covers(e::Exemption, name::Symbol, @nospecialize(types), g::Union{Nothing, Symbol})
+# `types` may also be one `Method`, or `nothing` for the whole function.
+#
+# An exemption with `types` names a method: the one its signature selects, as `invoke` would for
+# that signature. It covers a body of that method whose argument types are within the signature,
+# and nothing else. A specialization of a wider method compiled through `invoke` for the same
+# argument types is another method's body, so it stays judged.
+function _covers(e::Exemption, name::Symbol, @nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
     e.func === name || return false
     isnothing(e.guarantees) || isnothing(g) || g in e.guarantees || return false
-    isnothing(e.types) || isnothing(types) || types isa Method || Tuple(types) == e.types || return false
-    return true
+    (isnothing(e.types) || isnothing(types)) && return true
+    types isa Method && return _exemption_method(e, types.sig) === types
+    # A signature is read by dispatch, so its own types name the method it reads.
+    !(f isa _Spec) && Tuple(types) == e.types && return true
+    key = try
+        _entry_key(f, types)
+    catch
+        return false
+    end
+    sig = key isa Core.MethodInstance ? key.specTypes : key
+    m = _key_method(key)
+    return !isnothing(m) && _exemption_method(e, sig) === m && sig <: _exemption_sig(e, sig)
+end
+
+# The signature `e` names, on the callee type of `sig`, and the method that signature selects.
+_exemption_sig(e::Exemption, @nospecialize(sig)) =
+    Base.rewrap_unionall(Tuple{Base.unwrap_unionall(sig).parameters[1], e.types...}, sig)
+_exemption_method(e::Exemption, @nospecialize(sig)) = try
+    _key_method(_exemption_sig(e, sig))
+catch
+    nothing
 end
 
 # The coarse question the module sweeps ask: is this function, or its method `at`, opted out of
@@ -488,7 +512,7 @@ end
 function _is_exempt(@nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
     name = _demangle(_callable_name(f))
     for (mod, e) in _scoped_exemptions()
-        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return true
+        _covers(e, name, f, types, g) && _exempt_in(mod, e, f, types) && return true
     end
     return false
 end
@@ -661,7 +685,7 @@ end
 function _matching_exemption(@nospecialize(f), @nospecialize(types), g::Symbol)
     name = _demangle(_callable_name(f))
     for (mod, e) in _scoped_exemptions()
-        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return e
+        _covers(e, name, f, types, g) && _exempt_in(mod, e, f, types) && return e
     end
     return nothing
 end
@@ -887,11 +911,11 @@ end
 # instantiations are declared with `@strict_function signatures = [...]`, or it is a macro, a
 # constructor or a callable object's method, none of which the policy judges. Only generic methods
 # nobody declared are left unread. An exemption narrowed with `types = (...)` counts here like a
-# declared instantiation: it names a signature of the method, though not every one.
+# declared instantiation when its signature selects this method (`_covers`).
 function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
     ms, skipped = module_methods(mod; only, exempt)
     (get(skipped, :exempt, 0) > 0 || get(skipped, :constructor, 0) > 0) && return nothing
-    decls = keys(declarations())
+    decls = _declared_methods(keys(declarations()))
     for m in ms
         _method_declared(m, decls) && return nothing
         startswith(String(m.name), "@") && return nothing
@@ -1443,59 +1467,67 @@ function _findings_compiled(analyze, mod::Module; guarantees = (:typestable, :no
     return _map_findings(analyze, items)
 end
 
-# Whether a declaration in the registry speaks for this method. A declaration names a signature,
-# so it covers `m` when that signature is one `m` would be dispatched for — which is also how a
-# `signatures = [...]` list covers a generic declaration it instantiates.
-function _method_declared(m::Method, keys)
+# The methods the declarations `keys` name, each with the signatures that name it. A declaration
+# names the method its signature dispatches to, which is the method the registry checks, and no
+# other: a wider method the signature also matches is not declared by it, since a call with that
+# signature never runs it. A `signatures = [...]` list declares the generic method it instantiates
+# the same way.
+function _declared_methods(keys)
+    out = IdDict{Method, Vector{Any}}()
     for (f, types) in keys
-        Tuple{typeof(f), types...} <: m.sig && return true
-    end
-    return false
-end
-
-# The concrete signatures this method has actually compiled. A generic method has as many as it has
-# been called with argument types for, and only these can carry a verdict: the declaration itself
-# infers to `Any`.
-function _method_signatures(m::Method)
-    out = Vector{Any}[]
-    for mi in _specializations(m)
-        tt = try
-            collect(Any, (mi.specTypes::DataType).parameters[2:end])
+        sig = try
+            _sigtype(f, types)
         catch
             continue
         end
-        Base.isdispatchtuple(Tuple{tt...}) || continue
-        tt in out || push!(out, tt)
+        m = _key_method(sig)
+        isnothing(m) || push!(get!(Vector{Any}, out, m), sig)
     end
     return out
 end
 
-# The items `(f, types)` for the specializations `_method_signatures` lists, each named as
-# `_entry_of` names it, so that a reader of `m`'s code reads `m` and not the method its argument
-# types dispatch to.
+# Whether a declaration names the method `m`, given `_declared_methods`.
+_method_declared(m::Method, index::IdDict{Method, Vector{Any}}) = haskey(index, m)
+
+# Whether a declaration of the method `m` names its compiled signature `sig`.
+_signature_declared(m::Method, @nospecialize(sig), index::IdDict{Method, Vector{Any}}) =
+    any(d -> sig <: d, get(index, m, ()))
+
+# The concrete specializations this method has actually compiled. A generic method has as many as
+# it has been called with argument types for, and only these can carry a verdict: the declaration
+# itself infers to `Any`.
+_compiled_rows(m::Method) = Core.MethodInstance[
+    mi for mi in _specializations(m) if mi.specTypes isa DataType && Base.isdispatchtuple(mi.specTypes)
+]
+
+# The items `(f, types)` for the specializations `_compiled_rows` lists, each named as `_entry_of`
+# names it, so that a reader of `m`'s code reads `m` and not the method its argument types
+# dispatch to.
 function _method_entries(m::Method, @nospecialize(f))
     out = Tuple{Any, Tuple}[]
-    for mi in _specializations(m)
-        sig = mi.specTypes
-        (sig isa DataType && Base.isdispatchtuple(sig)) || continue
-        push!(out, (_entry_of(f, mi), Tuple(sig.parameters[2:end])))
+    for mi in _compiled_rows(m)
+        push!(out, (_entry_of(f, mi), Tuple(mi.specTypes.parameters[2:end])))
     end
     return out
 end
 
-# Whether a declaration names this exact compiled signature of `m`.
-function _signature_declared(m::Method, tt::Vector{Any}, keys)
-    want = Tuple{tt...}
-    for (f, types) in keys
-        Tuple{typeof(f), tt...} <: m.sig || continue
-        want <: Tuple{types...} && return true
-    end
-    return false
-end
-
-# One `:coverage` failure, naming the method and the signature it was reached with.
-function _coverage_finding(mod::Module, m::Method, sig::AbstractString)
+# One `:coverage` failure, naming the method and the compiled specialization `mi` of it. A
+# specialization compiled through `invoke` of `m` for argument types that dispatch to another method
+# is named as a sweep names it, and no declaration can cover it.
+function _coverage_finding(mod::Module, m::Method, mi::Core.MethodInstance)
     fname = string(_method_label(m))
+    tt = Tuple(mi.specTypes.parameters[2:end])
+    item = _entry_of(nothing, mi)
+    sig = _sig_string(item, tt)
+    item isa _Spec && return StrictFinding(
+        nameof(mod), fname, sig, :coverage, :fail, string(m.file), Int(m.line),
+        "`$fname$sig` has no registered StrictMode guarantee: this method runs for these argument " *
+            "types only through `invoke`, and a declaration names the method its signature " *
+            "dispatches to, which is another method of `$fname`",
+        "no declaration can name this row. `StrictModeTest.test_compiled` and " *
+            "`audit(mod; sweep = true)` check it as this method. Opt it out visibly with " *
+            "`@strict_exempt $fname` if it is cold by design."
+    )
     return StrictFinding(
         nameof(mod), fname, sig, :coverage, :fail, string(m.file), Int(m.line),
         "`$fname$sig` has no registered StrictMode guarantee",
@@ -1518,24 +1550,25 @@ end
 # declaration exists, which is a fact, not an inference.
 function _coverage_all_findings(mod::Module; only = nothing, exempt = ())
     ms, skipped = module_methods(mod; only, exempt)
-    keys_ = collect(keys(declarations()))
+    index = _declared_methods(keys(declarations()))
     out = StrictFinding[]
     for m in ms
         # Every concrete signature this method has compiled must be declared, not just one of them:
         # a declaration names a signature, and one instantiation says nothing about the others that
         # reach the same body. Declaring `f(Float64)` leaves `f(Int32)` unchecked, and a gate that
-        # counted the method as covered would hide exactly that.
-        sigs = _method_signatures(m)
-        if !isempty(sigs)
-            for tt in sigs
-                _signature_declared(m, tt, keys_) && continue
-                push!(out, _coverage_finding(mod, m, _sig_string(Tuple(tt))))
+        # counted the method as covered would hide exactly that. A declaration counts only for the
+        # method it dispatches to (`_declared_methods`).
+        rows = _compiled_rows(m)
+        if !isempty(rows)
+            for mi in rows
+                _signature_declared(m, mi.specTypes, index) && continue
+                push!(out, _coverage_finding(mod, m, mi))
             end
             continue
         end
         # Nothing has compiled, so there is no signature to name: the only claim available is that
         # some declaration speaks for the method at all.
-        _method_declared(m, keys_) && continue
+        _method_declared(m, index) && continue
         fname = string(_method_label(m))
         # The argument types, rendered as every other finding renders them. A method's `sig` also
         # carries the function's own type as its first parameter, which a reader does not need.

@@ -197,7 +197,10 @@
     # R10 A module sweep checks each specialization it lists as an entry point. The helper's wider
     #    method, compiled only through `invoke`, is one row, named `via invoke of` that method, and
     #    its causes are the helper's own effect. The specific method, `-1.0`, passes wherever it has
-    #    a row; it has one when anything inferred a call of it, the analysis itself included.
+    #    a row; it has one when anything inferred a call of it, the analysis itself included. A
+    #    declaration or a `types` exemption names the one method its signature selects: declaring
+    #    `(W, Int)` leaves the wider row the only undeclared one, exempting `(W, Int)` leaves its
+    #    verdict as it is, and exempting `(W, Integer)` turns it into an `:info` note in both tiers.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
 
     # What a sweep of the helper's function reports, for a case whose helper is reached by `invoke`
@@ -206,7 +209,10 @@
         (k.shape === :invoke && k.pos === :helper) || return nothing
         c = effect_cause(k.effect)
         v = c === :alloc ? (:fail, :SM0002) : c === :wait ? (:fail, :SM0017) : (:pass, nothing)
-        return (; scan = v, proof = v, others = :pass)
+        return (;
+            scan = v, proof = v, others = :pass, undeclared = [true],
+            narrow = (; scan = v, proof = v), wide = (; scan = (:info, :SM0002), proof = (:info, :SM0002)),
+        )
     end
 
     function causes(k::Case)
@@ -276,7 +282,30 @@
                 wide(x) = occursin(" via invoke of ", x.signature)
                 row(fs) = (r = filter(wide, fs); length(r) == 1 ? verdict(only(r)) : (:rows, length(r)))
                 others = all(x -> wide(x) || x.status === :pass, vcat(sf, pf)) ? :pass : :fail
-                sweep = (; scan = row(sf), proof = row(pf), others)
+                # The coverage gate and a `types` exemption, each naming the specific method or the
+                # wider one.
+                A = (M.W, Int)
+                StrictMode.register_strict!(M.mid, A; guarantees = (:noalloc,))
+                undeclared = try
+                    map(wide, filter(StrictMode._failed, StrictMode._coverage_all_findings(M; only = [:mid])))
+                finally
+                    delete!(StrictMode.STRICT_REGISTRY, (M.mid, A))
+                end
+                function exempted(types)
+                    StrictMode._exempt!(:mid; types, guarantees = (:noalloc,))
+                    try
+                        return (;
+                            scan = row(StrictMode._findings_compiled(M; guarantees = (:noalloc,), only = [:mid])),
+                            proof = row(StrictModeTest.proof_findings(M; guarantees = (:noalloc,), only = [:mid])),
+                        )
+                    finally
+                        filter!(e -> e.func !== :mid, StrictMode.STRICT_EXEMPT)
+                    end
+                end
+                sweep = (;
+                    scan = row(sf), proof = row(pf), others, undeclared,
+                    narrow = exempted(A), wide = exempted((M.W, Integer)),
+                )
             end
             return (; name = k.name, scan, proof, proof_ae, diverged = !isempty(d), cause = !isempty(d.cause_diverged), sweep)
         finally

@@ -57,3 +57,79 @@ end
     @test occursin("Integer", only(fs).signature)
     @test occursin("ArgumentError", only(fs).reason)
 end
+
+@testitem "a declaration covers only the method its signature dispatches to" begin
+    using StrictMode
+    include(joinpath(@__DIR__, "sweep_invoke_fixtures.jl"))
+    M = SweepInvoke
+    M.warm!()
+    A = Vector{Float64}
+    undeclared(name) = filter(
+        x -> x.guarantee === :coverage && x.status === :fail, audit(M; require = :all, only = [name])
+    )
+    StrictMode.clear_declarations!()
+    try
+        # `(A, Int)` dispatches to the specific method, so the wider method's row, compiled for the
+        # same argument types through `invoke`, is undeclared, and the finding says why.
+        StrictMode.register_strict!(M.noalloc_d, (A, Int); guarantees = (:noalloc,))
+        fs = undeclared(:noalloc_d)
+        @test length(fs) == 1
+        @test only(fs).signature == "(Vector{Float64}, Int64) via invoke of (Vector{Float64}, Integer)"
+        @test occursin("invoke", only(fs).reason)
+        @test occursin("@strict_exempt", only(fs).suggestion)
+        # A signature the wider method is dispatched for declares that method's row, and only it.
+        M.noalloc_d([1.0], Int32(1))
+        @test length(undeclared(:noalloc_d)) == 2
+        StrictMode.register_strict!(M.noalloc_d, (A, Int32); guarantees = (:noalloc,))
+        fs = undeclared(:noalloc_d)
+        @test length(fs) == 1
+        @test occursin(" via invoke of ", only(fs).signature)
+        # A function with one method is covered by its declaration, as before.
+        StrictMode.register_strict!(M.noalloc_dp, (A, Int); guarantees = (:noalloc,))
+        @test isempty(undeclared(:noalloc_dp))
+        @test length(undeclared(:noalloc_cp)) == 1
+    finally
+        StrictMode.clear_declarations!()
+    end
+end
+
+@testitem "a narrow exemption excuses only the method its signature dispatches to" begin
+    using StrictMode
+    include(joinpath(@__DIR__, "narrow_invoke_fixtures.jl"))
+    A = Vector{Float64}
+    wide(x) = occursin(" via invoke of ", x.signature)
+    sweep(M) = StrictMode._findings_compiled(M; guarantees = (:noalloc,), only = [:d, :c])
+    row(fs, name, w) = only(filter(x -> x.func == name && wide(x) == w, fs)).status
+    scan(f) = only(findings(f, (A, Int); guarantees = (:noalloc,)))
+
+    # `(A, Int)` names the specific methods. The wider ones are judged on their own: `d`'s allocates
+    # and fails, `c`'s is clean and passes, and a caller reaching `d`'s through `invoke` fails.
+    N = narrow_invoke_module(@__MODULE__, "NarrowSpecific", "(Vector{Float64}, Int)")
+    fs = sweep(N)
+    @test length(fs) == 4
+    @test row(fs, "d", true) === :fail
+    @test row(fs, "d", false) === :info
+    @test row(fs, "c", true) === :pass
+    @test row(fs, "c", false) === :info
+    @test scan(N.dv).status === :fail
+    @test scan(N.dv).code === :SM0002
+    @test scan(N.cv).status === :pass
+
+    # `(A, Integer)` names the wider methods, which excuses their rows and the call `invoke` makes,
+    # and leaves the specific ones judged.
+    W = narrow_invoke_module(@__MODULE__, "NarrowWide", "(Vector{Float64}, Integer)")
+    fs = sweep(W)
+    @test row(fs, "d", true) === :info
+    @test row(fs, "d", false) === :pass
+    @test row(fs, "c", true) === :info
+    @test row(fs, "c", false) === :fail
+    @test scan(W.dv).status === :info
+    @test scan(W.cv).status === :pass
+    # A row the wider method is dispatched for is in that method and within the signature named, so
+    # `(A, Integer)` excuses it and `(A, Int)` does not.
+    int32(M) = only(filter(x -> x.func == "d" && occursin("Int32", x.signature), sweep(M))).status
+    W.d([1.0], Int32(1))
+    N.d([1.0], Int32(1))
+    @test int32(W) === :info
+    @test int32(N) === :fail
+end

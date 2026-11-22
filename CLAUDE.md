@@ -544,8 +544,12 @@ StrictMode/src/
                         _module_load_items) is the module that WROTE the declared method,
                         _mod_sym(f, types), the module its rows name, not the function's owner;
                         _coverage_all_findings
-                        is default-deny over it, _coverage_findings the narrower public-function
-                        form; _is_parametric_def keeps a `where` definition out of the registry.
+                        is default-deny over it. A declaration and a `types = (...)` exemption
+                        each name ONE method, the one their signature selects (_declared_methods,
+                        _covers via _key_method), so a wider method that an invoke compiled for the
+                        same argument types is neither declared nor excused by them; such a
+                        coverage row cannot be declared at all. _coverage_findings the narrower
+                        public-function form; _is_parametric_def keeps a `where` definition out of the registry.
                         _STORES/_store_for memoize each module's store so a reader never touches a
                         binding created in its own world (a Julia 1.12 warning, a later error).
                         declarations()/exemptions() union each loaded package's OWN store with this

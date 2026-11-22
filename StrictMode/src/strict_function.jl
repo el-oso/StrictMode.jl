@@ -313,6 +313,13 @@ A workspace or arena allocator is the case this exists for: it has to allocate, 
 go, while its concrete return type is the whole reason its callers can be fast and `:typestable`
 stays on to protect it. Exempting the function instead would hide exactly that.
 
+A subject can also be narrowed to a signature with `types = (...)`, as in
+`@strict_exempt :noalloc types = (Vector{Float64}, Integer) f`. That names one method, the one the
+signature selects, as `invoke(f, Tuple{Vector{Float64}, Integer}, …)` would select it, and excuses
+its specializations whose argument types are within the signature. Another method of `f` stays
+judged even for the same argument types: next to an exemption of `(Vector{Float64}, Int)`, a wider
+`f(a, n::Integer)` that an `invoke` compiled for `(Vector{Float64}, Int64)` is checked on its own.
+
 `reason = "..."` is carried into the report, where it is the difference between an opt-out a
 reviewer can judge and one they can only wonder about.
 

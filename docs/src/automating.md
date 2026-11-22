@@ -298,6 +298,12 @@ per method:
   `(Float64,)` leaves `(Int32)` reported, because nothing checked it.
 - A method nothing has compiled yet has no signature to name, so the gate falls back to asking
   whether any declaration speaks for the method at all.
+- A declaration counts for the method its signature dispatches to, which is the method
+  `test_registered` checks, and for no other. With `f(x, n::Integer)` and `f(x, n::Int)`,
+  declaring `(Int, Int)` covers the second. A row the sweep lists as
+  `(Int64, Int64) via invoke of (Any, Integer)` belongs to the first, and no signature dispatches
+  to it, so it is reported as undeclared: `test_compiled` checks it, and `@strict_exempt f` opts
+  it out.
 
 Coverage therefore follows what actually ran. A signature that appears for the first time in a
 later run is reported then — which is the point: it was not checked before either.

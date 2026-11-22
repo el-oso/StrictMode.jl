@@ -2347,7 +2347,9 @@ function _mi_exemption(mi::Core.MethodInstance; declared_in_module::Bool = false
         else
             (isnothing(mod) || mod === root) || continue
         end
-        _covers(e, name, types, :noalloc) && return e
+        # The specialization is named by its MethodInstance, as a `_Spec` names it, so an exemption
+        # that names another method of the function does not cover it.
+        _covers(e, name, _Spec(mi), types, :noalloc) && return e
     end
     return nothing
 end
