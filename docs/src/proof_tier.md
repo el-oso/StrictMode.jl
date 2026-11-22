@@ -131,11 +131,11 @@ barrier, and the allocation sites the barrier accounts for are dropped, from eit
 run (see "Error paths" in the guarantees page for the second one). When no site is left but the
 value-free scan finds allocation, boxing or an abstract-eltype container in the call, every site
 is kept and reported, the barrier's included, so the proof is never more permissive than the scan.
-A site is the barrier's when its backtrace passes through the barrier,
-when none of its frames lies outside Base and Core, or when its function is reached from a barrier
-and on no path from the call that avoids one. The last case covers a helper the barrier calls
-from several places: it is compiled once, and AllocCheck ends its backtrace at a frame named
-"multiple call sites", so the backtrace cannot name the barrier. If the call also reaches that
+A site is the barrier's when its backtrace passes through the barrier, or when its function is
+reached from a barrier and on no path from the call that avoids one. The second case covers a
+helper the barrier calls from several places, and the lock and task internals of a once-guard: it
+is compiled once, and AllocCheck ends its backtrace at a frame named "multiple call sites", so the
+backtrace cannot name the barrier. If the call also reaches that
 helper outside the barrier, its sites are kept, as they are whenever the call graph outside the
 barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape,

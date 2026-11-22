@@ -974,6 +974,56 @@ end
     end
 end
 
+@testitem "a barrier does not excuse a lock wait in a helper compiled for several callers" begin
+    using StrictMode, StrictModeTest, Test
+
+    # Two callers of `unsafe_write(::IOStream, …)`: AllocCheck ends the backtrace of its lock-wait
+    # sites at "multiple call sites", so no frame outside Base and Core is left on them. The wait is
+    # reached outside any barrier, so it is the call's, exempt pool or not.
+    module TwoWriters
+    using StrictMode
+    mutable struct W
+        io::IOStream
+        a::Vector{Float64}
+        m::Matrix{Float64}
+    end
+    @noinline wra(w::W) = (write(w.io, w.a); 0.0)
+    @noinline wrb(w::W) = (write(w.io, w.m); 0.0)
+    @noinline wr1(w::W) = (write(w.io, w.a); 0.0)
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    @noinline drive(f::F, n::Int) where {F} = (s = 0.0; for i in 1:n
+            s += f(i)
+        end; s)
+    c_two(w::W, n::Int) = drive(i -> wra(w) + wrb(w), n)
+    c_two_ex(w::W, n::Int) = drive(i -> wra(w) + wrb(w) + grow!(i)[1], n)
+    d_two_ex(w::W, n::Int) = wra(w) + wrb(w) + grow!(n)[1]
+    c1(w::W, n::Int) = drive(i -> wr1(w), n)
+    const TW = W(open(tempname(), "w"), zeros(4), zeros(2, 2))
+    end
+    T = TwoWriters
+    tt = (T.W, Int)
+    waits(a) = any(fr -> fr.func === :_wait2, a.backtrace)
+    for f in (T.c_two, T.c_two_ex, T.d_two_ex, T.c1)
+        f(T.TW, 2)
+        for allow_exempt in (false, true)
+            p = only(StrictModeTest.proof_findings(f, tt; guarantees = (:noalloc,), allow_exempt))
+            @test StrictMode._failed(p)
+            @test p.code !== :SM0018
+        end
+        kept, _ = StrictModeTest._checked_allocs(f, tt)
+        @test any(waits, kept)
+    end
+    # With nothing else allocating, every site kept is the wait.
+    for f in (T.c_two, T.c1)
+        @test only(StrictModeTest.proof_findings(f, tt; guarantees = (:noalloc,))).code === :SM0017
+    end
+end
+
 @testitem "proof_audit and proof_findings(mod) accept exemptions with allow_exempt" begin
     using StrictMode, StrictModeTest, Test
 

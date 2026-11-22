@@ -636,12 +636,15 @@ end
 # Barrier-aware wrapper around `_raw_allocs`. A call that reaches a one-time-init allocation barrier
 # (StrictMode's `barrier` signal) keeps AllocCheck's all-paths proof; only the sites the barrier
 # accounts for are dropped. A site is the barrier's when its backtrace passes through the barrier's
-# own frame, or when no frame of it lies outside Base and Core: AllocCheck merges the lock and task
-# internals of a once-guard into "multiple call sites" with no caller left to name (24 of 52 sites on
-# a `OncePerProcess` calibrator), and those are the guard's. A site is the barrier's too when its
-# function is reached only through a barrier (`_only_through_barrier`). Every other site stands, so a
-# buffer grown later through the barrier's accessor is still reported where it grows; the value-free
-# scan stops two calls deep and cannot see it.
+# own frame, or when its function is reached only through a barrier (`_only_through_barrier`). The
+# second covers a function compiled once for several callers: AllocCheck ends its backtrace at
+# "multiple call sites", which names no caller, so only the call graph can place it (24 of 52 sites
+# on a `OncePerProcess` calibrator are the guard's lock and task internals, merged this way). A
+# merged site the call also reaches outside a barrier, such as a lock wait in a stream write two
+# callers share, is the call's own, and so is every site when the call graph outside the barriers
+# cannot be read in full. Every other site stands, so a buffer grown later through the barrier's
+# accessor is still reported where it grows; the value-free scan stops two calls deep and cannot see
+# it.
 # The filter applies to every site, whichever AllocCheck run found it. When the scan finds allocation,
 # boxing or an abstract-eltype container and the filter leaves no site, the unfiltered proof is
 # returned, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
@@ -650,7 +653,7 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     _IGNORE_BARRIER[] || return (allocs, false)
     sig = StrictMode._alloc_signals(f, types)
     sig.barrier || return (allocs, false)
-    kept = filter(a -> !_through_barrier(a) && _has_user_frame(a), allocs)
+    kept = filter(!_through_barrier, allocs)
     if !isempty(kept)
         inside = _only_through_barrier(StrictMode._sigtype(f, types))
         isnothing(inside) || filter!(a -> !(_site_mi(a) in inside), kept)
@@ -875,12 +878,6 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
         end
     end
     return (reached, barriers, complete)
-end
-
-_has_user_frame(@nospecialize(a)) = any(a.backtrace) do fr
-    mi = _frame_mi(fr)
-    mi isa Core.MethodInstance && mi.def isa Method &&
-        !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
 end
 
 # The name of the first barrier frame any site passes through, for the note.
