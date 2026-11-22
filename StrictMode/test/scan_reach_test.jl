@@ -693,3 +693,29 @@ end
     ci = StrictMode._typed_body(sig3)
     @test !any(i -> StrictMode._stmt_in_scheduler(ci, sig3, i), eachindex(ci.code))
 end
+
+@testitem "a method reached by a wider invoke is never read as the method its signature names" begin
+    using StrictMode
+    # `invoke` runs the `Integer` method on an `Int`. The signature `(W, Int)` dispatches to the other
+    # method, which allocates nothing, and the scan reads a body by its signature.
+    @noinline wide(w, n::Integer) = sum(zeros(n))
+    @noinline wide(w, n::Int) = -1.0
+    via_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
+    by_dispatch(w::Vector{Float64}, n::Int) = wide(w, n)
+    @noinline clean(w, n::Integer) = Float64(n)
+    @noinline clean(w, n::Int) = -1.0
+    clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
+    T = (Vector{Float64}, Int)
+
+    @test via_invoke([1.0], 3) == 0.0 && by_dispatch([1.0], 3) == -1.0
+    for g in (:noalloc, :noboxing)
+        @test !StrictMode._failed(only(StrictMode.findings(by_dispatch, T; guarantees = (g,))))
+        # The scan cannot read the invoked method, so it does not pass a call of it, whatever the
+        # method does.
+        for f in (via_invoke, clean_invoke)
+            r = only(StrictMode.findings(f, T; guarantees = (g,)))
+            @test StrictMode._failed(r)
+            @test r.code === :SM0207
+        end
+    end
+end

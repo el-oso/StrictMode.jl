@@ -265,6 +265,13 @@ StrictMode/src/
                         under :noalloc a box is an allocation, so a caller of a registered
                         barrier that boxes passes with no note, as a caller of a once-guard does;
                         the :info note that names the barrier is :noboxing's and :owned's.
+                        A WIDER INVOKE is unread: every walk reads a body by the signature that
+                        dispatches to it (_typed_body), and `invoke(f, Tuple{wider}, args...)`
+                        names a specialization whose signature dispatches to ANOTHER method
+                        (_names_other_method). _scan_ci does not follow that callee and marks the
+                        result truncated (SM0207), so the call never passes on the strength of the
+                        other method's body. The proof reads it (_reach_body, by specialization),
+                        which makes this a real cause_diverged case: SM0207 against SM0002.
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch

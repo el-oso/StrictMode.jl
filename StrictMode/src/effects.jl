@@ -1118,6 +1118,21 @@ function _sig_instance(@nospecialize(sig), world::UInt)
     return mi isa Core.MethodInstance ? mi : nothing
 end
 
+# Whether the signature of the specialization `mi` dispatches to a method other than its own. It
+# does for a method reached by `invoke` with a signature wider than its arguments, where a more
+# specific method answers the signature. A body read by signature (`_typed_body`) is then that other
+# method's, so `mi` cannot be read that way.
+#
+# The read of that body records what the signature dispatches to in this world, so the question
+# costs no second method lookup.
+function _names_other_method(mi::Core.MethodInstance)
+    sig = mi.specTypes
+    _typed_body(sig)
+    hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
+    own = isnothing(hit) ? nothing : hit[1].mi
+    return own isa Core.MethodInstance && own.def !== mi.def
+end
+
 # The compiler's record of a specialization in `world`: the cached `CodeInstance` that says in which
 # worlds its inference holds.
 function _record_of(mi::Core.MethodInstance, world::UInt)
@@ -2130,7 +2145,10 @@ function _scan_ci(
                         # Under `:alloc` that is all of it: a box is an allocation. The other modes
                         # read a registered barrier for the causes it does not excuse.
                         barrier = true
-                        if depth > 0 && mode !== :alloc && _is_registered_callee(first(mi.specTypes.parameters))
+                        registered = depth > 0 && mode !== :alloc && _is_registered_callee(first(mi.specTypes.parameters))
+                        if registered && _names_other_method(mi)
+                            truncated = true
+                        elseif registered
                             _, b2, d2, _, _, _, _, bd2, bb2, _ = _excused_signals(mi, depth - 1, seen, mode, callee_caught(i))
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
@@ -2164,6 +2182,10 @@ function _scan_ci(
                         undecided = mode === :full ? (!alloc || !boxing || !dictlookup) :
                             mode === :alloc ? (!alloc && !boxing) : !boxing
                         if follows && undecided && length(seen) > _SCAN_BODY_BUDGET[]
+                            truncated = true
+                        elseif follows && undecided && _names_other_method(mi)
+                            # Its body cannot be read by signature, and no walk reads one another
+                            # way, so what it does is not in this verdict.
                             truncated = true
                         elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
