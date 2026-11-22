@@ -2,7 +2,9 @@
 # StrictMode's own static rule agrees with it.
 
 @testitem "issue #20: juliac WARNINGS are not trim failures" begin
-    using StrictMode, StrictModeTest, TrimCheck
+    using StrictMode, StrictModeTest
+    # Through StrictModeTest, which depends on TrimCheck: StrictMode's test environment does not.
+    using StrictModeTest: TrimCheck
     # `TrimVerificationErrors.errors` is a `Vector{Pair{Bool, Any}}` whose Bool is `warn`, and
     # juliac's own gate fails only on the non-warning entries. Counting warnings as failures reds
     # signatures juliac itself would build. A warnings-only raise cannot be provoked deterministically
