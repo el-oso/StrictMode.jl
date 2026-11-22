@@ -140,3 +140,39 @@ end
     @test occursin("different cause", s) && occursin("SM0017", s) && occursin("SM0002", s)
     @test !occursin("c_two_ex", s) && !occursin("grow", s)
 end
+
+@testitem "a call the scan cannot read and the proof can is a different cause" begin
+    using StrictMode, StrictModeTest, Test
+
+    # `invoke` runs the `Integer` method on an `Int`. The scan reads a body by the signature that
+    # dispatches to it, and `(W, Int)` dispatches to the other method, so it reports the call tree
+    # as unread (SM0207). AllocCheck compiles the method `invoke` names and finds its allocation
+    # (SM0002). Both fail, for causes only one of them can see.
+    module WiderInvoke
+    @noinline wide(w, n::Integer) = sum(zeros(n))
+    @noinline wide(w, n::Int) = -1.0
+    alloc_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
+    @noinline clean(w, n::Integer) = Float64(n)
+    @noinline clean(w, n::Int) = -1.0
+    clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
+    end
+    M = WiderInvoke
+    T = (Vector{Float64}, Int)
+    M.alloc_invoke([1.0], 2); M.clean_invoke([1.0], 2)
+
+    @test only(StrictMode.findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0207
+    @test only(StrictModeTest.proof_findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0002
+    d = divergence_report(M.alloc_invoke, T; guarantees = (:noalloc,))
+    @test isempty(d)
+    @test isempty(d.diverged)
+    @test d.cause_diverged == [(:noalloc, :SM0207, :SM0002)]
+    s = sprint(show, d)
+    @test occursin("different cause", s) && occursin("SM0207", s) && occursin("SM0002", s)
+
+    # Where the invoked method allocates nothing, the proof passes and the scan still cannot say:
+    # that is a different verdict, not a different cause.
+    @test !StrictMode._failed(only(StrictModeTest.proof_findings(M.clean_invoke, T; guarantees = (:noalloc,))))
+    d = divergence_report(M.clean_invoke, T; guarantees = (:noalloc,))
+    @test d.diverged == [(:noalloc, true, false)]
+    @test isempty(d.cause_diverged)
+end

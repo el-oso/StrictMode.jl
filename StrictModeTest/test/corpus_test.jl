@@ -1,7 +1,8 @@
 # A generated corpus for `:noalloc`: every combination of a wrapper (none, an exempt function, a
 # registered barrier, a `OncePerProcess` or `OncePerThread` guard, or two of them nested), the way the
 # wrapper reaches a helper, whether the caller also calls the helper itself, whether the helper is
-# compiled for one caller or several, and what the helper does. The expected verdict of each case is
+# compiled for one caller or several, and what the helper does. A second set gives the helper's
+# caller, or the wrapper, each of the declaration and call shapes in `SHAPES`. The expected verdict of each case is
 # computed from the documented rules alone (`expected`), never from either engine, and both engines
 # and `divergence_report` are compared against it.
 @testmodule NoallocCorpus begin
@@ -13,6 +14,12 @@
     const COMPS = (:single, :multi)
     const EFFECTS = (:alloc, :iowait, :throw, :caught, :none)
     const NESTS = (:bar_in_ex, :ex_in_bar)
+    # How a function is declared and called (`shaped`). Each is a call whose callee Julia compiles for
+    # a signature other than the argument types at the call, or reaches by a route other than an
+    # ordinary positional call.
+    const SHAPES = (:any, :absvec, :vararg, :invoke, :nospec, :typespec, :typewide, :callable, :kw, :pair, :pair2)
+    const POSITIONS = (:helper, :wrapper)
+    const SHAPE_EFFECTS = (:alloc, :iowait, :caught, :none)
 
     # The helper's body for each effect: `h(w::W, n::Int)::Float64`.
     const EFFECT_SRC = Dict(
@@ -31,6 +38,8 @@
         repeat::Symbol
         comp::Symbol
         effect::Symbol
+        shape::Symbol       # one of SHAPES, or :plain
+        pos::Symbol         # which function has the shape: one of POSITIONS, or :none
     end
 
     meaningful(w, r, rep) =
@@ -42,12 +51,48 @@
         out = Case[]
         for w in WRAPPERS, r in REACHES, rep in REPEATS, c in COMPS, e in EFFECTS
             meaningful(w, r, rep) || continue
-            push!(out, Case(join(("c", w, r, rep, c, e), "_"), w, :none, r, rep, c, e))
+            push!(out, Case(join(("c", w, r, rep, c, e), "_"), w, :none, r, rep, c, e, :plain, :none))
         end
         for nst in NESTS, rep in REPEATS, c in COMPS, e in EFFECTS
-            push!(out, Case(join(("n", nst, rep, c, e), "_"), :nested, nst, :inside, rep, c, e))
+            push!(out, Case(join(("n", nst, rep, c, e), "_"), :nested, nst, :inside, rep, c, e, :plain, :none))
         end
         return out
+    end
+
+    # Every shape, as the helper's caller under each wrapper and as the wrapper itself.
+    function shape_cases()
+        out = Case[]
+        for s in SHAPES, w in WRAPPERS, rep in (:once, :after), c in COMPS, e in SHAPE_EFFECTS
+            r = w === :none ? :direct : :inside
+            meaningful(w, r, rep) || continue
+            push!(out, Case(join(("s", s, w, rep, c, e), "_"), w, :none, r, rep, c, e, s, :helper))
+        end
+        for s in SHAPES, w in (:exempt, :barrier), c in COMPS, e in SHAPE_EFFECTS
+            s in (:pair, :pair2) && continue        # two helpers, and there is one wrapper
+            push!(out, Case(join(("sw", s, w, c, e), "_"), w, :none, :inside, :once, c, e, s, :wrapper))
+        end
+        return out
+    end
+
+    # The definition of `name` in shape `s`, running `inner` (an expression in `w` and `n`), and the
+    # call of it from a scope that has `w::W` and `n::Int`.
+    function shaped(s::Symbol, name::String, inner::String)
+        def(sig, body = inner) = "@noinline function $sig\n    $body\nend"
+        s === :any && return def("$name(w::Any, n::Real)"), "$name(w, n)"
+        s === :absvec && return def("$name(w, v::AbstractVector, n::Integer)"), "$name(w, w.a, n)"
+        s === :vararg && return def("$name(xs...)", "w, n = xs[1], xs[2]\n    $inner"), "$name(w, n, 1, 2.0, 0x03)"
+        s === :invoke && return def("$name(w, n::Integer)") * "\n@noinline $name(w, n::Int) = -1.0",
+            "invoke($name, Tuple{W, Integer}, w, n)"
+        s === :nospec && return def("$name(w, @nospecialize(x), n)"), "$name(w, w.a, n)"
+        s === :typespec && return def("$name(::Type{T}, w, n) where {T}", "$inner + zero(T)"), "$name(Float64, w, n)"
+        s === :typewide && return def("$name(T, w, n)"), "$name(Float64, w, n)"
+        s === :callable && return "struct $(name)_T\n    k::Int\nend\n" * def("(m::$(name)_T)(w, n)", "$inner + m.k") *
+            "\nconst $name = $(name)_T(0)", "$name(w, n)"
+        s === :kw && return def("$name(w, n; k::Int = 0)", "$inner + k"), "$name(w, n; k = 0)"
+        a, b = s === :pair ? (:nospec, :kw) : (:vararg, :typewide)
+        da, ca = shaped(a, name * "a", inner)
+        db, cb = shaped(b, name * "b", inner)
+        return da * "\n" * db, "($ca + $cb)"
     end
 
     function source(k::Case)
@@ -65,11 +110,16 @@
                 $(EFFECT_SRC[k.effect])
             end"""
         )
+        hcall = "h(w, n)"
+        if k.pos === :helper
+            defs, hcall = shaped(k.shape, "mid", "h(w, n)")
+            println(io, defs)
+        end
         if k.comp === :single
-            println(io, "@noinline site(w::W, n::Int) = h(w, n)")
+            println(io, "@noinline site(w::W, n::Int) = $hcall")
         else
-            println(io, "@noinline ha(w::W, n::Int) = h(w, n)")
-            println(io, "@noinline hb(w::W, n::Int) = h(w, n) + 0.5")
+            println(io, "@noinline ha(w::W, n::Int) = $hcall")
+            println(io, "@noinline hb(w::W, n::Int) = $hcall + 0.5")
             println(io, "@noinline site(w::W, n::Int) = ha(w, n) + hb(w, n)")
         end
         println(io, "const TW = W(open(tempname(), \"w\"), zeros(4))")
@@ -98,11 +148,16 @@
             if r === :handed
                 println(io, "@noinline wr(g::G, w::W, n::Int) where {G} = g(w, n)")
                 call = "wr(site, w, n)"
+            elseif k.pos === :wrapper
+                defs, call = shaped(k.shape, "wr", body)
+                println(io, defs)
             else
                 println(io, "@noinline wr(w::W, n::Int) = $body")
                 call = r === :lock_outer ? "lock(() -> wr(w, n), LK)" : "wr(w, n)"
             end
-            w === :exempt && println(io, "@strict_exempt :noalloc reason = \"corpus\" wr")
+            # A callable's method is named for its type.
+            exname = k.pos === :wrapper && k.shape === :callable ? "wr_T" : "wr"
+            w === :exempt && println(io, "@strict_exempt :noalloc reason = \"corpus\" $exname")
             r === :direct && (call = "wr(w, n) + site(w, n)")
         else
             T = w === :oncep ? "OncePerProcess" : "OncePerThread"
@@ -135,14 +190,25 @@
     # R7 A helper the caller also calls itself is the caller's there.
     # R8 Any counted allocation is SM0002; counted causes that are all waits are SM0017; with no
     #    counted cause, exempt ones are R3.
+    # R9 A method reached by `invoke` with a signature wider than its arguments is unreadable to the
+    #    scan, which reads a body by the signature that dispatches to it. Where the scan meets such a
+    #    call, outside a barrier, and finds no counted cause elsewhere, it fails with the call tree
+    #    unread (SM0207). The proof reads the method. An exempt function reached that way excuses
+    #    nothing in either engine, since the code it was handed cannot be read.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
+
+    # R9: the wrapper is an exempt function reached by a wider `invoke`.
+    unread_exempt(k::Case) = k.shape === :invoke && k.pos === :wrapper && k.wrapper === :exempt
+    # R9: the scan meets a wider `invoke` outside a barrier.
+    scan_unread(k::Case) = unread_exempt(k) ||
+        (k.shape === :invoke && k.pos === :helper && k.wrapper in (:none, :exempt))
 
     function causes(k::Case)
         cs = Tuple{Symbol, Symbol}[]
         ec = effect_cause(k.effect)
         add!(c, ctx) = isnothing(c) || push!(cs, (c, ctx))
         w, r = k.wrapper, k.reach
-        ctxw = w === :none ? :caller : w === :exempt ? :exempt : :guarded
+        ctxw = w === :none || unread_exempt(k) ? :caller : w === :exempt ? :exempt : :guarded
         if r === :direct
             add!(ec, :caller)
         elseif r === :handed
@@ -175,13 +241,24 @@
         else
             (:pass, nothing), (:pass, nothing), (:pass, nothing)
         end
-        return (; name = k.name, scan = s, proof = p, proof_ae = pa, diverged = false, cause = false)
+        if scan_unread(k)
+            # What the scan still reads is the helper the caller calls itself.
+            seen = k.repeat === :once ? nothing : effect_cause(k.effect)
+            s = seen === :alloc ? (:fail, :SM0002) : seen === :wait ? (:fail, :SM0017) : (:fail, :SM0207)
+        end
+        # The scan's note and the proof's SM0018 name the same exempt callee, so they agree.
+        sfail = s[1] === :fail
+        pfail = p[1] === :fail && !(p[2] === :SM0018 && s[1] === :info)
+        return (;
+            name = k.name, scan = s, proof = p, proof_ae = pa,
+            diverged = sfail != pfail, cause = sfail && p[1] === :fail && s[2] !== p[2],
+        )
     end
 
     verdict(f) = f.status === :pass ? (:pass, nothing) : (f.status, f.code)
 
     function observe(k::Case, M::Module)
-        k.wrapper === :barrier && register_alloc_barrier!(M.wr)
+        k.wrapper === :barrier && register_alloc_barrier!(M.wr isa Function ? M.wr : typeof(M.wr))
         k.wrapper === :nested && register_alloc_barrier!(M.bar)
         tt = (M.W, Int)
         try
@@ -202,10 +279,10 @@
         Base.invokelatest(observe, k, Base.include_string(into, source(k), k.name * ".jl")::Module)
     # Every case of one wrapper, as `(expected, observed)`. The barriers the cases register are
     # dropped again afterwards.
-    function run(wrapper::Symbol, into::Module)
+    function run(wrapper::Symbol, into::Module; from = cases)
         saved = copy(StrictMode._ALLOC_BARRIERS)
         try
-            return [(expected(k), observed(k, into)) for k in cases() if k.wrapper === wrapper]
+            return [(expected(k), observed(k, into)) for k in from() if k.wrapper === wrapper]
         finally
             empty!(StrictMode._ALLOC_BARRIERS)
             union!(StrictMode._ALLOC_BARRIERS, saved)
@@ -246,6 +323,36 @@ end
 
 @testitem "noalloc corpus: exemption and barrier nested" setup = [NoallocCorpus] begin
     for (e, o) in NoallocCorpus.run(:nested, @__MODULE__)
+        @test o == e
+    end
+end
+
+@testitem "noalloc corpus: callee shapes, no wrapper" setup = [NoallocCorpus] begin
+    for (e, o) in NoallocCorpus.run(:none, @__MODULE__; from = NoallocCorpus.shape_cases)
+        @test o == e
+    end
+end
+
+@testitem "noalloc corpus: callee shapes, exempt function" setup = [NoallocCorpus] begin
+    for (e, o) in NoallocCorpus.run(:exempt, @__MODULE__; from = NoallocCorpus.shape_cases)
+        @test o == e
+    end
+end
+
+@testitem "noalloc corpus: callee shapes, registered barrier" setup = [NoallocCorpus] begin
+    for (e, o) in NoallocCorpus.run(:barrier, @__MODULE__; from = NoallocCorpus.shape_cases)
+        @test o == e
+    end
+end
+
+@testitem "noalloc corpus: callee shapes, OncePerProcess guard" setup = [NoallocCorpus] begin
+    for (e, o) in NoallocCorpus.run(:oncep, @__MODULE__; from = NoallocCorpus.shape_cases)
+        @test o == e
+    end
+end
+
+@testitem "noalloc corpus: callee shapes, OncePerThread guard" setup = [NoallocCorpus] begin
+    for (e, o) in NoallocCorpus.run(:oncet, @__MODULE__; from = NoallocCorpus.shape_cases)
         @test o == e
     end
 end
