@@ -940,7 +940,17 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         not to the compilation signature Julia's :invoke names: a site's
                         specialization is otherwise in no set and a guarded helper that builds a
                         string fails (print_to_string(::String, ::Vararg{Any}) on 1.13). An edge
-                        whose specialization cannot be determined makes the graph incomplete. A
+                        whose specialization cannot be determined makes the graph incomplete. Each
+                        edge ALSO leads to the specialization the statement names, the one the
+                        native walk reports a dispatch in. A body whose signature dispatches to
+                        another method (a wider invoke) is read from the specialization itself
+                        (_reach_body); an exempt function reached that way excuses nothing, since
+                        its handed-in code is read by signature. OFF-GRAPH SITES: the graph is
+                        this package's reconstruction of what AllocCheck compiled, so a site
+                        whose specialization (_site_mi) the graph does not name (_off_graph)
+                        shows the two disagree. Such a site is kept as the call's own and the
+                        failure's reason names the specialization (_unplaced_note);
+                        _checked_allocs and _exempt_split each return those sites third. A
                         site is taken from the call only when the graph names its specialization
                         inside the excused callee; a graph that cannot
                         be read in full keeps the site. The filter runs on every site, from
@@ -958,7 +968,11 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         method's compilation signature (a passed-along `Function` stays `Function`)
                         and leaves a call dynamic when that signature is not compileable. The walk
                         reads natively optimized bodies and reports each non-builtin :call as a
-                        DynamicDispatch. _is_boxing reads a heap allocation of an isbits type as a
+                        DynamicDispatch. Its backtrace (_native_backtrace) follows the callers of
+                        the body while there is exactly ONE, and ends at a "multiple call sites"
+                        frame otherwise, as AllocCheck's does: a backtrace along one of several
+                        paths let an exempt function on that path take a dispatch the call also
+                        reaches outside it, depending on the order the calls were written in. _is_boxing reads a heap allocation of an isbits type as a
                         box; do NOT narrow it to `Any` slots: an abstract-eltype slot boxes the same
                         way and the site carries no destination.
                         CAUGHT THROWS: AllocCheck's ignore_throw drops every site leading to a throw,

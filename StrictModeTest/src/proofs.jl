@@ -446,7 +446,9 @@ function _native_walk(@nospecialize(f), @nospecialize(types))
     out = Any[]
     caught = false
     entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
-    parent = IdDict{Any, Any}(entry => nothing)
+    # Every caller of each body, in the order found. A backtrace is built once all are known.
+    parents = IdDict{Any, Vector{Core.MethodInstance}}()
+    found = Tuple{Core.MethodInstance, Symbol}[]
     visited = Set{Tuple{Core.MethodInstance, Any}}([(entry, false)])
     work = Tuple{Core.MethodInstance, Any}[(entry, false)]
     while !isempty(work)
@@ -456,27 +458,44 @@ function _native_walk(@nospecialize(f), @nospecialize(types))
         for step in steps
             if step isa Tuple
                 callee, ctx = step
+                ps = get!(() -> Core.MethodInstance[], parents, callee)
+                mi in ps || push!(ps, mi)
                 (callee, ctx) in visited && continue
                 push!(visited, (callee, ctx))
-                haskey(parent, callee) || (parent[callee] = mi)
                 push!(work, (callee, ctx))
             else
-                bt = Base.StackTraces.StackFrame[]
-                m = mi
-                while !isnothing(m)
-                    d = m.def
-                    push!(
-                        bt, d isa Method ?
-                            Base.StackTraces.StackFrame(d.name, d.file, Int(d.line), m, false, false, 0) :
-                            Base.StackTraces.StackFrame(Symbol("top-level scope"), :none, 0, m, false, false, 0)
-                    )
-                    m = parent[m]
-                end
-                push!(out, AllocCheck.DynamicDispatch(bt, step))
+                push!(found, (mi, step))
             end
         end
     end
+    for (mi, name) in found
+        push!(out, AllocCheck.DynamicDispatch(_native_backtrace(mi, entry, parents), name))
+    end
     return out, caught
+end
+
+# The backtrace of a dispatch in the body `mi`: its callers up to `entry`, while there is one caller
+# to name. A body with several callers ends it with the frame AllocCheck ends its own with there,
+# "multiple call sites", so a reader places the site by the call graph and not by one of the paths.
+function _native_backtrace(mi::Core.MethodInstance, entry::Core.MethodInstance, parents::IdDict)
+    bt = Base.StackTraces.StackFrame[]
+    m = mi
+    while true
+        d = m.def
+        push!(
+            bt, d isa Method ?
+                Base.StackTraces.StackFrame(d.name, d.file, Int(d.line), m, false, false, 0) :
+                Base.StackTraces.StackFrame(Symbol("top-level scope"), :none, 0, m, false, false, 0)
+        )
+        m === entry && break
+        ps = get(parents, m, nothing)
+        if isnothing(ps) || length(ps) != 1 || length(bt) > length(parents)
+            push!(bt, Base.StackTraces.StackFrame("multiple call sites", "unknown", 0))
+            break
+        end
+        m = only(ps)
+    end
+    return bt
 end
 
 # What the walk reads from one optimized body: in statement order, each `:invoke` as its
@@ -647,18 +666,24 @@ end
 # it.
 # The filter applies to every site, whichever AllocCheck run found it. When the scan finds allocation,
 # boxing or an abstract-eltype container and the filter leaves no site, the unfiltered proof is
-# returned, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
+# returned, so the proof is never more permissive than the scan. Returns `(allocs, exempted, unplaced)`;
+# `unplaced` are the sites kept because the call graph does not name their specialization (`_off_graph`).
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     allocs = _not_own_excused(f, _raw_allocs(f, types))
-    _IGNORE_BARRIER[] || return (allocs, false)
+    _IGNORE_BARRIER[] || return (allocs, false, empty(allocs))
     sig = StrictMode._alloc_signals(f, types)
-    sig.barrier || return (allocs, false)
+    sig.barrier || return (allocs, false, empty(allocs))
     kept = filter(!_through_barrier, allocs)
+    unplaced = empty(allocs)
     if !isempty(kept)
-        inside = _only_through_barrier(StrictMode._sigtype(f, types))
-        isnothing(inside) || filter!(a -> !(_site_mi(a) in inside), kept)
+        nodes = Base.IdSet{Core.MethodInstance}()
+        inside = _only_through_barrier(StrictMode._sigtype(f, types), nodes)
+        if !isnothing(inside)
+            filter!(a -> !(_site_mi(a) in inside), kept)
+            unplaced = filter(a -> _off_graph(a, nodes), kept)
+        end
     end
-    isempty(kept) && (sig.alloc || sig.boxing || !isnothing(sig.abscontainer)) && return (allocs, false)
+    isempty(kept) && (sig.alloc || sig.boxing || !isnothing(sig.abscontainer)) && return (allocs, false, unplaced)
     excused = length(allocs) - length(kept)
     if excused > 0
         name = something(_barrier_frame_name(allocs), :barrier)
@@ -666,7 +691,27 @@ function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
             "$excused allocation site(s) inside it are excused, $(length(kept)) other(s) checked as " *
             "usual. Disable with set_ignore_barrier!(false)." maxlog = 1
     end
-    return (kept, isempty(kept) && excused > 0)
+    return (kept, isempty(kept) && excused > 0, unplaced)
+end
+
+# Whether the call graph `nodes` does not name the specialization compiled around the site `a`. The
+# graph is read to reproduce what AllocCheck compiles, so each site's specialization is one of its
+# nodes. One that is not shows the two disagree about the code, and the graph then says nothing
+# about how that site is reached.
+function _off_graph(@nospecialize(a), nodes)
+    hasproperty(a, :backtrace) || return false
+    mi = _site_mi(a)
+    return mi isa Core.MethodInstance && !(mi in nodes)
+end
+
+# What a failure says of the sites the call graph does not name.
+function _unplaced_note(unplaced)
+    isempty(unplaced) && return ""
+    specs = unique!(String[sprint(show, _site_mi(a)) for a in unplaced])
+    return " " * string(length(unplaced)) * " site(s) could not be matched to the call graph and are " *
+        "counted as the call's own: the graph does not name " * join(("`" * s * "`" for s in specs), ", ") *
+        ". The graph is StrictModeTest's reading of what AllocCheck compiled, so this is a defect in " *
+        "that reading; please report it."
 end
 
 # Running pending finalizers is not the call's own allocation. Base's `unlock` does it on every lock,
@@ -687,8 +732,9 @@ end
 
 _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)
 
-# The allocation sites split by owner: `(own, by)`, the sites that are the call's own, and the exempt
-# functions that account for the rest, each with the reason its exemption gave. A site is taken from
+# The allocation sites split by owner: `(own, by, unplaced)`, the sites that are the call's own, the exempt
+# functions that account for the rest, each with the reason its exemption gave, and the own sites the
+# call graph was asked about and does not name (`_off_graph`). A site is taken from
 # the call only when the call graph places it in an exempt function; any other site is the call's.
 # A site is an exempt function's when its
 # backtrace passes through a frame whose METHOD an exemption covers for `:noalloc`: matched on the
@@ -704,7 +750,9 @@ _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : 
 function _exempt_split(allocs, @nospecialize(sig))
     by = Pair{String, String}[]
     own = empty(allocs)
+    unplaced = empty(allocs)
     inside = nothing
+    nodes = Base.IdSet{Core.MethodInstance}()
     for a in allocs
         if !hasproperty(a, :backtrace)
             push!(own, a)
@@ -726,8 +774,10 @@ function _exempt_split(allocs, @nospecialize(sig))
             _runs_handed_in(a, k, mi) ? (e = nothing) : break
         end
         if isnothing(e) && !framed
-            isnothing(inside) && (inside = something(_only_through_exempt(sig), IdDict{Core.MethodInstance, Any}()))
+            isnothing(inside) && (inside = something(_only_through_exempt(sig, nodes), IdDict{Core.MethodInstance, Any}()))
             e = get(inside, _site_mi(a), nothing)
+            # An empty `nodes` is a graph that was not read in full, which places no site.
+            isempty(nodes) || !_off_graph(a, nodes) || push!(unplaced, a)
         end
         if isnothing(e)
             push!(own, a)
@@ -736,7 +786,7 @@ function _exempt_split(allocs, @nospecialize(sig))
             p in by || push!(by, p)
         end
     end
-    return own, Tuple(by)
+    return own, Tuple(by), unplaced
 end
 
 # Whether the allocation site `a`, under the exempt function at backtrace frame `k`, runs code that
@@ -748,6 +798,7 @@ end
 # resolved), every site in or below the exempt frame counts, as in the scan.
 function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
     bt = a.backtrace
+    StrictMode._names_other_method(mi) && return true
     found, complete = StrictMode._handed_code(mi.specTypes)
     complete || return true
     (isempty(found) || k <= 1) && return false
@@ -798,25 +849,27 @@ const _BARRIER_WALK_MAX = 4096
 # compiled once, and AllocCheck ends the backtrace of its sites at a frame named "multiple call
 # sites", so the backtrace cannot say whether the barrier is on every path to it; this call graph
 # can. `nothing` when the graph outside the barriers could not be read in full, since an edge the
-# walk did not see may reach any site.
-function _only_through_barrier(@nospecialize(sig))
+# walk did not see may reach any site. `nodes` receives every specialization the graph names.
+function _only_through_barrier(@nospecialize(sig), nodes = Base.IdSet{Core.MethodInstance}())
     root = StrictMode._sig_instance(sig, Base.get_world_counter())
     root isa Core.MethodInstance || return nothing
     outside, barriers, complete = _invoke_reach(Core.MethodInstance[root], true)
     (complete && !isempty(barriers)) || return nothing
     inside, _, _ = _invoke_reach(collect(barriers), false)
+    union!(nodes, outside, barriers, inside)
     return Base.IdSet{Core.MethodInstance}(mi for mi in inside if !(mi in outside))
 end
 
 # The specializations the call `sig` reaches only by entering a callee exempt from `:noalloc` whose
 # handed-in code is read in full (`StrictMode._handed_code`), each mapped to that callee's exemption.
 # The code it calls that its caller handed in, and all that this reaches, is the caller's, and so is
-# not in the result. `nothing` when the graph could not be read in full.
-function _only_through_exempt(@nospecialize(sig))
+# not in the result. `nothing` when the graph could not be read in full. `nodes` receives every
+# specialization the graph names, and stays empty when it could not be read in full.
+function _only_through_exempt(@nospecialize(sig), nodes = Base.IdSet{Core.MethodInstance}())
     root = StrictMode._sig_instance(sig, Base.get_world_counter())
     root isa Core.MethodInstance || return nothing
     excuses(mi) = !isnothing(StrictMode._mi_exemption(mi; declared_in_module = true)) &&
-        StrictMode._handed_code(mi.specTypes)[2]
+        !StrictMode._names_other_method(mi) && StrictMode._handed_code(mi.specTypes)[2]
     outside, stops, complete = _invoke_reach(Core.MethodInstance[root], true; isstop = excuses)
     (complete && !isempty(stops)) || return nothing
     handed = Core.MethodInstance[]
@@ -831,21 +884,25 @@ function _only_through_exempt(@nospecialize(sig))
         union!(outside, theirs)
     end
     out = IdDict{Core.MethodInstance, Any}()
+    seen = copy(outside)
     for ex in stops
         e = StrictMode._mi_exemption(ex; declared_in_module = true)
         reached, _, done = _invoke_reach(Core.MethodInstance[ex], true; isstop = mi -> any(x -> x === mi, handed))
         done || return nothing
+        union!(seen, reached)
         for mi in reached
             mi in outside || haskey(out, mi) || (out[mi] = e)
         end
     end
+    union!(nodes, seen, stops)
     return out
 end
 
 # The specializations reached from `roots` along the `:invoke` edges of their optimized bodies,
 # which are the static calls AllocCheck compiles and follows. Each edge leads to the specialization
 # AllocCheck compiles for it (`_compiled_callee`), so a site's specialization (`_site_mi`) is one
-# the walk names. A call left to
+# the walk names. It also leads to the specialization the statement itself names, which is the
+# one Julia's own compiler runs and the native walk reports a dispatch in (`_native_walk`). A call left to
 # run-time dispatch is not such an edge: AllocCheck reports the dispatch itself and compiles nothing
 # behind it. With `stop`, a barrier is recorded rather than entered. Returns `(reached, barriers, complete)`;
 # `complete` is false when a body could not be read, when the specialization an edge leads to could
@@ -868,16 +925,19 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
         for st in ci.code
             st isa Expr || continue
             if st.head === :invoke || st.head === :invoke_modify
-                callee = StrictMode._invoke_mi(st.args[1])
-                isnothing(callee) || (callee = _compiled_callee(ci, mi, st, callee))
+                named = StrictMode._invoke_mi(st.args[1])
+                callee = isnothing(named) ? nothing : _compiled_callee(ci, mi, st, named)
                 if isnothing(callee)
                     complete = false
-                elseif !(callee in reached || callee in barriers)
-                    if stop && isstop(callee)
-                        push!(barriers, callee)
+                    continue
+                end
+                for c in (callee, named)
+                    (c in reached || c in barriers) && continue
+                    if stop && isstop(c)
+                        push!(barriers, c)
                     else
-                        push!(reached, callee)
-                        push!(queue, callee)
+                        push!(reached, c)
+                        push!(queue, c)
                     end
                 end
             elseif st.head === :call
@@ -891,12 +951,16 @@ function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = 
     return (reached, barriers, complete)
 end
 
-# The optimized body of the specialization `mi`, or `nothing` when the body its signature dispatches
-# to is another method's (a method reached by `invoke` with a wider signature).
+# The optimized body of the specialization `mi`, or `nothing` when it cannot be read. A signature
+# that dispatches to no single method leaves it unread. One that dispatches to another method, as
+# for a method reached by `invoke` with a wider signature, is read from the specialization itself.
 function _reach_body(mi::Core.MethodInstance)
-    own = StrictMode._sig_instance(mi.specTypes, Base.get_world_counter())
-    (own isa Core.MethodInstance && own.def === mi.def) || return nothing
-    return StrictMode._typed_body(mi.specTypes)
+    world = Base.get_world_counter()
+    own = StrictMode._sig_instance(mi.specTypes, world)
+    own isa Core.MethodInstance || return nothing
+    own.def === mi.def && return StrictMode._typed_body(mi.specTypes)
+    src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
+    return src isa Core.CodeInfo ? src : nothing
 end
 
 # The specialization AllocCheck compiles for the `:invoke` statement `st` in the body `ci` of
@@ -1675,9 +1739,9 @@ function _proof_findings(
     target = fn * sg
     # AllocCheck runs at most once per signature even when both allocation guarantees are asked
     # for: the boxing verdict is a filter over the same instance list.
-    allocs, alloc_error = if :noalloc in guarantees || :noboxing in guarantees
+    checked, alloc_error = if :noalloc in guarantees || :noboxing in guarantees
         try
-            (first(_checked_allocs(f, types)), nothing)
+            (_checked_allocs(f, types), nothing)
         catch err
             err isa StrictViolation && rethrow()
             (nothing, sprint(showerror, err))
@@ -1685,6 +1749,9 @@ function _proof_findings(
     else
         (nothing, nothing)
     end
+    allocs = isnothing(checked) ? nothing : checked[1]
+    # The sites kept because the call graph does not name their specialization (`_off_graph`).
+    unplaced = isnothing(checked) ? Any[] : checked[3]
     out = StrictFinding[]
     for g in guarantees
         shared = StrictMode._compiled_output_finding(g, f, types, md, fn, sg; tier = :proof)
@@ -1700,7 +1767,8 @@ function _proof_findings(
                 # sets them aside, and the call's own sites decide the result: none of its own is
                 # the exempt-only result, own sites that all wait are a wait, anything else is an
                 # allocation.
-                own, by = _exempt_split(allocs, StrictMode._sigtype(f, types))
+                own, by, offgraph = _exempt_split(allocs, StrictMode._sigtype(f, types))
+                note = _unplaced_note(filter(a -> any(u -> u === a, unplaced) || any(u -> u === a, offgraph), own))
                 file, line = _first_loc(isempty(own) ? allocs : own, false)
                 nexempt = length(allocs) - length(own)
                 if !isempty(own) && all(_scheduler_site, own)
@@ -1710,7 +1778,7 @@ function _proof_findings(
                             "blocks in the task scheduler: AllocCheck reports $(length(own)) site(s)" *
                                 (nexempt > 0 ? " outside functions exempt from :noalloc" : "") * ", all in " *
                                 "Base's task, lock and condition code (first: $(basename(file)):$line). It " *
-                                "waits for another task, so it can allocate.",
+                                "waits for another task, so it can allocate." * note,
                             file, line,
                             "if the wait is a pool join that is expected, register the function that joins " *
                                 "with `register_alloc_barrier!` or exempt it with `@strict_exempt` by name";
@@ -1735,7 +1803,7 @@ function _proof_findings(
                     push!(
                         out, _mkproof(
                             md, fn, sg, g, !isempty(allocs),
-                            "allocates ($(length(allocs)) site(s))", file, line
+                            "allocates ($(length(allocs)) site(s))" * (isempty(note) ? "" : "." * note), file, line
                         )
                     )
                 end

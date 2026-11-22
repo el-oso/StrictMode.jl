@@ -1541,3 +1541,90 @@ end
     @test !StrictMode._failed(only(StrictMode.findings(R.reads_err, (Int,); guarantees = (:noalloc,))))
     @test StrictMode._failed(proof(R.shows_err))
 end
+
+@testitem "a dispatch reached inside and outside an exempt function is the call's own" begin
+    using StrictMode, StrictModeTest, Test
+
+    # `relay` only passes `g` along, so Julia compiles it for `g::Function` and its call of `apply`
+    # is a dynamic dispatch there. AllocCheck compiles it for `typeof(abs)` and reports nothing, so
+    # the site comes from the native walk alone. `h` holds it, and is reached through the exempt
+    # `inside` and through `outside`.
+    module SharedDispatch
+    using StrictMode
+    @noinline relay(g, x) = apply(g, x)
+    @noinline apply(g::G, x) where {G} = g(x)
+    @noinline h(x::Int) = relay(abs, x)
+    @noinline site(x::Int) = h(x)
+    @noinline inside(x::Int) = site(x)
+    @noinline outside(x::Int) = h(x) + 1
+    @strict_exempt :noalloc reason = "test" inside
+    outside_first(x::Int) = outside(x) + inside(x)
+    inside_first(x::Int) = inside(x) + outside(x)
+    only_inside(x::Int) = inside(x)
+    end
+    M = SharedDispatch
+    proof(f; kw...) = only(StrictModeTest.proof_findings(f, (Int,); guarantees = (:noalloc,), kw...))
+    M.outside_first(-2); M.inside_first(-2); M.only_inside(-2)
+    @test any(a -> a isa StrictModeTest.AllocCheck.DynamicDispatch, StrictModeTest._raw_allocs(M.only_inside, (Int,)))
+    # The order the two paths are written in does not decide who owns the site.
+    for f in (M.outside_first, M.inside_first)
+        @test proof(f).code === :SM0002
+        @test StrictMode._failed(proof(f; allow_exempt = true))
+        @test only(StrictMode.findings(f, (Int,); guarantees = (:noalloc,))).code === :SM0002
+    end
+    @test proof(M.only_inside).code === :SM0018
+    @test !StrictMode._failed(proof(M.only_inside; allow_exempt = true))
+end
+
+@testitem "a site the call graph does not name is the call's own, and the failure says so" begin
+    using StrictMode, StrictModeTest, Test
+
+    module OffGraph
+    using StrictMode
+    @noinline helper(n::Int) = sum(zeros(n))
+    @noinline ha(n::Int) = helper(n)
+    @noinline hb(n::Int) = helper(n) + 0.5
+    @noinline inside(n::Int) = ha(n) + hb(n)
+    @strict_exempt :noalloc reason = "test" inside
+    caller(n::Int) = inside(n)
+    @noinline stray(n::Int) = sum(ones(n))
+    @noinline sa(n::Int) = stray(n)
+    @noinline sb(n::Int) = stray(n) + 0.5
+    elsewhere(n::Int) = sa(n) + sb(n)
+    end
+    M = OffGraph
+    try
+        M.caller(2); M.elsewhere(2)
+        sig = StrictMode._sigtype(M.caller, (Int,))
+        merged(a) = any(fr -> fr.func === Symbol("multiple call sites"), a.backtrace)
+        # The call's sites end at "multiple call sites", so the graph places them: in `inside`.
+        mine = StrictModeTest._raw_allocs(M.caller, (Int,))
+        @test !isempty(mine) && all(merged, mine)
+        own, by, unplaced = StrictModeTest._exempt_split(mine, sig)
+        @test isempty(own) && isempty(unplaced) && first.(by) == ("inside",)
+        @test only(StrictModeTest.proof_findings(M.caller, (Int,); guarantees = (:noalloc,))).code === :SM0018
+        # Sites of code this call never reaches stand for a graph that misses what AllocCheck
+        # compiled. They are kept as the call's own and listed, and the failure names them.
+        theirs = filter(merged, StrictModeTest._raw_allocs(M.elsewhere, (Int,)))
+        @test !isempty(theirs)
+        own, by, unplaced = StrictModeTest._exempt_split(vcat(mine, theirs), sig)
+        @test length(own) == length(theirs) && length(unplaced) == length(theirs)
+        @test all(a -> any(o -> o === a, own), unplaced)
+        note = StrictModeTest._unplaced_note(unplaced)
+        @test occursin("could not be matched to the call graph", note)
+        @test occursin("stray(::Int64)", note)
+        @test isempty(StrictModeTest._unplaced_note(empty(mine)))
+        # A barrier's graph reports the same.
+        nodes = Base.IdSet{Core.MethodInstance}()
+        register_alloc_barrier!(M.inside)
+        @test !isnothing(StrictModeTest._only_through_barrier(sig, nodes))
+        @test !any(a -> StrictModeTest._off_graph(a, nodes), mine)
+        @test all(a -> StrictModeTest._off_graph(a, nodes), theirs)
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, M.inside)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(M)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== M.inside, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end

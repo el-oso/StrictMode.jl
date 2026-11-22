@@ -138,12 +138,18 @@ is compiled once, and AllocCheck ends its backtrace at a frame named "multiple c
 backtrace cannot name the barrier. The call graph is read as AllocCheck compiles it: a call leads
 to the specialization for the argument types inferred there. If the call also reaches that
 helper outside the barrier, its sites are kept, as they are whenever the call graph outside the
-barriers cannot be read in full. `divergence_report` / `StrictDivergence` run both engines on one
+barriers cannot be read in full. A site whose specialization the call graph does not name at all
+is kept too, and the failure's reason says that it could not be matched to the call graph and names
+the specialization: the graph is StrictModeTest's reading of what AllocCheck compiled, so that is a
+defect to report, not a property of your code. `divergence_report` / `StrictDivergence` run both engines on one
 signature and capture an **IP-free** record of any disagreement — anonymized signature shape,
 signal *categories*, and versions only — that you can send to the maintainers to fix the scan.
 Its `diverged` field lists each guarantee one engine fails and the other passes, and `isempty`
 reads only that field. Its `cause_diverged` field lists each guarantee both engines fail with
-different codes, such as the scan's SM0017 against the proof's SM0002.
+different codes. One case is a method reached by `invoke` with a signature wider than its arguments. The scan reads a body by the
+signature that dispatches to it, which there is another method's, so it reports the call tree as
+unread (SM0207) whatever the invoked method does. The proof compiles the invoked method, and reports
+SM0002 when it allocates.
 
 A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
 dropped. A call whose every allocation lies inside such functions gets a result of its own from the
