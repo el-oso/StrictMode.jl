@@ -94,23 +94,23 @@ nothing has called.
 function resource_leak_report(mod::Module; only = nothing, exempt = ())
     out = StrictFinding[]
     # Nothing registered renders exactly like nothing leaking, so say so, as the registry does.
-    if isempty(_SCOPED_TYPES)
+    if isempty(_scoped_types())
         @warn "resource_leak_report($(nameof(mod))): no type is registered with " *
             "`register_scoped!` (0 checks) — this result proves nothing."
         return out
     end
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
-        sigs = _method_signatures(m)
-        isempty(sigs) && continue
         f = try
             _method_function(m).instance
         catch
             continue
         end
+        entries = _method_entries(m, f)
+        isempty(entries) && continue
         shapes = Set{String}()
-        for tt in sigs
-            union!(shapes, _resource_escapes(f, Tuple(tt)))
+        for (e, tt) in entries
+            union!(shapes, _resource_escapes(e, tt))
         end
         isempty(shapes) && continue
         push!(

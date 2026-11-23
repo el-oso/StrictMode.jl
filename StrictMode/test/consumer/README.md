@@ -28,6 +28,21 @@ What it pins:
    precompile runs. The test asserts both halves: `registered_strict()` (this session) is empty
    while `declarations()` carries ConsumerPkg's two, `test_registered` re-proves them and throws,
    and the coverage gate does not report a package's annotated methods as undeclared.
+4. That the registrations a verdict depends on survive the same way: a trust boundary, a scoped type
+   and an allocation barrier registered at the top level of `src/` are in force in the test process,
+   where this session registered nothing. Without that, `:trusted` fails on the boundary itself and
+   `:noescape` passes every signature with nothing checked. A type or function another package
+   owns is refused.
+5. The cases one package cannot show. `dependents.jl` generates three packages in a scratch
+   directory and loads them from their caches: a registration made in a dependency's `__init__`
+   (which also runs while its dependent precompiles, and must not raise there), a function or type
+   of another package registered at top level (refused without `mod = @__MODULE__`, leaving nothing
+   registered even in the precompile that refused it, and including when its owner already holds a
+   store of that kind, or when the registrant is the owner's extension or a package nested in the
+   owner's directory), a callable object (a trust boundary by value, an allocation barrier by its
+   type, with one instance refused), and a registration a package makes of its own function when a
+   dependent's precompile first calls it (it does not raise there and is not stored with the
+   dependent's image; calling it again in the session registers it).
 
 ## Two builds
 

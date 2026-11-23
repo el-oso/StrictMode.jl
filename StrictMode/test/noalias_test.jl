@@ -69,6 +69,9 @@ end
 
     @test_throws "out of range" @assert_noalias mutates = (9,) swap2!(x, y)
     @test_throws "argument position" @assert_noalias mutates = (:first,) swap2!(x, y)
+    # An empty list names nothing written, which compares no pair.
+    @test_throws "names no argument" @assert_noalias mutates = () swap2!(x, x)
+    @test_throws "names no argument" @assert_noalias mutates = Int[] swap2!(x, x)
 
     # `mutates` names positional arguments, so a keyword call has nothing for it to name.
     @test_throws LoadError @eval @assert_noalias copyto!($x; dims = 1)
@@ -112,4 +115,321 @@ end
     # It still carries a diagnostic code, because a violation is reported to a human.
     @test StrictMode.explain(:SM0012) isa String
     @test occursin("shares memory", StrictMode.explain(:SM0012))
+end
+
+@testitem "@assert_noalias does not pass a pair it could not compare" begin
+    using StrictMode, LinearAlgebra
+
+    y = [1.0, 2.0, 3.0, 4.0]
+    x = [4.0, 3.0, 2.0, 1.0]
+
+    # The `!` default names argument 1. A scalar there holds no memory, so the default compares
+    # nothing: the call is rejected until `mutates` names what is written.
+    @test_throws ArgumentError @assert_noalias BLAS.axpy!(2.0, y, y)
+    @test_throws "argument 1 is a `Float64`, which holds no memory to write" @assert_noalias BLAS.axpy!(2.0, y, y)
+    @test_throws "mutates = (2,)" @assert_noalias BLAS.axpy!(2.0, y, y)
+    scale_into!(a, src, dst) = (dst .= a .* src; dst)
+    @test_throws "holds no memory to write" @assert_noalias scale_into!(2.0, x, y)
+    @test_throws "share memory: argument 3 (written) and argument 2" @assert_noalias mutates = (3,) BLAS.axpy!(2.0, y, y)
+    @test (@assert_noalias mutates = (3,) BLAS.axpy!(2.0, x, copy(y))) == [9.0, 8.0, 7.0, 6.0]
+    # A named position that cannot be written is the same mistake, spelled out.
+    @test_throws "mutates = 1, but argument 1 is a `Float64`" @assert_noalias mutates = (1,) scale_into!(2.0, x, y)
+    # A function or a type in the first position is no better than a scalar.
+    @test_throws "holds no memory to write" @assert_noalias map!(abs, y, y)
+    @test (@assert_noalias mutates = (2,) map!(abs, copy(y), x)) == x
+
+    # An array type with no `Base.dataids` method answers with its own identity, which never
+    # matches the vector it wraps.
+    struct Wrapped{T} <: AbstractVector{T}
+        data::Vector{T}
+    end
+    Base.size(w::Wrapped) = size(w.data)
+    Base.getindex(w::Wrapped, i::Int) = w.data[i]
+    Base.setindex!(w::Wrapped, v, i::Int) = (w.data[i] = v)
+    @test !Base.mightalias(Wrapped(y), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(Wrapped(y), y)
+    @test_throws "argument 1 (written) and argument 2" @assert_noalias copyto!(Wrapped(y), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(y, Wrapped(y))
+    @test (@assert_noalias copyto!(Wrapped(copy(y)), y)) isa Wrapped
+    # A wrapper that declares its ids is taken at its word.
+    struct Declared{T} <: AbstractVector{T}
+        data::Vector{T}
+    end
+    Base.size(w::Declared) = size(w.data)
+    Base.getindex(w::Declared, i::Int) = w.data[i]
+    Base.setindex!(w::Declared, v, i::Int) = (w.data[i] = v)
+    Base.dataids(w::Declared) = Base.dataids(w.data)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(Declared(y), y)
+    @test (@assert_noalias copyto!(Declared(copy(y)), y)) isa Declared
+
+    # A buffer held in a field of an argument that is not an array is shared memory the kernel
+    # may never read: reported, not raised.
+    struct Workspace
+        buf::Vector{Float64}
+    end
+    from_ws!(dst, ws) = (dst .= ws.buf; dst)
+    from_fact!(F, dst) = (dst .= F.factors; dst)
+    @test_logs (:warn, r"argument 1 \(written\) and argument 2 \(a buffer held in a field of argument 2, a `[^`]*Workspace`\)"s) match_mode = :any (@assert_noalias from_ws!(y, Workspace(y)))
+    @test_logs (@assert_noalias from_ws!(y, Workspace(x)))
+    # A factorization that is the first argument of a two-argument `ldiv!`: the written argument
+    # is the second, and the pair compared is the same one.
+    F = lu([4.0 1.0; 1.0 3.0])
+    @test_logs (:warn, r"argument 2 \(written\) and argument 1 \(a buffer held in a field of argument 1"s) match_mode = :any (@assert_noalias mutates = (2,) from_fact!(F, F.factors))
+    # The `!` default compares argument 1 with the rest, which finds the same shared buffer.
+    @test_logs (:warn, r"argument 1 \(written\) and argument 2 \(a buffer held in a field of argument 1"s) match_mode = :any (@assert_noalias from_fact!(F, F.factors))
+    @test_logs (@assert_noalias ldiv!(F, [1.0, 2.0]))
+
+    # A closure is a struct whose fields are what it captured, and is read the same way. It is
+    # still not something a kernel writes.
+    struct FnHolder{G}
+        g::G
+    end
+    ignore_ws!(dst, ws) = dst
+    let w = [1.0, 2.0, 3.0]
+        rev = i -> w[4 - i]
+        @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias mutates = (2,) map!(rev, w, 1:3))
+        @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias ignore_ws!(w, FnHolder(rev)))
+        @test_logs (@assert_noalias mutates = (2,) map!(rev, zeros(3), 1:3))
+        @test_throws "holds no memory to write" @assert_noalias map!(rev, w, w)
+    end
+
+    # Disjoint views of one parent are still told apart, and distinct arrays still cost nothing.
+    M = zeros(4, 4)
+    @test (@assert_noalias copyto!(view(M, :, 1), view(M, :, 2))) == zeros(4)
+    check(a, b) = StrictMode._assert_noalias("t", copyto!, (a, b); mutates = (1,))
+    fs = findings(check, (Vector{Float64}, Vector{Float64}); guarantees = (:noalloc, :noboxing))
+    @test all(f -> f.status === :pass, fs)
+    vcheck(a, b) = StrictMode._assert_noalias("t", copyto!, (a, b); mutates = (1,))
+    V = SubArray{Float64, 1, Matrix{Float64}, Tuple{Base.Slice{Base.OneTo{Int}}, Int}, true}
+    @test all(f -> f.status === :pass, findings(vcheck, (V, V); guarantees = (:noalloc,)))
+end
+
+@testitem "@assert_noalias does not reject or fail what it can compare" begin
+    using StrictMode
+
+    y = collect(1.0:6.0)
+    z = zeros(6)
+
+    # A plain-data array backed by a pointer holds memory, though it is isbits.
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)   # its layout; without it only where the elements start is known
+    GC.@preserve y z begin
+        pv = PtrVec(pointer(z), 6)
+        @test (@assert_noalias copyto!(pv, y)) === pv
+        @test z == y
+        # The same address is the same memory, and is found.
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), y)
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(pointer(y), 6), PtrVec(pointer(y), 3))
+        # Disjoint ranges of one buffer.
+        @test (@assert_noalias copyto!(PtrVec(pointer(y, 4), 3), view(y, 1:3))) isa PtrVec
+    end
+
+    # A `BigInt` is a number that holds memory.
+    bx, by = big(2)^80, big(3)^80
+    @test (@assert_noalias Base.GMP.MPZ.add!(bx, by)) == big(2)^80 + big(3)^80
+    @test_logs (:warn, r"share memory"s) match_mode = :any (@assert_noalias Base.GMP.MPZ.add!(bx, bx))
+    # A plain number still holds none.
+    setfirst!(a, v) = (v[1] = a; v)
+    @test_throws "holds no memory to write" @assert_noalias setfirst!(2.0, y)
+
+    # Views inside a wrapper with no `dataids` method are compared as the views are: disjoint
+    # ranges of one parent do not overlap, and overlapping ones do.
+    struct WV{A <: AbstractVector{Float64}} <: AbstractVector{Float64}
+        data::A
+    end
+    Base.size(w::WV) = size(w.data)
+    Base.getindex(w::WV, i::Int) = w.data[i]
+    Base.setindex!(w::WV, v, i::Int) = (w.data[i] = v)
+    @test (@assert_noalias copyto!(WV(view(y, 1:3)), WV(view(y, 4:6)))) isa WV
+    @test (@assert_noalias copyto!(WV(view(y, 1:3)), view(y, 4:6))) isa WV
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(view(y, 1:3)), WV(view(y, 3:5)))
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(view(y, 1:3)), y)
+    @test_throws StrictMode.StrictViolation @assert_noalias copyto!(WV(WV(y)), WV(y))
+    # A workspace holding a disjoint view of the written array shares none of it.
+    struct ViewSpace
+        v::SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int}}, true}
+    end
+    from_vs!(dst, ws) = (dst .= ws.v; dst)
+    @test_logs (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 4:6))))
+    @test_logs (:warn, r"buffer held in a field"s) match_mode = :any (@assert_noalias from_vs!(view(y, 1:3), ViewSpace(view(y, 2:4))))
+end
+
+@testitem "@assert_noalias compares the memory a pointer-backed array covers" begin
+    using StrictMode
+
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)
+    # A second pointer that is not the data: a library context shared by every vector.
+    struct CtxVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        ctx::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::CtxVec) = (v.n,)
+    Base.getindex(v::CtxVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::CtxVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::CtxVec) = (1,)
+
+    y = collect(1.0:10.0)
+    z = zeros(10)
+    ctx = Ref(0)
+    GC.@preserve y z ctx begin
+        py, pz = pointer(y), pointer(z)
+        handle = Ptr{Cvoid}(pointer_from_objref(ctx))
+        # A shared handle is not shared data.
+        @test_logs (@assert_noalias copyto!(CtxVec(py, handle, 3), CtxVec(pz, handle, 3)))
+        @test_throws "share memory" @assert_noalias copyto!(CtxVec(py, handle, 3), CtxVec(py, handle, 3))
+        # A view starts where it starts, not where its parent does.
+        @test_logs (@assert_noalias copyto!(PtrVec(py, 3), view(y, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py + 24, 3), view(y, 4:6))
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py + 32, 3), view(y, 4:6))
+        @test_logs (@assert_noalias copyto!(PtrVec(py + 48, 3), view(y, 4:6)))
+        @test_logs (@assert_noalias copyto!(view(y, 7:9), PtrVec(py, 3)))
+        # Two ranges of one buffer that overlap part-way.
+        @test_throws "share memory" @assert_noalias copyto!(PtrVec(py, 5), PtrVec(py + 8, 5))
+        @test_logs (@assert_noalias copyto!(PtrVec(py, 5), PtrVec(py + 40, 5)))
+    end
+
+    # A struct that is not an array says nothing about how far its pointer reaches, so a pointer
+    # it shares with another argument is reported, and does not raise.
+    struct Handle
+        p::Ptr{Float64}
+    end
+    fill_from!(dst, h) = dst
+    GC.@preserve z begin
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(Handle(pointer(z)), Handle(pointer(z))))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias fill_from!(z, Handle(pointer(z, 3))))
+        @test_logs (@assert_noalias fill_from!(y, Handle(pointer(z))))
+    end
+end
+
+@testitem "@assert_noalias places a pointer-backed array by the layout it declares" begin
+    using StrictMode
+
+    # A BLAS-style submatrix: `ld` elements between the starts of its columns.
+    struct PtrMat <: AbstractMatrix{Float64}
+        p::Ptr{Float64}
+        m::Int
+        n::Int
+        ld::Int
+    end
+    Base.size(a::PtrMat) = (a.m, a.n)
+    Base.getindex(a::PtrMat, i::Int, j::Int) = unsafe_load(a.p, (j - 1) * a.ld + i)
+    Base.setindex!(a::PtrMat, v, i::Int, j::Int) = unsafe_store!(a.p, v, (j - 1) * a.ld + i)
+    Base.strides(a::PtrMat) = (1, a.ld)
+    # The same layout, undeclared: the pointer says where the elements start, not where they lie.
+    struct RawMat <: AbstractMatrix{Float64}
+        p::Ptr{Float64}
+        m::Int
+        n::Int
+        ld::Int
+    end
+    Base.size(a::RawMat) = (a.m, a.n)
+    Base.getindex(a::RawMat, i::Int, j::Int) = unsafe_load(a.p, (j - 1) * a.ld + i)
+    Base.setindex!(a::RawMat, v, i::Int, j::Int) = unsafe_store!(a.p, v, (j - 1) * a.ld + i)
+    struct PtrVec <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+    end
+    Base.size(v::PtrVec) = (v.n,)
+    Base.getindex(v::PtrVec, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PtrVec, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PtrVec) = (1,)
+    # A pointer view that keeps its owner alive: the owner is not memory the view covers.
+    struct PView <: AbstractVector{Float64}
+        p::Ptr{Float64}
+        n::Int
+        owner::Vector{Float64}
+    end
+    Base.size(v::PView) = (v.n,)
+    Base.getindex(v::PView, i::Int) = unsafe_load(v.p, i)
+    Base.setindex!(v::PView, x, i::Int) = unsafe_store!(v.p, x, i)
+    Base.strides(::PView) = (1,)
+    # Built on an untyped pointer, as C wrappers often are.
+    struct CVec <: AbstractVector{Float64}
+        p::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::CVec) = (v.n,)
+    Base.getindex(v::CVec, i::Int) = unsafe_load(Ptr{Float64}(v.p), i)
+    Base.setindex!(v::CVec, x, i::Int) = unsafe_store!(Ptr{Float64}(v.p), x, i)
+    Base.strides(::CVec) = (1,)
+    struct RawCVec <: AbstractVector{Float64}
+        p::Ptr{Cvoid}
+        n::Int
+    end
+    Base.size(v::RawCVec) = (v.n,)
+    Base.getindex(v::RawCVec, i::Int) = unsafe_load(Ptr{Float64}(v.p), i)
+    Base.setindex!(v::RawCVec, x, i::Int) = unsafe_store!(Ptr{Float64}(v.p), x, i)
+
+    buf = zeros(16)
+    y = collect(1.0:10.0)
+    z = zeros(10)
+    GC.@preserve buf y z begin
+        p = pointer(buf)
+        # Columns 4 apart. {0,1,4,5} and {4,5,8,9} share two elements; {0,1,4,5} and {2,3,6,7},
+        # whose spans meet, share none.
+        @test_throws "share memory" @assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 32, 2, 2, 4))
+        @test_logs (@assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 16, 2, 2, 4)))
+        @test_logs (@assert_noalias copyto!(PtrMat(p, 2, 2, 4), PtrMat(p + 64, 2, 2, 4)))
+        # Undeclared, neither is decided, and neither raises.
+        @test_logs (:warn, r"may share memory.*Base.strides"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), RawMat(p + 32, 2, 2, 4)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), RawMat(p + 16, 2, 2, 4)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawMat(p, 2, 2, 4), view(buf, 5:8)))
+        @test_logs (@assert_noalias copyto!(RawMat(p, 2, 2, 4), view(z, 1:4)))
+
+        # A view whose index is not a range is placed within its parent.
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(PtrVec(pointer(y, 5), 3), view(y, [5, 6, 7])))
+        @test_logs (@assert_noalias copyto!(PtrVec(pointer(z, 5), 3), view(y, [5, 6, 7])))
+        pw = PtrVec(pointer(y), 6)
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(pw, view(pw, [1, 2, 3])))
+        rw = RawCVec(pointer(z), 6)
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(rw, view(rw, [1, 2, 3])))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(PtrVec(pointer(z), 3), view(rw, [4, 5, 6])))
+
+        # A view of a pointer-backed array covers its own elements, not its parent's.
+        pv = PtrVec(pointer(y), 6)
+        @test_logs (@assert_noalias copyto!(view(pv, 1:3), view(pv, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(view(pv, 1:3), view(pv, 3:5))
+        @test_logs (@assert_noalias copyto!(view(pv, 1:2:5), view(pv, 2:2:6)))
+        @test_throws "share memory" @assert_noalias copyto!(view(pv, 1:2:5), view(pv, 3:2:5))
+
+        # The data pointer is all such an array covers.
+        @test_logs (@assert_noalias copyto!(PView(pointer(y), 3, y), PView(pointer(y, 4), 3, y)))
+        @test_logs (@assert_noalias copyto!(PView(pointer(y), 3, y), view(y, 4:6)))
+        @test_throws "share memory" @assert_noalias copyto!(PView(pointer(y), 4, y), PView(pointer(y, 4), 3, y))
+
+        # The one pointer of an array type is its data, whatever it points to.
+        @test_throws "share memory" @assert_noalias copyto!(CVec(pointer(z), 5), CVec(pointer(z, 2), 5))
+        @test_logs (@assert_noalias copyto!(CVec(pointer(z), 5), CVec(pointer(z, 6), 5)))
+        @test_logs (:warn, r"may share memory"s) match_mode = :any (@assert_noalias copyto!(RawCVec(pointer(z), 5), RawCVec(pointer(z, 2), 5)))
+    end
+end
+
+@testitem "@assert_noalias does not take a BigFloat scale factor for the written argument" begin
+    using StrictMode
+
+    scale!(a, v) = (v .*= a; v)
+    z = ones(4)
+    # The `!` default names argument 1, and a number beside an array is not what such a call writes.
+    @test_throws "argument 1 is a `Float64`, which holds no memory to write" @assert_noalias scale!(2.0, z)
+    @test_throws "argument 1 is a `BigFloat`, a number, and the call also takes an array" @assert_noalias scale!(big(2.0), z)
+    @test_throws "mutates = (2,)" @assert_noalias scale!(big(2), z)
+    # Named, the position is taken at its word.
+    @test (@assert_noalias mutates = (2,) scale!(big(2.0), z)) === z
+    # A call on numbers alone does write its first.
+    bx, by = big(2)^80, big(3)^80
+    @test (@assert_noalias Base.GMP.MPZ.add!(bx, by)) == big(2)^80 + big(3)^80
 end

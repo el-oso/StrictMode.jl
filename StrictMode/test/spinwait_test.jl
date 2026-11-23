@@ -217,3 +217,93 @@
 
     @test_throws "no method matches" StrictMode.spin_wait_report(SpinPool.start_broken, (Int,))
 end
+
+@testitem "spin_wait_report reads a spin behind a Base call handed a user value" begin
+    using StrictMode
+
+    module SpinShow
+    const go = Threads.Atomic{Bool}(false)
+    struct Spin end
+    @noinline function spinwait()
+        while !go[]
+            yield()
+        end
+        return 1
+    end
+    # A `show` method that spins: Base's printing runs it.
+    Base.show(io::IO, ::Spin) = (spinwait(); print(io, "Spin"))
+    struct Parks end
+    @noinline park() = wait(Threads.Event())
+    Base.show(io::IO, ::Parks) = (park(); print(io, "Parks"))
+    # Base's default `show` of `Out` prints its field, whose `show` spins; `Out`'s own parks.
+    struct Out; x::Spin; end
+    Base.show(io::IO, ::Out) = (park(); print(io, "Out"))
+    @noinline dflt(io::IOBuffer, o::Out) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
+
+    direct() = fetch(Threads.@spawn spinwait())
+    # Blocks properly, and hands Base nothing of its own.
+    blocks() = fetch(Threads.@spawn park())
+    # The user type is concrete at the Base call; the spin is inside Base's printing of it.
+    viashow(s::Spin) = fetch(Threads.@spawn repr(s))
+    # The value reaches Base typed `Any`, so which `show` runs is not known from the IR.
+    viaany(r::Base.RefValue{Any}) = fetch(Threads.@spawn string("a", r[]))
+    # A `show` that parks, reached the same way as `viashow`.
+    viashow_parks(s::Parks) = fetch(Threads.@spawn repr(s))
+    # `invoke` runs Base's default `show`, which the call-site types do not select.
+    viainvoke(o::Out) = fetch(Threads.@spawn dflt(IOBuffer(), o))
+    end
+
+    clean(r) = isempty(r.findings) && isempty(r.unread) && iszero(r.unfollowed)
+
+    @test :yield in only(StrictMode.spin_wait_report(SpinShow.direct, ()).findings).polls
+
+    @test clean(StrictMode.spin_wait_report(SpinShow.blocks, ()))
+
+    # Base is entered when it is handed a user value whose type the call site names, so the user
+    # `show` it runs is read: one that spins is a finding, one that parks is clean.
+    @test :yield in only(StrictMode.spin_wait_report(SpinShow.viashow, (SpinShow.Spin,)).findings).polls
+    @test clean(StrictMode.spin_wait_report(SpinShow.viashow_parks, (SpinShow.Parks,)))
+
+    # A value typed `Any` at the Base call, and an `invoke` of a method the site does not select,
+    # are counted rather than read, so the report is not clean. Reading the `invoke` at the site's
+    # types would read `Out`'s own `show`, which parks, and report the call as clean.
+    for (f, T) in ((SpinShow.viaany, (Base.RefValue{Any},)), (SpinShow.viainvoke, (SpinShow.Out,)))
+        r = StrictMode.spin_wait_report(f, T)
+        @test isempty(r.findings)
+        @test r.unfollowed > 0
+        @test !clean(r)
+        @test !occursin("no spin-wait loop", sprint(show, r))
+    end
+end
+
+@testitem "spin_wait_report reads the method a wider invoke runs" begin
+    using StrictMode
+    module WideSpin
+    mutable struct P
+        @atomic gen::Int
+        ev::Threads.Event
+    end
+    @noinline function spins(p::P, n::Integer)
+        while iszero(@atomic p.gen)
+            yield()
+        end
+        return nothing
+    end
+    @noinline spins(p::P, n::Int) = (wait(p.ev); nothing)
+    @noinline parks(p::P, n::Integer) = (wait(p.ev); nothing)
+    @noinline function parks(p::P, n::Int)
+        while iszero(@atomic p.gen)
+            yield()
+        end
+        return nothing
+    end
+    # `invoke` runs the `Integer` method on an `Int`; `(P, Int)` dispatches to the other one.
+    start_spinning(p::P, n::Int) = Threads.@spawn invoke(spins, Tuple{P, Integer}, p, n)
+    start_parking(p::P, n::Int) = Threads.@spawn invoke(parks, Tuple{P, Integer}, p, n)
+    end
+    M = WideSpin
+    r = spin_wait_report(M.start_spinning, (M.P, Int))
+    @test length(r.findings) == 1 && r.unfollowed == 0
+    r = spin_wait_report(M.start_parking, (M.P, Int))
+    @test isempty(r.findings) && r.unfollowed == 0
+end

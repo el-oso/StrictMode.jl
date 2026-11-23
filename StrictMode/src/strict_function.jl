@@ -44,7 +44,7 @@ _warn_parametric_decl(target) = @warn "@strict_function $target: the signature i
 function _verify_strict_def(
         @nospecialize(f), @nospecialize(types::Tuple), target;
         warn_abstract::Bool = true, mod::Union{Nothing, Module} = nothing,
-        source::AbstractString = "", guarantees = nothing
+        source::AbstractString = "", guarantees = nothing, listed::Bool = false
     )
     Base.isdispatchtuple(Tuple{types...}) || return begin
         # Silent when the caller supplied `signatures =`: they have already answered which concrete
@@ -55,7 +55,7 @@ function _verify_strict_def(
         nothing
     end
     isnothing(guarantees) ||
-        return _verify_strict_guarantees(f, types, target, guarantees; mod, source)
+        return _verify_strict_guarantees(f, types, target, guarantees; mod, source, listed)
     # Record it so the automatic drivers (audit, @strict module, the Revise loop, and
     # StrictModeTest.test_registered) re-check it.
     register_strict!(f, types; mod, source)
@@ -67,6 +67,10 @@ function _verify_strict_def(
     isempty(rts) && _fail(
         :strict_function, target,
         "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
+    # A signature listed in `signatures = [...]` is one its author expects to return.
+    listed && all(T -> T === Union{}, rts) && _fail(
+        :strict_function, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"
     )
     if length(rts) != 1 || !_is_typestable_return(only(rts))
         _fail(
@@ -112,7 +116,7 @@ function _verify_strict_signatures(
     )
     for s in sigs
         types = s isa Tuple ? s : Tuple(s)
-        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source, guarantees)
+        _verify_strict_def(f, types, fname * "(" * join(types, ", ") * ")"; mod, source, guarantees, listed = true)
     end
     return nothing
 end
@@ -121,11 +125,16 @@ end
 # uses, so each one gates or warns as `_guarantee_gates` says.
 function _verify_strict_guarantees(
         @nospecialize(f), @nospecialize(types::Tuple), target, guarantees;
-        mod::Union{Nothing, Module} = nothing, source::AbstractString = ""
+        mod::Union{Nothing, Module} = nothing, source::AbstractString = "", listed::Bool = true
     )
     hasmethod(f, Tuple{types...}) || _fail(
         :strict_function, target,
         "no method matches ($(join(types, ", "))) — check the argument types given in `signatures`"
+    )
+    # A listed signature or call is one its author expects to return; a declaration on a
+    # definition gets the `:info` note the scan gives it.
+    listed && _always_throws(f, types) && _fail(
+        :strict_function, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"
     )
     gs = _check_guarantees(guarantees)
     register_strict!(f, types; guarantees = gs, mod, source)
@@ -189,7 +198,7 @@ trades load-time failure for open coverage. With checks disabled this is just th
 ```
 """
 macro strict_function(args...)
-    pos, opts = _macro_call(args, (:signatures, :guarantees))
+    pos, opts = _macro_call("@strict_function", args, (:signatures, :guarantees))
     length(pos) == 1 || throw(
         ArgumentError("@strict_function expects one function definition, got $(length(pos))")
     )
@@ -280,16 +289,30 @@ subject follows it.
 
 Subjects:
 
-- a **definition** — defines the function and exempts it. A qualified name works, so a method on a
-  foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`.
+- a **definition** — defines the method and exempts that method. Its own signature is recorded as
+  `types`, so the exemption covers the methods the definition writes (with the extra positional
+  methods of default arguments and the body of a keyword method) and no other method of the
+  function: next to `@strict_exempt f(x::Int) = …`, a separate `f(x::Integer)` is still checked. A
+  function whose every method is exempted this way is exempt as a whole. A qualified name works, so
+  a method on a foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`. That
+  excuses that method of `Base.length`, and no other. A signature whose type variables tie two
+  arguments together (`f(x::T, y::T) where T`) has no `types` that names exactly it, and is an
+  error; use the name form or an explicit `types = (...)` there. An explicit `types` replaces the
+  definition's own.
 - a **name** — `@strict_exempt foo` or `@strict_exempt :foo`, exempting every signature of it.
-- a **block** — `@strict_exempt begin … end`, exempting every function it defines. One visible
-  marker for a cold region instead of one per definition; each definition still records this line,
-  so a report points at the function and at the region that excused it.
-- an **`include`** — `@strict_exempt include("plan.jl")`, exempting everything that file defines.
-  The file's own `include` is called, so relative paths resolve as they would have, and the
-  definitions are found by comparing the module's methods before and after rather than by rewriting
-  the file — which is also why a nested `include` inside it is covered.
+- a **block** — `@strict_exempt begin … end`, exempting each method its definitions write, by its
+  own signature as the definition form does: a method of the same name written outside the block is
+  still checked. One visible marker for a cold region instead of one per definition; each
+  definition still records this line, so a report points at the function and at the region that
+  excused it. A signature with tied type variables is an error here too.
+- an **`include`** — `@strict_exempt include("plan.jl")`, exempting each method that file defines,
+  by its own signature, so a method of the same name written elsewhere is still checked. A method
+  whose type variables tie two arguments together has no signature that names it; its function is
+  then exempted by name, every method of it, with a warning that names the method, so one such
+  method does not reject the whole file. The file's own `include` is called, so relative paths
+  resolve as they would have, and the definitions are found from the module's methods defined
+  during the call rather than by rewriting the file — which is also why a nested `include` inside
+  it is covered.
 
 Any subject can be **narrowed** by naming guarantees, positionally or with `guarantees = (...)`:
 
@@ -303,6 +326,13 @@ A workspace or arena allocator is the case this exists for: it has to allocate, 
 go, while its concrete return type is the whole reason its callers can be fast and `:typestable`
 stays on to protect it. Exempting the function instead would hide exactly that.
 
+A subject can also be narrowed to a signature with `types = (...)`, as in
+`@strict_exempt :noalloc types = (Vector{Float64}, Integer) f`. That names one method, the one the
+signature selects, as `invoke(f, Tuple{Vector{Float64}, Integer}, …)` would select it, and excuses
+its specializations whose argument types are within the signature. Another method of `f` stays
+judged even for the same argument types: next to an exemption of `(Vector{Float64}, Int)`, a wider
+`f(a, n::Integer)` that an `invoke` compiled for `(Vector{Float64}, Int64)` is checked on its own.
+
 `reason = "..."` is carried into the report, where it is the difference between an opt-out a
 reviewer can judge and one they can only wonder about.
 
@@ -315,7 +345,7 @@ for any other guarantee, which is what keeps `guarantees = (:noalloc,)` from qui
 type stability too.
 """
 macro strict_exempt(args...)
-    pos, opts = _macro_call(args, (:guarantees, :reason, :types))
+    pos, opts = _macro_call("@strict_exempt", args, (:guarantees, :reason, :types))
     isempty(pos) && throw(
         ArgumentError("@strict_exempt expects a definition, a function name, or a `begin … end` block")
     )
@@ -330,14 +360,19 @@ macro strict_exempt(args...)
     types = get(opts, :types, nothing)
     file, line = string(__source__.file), __source__.line
 
-    # A block exempts every definition it contains, which is one visible marker for a cold region
-    # instead of one per function. Each definition still records this line, so a report points at
-    # the function and at the region that excused it.
+    # A block exempts the methods its definitions write, which is one visible marker for a cold
+    # region instead of one per function. Each definition still records this line, so a report
+    # points at the function and at the region that excused it.
     if Meta.isexpr(arg, :block)
         defs = filter(s -> Meta.isexpr(s, (:function, :(=))), arg.args)
         isempty(defs) && throw(
             ArgumentError("@strict_exempt: the block defines no functions to exempt")
         )
+        fexprs = Dict{Symbol, Any}()
+        for d in defs
+            fx = _strictdef_sig(d).args[1]
+            get!(fexprs, _exempt_name(fx), fx)
+        end
         names = unique(_exempt_name(_strictdef_sig(d).args[1]) for d in defs)
         # Each definition is marked, so a docstring in front of the block reaches all of them;
         # `@doc` cannot document the block this expands to otherwise.
@@ -348,6 +383,17 @@ macro strict_exempt(args...)
                     for s in arg.args
             )...,
         )
+        # Each method the block writes is exempted by its own signature, as the definition form
+        # does, so a method of the same name written outside the block stays judged.
+        isnothing(types) && return quote
+            $(_exempt_mark!)()
+            $(esc(marked))
+            $(_exempt_defined!)(
+                @__MODULE__, ($((esc(fexprs[n]) for n in names)...),), $(Tuple(names));
+                guarantees = $(esc(gs)), reason = $(esc(reason)), file = $file, line = $line
+            )
+            nothing
+        end
         return quote
             $(esc(marked))
             $(
@@ -365,10 +411,10 @@ macro strict_exempt(args...)
         end
     end
 
-    # `@strict_exempt include("plan.jl")` excuses everything that file defines. The file's own
+    # `@strict_exempt include("plan.jl")` excuses each method that file defines. The file's own
     # `include` is escaped and called, so relative paths resolve exactly as they would have, and the
-    # definitions are found by comparing the module's methods before and after rather than by
-    # rewriting the file's syntax — which is also what makes a nested `include` inside it work.
+    # methods it defines are found by the world they were defined in rather than by rewriting the
+    # file's syntax — which is also what makes a nested `include` inside it work.
     if Meta.isexpr(arg, :call) && _exempt_name_or_nothing(arg.args[1]) === :include
         return :(
             $(_exempt_included)(
@@ -391,9 +437,20 @@ macro strict_exempt(args...)
         )
     )
     Meta.isexpr(arg, (:function, :(=))) || return record
-    return quote
+    isnothing(types) || return quote
         Base.@__doc__ $(esc(arg))
         $record
+        nothing
+    end
+    # The definition's own methods are exempted, each by its own signature, and no other method of
+    # the function.
+    return quote
+        $(_exempt_mark!)()
+        Base.@__doc__ $(esc(arg))
+        $(_exempt_defined!)(
+            @__MODULE__, $(esc(_strictdef_sig(arg).args[1])), $(QuoteNode(name));
+            guarantees = $(esc(gs)), reason = $(esc(reason)), file = $file, line = $line
+        )
         nothing
     end
 end
@@ -520,6 +577,10 @@ macro strict_stable(def)
     )
 end
 
+macro strict_stable(args...)
+    return _reject_options("@strict_stable", args, "one function definition")
+end
+
 """
     @strict_policy guarantees
     @strict_policy guarantees check = false
@@ -543,11 +604,24 @@ include("b.jl")
 end
 ```
 
-Every definition the module made is checked, **including those in `include`d files** — the check
-reads the module's methods, not the text of its body. A method whose own signature is not concrete
-cannot be checked at load (a generic declaration infers to `Any`); declare its instantiations with
+Every definition the module has made **by that line** is checked, including those in `include`d
+files: the check reads the module's methods, not the text of its body, and it runs where the macro
+is written. A method defined below the line is not read. A policy raises an `ArgumentError` when
+no method above its line is checked or accounted for: written first in a module it would load
+cleanly over methods it never looked at. A method is accounted for when it is exempt, when its
+instantiations are declared with `@strict_function signatures = [...]`, or when it is a
+constructor, a macro or a callable object's method. An exemption accounts for a method only when
+it covers every guarantee in the policy, alone or with others: under `:default`,
+`@strict_exempt :noalloc` leaves `:typestable` and `:noboxing` unanswered. One narrowed with
+`types = (...)` counts like a declared instantiation. Place it at the end of the module, or wrap
+the module with `@strict module`. A method whose own signature is not concrete cannot be checked
+at load (a generic declaration infers to `Any`); declare its instantiations with
 [`@strict_function`](@ref)'s `signatures = [...]`, or gate on them from the test environment with
 `StrictModeTest.test_coverage`.
+
+A callable object with fields, `(c::Reader)(x)`, is not checked here: it has no instance at load.
+The module sweeps (`audit(mod; sweep = true)`, `test_compiled`) and the proofs check it from its
+compiled specializations. A singleton callable has an instance and is checked like a function.
 
 An unknown guarantee name is an error here, not a no-op: a misspelled guarantee that was accepted
 would check nothing while reading as though it checked something.
@@ -576,7 +650,7 @@ Allocation verdicts here only warn — the same rule `@strict_function` follows,
 consumer's own precompile the proofs are not loadable and a structural guess must not break a build.
 """
 macro strict_policy(args...)
-    pos, opts = _macro_call(args, (:check, :only, :exempt))
+    pos, opts = _macro_call("@strict_policy", args, (:check, :only, :exempt))
     isempty(pos) && throw(ArgumentError("@strict_policy needs a guarantee or a collection of them"))
     check = get(opts, :check, true)
     spec = pos[1]
@@ -587,7 +661,8 @@ macro strict_policy(args...)
         $(check) && $(_auto_check_module)(
             @__MODULE__, _gs,
             $("@strict_policy at " * string(__source__.file) * ":" * string(__source__.line));
-            only = $(esc(get(opts, :only, nothing))), exempt = $(esc(get(opts, :exempt, ())))
+            only = $(esc(get(opts, :only, nothing))), exempt = $(esc(get(opts, :exempt, ()))),
+            require_methods = true
         )
         _gs
     end
@@ -601,24 +676,34 @@ catch
     nothing
 end
 
-# Run `includer(args...)` and exempt every function it defined. The set is read from the module's
-# methods on either side of the call, so a definition inside a file the included file includes is
-# covered too, and no syntax is rewritten.
+# Run `includer(args...)` and exempt each method it defined by its own signature, as the definition
+# form does, so a method of the same name written outside the file stays judged. The set is read
+# from the module's methods after the call, by the world they were defined in, so a definition
+# inside a file the included file includes is covered too, and no syntax is rewritten. A method whose
+# type variables tie two arguments together has no signature that names exactly it; its function is
+# exempted by name instead, with a warning naming the method, so one such method does not reject the
+# whole file.
 function _exempt_included(
         mod::Module, includer, args...;
         guarantees = nothing, reason::AbstractString = "",
         file::AbstractString = "", line::Integer = 0
     )
-    before = _defined_names(mod)
+    since = Base.get_world_counter()
     result = includer(args...)
-    for nm in setdiff(_defined_names(mod), before)
-        _exempt!(nm, mod; guarantees, reason, file, line)
+    ms, _ = module_methods(mod; include_exempt = true)
+    for m in ms
+        m.primary_world > since || continue
+        name = _demangle(m.name)
+        types = try
+            _method_exempt_types(m)
+        catch err
+            err isa ArgumentError || rethrow()
+            @warn "@strict_exempt include: `$m` ties its argument types together through a type " *
+                "variable, so no signature names exactly that method. `$name` is exempted by " *
+                "name instead, every method of it."
+            nothing
+        end
+        _exempt!(name, mod; types, guarantees, reason, file, line)
     end
     return result
-end
-
-# The demangled names of every function the module defines, as the census sees them.
-function _defined_names(mod::Module)
-    ms, _ = module_methods(mod; include_exempt = true)
-    return Set{Symbol}(_demangle(m.name) for m in ms)
 end

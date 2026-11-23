@@ -102,3 +102,71 @@ end
     @test_throws "no method matches" Core.eval(Module(:_DeclTypo), typo)
     StrictMode.clear_declarations!()
 end
+
+@testitem "@strict_policy raises when it has nothing to check at its line" begin
+    using StrictMode
+
+    load(src) = Core.eval(@__MODULE__, Meta.parse(src))
+    unstable = "later(x::Int) = x > 0 ? 1 : \"s\""
+
+    # A policy checks the methods defined ABOVE it. Written first, it finds none, and loading on
+    # would read as a module that satisfies its policy: the unstable method below is never read.
+    @test_throws "@strict_policy checked nothing: no method is defined above this line in `PolFirst`" load("module PolFirst; using StrictMode; @strict_policy :typestable; $unstable; end")
+    @test_throws "place `@strict_policy` at the end of the module, or use `@strict module`" load("module PolFirstB; using StrictMode; @strict_policy :typestable; $unstable; end")
+    # The same with a filter: there is nothing above it for the name to match yet.
+    @test_throws "no method is defined above this line in `PolFirstOnly`" load("module PolFirstOnly; using StrictMode; @strict_policy :typestable only = (:later,); $unstable; end")
+    @test_throws "no method is defined above this line" load("module PolFirstExempt; using StrictMode; @strict_policy :typestable exempt = (:later,); $unstable; end")
+
+    # Written last, it reads the method.
+    @test_throws StrictMode.StrictViolation load("module PolLast; using StrictMode; $unstable; @strict_policy :typestable; end")
+    @test_throws StrictMode.StrictViolation load("module PolLastOnly; using StrictMode; $unstable; @strict_policy :typestable only = (:later,); end")
+    @test load("module PolLastClean; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable; end") isa Module
+
+    # A policy that does check something still rejects a name that matches nothing.
+    @test_throws "`only` names `latr`, which matches no function" load("module PolTypo; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable only = (:latr,); end")
+
+    # Methods above it, none of them with a concrete signature to check.
+    @test_throws "@strict_policy checked nothing: 1 method(s) are defined above this line in `PolGeneric`, and none is checked or accounted for" load("module PolGeneric; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    @test_throws "check = false" load("module PolGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+
+    # `check = false` records the policy and checks nothing, by request.
+    @test load("module PolRecorded; using StrictMode; @strict_policy :typestable check = false only = (:later,); $unstable; end") isa Module
+    @test StrictMode.module_policy(PolRecorded) == (:typestable,)
+end
+
+@testitem "@strict_policy accepts a module whose methods are accounted for" begin
+    using StrictMode
+
+    load(src) = Core.eval(@__MODULE__, Meta.parse(src))
+    # Nothing concrete to check at the line, and nothing left unlooked-at either: each method
+    # above the policy is declared, exempt, a constructor or a callable object's.
+    @test load("module AccDeclared; using StrictMode; @strict_function signatures = [(Int,), (Float64,)] f(x::T) where {T} = x + 1; @strict_policy :typestable; end") isa Module
+    @test load("module AccExempt; using StrictMode; @strict_exempt gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end") isa Module
+    @test load("module AccNarrow; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = collect(x); @strict_policy :noalloc; end") isa Module
+    @test load("module AccFiltered; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable exempt = (:gen,); end") isa Module
+    @test load("module AccStruct; using StrictMode; struct S; x::Int; end; @strict_policy :typestable; end") isa Module
+    @test load("module AccCallable; using StrictMode; struct C; k::Int; end; (c::C)(x::AbstractVector) = c.k * sum(x); @strict_policy :typestable; end") isa Module
+    @test load("module AccMacro; using StrictMode; macro twice(x); esc(:(2 * \$x)); end; @strict_policy :typestable; end") isa Module
+
+    # Still nothing to check: nothing above the line, or only generic methods nobody declared.
+    @test_throws "no method is defined above this line in `AccNothing`" load("module AccNothing; using StrictMode; @strict_policy :typestable; g(x::Int) = x; end")
+    @test_throws "1 method(s) are defined above this line in `AccGeneric`, and none is checked or accounted for" load("module AccGeneric; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    @test_throws "`@strict_function signatures = [...]`" load("module AccGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    # An exemption from none of the policy's guarantees does not account for the method.
+    @test_throws "none is checked or accounted for" load("module AccOther; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
+    # Nor does one from only some of them: under `:default`, a `:noalloc` exemption leaves
+    # `:typestable` and `:noboxing` unanswered.
+    @test_throws "none is checked or accounted for" load("module AccPart; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end")
+    @test_throws "none is checked or accounted for" load("module AccPartTypes; using StrictMode; @strict_exempt :noalloc types = (Vector{Int},) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end")
+    # Exemptions that together name every guarantee of the policy do account for it.
+    @test load("module AccEvery; using StrictMode; @strict_exempt (:typestable, :noalloc, :noboxing) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end") isa Module
+    @test load("module AccSplit; using StrictMode; @strict_exempt :noalloc reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_exempt (:typestable, :noboxing) gen; @strict_policy :default; end") isa Module
+    # A signature-narrowed exemption counts like a declared instantiation: the method is accounted
+    # for, and only the named signature is excused when it is checked.
+    @test load("module AccTypes; using StrictMode; @strict_exempt types = (Vector{Int},) reason = \"r\" gen(x::AbstractVector) = sum(x); @strict_policy :default; end") isa Module
+    # A filter that leaves only an undeclared generic method checks nothing.
+    @test_throws "none is checked or accounted for" load("module AccOnly; using StrictMode; ok(x::Int) = x; gen(x::AbstractVector) = sum(x); @strict_policy :typestable only = (:gen,); end")
+    # A struct beside an undeclared generic method: the constructor is accounted for, and the
+    # policy has still read something it can answer for.
+    @test load("module AccMixed; using StrictMode; struct S; x::Int; end; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end") isa Module
+end

@@ -41,6 +41,20 @@ A check that could not finish never passes. A scan that read only part of the co
 "not established". An analysis that errored reports the error as a failure. A scan that could not
 follow a callee reports that callee as undecided.
 
+A signature that always throws or never returns does not pass either. Its inferred return type is
+`Union{}`, so no path returns and there is nothing for a guarantee to check: that is an error
+helper, a worker loop that runs until its task ends, and it is also a kernel called with a wrong
+argument type or without a required keyword argument. Every guarantee
+reports SM0208 for it. In a sweep (`audit`, `test_compiled`, `test_registered`, `@strict_policy`)
+that is a note, because a module's error helpers are not defects. Where the signature was listed
+(`test_signatures`, a `@verify_strict` line, `@strict_function signatures = [...]`) it is a failure.
+
+A module policy is a sweep with a position. `@strict_policy` checks only the methods defined above
+it, and raises when none of them is checked or accounted for (exempt from every guarantee in the
+policy, declared with `signatures = [...]`, a constructor, a macro or a callable object's
+method), so it is written at the end of the module ([Automating](automating.md)). It does not
+check a callable object with fields, which has no instance at load; the sweeps and the proofs do.
+
 Whether a failure throws or warns depends on how sure the check is. A check that observes what it
 reports throws: it read compiled output, the type the compiler assigned, or a store in the IR. A
 check that infers something it cannot see, such as the allocation scan, warns, and the proof in
@@ -175,7 +189,7 @@ the union-typed local) report.
 
 ### What the scan leaves out of your body
 
-Two kinds of statement are in the compiled body but never counted against it.
+Three kinds of statement are in the compiled body but never counted against it.
 
 **StrictMode's own machinery.** With checks enabled, a `@strict` or `@assert_*` site leaves a live call
 to StrictMode's scan behind a per-site flag, so a function containing one carries the tool in its IR.
@@ -188,7 +202,48 @@ your code allocates.
 which no path reaches a `return` carrying a value, not just the `throw`: the message an
 `ArgumentError("… $x …")` builds is usually assembled in an earlier block that jumps to the throw, and
 counting only the throw's own block reported allocation for text no successful call builds. A loop is
-never an error path.
+never an error path, and neither is a throw that a catch handles: when the `catch` can return, the code
+before the `try` and every statement in the try body, the throw and the message it builds included, run
+on a call that returns normally, and they count, as does the handler itself. A catch that only
+rethrows leaves them error paths. The proof tier agrees: AllocCheck drops every site that leads to a
+throw, caught or not, and every site a catch reaches, so where a caught throw is reachable
+`StrictModeTest` checks the code a second time without `ignore_throw` and keeps the sites a caught
+throw reaches on a call that returns. That second check is a second AllocCheck run over the call graph,
+so a proof whose reach holds such a `try` costs about twice as much.
+
+The same holds for a throw raised *inside a callee* the try body calls, inlined or not, such as the
+`BoundsError` of a `v[i]` that a `catch` turns into a default: a callee called from a try region whose
+handler can return is read with none of its statements skipped as error paths, and so is everything it
+calls, since any throw below it ends in that handler. Both tiers count what the callee allocates there:
+the scan keeps a separate verdict for each body read in that context, and the proof keeps a site whose
+frames outside the caught call lie on no error path.
+
+A handler that returns only for one type of exception is read as such when the typed IR shows it:
+`catch err; err isa T || rethrow(); …`, whose first test is `isa` of the caught exception against a
+constant type and whose other branch only rethrows. A throw whose exception type is known and
+concrete and is not a `T` ends in that rethrow, so the path to it is an error path again, in the try
+body and in every callee below it: the `BoundsError` of an out-of-bounds index under
+`err isa ArgumentError || rethrow()` does not count. A throw of a `T`, or of a type the IR does not
+name, still counts, and so does any statement on the way that may itself throw, since what it throws
+may be a `T`. A handler that decides by anything else, such as a value, is taken to return whatever is
+thrown. Both tiers read handlers this way.
+
+A bounds-checked `memoryrefnew` throws its `BoundsError` itself, with no call to follow: indexing a
+`Memory` on Julia 1.12 does, and on 1.12 under `--check-bounds=yes` codegen also checks a `memoryrefnew`
+the IR marks unchecked. Both tiers name that throw as a `BoundsError`. The scan counts a
+`memoryrefnew` whose check is in the IR as an allocation wherever a handler returns for that throw. The
+proof treats a `jl_bounds_error*` runtime call as that throw, together with the box of the memory reference
+it is passed when the box has the same frames and the IR statements there are a `memoryrefnew` of a
+reference of the box's type plus others that allocate nothing. Under `err isa ArgumentError || rethrow()`
+neither counts the `BoundsError`; under a handler that returns for it, both do.
+
+**A branch that cannot run.** A value compared with itself is always `===` to itself, so the scan never
+follows the false side of a `goto` on `x === x`. Inlining leaves that guard whenever a callee receives the
+same value twice: `ldiv!(U, b)` for a triangular `U` solves in place by calling `_ldiv!(b, U, b)`, which
+inlines to `b === b ? b : copyto!(b, b)`. LLVM folds the comparison and the copy never
+runs, but it is still in the optimized IR, and its unaliasing allocates. Only an SSA value or an
+argument compared with itself counts: `d === s` for two arguments `d` and `s` keeps both sides, since
+whether they are the same object depends on the values passed.
 
 ### One-time-init calibration doesn't have to break this
 
@@ -196,9 +251,8 @@ A lazy calibration memoized with `Base.OncePerProcess`/`OncePerThread` allocates
 the memoized value forever after. AllocCheck's all-paths proof sees the initializer's one-time
 allocation as statically reachable and would red a call that's provably alloc-free in steady
 state. The IR scan recognizes the two `Base` once-guard types automatically and stops at them,
-and `@test_noalloc`/`@test_noboxing` honor that: on a call whose ONLY allocation risk is the
-barrier, they substitute the steady-state scan for AllocCheck's all-paths proof rather than
-report the cold-path allocation as a violation — logged once per session via `@info`, never
+and `@test_noalloc`/`@test_noboxing` honor that: on a call that reaches the barrier, they keep AllocCheck's all-paths proof and drop the sites the barrier accounts for
+rather than report the cold-path allocation as a violation — logged once per session via `@info`, never
 silently:
 
 ```julia
@@ -231,6 +285,28 @@ then nothing" is a property of the call sequence, not of the code, so an all-pat
 the growth path forever. Excuse it visibly with
 `@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured, by
 warming the call and checking that a second identical call allocates nothing.
+
+The value-free scan reports a caller whose only allocations are inside such exempt functions as an
+`:info` note naming one of them; the allocation proof reports it as SM0018, a failure unless the
+gate is given `allow_exempt = true`. Under `:noalloc` a box is an allocation, so the exemption also
+excuses boxing and dynamic dispatch inside the exempt function and what it calls, on every path the
+scan reads: the paths that return, including a throw that a returning catch handles. A throw path
+that nothing catches is not read at all while `ignore_throw()` is on, the default, inside an exempt
+function or not.
+
+Two things are not excused. Code the exempt function was handed by its caller and calls is the
+caller's: a function, closure or callable struct passed as an argument, or loaded from one (a field,
+an array element, an item it iterates over, at any depth), whether the exempt function calls it,
+inlines it or passes it to a callee that calls it. What that code allocates or boxes fails the
+caller, in both tiers. A value the exempt function only uses is not called: a lock, a
+`Threads.Condition`, a `Channel` or a stream it holds still leaves the exemption in place, though a
+`Task` inside them has fields declared `Any`, and so does a closure the exempt function defines
+itself around one of them. When a handed value reaches a call whose target is decided at run time (a
+`Function` or `Any` argument it calls, a `Vector{Function}` it iterates and calls), or a body the
+check cannot read, the exemption excuses nothing in that call: what the exempt function and its
+callees allocate or box fails the caller, in both tiers. And the exemption names
+`:noalloc` only: under `:noboxing` the exempt function's boxing still fails the caller, and the
+warning names where it is.
 
 ## `@assert_noboxing` / `@test_noboxing` — forbid boxing, allow buffers
 
@@ -854,10 +930,9 @@ steady_state_report(solve!, ws, A, b)                  # SteadyStateReport: stea
 steady_state_report(scratch, ws; fresh_task = true)    # a per-task initializer shows up here
 ```
 
-It returns what it measured and never raises. Like [`memsafe_report`](@ref) and
-[`mca_report`](@ref) it takes **values** and runs the call, so it sits outside the value-free
-`findings`/`audit` pipeline and does not belong at a `src` call site — put it in a probe, a dogfood
-block, or a REPL session.
+It returns what it measured and never raises. Like [`memsafe_report`](@ref) it takes **values** and
+runs the call, so it sits outside the value-free `findings`/`audit` pipeline and does not belong at
+a `src` call site — put it in a probe, a dogfood block, or a REPL session.
 
 There is deliberately no `@assert_steady_state`. Every `@assert_*` macro is a call-site annotation
 backed by the value-free scan, and this property cannot be settled that way: it needs real argument
@@ -973,9 +1048,22 @@ test_no_unsafe(MyKernels)                            # …and fail if there are 
 test_no_unsafe(MyKernels; allow = (:unsafe_load,))   # one reviewed read, the rest held
 ```
 
-It looks for `ccall`, `pointer`, and any function whose name begins with `unsafe_`. `allow` is per
-construct, so excusing a pointer read still holds a `ccall` elsewhere — a deliberate escape ends up
-recorded where the policy is written rather than silently tolerated.
+It looks for `ccall`, `@cfunction`, `pointer`, any function whose name begins with `unsafe_`, the
+pointer intrinsics (`pointerref`, `pointerset`), `llvmcall`, `cglobal`, the C allocator
+(`Libc.malloc`, `Libc.free`), a pointer made from an integer or an offset (`Ptr{T}(addr)`, `C_NULL + addr`, `p + 8`, `8 + p` and
+`p - 1` on an argument declared as a pointer type, and `Ptr{T}` handed to
+any call that may apply it: `map(Ptr{T}, addrs)`, `Ptr{T}.(addrs)`, `ntuple(Ptr{T}, n)`, `Ptr{T}(xs...)`;
+only calls that merely look at the type, such as `Vector{Ptr{T}}`, `isa`, `promote_type`, `string`
+and a tuple of types used as a signature, are exempt), the difference of two pointer arguments, `p - q` (an integer, but Go needs package
+`unsafe` to take it and Rust's `offset_from` is an `unsafe fn`; comparing them is not reported), and
+a `memoryrefnew` or `getfield` whose bounds check is a literal `false`. A function counts wherever the method names
+it: `map(unsafe_load, ps)`, `unsafe_load.(ps)`, a splat, a keyword call and a local alias are
+reported like the plain call. [`unsafe_report`](@ref) lists each construct with the name `allow`
+takes.
+
+`allow` is per construct, so excusing a pointer read still holds a `ccall` elsewhere — a deliberate
+escape ends up recorded where the policy is written rather than silently tolerated. An `allow` entry
+that names no construct raises, listing the accepted names.
 
 ### Why it reads unoptimized IR
 
@@ -1127,7 +1215,9 @@ frame = Untrusted(read(sock, n))
 ```
 
 That changes its type, so nothing written for `Vector{UInt8}` accepts it. `sum(frame)` and
-`frame[1]` are `MethodError`s; `frame.x` throws. You can pass it around, and that is all.
+`frame[1]` are `MethodError`s; `frame.x` and `reinterpret(T, frame)` throw. Printing it shows
+`Untrusted{Vector{UInt8}}(<redacted>)`, so a log line does not carry the payload. You can pass it
+around, and that is all.
 Wrapping costs nothing — same layout as the payload, no allocation — and the type is still there
 in a shipped build.
 
@@ -1172,7 +1262,31 @@ Two limits, both real.
 **The type does most of the work on its own.** An `Untrusted{T}` matches no method written for
 `T`, in a shipped build as much as in tests. The check only covers the deliberate way out:
 `unsafe_trust` and `getfield` can be called from anywhere, and no type design in Julia can stop
-that.
+that. Handing one to another call counts as calling it: `getfield.([u], :x)`, `map(unsafe_trust, us)`,
+`getfield((u, :x)...)` and `Base.Fix2(getfield, :x)(u)` are reported. Comparing with one passes
+when it applies nothing, so `f === unsafe_trust` and `f in (unsafe_trust, getfield)` pass. `===`
+is a builtin; any other comparison is followed into every method it can call, Base's included, and
+a method that applies the function it is compared with, such as
+`==(g::typeof(unsafe_trust), s::S) = g(s.u)`, makes `unsafe_trust == s`, and `f in (unsafe_trust,
+getfield)` for an `f` that can be an `S`, a read. A comparison reaching more than eight methods, or
+more than eight calls deep, counts as one, and so does one that can return the function it was
+given. A tuple of
+`unsafe_trust` that is returned, indexed or passed to any other call is reported. On untyped values a constant
+field decides it as it does for a direct call: `getfield.(xs, :x)` is reported, while
+`getfield.(xs, :a)` and `getproperty.(xs, :a)` raise on an `Untrusted` and are not. A `reinterpret` of an `Untrusted` is reported too, and so are the calls that copy out the bits of
+an array or a `Ref` of them: `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])`. All of
+these also raise when they run, as does `unsafe_write(io, Ref(u), n)`. Handed a value of a type that can hold an `Untrusted`,
+those calls warn and name the type. Any abstract type can, `Real` and `IO` included, since a package
+can subtype it with a struct that has an `Untrusted` field, so `write(io, x::Real)` and
+`reinterpret(UInt64, m::AbstractMsg)` warn, as do `Any` and `Vector{Any}`. A concrete type is judged
+exactly: `write(io, x::Float64)` passes, and `reinterpret(UInt64, r)` of a struct with an `Untrusted`
+field warns. Another generic method that copies what it is given, such as
+`Serialization.serialize`, is not seen. Printing,
+`dump` included, shows `<redacted>` in place of the payload. `==`, `isequal` and `hash` raise
+rather than compare or hash it, and so do the same calls on a container holding one, so an
+`Untrusted` cannot be a `Dict` or `Set` key. `===` is a builtin that cannot be overridden: it,
+`objectid` and `IdDict` still read the bits, so for an `isbits` payload
+`Untrusted(1) === Untrusted(1)` is `true`.
 
 **Registering a boundary is a promise, not a proof.** Nothing verifies that `parse_header`
 really checks what it read, or that it copied instead of handing back the caller's buffer. Both
@@ -1275,13 +1389,57 @@ slices of one workspace are accepted, which matters: a blocked kernel carving ti
 scratch is the normal case, and a predicate that compared only the parent would reject every one of
 them.
 
+`Base.mightalias` reads `Base.dataids`, which an array type has to define. A wrapper struct around
+a `Vector` that defines none answers with its own identity, and never matches the vector it holds.
+So an array type without a `dataids` method, and an argument that is not an array at all (a
+workspace struct, a factorization, a closure), is read through its fields, three levels down, and compared by
+the buffers found there.
+
+An array type built on a pointer (a plain-data struct whose one `Ptr{T}` field for its `T`
+elements, or whose only `Ptr` field, holds its data) is compared by where its elements lie.
+`Base.mightalias` answers `false` for every plain-data array, and a view names its parent's start
+as its data, so neither can say whether such an array and a view overlap. The layout can, and the
+type states it the way Julia's strided-array interface asks: by defining `Base.strides`. With it,
+the pointer, the size and the strides place every element, and a view of the array with range
+indices is placed the same way. A vector, a strided vector and a matrix with contiguous columns
+are compared element by element, so two submatrices with a leading dimension whose spans
+interleave are told apart; any other layout is compared by its span. The type's other fields — a
+library handle, the vector that keeps the memory alive — are not memory it covers, so two arrays
+that share one share no element.
+
+```julia
+struct PtrMat <: AbstractMatrix{Float64}
+    p::Ptr{Float64}; m::Int; n::Int; ld::Int
+end
+Base.strides(a::PtrMat) = (1, a.ld)   # without this, only where the elements start is known
+```
+
+Two arrays that overlap raise. An overlap with a buffer held in a field of a non-array argument
+warns: the memory is shared, but nothing says the kernel reads that field.
+
+What cannot be placed exactly, and may meet the other argument's memory, warns that the arguments
+may share memory, and never raises. That covers an array built on a pointer with no
+`Base.strides`, placed only within the allocation its pointer points into (any other such array,
+or any array whose layout is known but whose allocation is not, may be in the same one); a view
+whose indices are not ranges, placed within its parent; a layout compared by its span; and a raw
+pointer that is not an array's data, such as a field of a struct that is not an array, which says
+where memory starts and not how far it reaches. Such a pointer is reported when it equals another
+pointer or points into memory another argument reaches.
+
 ### Which arguments count as written
 
-From the name: a trailing `!` means argument 1, Julia's convention. Anything else must say so with
-`mutates = (…)`. A call that gives neither is **rejected**, not passed — "nothing is written" would
+From the name: a trailing `!` means argument 1, Julia's convention. A number in that position is
+not taken for the written argument when the call also takes an array: `scale!(2.0, v)` and
+`scale!(big(2.0), v)` are both rejected until `mutates` names the position. Anything else must say so with
+`mutates = (…)`. A call that gives neither, or an empty `mutates`, is **rejected**, not passed — "nothing is written" would
 compare no pair and accept every call, and a check that cannot fail is worse than no check. Where
 the callee is written as a plain name the rejection happens at macro expansion, before the call
 runs.
+
+The convention is not the whole truth: `ldiv!(F, B)` writes its second argument, and `axpy!(a, x, y)`
+its third. A written position that holds no memory — the scalar `a` — compares nothing, so that call
+raises an `ArgumentError` asking for `mutates = (3,)` in place of passing. For a two-argument call
+the default still compares the right pair, since there is only one.
 
 ### What it cannot promise
 
@@ -1339,11 +1497,16 @@ end
 # ERROR: StrictViolation (@concurrency_safe): guarantee not satisfied
 #   target:  apply_counted!(CountingPlan(ones(4), 0), ones(4))
 #   reason:  writes state that concurrent tasks share (the plan argument, or a global) — NOT safe
-#            to run concurrently (1 site(s)):
-#              [1] writes field `calls` of the plan argument directly (`setfield!`) — the plan is
-#                  mutated during apply
+#            to run concurrently (1 write(s) the scan read, 0 site(s) it could not rule out):
+#              Writes the scan read (1):
+#              [write 1] writes field `calls` of the plan argument directly (`setfield!`) — the
+#                  plan is mutated during apply
 #                    at …
 ```
+
+The message lists what the scan read first, each entry marked `[write n]`, then atomic writes as
+`[atomic n]`, then the sites it could not rule out as `[undecided n]`. Only a `[write n]` entry
+makes the call raise, so in a long report those are the ones to fix.
 
 The fix is to move what the call writes out of the shared object: return the count, or keep it in
 an argument that each task owns.
@@ -1365,29 +1528,49 @@ captures it, so a `Threads.@spawn` inside the call is read too.
 A struct built around the plan is a different object. A method that wraps its plan in a fresh
 struct and fills in that struct's own fields passes.
 
+A Base function that was not inlined is read the same way when its name ends in `!` (`sort!`,
+`reverse!`, `delete!`) or when what it returns can be a reference into an argument (`get`,
+`reshape`, `unsafe_wrap`). Its body says which argument it writes and whether its result is the
+plan's memory or a copy, so `sort!(plan.buf)` and `get(plan.cache, k, x)[1] = v` are writes, and
+`copyto!(out, plan.buf)`, `mul!(out, plan.A, x)` and `sort!(copy(plan.buf))` are not.
+
+A lock, a condition, an event, a channel or a semaphore held by the plan is not marked. What
+`lock(plan.lk)` writes inside the lock is the synchronization, not shared data. A `Threads.Atomic`
+is marked: `Threads.atomic_add!(plan.ctr, 1)` and `plan.ctr[] = v` are atomic writes to shared
+state, and warn as `@atomic plan.count += 1` does. The same holds for a constant global
+`Threads.Atomic`: an atomic write to one is reported as an atomic write to process-global state,
+and warns. A global handed to a helper is followed into it, as the plan is, so
+`bump!(HITS)` is reported where `bump!` does the write. When atomic writes to a global are all
+that was found, the report says that, and that the plan argument is not written.
+
 ### Throw or warn
 
 Each finding is judged on its own, by how sure the scan is.
 
 It throws on a write it read: a store through the shared argument, a store into a mutable `const`
-global, or a marked value handed to one of the Base functions the scan knows to mutate, such as
-`push!`, `resize!`, `copyto!` or `fill!`. One such finding is enough to throw, whatever else was
+global, a marked value at the destination of one of the Base functions the scan knows to mutate
+(`push!`, `resize!`, `copyto!`, `fill!`), or a marked buffer as the destination of `memmove`,
+`memcpy` or `memset`. One such finding is enough to throw, whatever else was
 found.
 
 It warns on what it could not rule out: a marked value passed to a call that dispatches at run
-time, a task whose body it could not read, or a call chain that reached `max_depth` before the
-scan saw a store. The warning says so: "cannot establish that the plan argument is read-only —
+time, a task whose body it could not read, a call chain that reached `max_depth` before the
+scan saw a store, or a marked pointer handed to a foreign function. The last follows Go's rule for
+cgo: a C function is assumed to write through every pointer it is given, and the scan cannot read
+it. That includes every BLAS and LAPACK routine, so `mul!(out, plan.A, x)` on `Float64` matrices
+warns that `dgemv` received a pointer into the plan. The warning says so: "cannot establish that the plan argument is read-only —
 sharing it across concurrent tasks is unproven, not disproven". For a chain that is too deep,
 raise `max_depth` or assert on the inner method.
 
 An atomic write, such as `@atomic plan.count += 1`, also warns. It cannot tear, but two calls that
-share the plan still both change it, and the scan cannot tell whether they are meant to.
+share the plan still both change it, and the scan cannot tell whether they are meant to. The warning
+says what was read: "makes atomic writes to the plan argument".
 
 ### Limits
 
 The scan does not model aliasing: if the scratch buffer you pass shares memory with something the
-plan owns, a write to the scratch passes. Apart from the Base functions it knows to mutate, calls
-into Base and Core are treated as reads. Which part of a captured array a task writes depends on
+plan owns, a write to the scratch passes. A Base function whose name does not end in `!` and
+whose result holds no reference is treated as a read, so `write(plan.io, x)` passes. Which part of a captured array a task writes depends on
 values, so a task that writes its own slice of a shared output is reported. And the verdict covers
 the argument types of this call only.
 
@@ -1445,7 +1628,13 @@ The scan reports a store to `buf[threadid()]`, whether the index is written in p
 local. It also reports a store into an object loaded out of such a slot, as in
 `buf[threadid()].field = …`, `buf[threadid()][i] = …` and `rand(rngs[threadid()])`. A slot's value
 passed to a callee that was not inlined counts when the callee writes it, or returns it and the
-caller then writes it. Suspension points are looked for in callees too.
+caller then writes it. Suspension points are looked for in callees too. Writing to an `IOBuffer`, or
+to an `IOContext` around one, and taking a `SpinLock` are not suspension points, so building a
+string is one only when the `show` of a value it prints can suspend, read through Base's default
+`show` of a struct into the `show` of each field.
+Copying from a stream into an `IOBuffer`, as `write(buf, stream)` does, is one: it reads the
+source until its end and waits on it while it is open. Every argument that may be a stream is
+judged, not only the first.
 
 A thread id stored into another array and read back later is not tracked.
 
@@ -1661,11 +1850,14 @@ split their own signals the same way.
 [`static_ownership_suggestions`](@ref), and the measured ones —
 [`steady_state_report`](@ref), [`gc_pause_report`](@ref), [`latency_report`](@ref),
 [`kernel_report`](@ref), [`register_report`](@ref), [`spill_report`](@ref), [`mca_report`](@ref),
-[`memsafe_report`](@ref). Thirteen of the seventeen `@assert_` guarantees are also swept by
-[`audit`](@ref) with nothing written at the call site; the four that are not need actual argument
-values, or an optional dependency, or a set of effects only the caller can name.
+[`memsafe_report`](@ref). Thirteen of the eighteen `@assert_` guarantees are also swept by
+[`audit`](@ref) with nothing written at the call site; the five that are not need actual argument
+values (`@assert_memsafe`, `@assert_noalias`), an optional dependency (`@assert_mca`), a set of
+effects only the caller can name (`@assert_effects`), or a target only the caller can name
+(`@assert_reaches`).
 
-**[`audit`](@ref) is the second step, not the first.** It never throws and returns no exit status, so
+**[`audit`](@ref) is the second step, not the first.** It never throws on a violation (an invalid
+argument, such as an unknown guarantee or an `only` entry that matches no function, does raise) and returns no exit status, so
 it is not a gate — it is what you run *after* a warning or a failing test, to see the whole picture
 around the one site that complained. The gate is the `@assert_` at the call site, or a
 `StrictModeTest` driver in your suite; `audit` is how you work out what to change. That is also why
@@ -1679,7 +1871,8 @@ measured in the field rather than reasoned about:
   finding that write is reading the convention back rather than finding a defect. The suggestion
   names the fix — `@assert_concurrency_safe self=N f(…)` at a call site, where you can say which
   argument is actually shared. On one package this was 92 of 134 sweep failures; on another, 755 of
-  762.
+  762. The name says nothing about global state, so a `!` method still gets `:fail` when the scan
+  reads a write to a constant global.
 - **An `isbits` first argument reports nothing at all.** A copy cannot be written through, so the
   guarantee holds trivially — and seeding it as shared taints every index derived from it, which
   made a store into a buffer the method allocated *itself* read as a write to the shared object.
@@ -1737,7 +1930,7 @@ per signature, for the property you actually need:
 
 Nothing in that column is a trade against correctness, and nothing is all-or-nothing: a module can
 require allocation-freedom of three kernels and say nothing about the rest. The guarantee is scoped
-to where it earns its place, which is why there are seventeen of them rather than one mode.
+to where it earns its place, which is why there are eighteen of them rather than one mode.
 
 A garbage collector only pauses code that allocates. Remove the allocation from the hot path — the
 property [`@assert_noalloc`](@ref) checks and `StrictModeTest.@test_noalloc` proves — and the pause

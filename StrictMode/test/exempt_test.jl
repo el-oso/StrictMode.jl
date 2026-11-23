@@ -12,7 +12,8 @@
     # An exemption records WHERE it is written, so a report can send a reader to the line.
     e = only(x for x in StrictMode.exemptions() if x.func === :xcold)
     @test endswith(e.file, "exempt_test.jl") && e.line > 0
-    @test isnothing(e.guarantees) && isnothing(e.types)   # the whole function, every guarantee
+    # Every guarantee, for the method the definition wrote: its own signature.
+    @test isnothing(e.guarantees) && e.types == (Int,)
 end
 
 @testitem "exempt functions are skipped by the registry sweep" begin
@@ -47,7 +48,7 @@ end
     inner = Meta.isexpr(out, :escape) ? out.args[1] : out
     s = string(inner)
     @test occursin("register_strict!", s)               # the hot def is registered
-    @test occursin("_exempt!", s)                       # the cold def is exempted inline
+    @test occursin("_exempt_defined!", s)               # the cold def is exempted inline
     @test !occursin("@strict_exempt", s)                # …not left as a macrocall to resolve
 end
 
@@ -279,12 +280,15 @@ end
     @noinline xbox_note!(n::Int) = BOXES[1] + n
     StrictMode._exempt!(:xgrow_note!; guarantees = (:noalloc,), reason = "grows to a high-water mark")
     StrictMode._exempt!(:xbox_note!; guarantees = (:noalloc,), reason = "boxes")
+    @noinline xbox_typed!(n::Int) = (BOXES[1] + n)::Int
+    StrictMode._exempt!(:xbox_typed!; guarantees = (:noalloc,), reason = "boxes")
     only_grows(n::Int) = (b = xgrow_note!(n); b[1])
     also_allocs(n::Int) = (b = xgrow_note!(n); sum(zeros(n)) + b[1])
     calls_boxer(n::Int) = xbox_note!(n) + 1
+    calls_typed_boxer(n::Int) = xbox_typed!(n) + 1
     end
     E = ExemptCallers
-    E.only_grows(4); E.also_allocs(4); E.calls_boxer(1)
+    E.only_grows(4); E.also_allocs(4); E.calls_boxer(1); E.calls_typed_boxer(1)
     noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
 
     r = noalloc(E.only_grows)
@@ -294,13 +298,271 @@ end
 
     # Its own allocation is not excused by reaching an exempt one.
     @test StrictMode._failed(noalloc(E.also_allocs))
-    # `:noalloc` excuses the callee's allocation, not its boxing.
+    noboxing(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noboxing,)))
+    # `:noboxing` is not excused by a `:noalloc` exemption.
+    @test StrictMode._failed(noboxing(E.calls_boxer))
+    @test StrictMode._failed(noboxing(E.calls_typed_boxer))
+    # Under `:noalloc` a box is an allocation, so the callee's boxing is excused…
+    r = noalloc(E.calls_typed_boxer)
+    @test r.status === :info && occursin("xbox_typed!", r.reason)
+    # …and the caller's own is not: it adds 1 to the callee's `Any` result by dispatch.
     @test StrictMode._failed(noalloc(E.calls_boxer))
 
     logs = Test.collect_test_logs() do
         @strict E.only_grows(4)
     end[1]
     @test !any(l -> l.level === Base.CoreLogging.Warn, logs)
+end
+
+@testitem "an exempt callee is a note whether or not its throw is caught" begin
+    using StrictMode, Test
+    # Names unique to this item: an exemption is matched by function name in every loaded module.
+    module ExemptCaught
+    using StrictMode
+    # Its only allocation is the exception of a throw that its own handler catches and returns from.
+    @noinline function xcaught_note!(n::Int)
+        try
+            n < 0 && throw(ArgumentError("negative"))
+        catch
+            return 0
+        end
+        return n
+    end
+    @noinline xplain_note!(n::Int) = n < 0 ? length(zeros(n)) : n
+    # The message of its caught throw is built by `print` over a `Vararg{Any}` tuple, which boxes.
+    @noinline function xcaught_box!(n::Int)
+        try
+            n < 0 && throw(ArgumentError(string("negative: ", n)))
+        catch
+            return 0
+        end
+        return n
+    end
+    const LATE = Any[1]
+    @noinline xlate_box(n::Int) = (LATE[1] + n)::Int
+    # Allocates first, then calls a callee that boxes.
+    @noinline function xgrow_then_box!(n::Int)
+        v = zeros(n)
+        return xlate_box(n) + length(v)
+    end
+    for name in (:xcaught_note!, :xplain_note!, :xcaught_box!, :xgrow_then_box!)
+        StrictMode._exempt!(name; guarantees = (:noalloc,), reason = "grows")
+    end
+    caught_caller(n::Int) = xcaught_note!(n) + 1
+    plain_caller(n::Int) = xplain_note!(n) + 1
+    own_caller(n::Int) = xcaught_note!(n) + sum(zeros(n))
+    boxed_caller(n::Int) = xcaught_box!(n) + 1
+    late_caller(n::Int) = xgrow_then_box!(n) + 1
+    end
+    E = ExemptCaught
+    for fn in (E.caught_caller, E.plain_caller, E.own_caller, E.boxed_caller, E.late_caller)
+        fn(1)
+    end
+    noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
+    reaches_box(fn, name) = any(
+        o -> occursin(name, string(o.signature)) || any(p -> occursin(name, string(p)), o.path),
+        StrictMode._signal_origin(fn, (Int,); mode = :boxing)
+    )
+
+    for (fn, callee) in ((E.caught_caller, "xcaught_note!"), (E.plain_caller, "xplain_note!"))
+        r = noalloc(fn)
+        @test r.status === :info
+        @test !StrictMode._failed(r)
+        @test occursin(callee, r.reason)
+    end
+    # Its own allocation is not excused by reaching an exempt one.
+    @test StrictMode._failed(noalloc(E.own_caller))
+    # Under `:noalloc` the exemption excuses the callee's boxing too, wherever in the callee it lies.
+    # Under `:noboxing` it excuses nothing, and the walk that names an origin finds the boxing there.
+    noboxing(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noboxing,)))
+    for (fn, callee) in ((E.boxed_caller, "xcaught_box!"), (E.late_caller, "xgrow_then_box!"))
+        r = noalloc(fn)
+        @test r.status === :info && occursin(callee, r.reason)
+        @test StrictMode._failed(noboxing(fn))
+        @test reaches_box(fn, callee)
+    end
+    @test reaches_box(E.late_caller, "xlate_box")
+end
+
+@testitem "an exempt function does not excuse a callable it was handed, in the scan" begin
+    using StrictMode, Test
+    # The same fixture as StrictModeTest's proof item, so the two tiers can be compared.
+    module ExemptHanded
+    using StrictMode
+    const POOL = Ref(Float64[])
+    @noinline function xh_grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" xh_grow!
+    @noinline xh_withbuf(f::F, n) where {F} = f(xh_grow!(n))
+    @strict_exempt :noalloc reason = "borrows the pool" xh_withbuf
+    @noinline mk(n) = zeros(n)
+    const BOXES = Any[1.0]
+    cb(n::Int) = xh_withbuf(b -> sum(mk(n)) + b[1], n)
+    cb_inline(n::Int) = xh_withbuf(b -> sum(zeros(n)) + b[1], n)
+    named_cb(b) = sum(zeros(length(b))) + b[1]
+    cb_named(n::Int) = xh_withbuf(named_cb, n)
+    cb_box(n::Int) = xh_withbuf(b -> (BOXES[1] + b[1])::Float64, n)
+    struct Cb2
+        n::Int
+    end
+    (c::Cb2)(b::Vector{Float64}) = sum(zeros(c.n)) + b[1]
+    (c::Cb2)(b::Vector{Float64}, k::Int) = b[k]
+    cb_struct2(n::Int) = xh_withbuf(Cb2(n), n)
+    @noinline xh_withbufs(fs::Vector{F}, n) where {F} = fs[1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "vec" xh_withbufs
+    const FS = [b -> sum(zeros(length(b))) + b[1]]
+    cb_vec(n::Int) = xh_withbufs(FS, n)
+    @noinline xh_withhooks(hooks::Vector{Function}, n::Int) = (
+        b = xh_grow!(n); for h in hooks
+            h(b)
+        end; b[1]
+    )
+    @strict_exempt :noalloc reason = "runs hooks" xh_withhooks
+    const HOOKS = Function[b -> sum(zeros(length(b)))]
+    cb_hooks(n::Int) = xh_withhooks(HOOKS, n)
+    struct Hook
+        f::Function
+    end
+    @noinline xh_withhook(h::Hook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withhook
+    const HOOK = Hook(b -> sum(zeros(length(b))))
+    cb_field(n::Int) = xh_withhook(HOOK, n)
+    @noinline xh_withany(@nospecialize(f), n::Int) = (b = xh_grow!(n); f(b); b[1])
+    @strict_exempt :noalloc reason = "nospecialize" xh_withany
+    const ANYCB = Ref{Any}(b -> sum(zeros(length(b))))
+    cb_any(n::Int) = xh_withany(ANYCB[], n)
+    # Callables nested three and five levels deep in tuples.
+    @noinline xh_run3(h, n::Int) = h[1][1][1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "runs" xh_run3
+    const H3A = (((b -> sum(zeros(length(b))) + b[1],),),)
+    const H3B = (((b -> (BOXES[1] + b[1])::Float64,),),)
+    cb_deep3(n::Int) = xh_run3(H3A, n)
+    cb_deep3box(n::Int) = xh_run3(H3B, n)
+    @noinline xh_run5(h, n::Int) = h[1][1][1][1][1](xh_grow!(n))
+    @strict_exempt :noalloc reason = "runs" xh_run5
+    const H5A = (((((b -> sum(zeros(length(b))) + b[1],),),),),)
+    cb_deep5(n::Int) = xh_run5(H5A, n)
+    # A callable struct held in a field of an abstract type that `Function` does not intersect, and
+    # a closure held in a field declared `Any`.
+    abstract type AbsCb end
+    struct CbImpl <: AbsCb end
+    (::CbImpl)(b::Vector{Float64}) = sum(zeros(length(b))) + b[1]
+    struct AbsHook
+        f::AbsCb
+    end
+    @noinline xh_withabs(h::AbsHook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withabs
+    const ABSHOOK = AbsHook(CbImpl())
+    cb_absfield(n::Int) = xh_withabs(ABSHOOK, n)
+    struct AnyHook
+        f::Any
+    end
+    @noinline xh_withanyf(h::AnyHook, n::Int) = (b = xh_grow!(n); h.f(b); b[1])
+    @strict_exempt :noalloc reason = "runs a hook" xh_withanyf
+    const ANYHOOK = AnyHook(b -> sum(zeros(length(b))))
+    cb_anyfield(n::Int) = xh_withanyf(ANYHOOK, n)
+    # The callback allocates and boxes nothing: every site is the exempt functions' own code.
+    cb_clean(n::Int) = xh_withbuf(b -> b[1], n)
+    plain(n::Int) = (b = xh_grow!(n); b[1])
+    # Callables in an abstract-eltype container that the exempt function iterates and calls.
+    @noinline xh_withabsvec(hs::Vector{AbsCb}, n::Int) = (
+        b = xh_grow!(n); for h in hs
+            h(b)
+        end; b[1]
+    )
+    @strict_exempt :noalloc reason = "runs hooks" xh_withabsvec
+    const ABSVEC = AbsCb[CbImpl()]
+    cb_absvec(n::Int) = xh_withabsvec(ABSVEC, n)
+    # A handed closure calling a function the exempt function also calls itself, and one calling a
+    # function only the closure calls.
+    @noinline xh_mk2(n) = zeros(n)
+    @noinline xh_withmk(f::F, n) where {F} = (xh_mk2(n); f(n))
+    @strict_exempt :noalloc reason = "shares a helper" xh_withmk
+    cb_shared(n::Int) = xh_withmk(k -> sum(xh_mk2(k)), n)
+    @noinline xh_withmk2(f::F, n) where {F} = f(n)
+    @strict_exempt :noalloc reason = "no helper" xh_withmk2
+    cb_noshare(n::Int) = xh_withmk2(k -> sum(xh_mk2(k)), n)
+    # The caller calling, after an exempt function, a function that exempt function also calls.
+    cb_then(n::Int) = xh_withmk(k -> k, n) + sum(xh_mk2(n))
+    @noinline xh_ex1(n) = length(xh_mk2(n))
+    @strict_exempt :noalloc reason = "x" xh_ex1
+    plain_then(n::Int) = xh_ex1(n) + sum(xh_mk2(n))
+    # A field declared `Any` that the exempt function reads but never calls.
+    @noinline xh_withanynocall(h::AnyHook, n::Int) = (b = xh_grow!(n); h.f === nothing ? 0.0 : b[1])
+    @strict_exempt :noalloc reason = "pool" xh_withanynocall
+    anyfield_nocall(n::Int) = xh_withanynocall(ANYHOOK, n)
+    # A lock, a condition and a channel (each holds tasks, whose fields are declared `Any`), which
+    # the exempt function locks, notifies and fills but calls nothing loaded from. The `do` block
+    # is a closure the exempt function defines, so it is the exempt function's own code.
+    struct LPool
+        l::ReentrantLock
+        c::Threads.Condition
+        ch::Channel{Int}
+        v::Vector{Float64}
+    end
+    const LP = LPool(ReentrantLock(), Threads.Condition(), Channel{Int}(4), Float64[])
+    @noinline function xh_lgrow!(p::LPool, n::Int)
+        lock(p.l)
+        try
+            length(p.v) < n && append!(p.v, zeros(n - length(p.v)))
+        finally
+            unlock(p.l)
+        end
+        lock(p.c) do
+            notify(p.c)
+        end
+        put!(p.ch, n)
+        take!(p.ch)
+        return p.v
+    end
+    @strict_exempt :noalloc reason = "pool" xh_lgrow!
+    lockuser(n::Int) = xh_lgrow!(LP, n)[1]
+    # An exempt function writing to the stream a struct holds (the stream's lock may wait inside
+    # it), run by a closure its non-exempt caller builds around the struct.
+    struct TWriter
+        io::IOStream
+    end
+    @noinline function xh_twrite(w::TWriter, x::Float64)
+        b = xh_grow!(4)
+        write(w.io, x)
+        return b[1]
+    end
+    @strict_exempt :noalloc reason = "writes a frame" xh_twrite
+    @noinline xh_drive(f::F, n::Int) where {F} = (s = 0.0; for i in 1:n
+            s += f(i)
+        end; s)
+    const TW = TWriter(open(tempname(), "w"))
+    tw_caller(w::TWriter, n::Int) = xh_drive(i -> xh_twrite(w, Float64(i)), n)
+    # Plain data nested five levels deep holds no callable.
+    @noinline xh_data(d, n::Int) = (b = xh_grow!(n); b[1] + d[1][1][1][1][1])
+    @strict_exempt :noalloc reason = "pool" xh_data
+    const D5 = (((((1.0,),),),),)
+    data_deep(n::Int) = xh_data(D5, n)
+    end
+    E = ExemptHanded
+    noalloc(fn) = only(StrictMode.findings(fn, (Int,); guarantees = (:noalloc,)))
+    for fn in (
+            E.cb, E.cb_inline, E.cb_named, E.cb_box, E.cb_struct2, E.cb_vec, E.cb_hooks, E.cb_field, E.cb_any,
+            E.cb_deep3, E.cb_deep3box, E.cb_deep5, E.cb_absfield, E.cb_anyfield, E.cb_absvec, E.cb_shared,
+            E.cb_noshare, E.cb_then, E.plain_then,
+        )
+        fn(3)
+        @test StrictMode._failed(noalloc(fn))
+    end
+    for fn in (E.cb_clean, E.plain, E.data_deep, E.anyfield_nocall, E.lockuser)
+        fn(3)
+        r = noalloc(fn)
+        @test r.status === :info && !StrictMode._failed(r)
+    end
+    E.tw_caller(E.TW, 2)
+    tw = only(StrictMode.findings(E.tw_caller, (E.TWriter, Int); guarantees = (:noalloc,)))
+    @test tw.status === :info && occursin("xh_twrite", tw.reason)
+    # A signature with a `Vararg` tail, as a callee called with a splat has: its element type is what
+    # an argument carries.
+    @test StrictMode._handed_types(Tuple{typeof(E.plain), Vararg{Union{Char, String}}}) == Any[]
+    @test StrictMode._handed_types(Tuple{typeof(E.plain), Int, Vararg{typeof(E.named_cb)}}) == Any[typeof(E.named_cb)]
 end
 
 @testitem "an allocation barrier excuses allocation only; its other causes are reported at it" begin
@@ -335,6 +597,35 @@ end
     end
 end
 
+@testitem "a registered barrier's boxing is excused under :noalloc and noted under :noboxing" begin
+    using StrictMode, Test
+    module BoxingBarrier
+    @noinline dyn(v::Vector{Any}) = v[1] + 1          # a dynamic call, and a boxed result
+    @noinline bar(v::Vector{Any}) = dyn(v)
+    entry(v::Vector{Any}) = bar(v) === nothing
+    end
+    v = Any[1]
+    BoxingBarrier.entry(v)
+    T = (Vector{Any},)
+    one(g) = only(StrictMode.findings(BoxingBarrier.entry, T; guarantees = (g,)))
+    @test StrictMode._failed(one(:noalloc))
+    @test StrictMode._failed(one(:noboxing))
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        StrictMode.register_alloc_barrier!(BoxingBarrier.bar)
+        # Under :noalloc a box is an allocation, which the barrier excuses: a pass, with no note.
+        @test one(:noalloc).status === :pass
+        @test_logs @assert_noalloc BoxingBarrier.entry(v)
+        # :noboxing is not excused: the caller is pointed to the barrier, where it is reported.
+        b = one(:noboxing)
+        @test b.status === :info && occursin("reaches `bar`", b.reason)
+        @test StrictMode._failed(only(StrictMode.findings(BoxingBarrier.bar, T; guarantees = (:noboxing,))))
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS); union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
+    end
+end
+
 @testitem "a package's :noalloc exemption covers that package's methods only" begin
     using StrictMode
     module Scoped6
@@ -350,4 +641,126 @@ end
     nf(f) = only(StrictMode.findings(f, (Int,); guarantees = (:noalloc,)))
     @test StrictMode._failed(nf(Scoped6.shower))          # an unrelated `string` is not excused
     @test nf(Scoped6.uses_mine).status === :info           # its own callee is
+end
+
+@testitem "an exemption of a method on another module's function excuses only that method" begin
+    using StrictMode
+
+    # Two modules add methods to the same function, `Base.length`, and one of them also extends a
+    # function the other owns. Only the module that wrote `@strict_exempt` has a method excused.
+    module SweptOwner
+    struct Grows
+        n::Int
+    end
+    Base.length(g::Grows) = length(zeros(g.n))
+    owned(g::Grows) = length(zeros(g.n))
+    end
+    module Exempter
+    using StrictMode
+    import ..SweptOwner
+    struct Foo end
+    @strict_exempt Base.length(::Foo) = 1
+    @strict_exempt SweptOwner.owned(::Foo) = 2
+    end
+    B, A = SweptOwner, Exempter
+    length(B.Grows(3)); B.owned(B.Grows(3))
+
+    fs = audit(B; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    @test count(f -> f.func == "length", fs) == 1
+    @test count(f -> f.func == "owned", fs) == 1
+    ms, skipped = StrictMode.module_methods(B)
+    @test count(m -> m.name === :length, ms) == 1
+    @test count(m -> m.name === :owned, ms) == 1
+    # The exempting module's own methods are still excused.
+    ms, skipped = StrictMode.module_methods(A)
+    @test !any(m -> m.name in (:length, :owned), ms)
+    @test get(skipped, :exempt, 0) == 2
+end
+
+@testitem "a definition-form exemption covers the method it defines, not its siblings" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module DefOne
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = collect(1:Int(n))            # allocates, and nothing excuses it
+    @strict_exempt tidy(n::Int) = collect(1:n)
+    tidy(n::Integer) = Int(n) + 1                   # clean
+    @strict_exempt kw(n::Int; k = 1) = collect(1:(n + k))
+    @strict_exempt only1(n::Int) = collect(1:n)
+    end
+    M = DefOne
+    M.grow(3); M.grow(Int32(3)); M.tidy(3); M.tidy(Int32(3)); M.kw(2); M.only1(2)
+
+    # The definition's own signature is recorded, so the exemption names that one method.
+    @test only(x for x in StrictMode.exemptions() if x.func === :grow).types == (Int,)
+    @test StrictMode._is_exempt(M.grow, which(M.grow, (Int,)))
+    @test !StrictMode._is_exempt(M.grow, which(M.grow, (Integer,)))
+    @test !StrictMode._is_exempt(M.grow)
+
+    fs = audit(M; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    rows(fn, T) = filter(f -> f.func == fn && occursin(string(T), f.signature), fs)
+    @test any(StrictMode._failed, rows("grow", Int32))        # the sibling is judged
+    @test !isempty(rows("tidy", Int32)) && !any(StrictMode._failed, rows("tidy", Int32))
+    @test isempty(rows("grow", Int64))                        # the exempt method is not swept
+
+    # A function whose every method an exemption wrote is exempt as a whole, as before: the sweep,
+    # the census and the coverage gate leave it alone, keyword body included.
+    @test StrictMode._is_exempt(M.only1) && StrictMode._is_exempt(M.kw)
+    @test !any(f -> f.func in ("kw", "only1"), fs)
+    ms, _ = StrictMode.module_methods(M)
+    @test !any(m -> StrictMode._demangle(m.name) in (:kw, :only1), ms)
+    @test count(m -> m.name === :grow, ms) == 1
+    cov = filter(StrictMode._failed, audit(M; require = :all))
+    @test !any(f -> f.func in ("kw", "only1"), cov)
+    @test !any(f -> f.func == "grow" && occursin("Int64", f.signature), cov)
+
+    # Type variables that tie two arguments together leave no tuple naming exactly that method.
+    @test_throws "ties its argument types together" @eval module DefDiag
+    using StrictMode
+    @strict_exempt pair(x::T, y::T) where {T <: Real} = x + y
+    end
+    StrictMode.clear_declarations!()
+end
+
+@testitem "block and include exemptions cover the methods written inside them" begin
+    using StrictMode, Test
+    StrictMode.clear_declarations!()
+    file = joinpath(mktempdir(), "cold.jl")
+    write(
+        file, """
+        igrow(n::Int) = collect(1:n)
+        itidy(n::Int) = collect(1:n)
+        pair(x::T, y::T) where {T <: Real} = collect(1:Int(x))
+        """
+    )
+    @test_logs (:warn, r"pair.*by name"s) match_mode = :any @eval module BlkInc
+    using StrictMode
+    @strict_exempt begin
+        bgrow(n::Int) = collect(1:n)
+        btidy(n::Int) = collect(1:n)
+    end
+    bgrow(n::Integer) = collect(1:Int(n))        # allocates, written outside the block
+    btidy(n::Integer) = Int(n) + 1               # clean, written outside the block
+    @strict_exempt include($file)
+    igrow(n::Integer) = collect(1:Int(n))
+    itidy(n::Integer) = Int(n) + 1
+    end
+    M = BlkInc
+    for f in (M.bgrow, M.btidy, M.igrow, M.itidy)
+        f(3); f(Int32(3))
+        @test StrictMode._is_exempt(f, which(f, (Int,)))
+        @test !StrictMode._is_exempt(f, which(f, (Integer,)))
+    end
+    fs = audit(M; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    rows(fn, T) = filter(f -> f.func == fn && occursin(string(T), f.signature), fs)
+    for (fn, dirty) in (("bgrow", true), ("btidy", false), ("igrow", true), ("itidy", false))
+        @test !isempty(rows(fn, Int32))
+        @test any(StrictMode._failed, rows(fn, Int32)) == dirty
+        @test isempty(rows(fn, Int64))
+    end
+    # A method with tied type variables is exempted by its function's name, with a warning.
+    @test isnothing(only(x for x in StrictMode.exemptions() if x.func === :pair).types)
+    @test StrictMode._is_exempt(M.pair)
+    StrictMode.clear_declarations!()
 end

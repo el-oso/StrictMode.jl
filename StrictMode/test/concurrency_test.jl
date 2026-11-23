@@ -183,7 +183,8 @@ end
     # this file do.
     @test_throws StrictMode._UnanalyzableSignature pool_balance_report(balanced!, (String,))
     @test_throws "could not analyze" pool_balance_report(balanced!, (String,))
-    @test_throws "UNKNOWN, not satisfied" pool_balance_report(balanced!, (String,))
+    @test_throws "StrictMode pool_balance_report: could not analyze" pool_balance_report(balanced!, (String,))
+    @test_throws "the result is UNKNOWN" pool_balance_report(balanced!, (String,))
 end
 
 @testitem "taint flows through a struct built from a shared argument" begin
@@ -1078,7 +1079,9 @@ end
     fails(f, T) = any(v -> v.certain && !v.deliberate, StrictMode.concurrency_findings(f, T))
     @test fails(Rev.bumpn, (Rev.P1,))                                  # a plain modifyfield! is not atomic
     @test isempty(StrictMode.concurrency_findings(Rev.withlock, (Rev.Plan,)))
-    @test isempty(StrictMode.concurrency_findings(Rev.counted, (Rev.Plan,)))
+    # An atomic write to a global counter is reported, the deliberate way, and never fails.
+    @test all(v -> v.deliberate, StrictMode.concurrency_findings(Rev.counted, (Rev.Plan,)))
+    @test !fails(Rev.counted, (Rev.Plan,))
     @test !fails(Rev.fresh_out, (Rev.Plan,))                           # writes only its own fresh buffer
     @test fails(Rev.callable, (Rev.Plan,))                             # a callable struct is read too
     tid(f, T) = (vs = StrictMode.threadid_state_findings(f, T); isempty(vs) ? :pass : any(v -> v.certain, vs) ? :fail : :maybe)
@@ -1160,17 +1163,20 @@ end
     struct Y end
     Base.show(io::IO, ::Y) = (yield(); print(io, "y"))
     struct Z; a::Int; end
+    struct ZY; y::Y; end
     held(::Int) = (i = threadid(); s = string(Y()); BUF[i] += length(s); nothing)
     plain(x::Int) = (i = threadid(); s = string(x, "a", 2.0); BUF[i] += length(s); nothing)
     zplain(z::Z) = (i = threadid(); s = string(z); BUF[i] += length(s); nothing)
+    zheld(z::ZY) = (i = threadid(); s = string(z); BUF[i] += length(s); nothing)
     end
-    Shows.held(1); Shows.plain(1); Shows.zplain(Shows.Z(1))
+    Shows.held(1); Shows.plain(1); Shows.zplain(Shows.Z(1)); Shows.zheld(Shows.ZY(Shows.Y()))
     tid(f, t) = only(StrictMode.findings(f, t; guarantees = (:no_threadid_state,))).status
-    # A yielding `show` is never cleared. On 1.13 `string` inlines to `print` and the yield is read
-    # (:fail); on 1.12 `print_to_string` stays out of line and is not read in full (:info).
-    @test tid(Shows.held, (Int,)) === (VERSION >= v"1.13-" ? :fail : :info)
+    @test tid(Shows.held, (Int,)) === :fail
     @test tid(Shows.plain, (Int,)) === :pass
-    @test tid(Shows.zplain, (Shows.Z,)) === (VERSION >= v"1.13-" ? :pass : :info)
+    # Base's default `show` of a struct is compiled for `Any` and called through a compiler barrier;
+    # it is read at the struct's own type, so the `show` of each field is read too.
+    @test tid(Shows.zplain, (Shows.Z,)) === :pass
+    @test tid(Shows.zheld, (Shows.ZY,)) === :fail
 end
 
 @testitem "per-thread state wrapped in a struct or tuple is still per-thread" begin
@@ -1191,4 +1197,646 @@ end
     @test tid(Wrapped.root) === :info         # handed on in a wrapper to a callee that suspends
     @test tid(Wrapped.tup) === :info
     @test tid(Wrapped.root_calm) === :pass    # the callee cannot suspend
+end
+
+@testitem "a plan value handed to a callee the scan cannot read is recorded" begin
+    using StrictMode
+
+    struct UnreadPlan
+        buf::Vector{Float64}
+    end
+    # A callable struct with a field is not a singleton, and the scan reads a callee through its
+    # singleton, so this body is one it does not read.
+    struct UnreadWriter
+        k::Int
+    end
+    @noinline (w::UnreadWriter)(p::UnreadPlan) = (p.buf[w.k] = 1.0; nothing)
+    through_callable(p::UnreadPlan, w::UnreadWriter) = w(p)
+    reads_only(p::UnreadPlan) = p.buf[1]
+
+    vs = StrictMode.concurrency_findings(through_callable, (UnreadPlan, UnreadWriter))
+    @test length(vs) == 1
+    # Not a write the scan read, so it reports and does not gate.
+    @test !only(vs).certain
+    @test occursin("could not be read", only(vs).message)
+    @test isempty(StrictMode.concurrency_findings(reads_only, (UnreadPlan,)))
+end
+
+@testitem "a write that reaches the plan through Base or through C is read" begin
+    using StrictMode, LinearAlgebra
+
+    struct BPlan
+        buf::Vector{Float64}
+        d::Dict{Symbol, Vector{Float64}}
+        A::Matrix{Float64}
+        lk::ReentrantLock
+    end
+    sig = (BPlan, Vector{Float64})
+    records(f) = StrictMode.concurrency_findings(f, sig)
+    written(f) = any(v -> v.certain && !v.deliberate, records(f))
+
+    # A Base callee that is not inlined: the scan reads its body and finds the store.
+    w_sort(p, x) = (sort!(p.buf); nothing)
+    w_sortby(p, x) = (sort!(p.buf; by = abs); nothing)
+    w_reverse(p, x) = (reverse!(p.buf); nothing)
+    w_delete(p, x) = (delete!(p.d, :a); nothing)
+    w_getbang(p, x) = (get!(p.d, :c, x); nothing)
+    w_circshift(p, x) = (circshift!(p.buf, 1); nothing)
+    w_cumsum(p, x) = (cumsum!(p.buf, x); nothing)
+    # A store made by a C function whose destination argument is known.
+    w_copyto(p, x) = (copyto!(p.buf, x); nothing)
+    w_memset(p, x) = (ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), p.buf, 0, 8); nothing)
+    w_memmove(p, x) = (ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), p.buf, x, 8); nothing)
+    w_unsafecopy(p, x) = (unsafe_copyto!(pointer(p.buf), pointer(x), 2); nothing)
+    # A reference a Base call returns is still the plan's memory.
+    w_dictget(p, x) = (get(p.d, :a, x)[1] = 0.0; nothing)
+    w_unsafewrap(p, x) = (a = unsafe_wrap(Array, pointer(p.buf), 2); a[1] = 0.0; nothing)
+    for f in (
+            w_sort, w_sortby, w_reverse, w_delete, w_getbang, w_circshift, w_cumsum, w_copyto,
+            w_memset, w_memmove, w_unsafecopy, w_dictget, w_unsafewrap,
+        )
+        @test written(f)
+    end
+    @test any(v -> occursin("`memmove` writes its destination", v.message), records(w_copyto))
+    @test any(v -> occursin("reached via reverse!", v.message), records(w_reverse))
+
+    # A foreign function the scan has no entry for is assumed to write through its pointers. The
+    # scan read no store, so the record reports and does not raise.
+    w_axpy(p, x) = (BLAS.axpy!(2.0, x, p.buf); nothing)
+    w_scal(p, x) = (BLAS.scal!(2.0, p.buf); nothing)
+    r_dot(p, x) = BLAS.dot(p.buf, x)
+    for f in (w_axpy, w_scal, r_dot)
+        vs = records(f)
+        @test !isempty(vs)
+        @test !any(v -> v.certain, vs)
+        @test any(v -> occursin("foreign function", v.message) && occursin("assumed to write", v.message), vs)
+    end
+
+    # The plan is read and something else is written: a source argument of a copy, a fresh buffer
+    # built from plan data, a reference returned by a Base call that is only read, a lock.
+    r_copyfrom(p, x) = (copyto!(x, p.buf); nothing)
+    r_memmove(p, x) = (ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), x, p.buf, 8); nothing)
+    r_freshsort(p, x) = (t = copy(p.buf); sort!(t); reverse!(t); t[1])
+    r_sortcopy(p, x) = sort(p.buf)[1]
+    r_freshfill(p, x) = (t = similar(p.buf); fill!(t, 1.0); t .= p.buf .+ x; sum(t))
+    r_freshdict(p, x) = (d = Dict{Symbol, Vector{Float64}}(); d[:a] = x; delete!(d, :a); length(d))
+    r_dictget(p, x) = (x[1] = get(p.d, :a, x)[1]; nothing)
+    r_copysort(p, x) = (sort!(x); x[1] + p.buf[1])
+    r_map(p, x) = (map!(abs, x, p.buf); nothing)
+    r_cumsum(p, x) = (cumsum!(x, p.buf); nothing)
+    r_show(p, x) = length(repr(p.buf))
+    r_sum(p, x) = sum(p.buf) + maximum(abs, p.A)
+    r_locked(p, x) = lock(() -> (x[1] = p.buf[1]; nothing), p.lk)
+    r_lock(p, x) = (lock(p.lk); x[1] = p.buf[1]; unlock(p.lk); nothing)
+    r_throw(p, x) = (
+        length(x) == length(p.buf) || throw(DimensionMismatch("$(length(x)) and $(length(p.buf))"));
+        x[1] = p.buf[1]; nothing
+    )
+    for f in (
+            r_copyfrom, r_memmove, r_freshsort, r_sortcopy, r_freshfill, r_freshdict, r_dictget,
+            r_copysort, r_map, r_cumsum, r_show, r_sum, r_locked, r_lock, r_throw,
+        )
+        @test isempty(records(f))
+    end
+
+    # A lock is not a plan: every task that uses one writes it.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+
+    p = BPlan(rand(4), Dict(:a => rand(4)), rand(4, 4), ReentrantLock())
+    x = rand(4)
+    @test_throws "`memmove` writes its destination" @assert_concurrency_safe w_copyto(p, x)
+    @test_throws StrictMode.StrictViolation @assert_concurrency_safe w_reverse(p, x)
+    @test_logs (:warn, r"cannot establish that the plan argument is read-only.*foreign function"s) match_mode = :any @assert_concurrency_safe w_axpy(p, x)
+    @test (@assert_concurrency_safe r_copyfrom(p, x)) === nothing
+end
+
+@testitem "atomic writes agree, builtins are not dispatch, and an unread result is undecided" begin
+    using StrictMode
+
+    mutable struct CPlan
+        ctr::Threads.Atomic{Int}
+        @atomic n::Int
+        buf::Vector{Float64}
+        d::Dict{Symbol, Vector{Float64}}
+        sd::Dict{String, Int}
+        name::String
+    end
+    sig = (CPlan, Vector{Float64})
+    records(f; kw...) = StrictMode.concurrency_findings(f, sig; kw...)
+
+    # Three spellings of an atomic write to the plan. Each cannot tear and each is still shared
+    # state, so each is reported the deliberate way: named, and not a failure.
+    a_field(p, x) = (@atomic p.n += 1; nothing)
+    a_add(p, x) = (Threads.atomic_add!(p.ctr, 1); nothing)
+    a_set(p, x) = (p.ctr[] = 3; nothing)
+    for f in (a_field, a_add, a_set)
+        vs = records(f)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate, vs)
+        @test any(v -> occursin("ATOMIC", v.message), vs)
+    end
+    a_read(p, x) = p.ctr[] + (@atomic p.n)
+    @test isempty(records(a_read))
+    # A lock is still not shared data.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+
+    # A builtin cannot dispatch, however the call to it is spelled in the IR, and a table a copy
+    # builds for itself is not the plan.
+    r_haskey(p, x) = haskey(p.sd, p.name)
+    r_parse(p, x) = parse(Int, p.name)
+    r_print(p, x) = (io = IOBuffer(); print(io, p.name); position(io))
+    r_deepcopy(p, x) = sum(deepcopy(p.buf))
+    for f in (r_haskey, r_parse, r_print, r_deepcopy)
+        vs = records(f)
+        @test !any(v -> occursin("`sizeof`", v.message), vs)
+        @test !any(v -> occursin("jl_eqtable_put", v.message), vs)
+    end
+    @test isempty(records(r_haskey))
+    # `deepcopy` dispatches at run time inside Base, which stays undecided; it is not a write.
+    @test !any(v -> v.certain, records(r_deepcopy))
+
+    # A Base callee whose result may be the plan's memory, past the depth the walk reads. Its
+    # result is undecided: the call is recorded, and so is a store through what it returned.
+    # Neither is a write the scan read.
+    w_get(p, x) = (get(p.d, :a, x)[1] = 0.0; nothing)
+    @test any(v -> v.certain, records(w_get))                # read at the default depth
+    shallow = records(w_get; max_depth = -StrictMode._BASE_EXTRA_DEPTH)
+    @test !isempty(shallow)
+    @test !any(v -> v.certain, shallow)
+    @test any(v -> occursin("`get`", v.message) && occursin("may be the plan's memory", v.message), shallow)
+    @test any(v -> occursin("stores into a value", v.message), shallow)
+    r_get(p, x) = (x[1] = get(p.d, :a, x)[1]; nothing)
+    shallow_read = records(r_get; max_depth = -StrictMode._BASE_EXTRA_DEPTH)
+    @test !any(v -> v.certain, shallow_read)
+    @test !any(v -> occursin("stores into a value", v.message), shallow_read)
+    @test isempty(records(r_get))
+end
+
+@testitem "the concurrency message lists the writes it read before the sites it could not rule out" begin
+    using StrictMode, LinearAlgebra
+
+    mutable struct MPlan
+        buf::Vector{Float64}
+        A::Matrix{Float64}
+        @atomic n::Int
+    end
+    # One write the scan reads, one atomic write, and one BLAS call it cannot read, written with
+    # the undecided one first.
+    mixed(p, x) = (y = p.A * x; @atomic p.n += 1; p.buf[1] = y[1]; nothing)
+    undecided(p, x) = (y = p.A * x; x[1] = y[1]; nothing)
+    p = MPlan(zeros(2), ones(2, 2), 0)
+    x = ones(2)
+
+    msg = try
+        @assert_concurrency_safe mixed(p, x)
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+    @test occursin("1 write(s) the scan read, 1 atomic write(s), 1 site(s) it could not rule out", msg)
+    w = findfirst("Writes the scan read (1):", msg)
+    a = findfirst("Atomic writes, which cannot tear (1):", msg)
+    u = findfirst("Sites the scan could not rule out (1):", msg)
+    @test !isnothing(w) && !isnothing(a) && !isnothing(u)
+    @test first(w) < first(a) < first(u)
+    @test occursin(r"\[write 1\] stores into a buffer reachable from the plan", msg)
+    @test occursin(r"\[atomic 1\] .*ATOMIC", msg)
+    @test occursin(r"\[undecided 1\] hands a plan-reachable pointer to (the|a) foreign function", msg)
+    @test first(findfirst("[write 1]", msg)) < first(findfirst("[undecided 1]", msg))
+
+    # With nothing read, there is no heading for writes, and the call warns.
+    @test_logs (:warn, r"cannot establish.*0 write\(s\) the scan read.*Sites the scan could not rule out \(1\):.*\[undecided 1\]"s) match_mode = :any @assert_concurrency_safe undecided(p, x)
+
+    # The finding a sweep gives says the same, in one line, and points at the write.
+    f = only(findings(mixed, (MPlan, Vector{Float64}); guarantees = (:concurrency_safe,)))
+    @test StrictMode._failed(f)
+    @test occursin("1 write(s) the scan read, 1 atomic write(s), 1 site(s) it could not rule out", f.reason)
+    @test first(findfirst("[write 1]", f.reason)) < first(findfirst("[undecided 1]", f.reason))
+    g = only(findings(undecided, (MPlan, Vector{Float64}); guarantees = (:concurrency_safe,)))
+    @test g.status === :info
+    @test occursin("[undecided 1]", g.reason) && !occursin("[write", g.reason)
+end
+
+@testitem "an atomic write to a global is reported as one to the plan is" begin
+    using StrictMode
+
+    module GlobalAtomics
+    const HITS = Threads.Atomic{Int}(0)
+    struct Stats
+        calls::Threads.Atomic{Int}
+        lk::ReentrantLock
+    end
+    const STATS = Stats(Threads.Atomic{Int}(0), ReentrantLock())
+    struct Plan
+        w::Vector{Float64}
+    end
+    add(p::Plan) = (Threads.atomic_add!(HITS, 1); p.w[1])
+    set(p::Plan) = (HITS[] = 3; p.w[1])
+    nested(p::Plan) = (Threads.atomic_add!(STATS.calls, 1); p.w[1])
+    read(p::Plan) = HITS[] + STATS.calls[] + p.w[1]
+    locked(p::Plan) = (lock(STATS.lk); x = p.w[1]; unlock(STATS.lk); x)
+    end
+    sig = (GlobalAtomics.Plan,)
+    for f in (GlobalAtomics.add, GlobalAtomics.set, GlobalAtomics.nested)
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate, vs)
+        @test any(v -> occursin("process-global state", v.message) && occursin("atomic", v.message), vs)
+    end
+    # Reading one, and taking a lock that sits beside one, write nothing.
+    @test isempty(StrictMode.concurrency_findings(GlobalAtomics.read, sig))
+    @test isempty(StrictMode.concurrency_findings(GlobalAtomics.locked, sig))
+
+    # It warns at a call site and is a note in a sweep: it never raises and never fails.
+    p = GlobalAtomics.Plan([1.0])
+    @test_logs (:warn, r"Atomic writes, which cannot tear \(1\)"s) match_mode = :any @assert_concurrency_safe GlobalAtomics.add(p)
+    GlobalAtomics.add(p)
+    @test only(findings(GlobalAtomics.add, sig; guarantees = (:concurrency_safe,))).status === :info
+end
+
+@testitem "a global handed to a helper is followed into it" begin
+    using StrictMode
+
+    module GlobalHelpers
+    const HITS = Threads.Atomic{Int}(0)
+    const LOG = Float64[]
+    const LK = ReentrantLock()
+    struct Plan
+        buf::Vector{Float64}
+        ctr::Threads.Atomic{Int}
+    end
+    @noinline bump!(c::Threads.Atomic{Int}) = (Threads.atomic_add!(c, 1); nothing)
+    @noinline bump_twice(c) = (bump!(c); bump!(c))
+    @noinline peek(c::Threads.Atomic{Int}) = c[]
+    @noinline note!(log::Vector{Float64}, x) = (log[1] = x; nothing)
+    @noinline with(lk, x) = (lock(lk); y = x + 1; unlock(lk); y)
+    g_helper(p::Plan) = (bump!(HITS); p.buf[1])
+    g_nested(p::Plan) = (bump_twice(HITS); p.buf[1])
+    g_plan(p::Plan) = (bump!(p.ctr); p.buf[1])
+    g_reads(p::Plan) = peek(HITS) + p.buf[1]
+    g_store(p::Plan) = (note!(LOG, 1.0); p.buf[1])
+    g_locks(p::Plan) = with(LK, p.buf[1])
+    end
+    G = GlobalHelpers
+    sig = (G.Plan,)
+    for f in (G.g_helper, G.g_nested)
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test !isempty(vs)
+        @test all(v -> v.deliberate && v.certain, vs)
+        @test any(v -> occursin("process-global state", v.message) && occursin("bump!", v.message), vs)
+    end
+    # The same helper on the plan's own counter is the plan's write, as before.
+    @test any(v -> occursin("reachable from the plan", v.message), StrictMode.concurrency_findings(G.g_plan, sig))
+    # A helper that reads the global, and one that takes a global lock, write nothing.
+    @test isempty(StrictMode.concurrency_findings(G.g_reads, sig))
+    @test isempty(StrictMode.concurrency_findings(G.g_locks, sig))
+    # A plain store through the helper is a write the scan read, and raises.
+    vs = StrictMode.concurrency_findings(G.g_store, sig)
+    @test any(v -> v.certain && !v.deliberate && occursin("process-global state", v.message), vs)
+    push!(G.LOG, 0.0)
+    @test_throws StrictViolation @assert_concurrency_safe G.g_store(G.Plan([1.0], Threads.Atomic{Int}(0)))
+end
+
+@testitem "an atomic write to a global is not reported as a doubt about the plan" begin
+    using StrictMode
+
+    module GlobalHeadline
+    const HITS = Threads.Atomic{Int}(0)
+    struct Plan
+        buf::Vector{Float64}
+    end
+    g_add(p::Plan) = (Threads.atomic_add!(HITS, 1); p.buf[1])
+    end
+    G = GlobalHeadline
+    p = G.Plan([1.0])
+    G.g_add(p)
+    # What was found is an atomic write to a global, and nothing about the plan.
+    headline = r"makes atomic writes to global state that every concurrent call shares; the plan argument is not written"
+    @test_logs (:warn, headline) match_mode = :any @assert_concurrency_safe G.g_add(p)
+    @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe G.g_add(p)
+    f = only(findings(G.g_add, (G.Plan,); guarantees = (:concurrency_safe,)))
+    @test f.status === :info
+    @test occursin("argument 1 is not written; global state every concurrent call shares is written atomically", f.reason)
+    @test !occursin("cannot prove argument 1 is read-only", f.reason)
+end
+
+@testitem "a builtin that calls the function it is handed passes the plan on to it" begin
+    using StrictMode
+
+    module CallingBuiltins
+    struct P
+        log::Vector{Float64}
+        buf::Vector{Float64}
+    end
+    splat!(p::P, xs::Vector{Float64}) = (push!(p.log, xs...); nothing)
+    late!(p::P) = (Base.invokelatest(fill!, p.buf, 0.0); nothing)
+    late_any(p::P, f::Function) = (Base.invokelatest(f, p.buf); nothing)
+    barrier!(p::P) = (b = Base.inferencebarrier(p.buf); b[1] = 0.0; nothing)
+    end
+    C = CallingBuiltins
+    # The inner callee is a known mutator and the plan sits where it writes: a write the scan read.
+    for (f, sig, nm) in ((C.splat!, (C.P, Vector{Float64}), "push!"), (C.late!, (C.P,), "fill!"))
+        vs = StrictMode.concurrency_findings(f, sig)
+        @test any(v -> v.certain && occursin(nm, v.message), vs)
+    end
+    # An inner callee the scan cannot name is a site it could not rule out.
+    vs = StrictMode.concurrency_findings(C.late_any, (C.P, Function))
+    @test !isempty(vs)
+    @test all(v -> !v.certain, vs)
+    # A barrier returns its argument, so the value behind it is still the plan's.
+    @test any(v -> v.certain, StrictMode.concurrency_findings(C.barrier!, (C.P,)))
+    @test_throws StrictViolation @assert_concurrency_safe C.late!(C.P(Float64[], [1.0]))
+end
+
+@testitem "a value an IdDict held by the plan returns is the plan's" begin
+    using StrictMode
+
+    module IdDictPlan
+    struct P
+        cache::IdDict{Symbol, Vector{Float64}}
+    end
+    const SHARED = IdDict{Symbol, Vector{Float64}}(:a => [1.0])
+    w_get(p::P, x) = (get(p.cache, :a, x)[1] = 0.0; nothing)
+    w_idx(p::P) = (p.cache[:a][1] = 0.0; nothing)
+    r_idx(p::P) = p.cache[:a][1]
+    g_idx(p::P) = (SHARED[:a][1] = 0.0; nothing)
+    end
+    D = IdDictPlan
+    @test any(v -> v.certain && !v.global_state, StrictMode.concurrency_findings(D.w_get, (D.P, Vector{Float64})))
+    @test any(v -> v.certain && !v.global_state, StrictMode.concurrency_findings(D.w_idx, (D.P,)))
+    @test isempty(StrictMode.concurrency_findings(D.r_idx, (D.P,)))
+    @test any(v -> v.certain && v.global_state, StrictMode.concurrency_findings(D.g_idx, (D.P,)))
+end
+
+@testitem "an out-of-line setindex! on a wrapper of a plan buffer is followed" begin
+    using StrictMode
+
+    module StoreWrapper
+    struct W
+        data::Vector{Float64}
+    end
+    @noinline Base.setindex!(w::W, v, i::Int) = (w.data[i] = v; w)
+    struct Own
+        data::Vector{Float64}
+        own::Vector{Float64}
+    end
+    @noinline Base.setindex!(w::Own, v, i::Int) = (w.own[i] = v; w)
+    struct P
+        buf::Vector{Float64}
+    end
+    f(p::P) = (w = W(p.buf); w[1] = 0.0; nothing)
+    g(p::P) = (w = Own(p.buf, zeros(2)); w[1] = 0.0; nothing)
+    end
+    S = StoreWrapper
+    vs = StrictMode.concurrency_findings(S.f, (S.P,))
+    @test any(v -> v.certain && occursin("setindex!", v.message), vs)
+    # The same call writing the wrapper's own fresh field is the method's own business.
+    @test isempty(StrictMode.concurrency_findings(S.g, (S.P,)))
+end
+
+@testitem "inline LLVM IR handed a plan pointer is cleared only when it cannot write" begin
+    using StrictMode
+
+    module LlvmPlan
+    struct P
+        buf::Vector{Float64}
+    end
+    memset_str!(p::P) = (GC.@preserve p Base.llvmcall("call void @llvm.memset.p0.i64(ptr %0, i8 0, i64 8, i1 false)\nret void", Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    memset_mod!(p::P) = (GC.@preserve p Base.llvmcall(("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\ndefine void @e(ptr %p) {\n call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n ret void\n}", "e"), Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    store_mod!(p::P) = (GC.@preserve p Base.llvmcall(("define void @e(ptr %p) {\n store double 0.0, ptr %p\n ret void\n}", "e"), Cvoid, Tuple{Ptr{Float64}}, pointer(p.buf)); nothing)
+    load_str(p::P) = GC.@preserve p Base.llvmcall("%v = load double, ptr %0\nret double %v", Float64, Tuple{Ptr{Float64}}, pointer(p.buf))
+    mutable struct Box
+        x::Float64
+    end
+    const GBOX = Box(1.0)
+    gstore(p::P) = (GC.@preserve GBOX Base.llvmcall("store double 0.0, ptr %0\nret void", Cvoid, Tuple{Ptr{Cvoid}}, pointer_from_objref(GBOX)); p.buf[1])
+    end
+    L = LlvmPlan
+    p = L.P([5.0])
+    L.memset_str!(p)
+    @test p.buf[1] == 0.0
+    for f in (L.memset_str!, L.memset_mod!, L.store_mod!)
+        vs = StrictMode.concurrency_findings(f, (L.P,))
+        @test !isempty(vs)
+        @test all(v -> !v.certain, vs)
+    end
+    # The same through a pointer into a constant global is undecided process-global state.
+    vs = StrictMode.concurrency_findings(L.gstore, (L.P,))
+    @test !isempty(vs)
+    @test all(v -> v.global_state && !v.certain, vs)
+    # IR that only loads writes nothing.
+    @test isempty(StrictMode.concurrency_findings(L.load_str, (L.P,)))
+end
+
+@testitem "a constant global written through a pointer is process-global state" begin
+    using StrictMode
+
+    module GlobalPointer
+    const LOG = zeros(4)
+    struct Plan
+        buf::Vector{Float64}
+    end
+    g_copy(p::Plan) = (copyto!(LOG, p.buf); p.buf[1])
+    g_ptr(p::Plan) = (GC.@preserve LOG unsafe_store!(pointer(LOG), 1.0); p.buf[1])
+    g_set(p::Plan) = (ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), LOG, 0, 8); p.buf[1])
+    g_read(p::Plan) = (GC.@preserve LOG unsafe_load(pointer(LOG))) + p.buf[1]
+    g_from(p::Plan) = (copyto!(p.buf, LOG); nothing)
+    end
+    G = GlobalPointer
+    for f in (G.g_copy, G.g_ptr, G.g_set)
+        vs = StrictMode.concurrency_findings(f, (G.Plan,))
+        @test any(v -> v.certain && v.global_state && occursin("process-global state", v.message), vs)
+    end
+    # Reading the global through a pointer, or copying out of it, writes nothing shared.
+    @test isempty(StrictMode.concurrency_findings(G.g_read, (G.Plan,)))
+    @test !any(v -> v.global_state, StrictMode.concurrency_findings(G.g_from, (G.Plan,)))
+    @test_throws StrictViolation @assert_concurrency_safe G.g_ptr(G.Plan([1.0]))
+end
+
+@testitem "a `!` name does not excuse a write to a global in a sweep" begin
+    using StrictMode
+
+    module BangGlobal
+    const G = zeros(2)
+    reset!(v::Vector{Float64}) = (G[1] = v[1]; nothing)
+    own!(v::Vector{Float64}) = (v[1] = 0.0; nothing)
+    end
+    B = BangGlobal
+    f = only(findings(B.reset!, (Vector{Float64},); guarantees = (:concurrency_safe,)))
+    @test StrictMode._failed(f)
+    @test !occursin("declares that argument 1 is written", f.reason)
+    # A `!` method writing only its first argument is still the convention read back.
+    f = only(findings(B.own!, (Vector{Float64},); guarantees = (:concurrency_safe,)))
+    @test f.status === :info
+end
+
+@testitem "a lock as the shared argument still has its global writes read" begin
+    using StrictMode
+
+    module LockArg
+    const LOG = zeros(4)
+    record!(lk::ReentrantLock, x::Float64) = (lock(lk); LOG[1] = x; unlock(lk); nothing)
+    const LKS = [ReentrantLock() for _ in 1:Threads.maxthreadid()]
+    @noinline note(lk::ReentrantLock) = (LOG[2] = 1.0; nothing)
+    per_thread() = (lk = LKS[Threads.threadid()]; note(lk); yield(); lk)
+    end
+    vs = StrictMode.concurrency_findings(LockArg.record!, (ReentrantLock, Float64))
+    @test any(v -> v.certain && v.global_state, vs)
+    @test_throws StrictViolation @assert_concurrency_safe LockArg.record!(ReentrantLock(), 1.0)
+    # The lock itself is still not a write.
+    @test isempty(StrictMode.concurrency_findings(lock, (ReentrantLock,)))
+    # A helper handed a per-thread lock that writes a global writes the global, not the lock.
+    @test isempty(StrictMode.threadid_state_findings(LockArg.per_thread, ()))
+end
+
+@testitem "the concurrency headline names what was written" begin
+    using StrictMode
+
+    module Headlines
+    const G = zeros(2)
+    f(p::Vector{Float64}) = (G[1] = p[1]; nothing)
+    mutable struct Q
+        @atomic n::Int
+    end
+    a(q::Q) = (@atomic q.n += 1; nothing)
+    end
+    H = Headlines
+    r = only(findings(H.f, (Vector{Float64},); guarantees = (:concurrency_safe,))).reason
+    @test !occursin("argument 1 is written", r)
+    @test occursin("global state every concurrent call shares is written", r)
+    fa = only(findings(H.a, (H.Q,); guarantees = (:concurrency_safe,)))
+    @test fa.status === :info
+    @test occursin("argument 1 is written atomically", fa.reason)
+    @test !occursin("cannot prove argument 1 is read-only", fa.reason)
+    @test_logs (:warn, r"makes atomic writes to the plan argument") match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
+    @test_logs (:warn, r"^(?!.*cannot establish that the plan argument is read-only)"s) match_mode = :any @assert_concurrency_safe H.a(H.Q(0))
+end
+
+@testitem "a constant index into a wrapper is an element, not a field" begin
+    using StrictMode
+
+    module ConstIndex
+    struct P
+        bufs::Vector{Vector{Float64}}
+    end
+    struct Wr
+        v::Vector{Vector{Float64}}
+    end
+    @noinline Base.getindex(w::Wr, i::Int) = w.v[i]
+    f1(p::P) = (w = Wr(p.bufs); w[1][1] = 0.0; nothing)
+    f2(p::P) = (w = Wr(p.bufs); w[2][1] = 0.0; nothing)
+    end
+    C = ConstIndex
+    for f in (C.f1, C.f2)
+        @test any(v -> v.certain, StrictMode.concurrency_findings(f, (C.P,)))
+    end
+end
+
+@testitem "a per-thread slot written through a pointer or C is threadid state" begin
+    using StrictMode
+
+    module TidPointer
+    const BUFS = [zeros(4) for _ in 1:Threads.maxthreadid()]
+    h(x) = (b = BUFS[Threads.threadid()]; yield(); GC.@preserve b unsafe_store!(pointer(b), x); nothing)
+    hm(x) = (b = BUFS[Threads.threadid()]; yield(); ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), b, 0, 32); nothing)
+    hr(x) = (b = BUFS[Threads.threadid()]; yield(); GC.@preserve b unsafe_load(pointer(b)))
+    end
+    T = TidPointer
+    for f in (T.h, T.hm)
+        vs = StrictMode.threadid_state_findings(f, (Float64,))
+        @test any(v -> v.certain && occursin("threadid", v.message), vs)
+    end
+    @test_throws StrictViolation @assert_no_threadid_state T.h(1.0)
+    # A read through the pointer writes nothing.
+    @test isempty(StrictMode.threadid_state_findings(T.hr, (Float64,)))
+end
+
+@testitem "copying from a stream into an inert target can suspend" begin
+    using StrictMode
+    module Streams
+    using Base.Threads: threadid
+    const BUF = zeros(Int, 64)
+    # `write(to::IO, from::IO)` reads `from` until its end, and waits on it while it is open.
+    ctx(io::IOContext{IOBuffer}, src::Base.BufferStream) = (i = threadid(); write(io, src); BUF[i] += 1; nothing)
+    top(io::IOBuffer, src::Base.BufferStream) = (i = threadid(); write(io, src); BUF[i] += 1; nothing)
+    @noinline inner(io::IOBuffer, src::Base.BufferStream) = (@noinline write(io, src))
+    nested(io::IOBuffer, src::Base.BufferStream) = (i = threadid(); inner(io, src); BUF[i] += 1; nothing)
+    str(io::IOBuffer, s::String) = (i = threadid(); write(io, s); BUF[i] += 1; nothing)
+    end
+    src() = (s = Base.BufferStream(); write(s, "abc"); close(s); s)
+    Streams.ctx(IOContext(IOBuffer()), src()); Streams.top(IOBuffer(), src())
+    Streams.nested(IOBuffer(), src()); Streams.str(IOBuffer(), "abc")
+    tid(f, t) = only(StrictMode.findings(f, t; guarantees = (:no_threadid_state,))).status
+    @test tid(Streams.ctx, (IOContext{IOBuffer}, Base.BufferStream)) === :fail
+    @test tid(Streams.top, (IOBuffer, Base.BufferStream)) === :fail
+    # Behind a callee the `write` is reached but not read, so it is reported without certainty.
+    @test tid(Streams.nested, (IOBuffer, Base.BufferStream)) === :info
+    @test StrictMode._sig_may_suspend(Tuple{typeof(Streams.inner), IOBuffer, Base.BufferStream}) !== :no
+    # Writing a string into an `IOBuffer` reads no stream.
+    @test tid(Streams.str, (IOBuffer, String)) === :pass
+end
+
+@testitem "an invoke of a less specific Base method can suspend in a user show" begin
+    using StrictMode
+    module Invokes
+    using Base.Threads: threadid
+    const BUF = zeros(Int, 64)
+    struct Inner end
+    Base.show(io::IO, ::Inner) = (yield(); print(io, "i"))
+    struct Outer; x::Inner; end
+    Base.show(io::IO, ::Outer) = print(io, "O")
+    # The default `show` is chosen explicitly; it runs `show` of the field, which yields.
+    @noinline dflt(io::IOBuffer, o::Outer) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
+    h(io::IOBuffer, o::Outer) = (i = threadid(); dflt(io, o); BUF[i] += 1; nothing)
+    end
+    Invokes.h(IOBuffer(), Invokes.Outer(Invokes.Inner()))
+    @test StrictMode._sig_may_suspend(Tuple{typeof(Invokes.dflt), IOBuffer, Invokes.Outer}) !== :no
+    @test only(StrictMode.findings(Invokes.h, (IOBuffer, Invokes.Outer);
+        guarantees = (:no_threadid_state,))).status !== :pass
+end
+
+@testitem "a write in a method reached by a wider invoke is the caller's" begin
+    using StrictMode
+    # `invoke` runs the `Integer` method on an `Int`; the signature `(Vector{Int}, Int)` dispatches
+    # to the other one. The method that runs is the one read.
+    module WideWrites
+    @noinline put_d(b::Vector{Int}, n::Integer) = (b[1] = n; nothing)
+    @noinline put_d(b::Vector{Int}, n::Int) = nothing
+    @noinline put_c(b::Vector{Int}, n::Integer) = nothing
+    @noinline put_c(b::Vector{Int}, n::Int) = (b[1] = n; nothing)
+    writes(b::Vector{Int}, n::Int) = invoke(put_d, Tuple{Vector{Int}, Integer}, b, n)
+    reads(b::Vector{Int}, n::Int) = invoke(put_c, Tuple{Vector{Int}, Integer}, b, n)
+    direct(b::Vector{Int}, n::Int) = put_c(b, n)
+    end
+    M = WideWrites
+    T = (Vector{Int}, Int)
+    M.writes([0], 1); M.reads([0], 1); M.direct([0], 1)
+    certain(f) = any(v -> v.certain, StrictMode.concurrency_findings(f, T))
+    @test certain(M.writes)
+    @test isempty(StrictMode.concurrency_findings(M.reads, T))
+    @test certain(M.direct)
+end
+
+@testitem "per-thread state handed to a method reached by a wider invoke is read in that method" begin
+    using StrictMode
+    module WideTid
+    using Base.Threads: threadid
+    const VB = [zeros(8) for _ in 1:64]
+    # Suspends while it holds the per-thread buffer, then writes it.
+    @noinline held_d(v::Vector{Float64}, n::Integer) = (yield(); v[1] += 1; nothing)
+    @noinline held_d(v::Vector{Float64}, n::Int) = (v[2]; nothing)
+    @noinline held_c(v::Vector{Float64}, n::Integer) = (v[2]; nothing)
+    @noinline held_c(v::Vector{Float64}, n::Int) = (yield(); v[1] += 1; nothing)
+    holds() = (invoke(held_d, Tuple{Vector{Float64}, Integer}, VB[threadid()], 1); nothing)
+    releases() = (invoke(held_c, Tuple{Vector{Float64}, Integer}, VB[threadid()], 1); nothing)
+    direct() = (held_c(VB[threadid()], 1); nothing)
+    end
+    M = WideTid
+    M.holds(); M.releases(); M.direct()
+    tid(f) = only(StrictMode.findings(f, (); guarantees = (:no_threadid_state,))).status
+    @test tid(M.holds) === :info
+    @test tid(M.releases) === :pass
+    @test tid(M.direct) === :info
+    @test !isempty(StrictMode.threadid_state_findings(M.holds, ()))
+    @test isempty(StrictMode.threadid_state_findings(M.releases, ()))
 end

@@ -356,6 +356,134 @@ end
     @test isempty(StrictMode._deadend_mask(Any[]))
 end
 
+@testitem "a try whose catch returns keeps the code before it live" begin
+    using StrictMode
+    # The try body always throws, but the catch returns `v`, so the `zeros` runs on every call.
+    @noinline function before_try(n::Int)
+        v = zeros(n)
+        try
+            throw(ArgumentError("x"))
+        catch
+        end
+        return v
+    end
+    # Passing control: an allocation only on a throw that nothing catches stays an error path.
+    @noinline function uncaught(n::Int)
+        n < 0 && throw(ArgumentError(string("negative: ", n)))
+        return n + 1
+    end
+    tt = (Int,)
+    before_try(3); uncaught(3)
+    code = Base.code_typed_by_type(Tuple{typeof(before_try), Int})[1][1].code
+    enter = findfirst(st -> st isa Core.EnterNode, code)
+    @test !isnothing(enter)
+    dead = StrictMode._deadend_mask(code)
+    @test !dead[enter]
+    # The vector `zeros` builds (its `:new`); the bounds-error branch inside `zeros` stays dead.
+    @test any(i -> Meta.isexpr(code[i], :new) && !dead[i], 1:enter)
+    @test StrictMode._alloc_signals(before_try, tt).alloc
+    @test StrictMode._failed(only(StrictMode.findings(before_try, tt; guarantees = (:noalloc,))))
+    @test !StrictMode._alloc_signals(uncaught, tt).alloc
+    @test !StrictMode._failed(only(StrictMode.findings(uncaught, tt; guarantees = (:noalloc,))))
+
+    # The same shape, hand-written: the EnterNode's handler is the only way to the return, and the
+    # throw it catches is not an error path either.
+    code = Any[
+        Expr(:call, GlobalRef(Base, :zeros), Core.Argument(2)),
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Core, :throw), 1),
+        Core.ReturnNode(),                        # unreachable
+        Core.ReturnNode(Core.SSAValue(1)),        # the catch returns
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [4]
+end
+
+@testitem "a throw that a catch handles is not an error path" begin
+    using StrictMode
+    # The try body builds a message and throws on every call, and the catch returns normally, so the
+    # message is built on every call.
+    @noinline function caught_message(n::Int)
+        try
+            throw(ArgumentError(string("x", n)))
+        catch
+        end
+        return n
+    end
+    # The handler runs on every call and returns what it allocates.
+    @noinline function handler_allocates(n::Int)
+        try
+            throw(ArgumentError("x"))
+        catch
+            return zeros(n)
+        end
+    end
+    # Passing controls: a throw nothing catches, a try that exits normally, a catch that rethrows.
+    @noinline function uncaught(n::Int)
+        n < 0 && throw(ArgumentError(string("negative: ", n)))
+        return n + 1
+    end
+    @noinline function normal_exit(n::Int)
+        try
+            n += 1
+        catch
+        end
+        return n
+    end
+    @noinline function rethrows(n::Int)
+        try
+            n < 0 && throw(ArgumentError(string("negative: ", n)))
+        catch
+            rethrow()
+        end
+        return n
+    end
+    tt = (Int,)
+    noalloc(f) = only(StrictMode.findings(f, tt; guarantees = (:noalloc,)))
+    for f in (caught_message, handler_allocates)
+        f(3)
+        @test StrictMode._alloc_signals(f, tt).alloc
+        @test StrictMode._failed(noalloc(f))
+    end
+    for f in (uncaught, normal_exit, rethrows)
+        f(3)
+        @test !StrictMode._alloc_signals(f, tt).alloc
+        @test !StrictMode._failed(noalloc(f))
+    end
+
+    # Hand-written: the throw inside the try reaches the handler, which returns. The `unreachable`
+    # after the throw never executes.
+    code = Any[
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(2)),
+        Core.ReturnNode(),
+        Core.ReturnNode(Core.Argument(2)),
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [4]
+    # A handler that rethrows leaves every statement an error path.
+    code = Any[
+        Core.EnterNode(5),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(2)),
+        Core.ReturnNode(),
+        Expr(:call, GlobalRef(Base, :rethrow)),
+        Core.ReturnNode(),
+    ]
+    @test all(StrictMode._deadend_mask(code))
+    # The region ends at the `:leave` that names its EnterNode: a throw after it is not caught.
+    code = Any[
+        Core.EnterNode(4),
+        Expr(:leave, Core.SSAValue(1)),
+        Core.GotoNode(6),
+        Expr(:pop_exception, Core.SSAValue(1)),
+        Core.ReturnNode(Core.Argument(2)),
+        Expr(:call, GlobalRef(Base, :string), "x", Core.Argument(2)),
+        Expr(:call, GlobalRef(Core, :throw), Core.SSAValue(6)),
+        Core.ReturnNode(),
+    ]
+    @test findall(StrictMode._deadend_mask(code)) == [2, 3, 6, 7, 8]
+end
+
 @testitem ":noescape reports a scoped handle that leaves the frame" begin
     using StrictMode
 
@@ -558,7 +686,7 @@ end
     eff = StrictMode.effects(mul, (Float64, Float64))
     syms = (
         :nothrow, :effect_free, :terminates, :consistent, :nonoverlayed,
-        :notaskstate, :noub, :inaccessiblememonly, :nortcall
+        :notaskstate, :noub, :inaccessiblememonly, :nortcall,
     )
     for s in syms
         @test StrictMode.effect_holds(eff, s) isa Bool
@@ -675,4 +803,60 @@ end
     @test StrictMode._failed(own(OwnedShared.b))
     @test own(OwnedShared.y).status === :pass
     @test length(StrictMode._OWNED_NODE_MEMO) <= n + 2
+end
+
+@testitem "effects of a signature no method matches are not read as holding" begin
+    using StrictMode
+    g(x::Float64) = x + 1
+    # The compiler answers a signature with no match with every effect but :nothrow.
+    @test_throws StrictMode._UnanalyzableSignature StrictMode.effects(g, (Int,))
+    @test_throws "no typed body" StrictMode.effects(g, (Int,))
+    @test_throws StrictViolation @assert_effects g(1.0) (:effect_free, :terminates, :consistent) types = (Int,)
+    @test_throws "no typed body" @assert_effects g(1.0) (:effect_free,) types = (Int,)
+    @test StrictMode.effect_holds(StrictMode.effects(g, (Float64,)), :effect_free)
+    @test (@assert_effects g(1.0) (:effect_free,)) === 2.0
+end
+
+@testitem "a throw raised in a callee that a catch handles is not an error path" begin
+    using StrictMode
+    # A throw raised inside a callee the try body calls, inlined or not, lands in the catch, which
+    # returns normally: the message and the exception are built on every call that throws.
+    @noinline thrower(n::Int) = throw(ArgumentError(string("x", n)))
+    @inline thrower_inl(n::Int) = throw(ArgumentError(string("x", n)))
+    @noinline middle(n::Int) = (thrower(n); n)
+    @noinline caught_callee(n::Int) = (try thrower(n) catch end; n)
+    @noinline caught_inlined(n::Int) = (try thrower_inl(n) catch end; n)
+    @noinline caught_deep(n::Int) = (try middle(n) catch end; n)
+    # An out-of-bounds index builds a `BoundsError` inside `throw_boundserror`.
+    @noinline caught_index(v::Vector{Int}, i::Int) = try v[i] catch; 0 end
+    # A bounds-checked `memoryrefnew` throws its `BoundsError` itself, with no call to read: through
+    # `getindex` on a `Memory` on Julia 1.12, and written out on every version.
+    @noinline caught_memory(m::Memory{Int}, i::Int) = try m[i] catch; 0 end
+    @noinline caught_ref(m::Memory{Int}, i::Int) =
+        try Core.memoryrefget(Core.memoryrefnew(Core.memoryrefnew(m), i, true), :not_atomic, false) catch; 0 end
+    # Passing controls: the callee's throw is uncaught, the catch rethrows, the call sits outside
+    # the try, and a try that exits normally.
+    @noinline uncaught_callee(n::Int) = (n < 0 && thrower(n); n + 1)
+    @noinline rethrows_callee(n::Int) = (try n < 0 && thrower(n) catch; rethrow() end; n)
+    @noinline outside_try(n::Int) = (try n += 1 catch end; n < 0 && thrower(n); n)
+    @noinline normal_exit(n::Int) = (try n += 1 catch end; n)
+    caught = ((caught_callee, (Int,)), (caught_inlined, (Int,)), (caught_deep, (Int,)),
+        (caught_index, (Vector{Int}, Int)), (caught_memory, (Memory{Int}, Int)),
+        (caught_ref, (Memory{Int}, Int)))
+    clean = ((uncaught_callee, (Int,)), (rethrows_callee, (Int,)), (outside_try, (Int,)),
+        (normal_exit, (Int,)))
+    caught_callee(1); caught_inlined(1); caught_deep(1); caught_index([1], 2)
+    caught_memory(Memory{Int}([1]), 2); caught_ref(Memory{Int}([1]), 2)
+    uncaught_callee(1); rethrows_callee(1); outside_try(1); normal_exit(1)
+    noalloc(f, tt) = only(StrictMode.findings(f, tt; guarantees = (:noalloc,)))
+    for (f, tt) in caught
+        @test StrictMode._alloc_signals(f, tt).alloc
+        @test StrictMode._failed(noalloc(f, tt))
+    end
+    for (f, tt) in clean
+        @test !StrictMode._alloc_signals(f, tt).alloc
+        @test !StrictMode._failed(noalloc(f, tt))
+    end
+    # A callee scanned in a caught context first is still judged on its own afterwards.
+    @test !StrictMode._alloc_signals(middle, (Int,)).alloc
 end

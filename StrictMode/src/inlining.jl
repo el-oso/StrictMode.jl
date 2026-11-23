@@ -6,23 +6,76 @@
 
 # Best-effort inlining detection from `(f, types)` alone (no values, no execution): compile a
 # wrapper that calls `f`, scan its optimized IR for a surviving `:invoke` to `f`'s method.
-# Returns `true` if the call was *not* inlined, `false` if it was, `nothing` if undeterminable
-# (e.g. a builtin/intrinsic with no resolvable method — effectively always inlined).
+# Returns `true` if the call was *not* inlined, `false` if it was, and `nothing` when that cannot
+# be read: no single method matches, the wrapper has no typed body, or the signature is not
+# concrete (the wrapper then calls `f` through run-time dispatch, which leaves no `:invoke` and
+# would read as inlined). A builtin or an intrinsic is not a call that could survive, so `false`.
 # Force specialization on the callee type (`where {F}`), exactly as `_allocated` in static_checks.jl
 # does. `_inlined_survives` takes `f` under `@nospecialize`, so a wrapper closure built there captures
 # an unspecialized field: on Julia 1.13 the wrapper's IR is then `Core.getfield(_1, :f); (%1)(%2)` — a
 # dynamic `:call`, with no `:invoke` for the scan below to find, which silently reports every callee as
 # inlined. Building the closure through this specialized helper restores the `:invoke`.
 _inline_wrapper(f::F) where {F} = (args...) -> f(args...)
+
+# The wrapper for a callable known by its type: the callable is its first argument.
+_call_through(c::C, args::Vararg{Any, N}) where {C, N} = c(args...)
+
+# The wrapper for a `_Spec`: the call `invoke` makes to the method `S` selects, which runs the
+# specialization for the argument types. `_invoke_call` is the call an inlining question asks
+# about. `_invoke_through` keeps the specialization a compiled function of its own, as an entry
+# point is, for a backend that takes a function and argument types (`_spec_call`).
+_invoke_call(::Type{S}, f::F, args::Vararg{Any, N}) where {S, F, N} = invoke(f, S, args...)
+_invoke_through(::Type{S}, f::F, args::Vararg{Any, N}) where {S, F, N} = @noinline invoke(f, S, args...)
+
+# The function and argument types that run the specialization of `s` through `_invoke_through`,
+# for a backend that takes those. Raises unless the wrapper's compiled body calls exactly `s.mi`:
+# a backend handed anything else would judge another method.
+function _spec_call(s::_Spec, @nospecialize(types::Tuple))
+    F = (s.mi.specTypes::DataType).parameters[1]
+    tt = (Type{_spec_invoke_types(s)}, F, types...)
+    cts = _code_typed_by_type(Tuple{typeof(_invoke_through), tt...}; optimize = true)
+    reached = !isempty(cts) && any(first(only(cts)).code) do st
+        Meta.isexpr(st, :invoke) || return false
+        a1 = st.args[1]
+        (a1 isa Core.CodeInstance ? a1.def : a1) === s.mi
+    end
+    reached || throw(ArgumentError("`invoke` with the argument types of `$(s.mi.def)` does not run $(s.mi)"))
+    return (_invoke_through, tt)
+end
+
+const _INLINED_UNREAD = "whether the call is inlined could not be read: the signature is not " *
+    "concrete, no single method matches it, or the calling wrapper has no typed body"
+
+# The call `f(types...)` runs as one of three bodies: the method it matches, the method that method
+# forwards to when it only fills in a default argument (`_forwarded_call`), and the callable's
+# keyword body, which a keyword call reaches through `Core.kwcall` and a positional call through its
+# forwarder. The forwarders are small and inline, so a surviving `:invoke` of any of the three is
+# the call not inlined.
+#
+# A `_Spec` is asked about the call that runs it, `invoke` with its method's argument types, once
+# `_spec_call` has confirmed that this call runs it.
 function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
+    f isa Union{Core.Builtin, Core.IntrinsicFunction} && return false
+    _has_compiled_body(f, types) || return nothing
     local m
     try
-        m = which(f, types)
+        m = _which(f, types)
     catch
         return nothing
     end
-    wrapper = _inline_wrapper(f)
-    cts = _code_typed(wrapper, types; optimize = true)
+    fm = try
+        _which(_forwarded_call(f, types)...)
+    catch
+        m
+    end
+    f isa _Spec && _spec_call(f, types)
+    fc = f isa _Spec ? _spec_callee(f) : f
+    ft = (_key_sig(_entry_key(f, types))::DataType).parameters[1]
+    owner = fc === Core.kwcall ? (length(types) >= 2 ? types[2] : nothing) : ft
+    cts = f isa _Spec ?
+        _code_typed(_invoke_call, (Type{_spec_invoke_types(f)}, ft, types...); optimize = true) :
+        f isa _Callable ? _code_typed(_call_through, (_ftype(f), types...); optimize = true) :
+        _code_typed(_inline_wrapper(f), types; optimize = true)
     isempty(cts) && return nothing
     for stmt in first(cts).first.code
         if Meta.isexpr(stmt, :invoke)
@@ -30,17 +83,21 @@ function _inlined_survives(@nospecialize(f), @nospecialize(types::Tuple))
             # `MethodInstance`); older Julia uses the `MethodInstance` directly.
             a1 = stmt.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
-            mi isa Core.MethodInstance && mi.def === m && return true
+            mi isa Core.MethodInstance || continue
+            (mi.def === m || mi.def === fm) && return true
+            !isnothing(owner) && _kwbody_self(mi) === owner && return true
         end
     end
     return false
 end
 
 function _assert_inlined(target, @nospecialize(f), @nospecialize(types::Tuple))
-    if _inlined_survives(f, types) === true
+    survives = _inlined_survives(f, types)
+    isnothing(survives) && return _fail(:inlined, target, _INLINED_UNREAD)
+    if survives
         _fail(
             :inlined, target,
-            "call to `$(which(f, types).name)` was not inlined — it survives as an `:invoke` at " *
+            "call to `$(_which(f, types).name)` was not inlined — it survives as an `:invoke` at " *
                 "the call site (inlining is a heuristic; this may be expected)."
         )
     end
@@ -70,7 +127,7 @@ to the bare call.
 ```
 """
 macro assert_inlined(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_inlined", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_inlined needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_inlined; types = get(opts, :types, nothing))
@@ -130,14 +187,17 @@ end
 # Base call is usually intentional. The user's own kernels (the actionable ones) live elsewhere.
 _is_base_core(m::Module) = (r = Base.moduleroot(m); r === Base || r === Core)
 
-# Walk `f`'s optimized IR; aggregate every non-inlined callee by Method.
+# Walk `f`'s optimized IR; aggregate every non-inlined callee by Method. A body that cannot be read
+# raises: an empty list would read as "nothing to suggest".
 function _noninlined_callees(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) ||
+        throw(_UnanalyzableSignature(:inline_suggestions, f, types, _output_unread(f, types)))
     cts = try
         _code_typed(f, types; optimize = true)
-    catch
-        return _NonInlinedCallee[]
+    catch err
+        throw(_UnanalyzableSignature(:inline_suggestions, f, types, sprint(showerror, err)))
     end
-    isempty(cts) && return _NonInlinedCallee[]
+    isempty(cts) && throw(_UnanalyzableSignature(:inline_suggestions, f, types, _NO_BODY_WHY))
     code = first(cts).first.code
     spans = _loop_spans(code)
     acc = Dict{Method, _NonInlinedCallee}()
@@ -190,6 +250,10 @@ column loop ran ~0.7× until marked `@inline`). `only_flagged = true` keeps just
 defaults to it to stay quiet); the single-function form shows all by default. Base/Core callees are
 skipped unless `include_base = true`.
 
+The `(f, types)` form raises `_UnanalyzableSignature` when it cannot read the body: a signature that
+is not concrete, one no method matches, or a generator that raised. The `Module` form records such
+a specialization as an `:info` finding saying the suggestions could not be computed.
+
 These findings are **never failures** — [`nfailures`](@ref) ignores them, so they never break a gate.
 Inlining is a heuristic: a tiny callee LLVM still inlines despite a Julia-IR `:invoke` is a false positive,
 so treat a suggestion as a prompt to *benchmark*, not a verdict.
@@ -203,7 +267,7 @@ function inline_suggestions(
         @nospecialize(f), @nospecialize(types::Tuple);
         include_base::Bool = false, only_flagged::Bool = false,
     )
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(types)
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, types)
     callees = _noninlined_callees(f, types)
     sort!(callees; by = c -> (_callee_priority(c), -c.count))
     out = StrictFinding[]
@@ -225,6 +289,7 @@ function inline_suggestions(
             append!(out, inline_suggestions(f, tt; include_base, only_flagged))
         catch err
             err isa StrictViolation && rethrow()
+            push!(out, _advisory_error(f, tt, err))
         end
     end
     return out

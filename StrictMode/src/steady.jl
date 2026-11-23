@@ -120,9 +120,9 @@ allocation is a workspace pool climbing to a high-water mark. `:noalloc` cannot 
 growth path exists on every path, so an all-paths proof must report it forever — and the property
 the code really has is about the call sequence, which is why this measures rather than infers.
 
-Like [`memsafe_report`](@ref) and [`mca_report`](@ref) it takes **values**, not types, and runs the
-call. It therefore sits outside the value-free `findings`/`audit` pipeline and does not belong at a
-`src` call site: put it in a probe, a dogfood block, or a REPL session.
+Like [`memsafe_report`](@ref) it takes **values**, not types, and runs the call. It therefore sits
+outside the value-free `findings`/`audit` pipeline and does not belong at a `src` call site: put it
+in a probe, a dogfood block, or a REPL session.
 
 ```julia
 ws = Workspace()

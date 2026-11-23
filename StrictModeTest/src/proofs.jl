@@ -116,6 +116,242 @@ function _is_guard_report(@nospecialize(rep))
     end
 end
 
+# AllocCheck takes a function value. A callable object known by its type alone is checked through
+# `StrictMode._call_through`, which takes the callable as its first argument and makes the call:
+# AllocCheck compiles the whole call graph, so the callable's sites are found whether or not it is
+# inlined into the wrapper, and the wrapper only forwards its arguments and result. A signature with
+# no method raises here, as `check_allocs` does, rather than proving the wrapper's `MethodError`.
+#
+# `caught` says the native walk read a statement that a caught throw reaches on a call that returns:
+# one in a try region whose handler can return, or one of that handler (`_caught_mask`). AllocCheck's
+# `ignore_throw` drops the sites of both, as it drops every site that leads to a throw or follows a
+# catch, so the code is then checked a second time without it and those extra sites are kept
+# (`_caught_sites`).
+#
+# A specialization reached only through `invoke` (`StrictMode._Spec`) is checked through
+# `StrictMode._invoke_through` (`_backend_call`), the same way: the wrapper runs exactly that
+# specialization, and its frame is dropped from every backtrace.
+function _check_allocs(@nospecialize(f), @nospecialize(types); caught::Bool = false)
+    ignore_throw = StrictMode.ignore_throw()
+    callable = f isa StrictMode._Callable
+    callable && StrictMode._which(f, types)
+    wrapped = callable || f isa StrictMode._Spec
+    target, tt = callable ? (StrictMode._call_through, (StrictMode._ftype(f), types...)) : _backend_call(f, types)
+    allocs = AllocCheck.check_allocs(target, tt; ignore_throw)
+    if ignore_throw && caught
+        every = AllocCheck.check_allocs(target, tt; ignore_throw = false)
+        append!(allocs, _caught_sites(filter(a -> !(a in allocs), every)))
+    end
+    # The wrapper's frame is not the callable's code, and every reader of a backtrace asks whose code a
+    # site is in.
+    if wrapped
+        for a in allocs
+            hasproperty(a, :backtrace) && filter!(fr -> !_is_call_through(fr), a.backtrace)
+        end
+    end
+    return allocs
+end
+
+# Runtime calls that allocate only the exception they throw. Without `ignore_throw`, AllocCheck
+# reports one at every call, the calls that succeed included; the scan reads them as not allocating.
+const _THROW_ONLY_RUNTIME = (
+    "jl_f_ifelse", "jl_f_typeassert", "jl_f_is", "jl_f_throw", "jl_f__svec_ref",
+    "jl_genericmemory_copyto",
+)
+
+# Of the sites AllocCheck reports only without `ignore_throw`, those on a path that returns normally
+# because a catch handles its throw, in the try body, in a callee it calls, or in the handler. A
+# backtrace is read as one group of frames per compiled body, innermost first, each ending at the
+# body's own frame, and judged outermost first (`_location_class`): a group on an error path of its
+# body drops the site; one in a try region whose handler can return keeps it, since what the groups
+# inside it do on their own error paths ends in that handler; one on a handler statement keeps it only
+# when no group inside lies on an error path, since a throw raised in a callee the handler calls is not
+# caught by that try. A backtrace AllocCheck cut short ("multiple call sites") is judged on the groups
+# it has. A try region whose handler returns only for a type `T` (`StrictMode._handler_filter`) keeps
+# the site only when no group inside it is on the way to a throw known to be no `T`: each group inside
+# is judged in that caught context (`StrictMode._join_caught`), as the scan reads those bodies.
+# A site on the way to a bounds check's `BoundsError` (`_bounds_error_site`) that no enclosing handler
+# returns for is on an error path.
+function _caught_sites(extra)
+    interp = Base.Compiler.NativeInterpreter(Base.get_world_counter())
+    bodies = Dict{Tuple{Core.MethodInstance, Any}, Any}()
+    return filter(extra) do a
+        a isa AllocCheck.AllocatingRuntimeCall && a.name in _THROW_ONLY_RUNTIME && return false
+        hasproperty(a, :backtrace) || return false
+        groups = Tuple{Core.MethodInstance, Vector{Base.StackTraces.StackFrame}, Any}[]
+        group = Base.StackTraces.StackFrame[]
+        callee = nothing
+        for fr in a.backtrace
+            push!(group, fr)
+            fr.inlined && continue
+            mi = _frame_mi(fr)
+            mi isa Core.MethodInstance || break
+            push!(groups, (mi, copy(group), callee))
+            empty!(group)
+            callee = mi
+        end
+        ctx = false
+        inhandler = false
+        inner = nothing
+        for (mi, g, c) in Iterators.reverse(groups)
+            inner = get!(() -> _body_classes(interp, mi, ctx), bodies, (mi, ctx))
+            cls, rctx = _location_class(inner, g, c)
+            cls === :dead && return false
+            if cls === :caught
+                ctx = StrictMode._join_caught(ctx, rctx)
+                ctx === true && return true
+            elseif ctx === false
+                inhandler |= cls === :handler
+            end
+        end
+        ctx isa Type && !(BoundsError <: ctx) && !isempty(groups) &&
+            _bounds_error_site(a, extra, inner, groups[1][2]) && return false
+        return ctx !== false || inhandler
+    end
+end
+
+# Whether site `a` is a bounds check's throw of a `BoundsError`: a call to a `jl_bounds_error*` runtime
+# function, which throws one, or the box of the memory reference such a call reports, at the same
+# frames as the call, where the innermost body's statements (`group` locates them, as
+# `_location_class` does) are all ones that allocate nothing on their way to returning normally and
+# one is a `memoryrefnew` of a reference of the box's type. Codegen emits that check for a `memoryrefnew`
+# (on Julia 1.12 under `--check-bounds=yes` also for one the IR marks unchecked) and boxes the reference
+# only to pass it to the call.
+_bounds_error_call(@nospecialize(a)) =
+    a isa AllocCheck.AllocatingRuntimeCall && startswith(a.name, "jl_bounds_error")
+
+function _bounds_error_site(@nospecialize(a), extra, body, group::Vector{Base.StackTraces.StackFrame})
+    _bounds_error_call(a) && return true
+    (a isa AllocCheck.AllocationSite && a.type isa Type && a.type <: Core.GenericMemoryRef) || return false
+    same(x, y) = length(x) == length(y) && all(
+        ((p, q),) -> p.func === q.func && p.file === q.file && p.line == q.line && p.inlined == q.inlined,
+        zip(x, y)
+    )
+    any(b -> _bounds_error_call(b) && same(b.backtrace, a.backtrace), extra) || return false
+    isnothing(body) && return false
+    refs, stacks = body[5], body[2]
+    want = [fr.line for fr in Iterators.reverse(group)]
+    at = [length(s) for s in stacks]
+    best = maximum((k for (k, s) in zip(at, stacks) if 0 < k <= length(want) && s == view(want, 1:k)); init = 0)
+    best > 0 || return false
+    matched = [i for i in eachindex(stacks) if at[i] == best && stacks[i] == view(want, 1:best)]
+    return all(i -> refs[i] !== nothing, matched) && any(i -> refs[i] === a.type, matched)
+end
+
+# Each statement of `mi`'s optimized body as `:dead` (an error path under `ignore_throw()`),
+# `:caught` (in a try region whose handler can return), `:handler` (a statement of a handler, reached
+# only through a catch, that is not an error path) or `:live`, with the line of each inlining level,
+# outermost first, the specialization of each `:invoke`, and the caught context a `:caught` statement's
+# handlers give (`StrictMode._caught_contexts`). `ctx` is the caught context the body runs in.
+# `nothing` for a body that cannot be read.
+function _body_classes(interp, mi::Core.MethodInstance, ctx = false)
+    src = try
+        Base.Compiler.typeinf_code(interp, mi, true)
+    catch
+        nothing
+    end
+    src isa Core.CodeInfo || return nothing
+    dead = StrictMode._deadend_mask(src.code, src, mi.specTypes, ctx)
+    region = StrictMode._caught_contexts(src.code, dead, src)
+    handler = isnothing(StrictMode._try_handlers(src.code)) ? falses(length(src.code)) : _catch_only_mask(src.code)
+    classes = [
+        dead[i] ? :dead : !isnothing(region) && region[i] !== false ? :caught : handler[i] ? :handler : :live
+            for i in eachindex(src.code)
+    ]
+    ctxs = isnothing(region) ? Any[false for _ in eachindex(src.code)] : region
+    invoked = [
+        Meta.isexpr(st, :invoke) ? StrictMode._invoke_mi(st.args[1]) : nothing for st in src.code
+    ]
+    refs = Any[_quiet_stmt(src, mi.specTypes, st) for st in src.code]
+    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs, refs)
+end
+
+# For a statement that allocates nothing on its way to returning normally: the reference type of a
+# `memoryrefnew`, `true` for the other such statements (`nothing`, a `boundscheck`, a branch, a
+# `getfield` or a `memoryrefget`). `nothing` for any other statement.
+function _quiet_stmt(src::Core.CodeInfo, @nospecialize(sig), @nospecialize(st))
+    (st === nothing || st isa Core.GotoNode || st isa Core.GotoIfNot || Meta.isexpr(st, :boundscheck)) && return true
+    Meta.isexpr(st, :call) || return nothing
+    c = StrictMode._static_callee(src, st.args[1])
+    c === Core.memoryrefnew && length(st.args) >= 2 &&
+        return StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, sig, st.args[2]))
+    return c === Core.getfield || c === Core.memoryrefget ? true : nothing
+end
+
+# The live statements a caught throw reaches: those in a try region whose handler can return, and
+# those of a handler itself (`_catch_only_mask`) that are not an error path.
+function _caught_mask(code::Vector{Any}, dead::BitVector)
+    handlers = StrictMode._try_handlers(code)
+    isnothing(handlers) && return falses(length(code))
+    mask = _catch_only_mask(code) .& .!dead
+    for i in eachindex(code)
+        mask[i] |= !dead[i] && any(d -> !dead[d], handlers[i])
+    end
+    return mask
+end
+
+# The line of statement `pc` at each inlining level, outermost first, read as codegen reads it for
+# the debug locations AllocCheck's frames come from (a line can index a further line table).
+_stmt_lines(src::Core.CodeInfo, mi::Core.MethodInstance, pc::Int) =
+    Int[Int(l.line) for l in Base.IRShow.buildLineInfoNode(src.debuginfo, mi, pc)]
+
+# The class of the statements an AllocCheck frame group points at: those whose inlining lines are
+# the longest prefix of the group's, outermost first. Among equally long matches `:caught` wins, then
+# `:handler`, then `:live`. A group that matches no statement is `:live`: it says nothing either way.
+# For a group that called `callee` (the next group in), only the statements that invoke it are read
+# when one matches: lines alone cannot tell a call in a try body from one in its handler written on
+# the same line. The class comes with the caught context of the `:caught` statements matched, joined.
+const _CLASS_RANK = Dict(:dead => 0, :live => 1, :handler => 2, :caught => 3)
+
+function _location_class(body, group::Vector{Base.StackTraces.StackFrame}, callee = nothing)
+    isnothing(body) && return (:live, false)
+    classes, stacks, invoked, ctxs = body
+    if !isnothing(callee)
+        best, cls, ctx = _location_class(classes, stacks, ctxs, group, i -> invoked[i] === callee)
+        best > 0 && return (cls, ctx)
+    end
+    _, cls, ctx = _location_class(classes, stacks, ctxs, group, Returns(true))
+    return (cls, ctx)
+end
+
+function _location_class(classes, stacks, ctxs, group, keep)
+    want = [fr.line for fr in Iterators.reverse(group)]
+    best, cls, ctx = 0, :live, false
+    for i in eachindex(classes)
+        keep(i) || continue
+        s = stacks[i]
+        k = length(s)
+        (0 < k <= length(want) && k >= best && s == view(want, 1:k)) || continue
+        c = classes[i]
+        if k > best
+            best, cls, ctx = k, c, false
+        elseif _CLASS_RANK[c] > _CLASS_RANK[cls]
+            cls = c
+        end
+        c === :caught && (ctx = StrictMode._join_caught(ctx, ctxs[i]))
+    end
+    return best, cls, ctx
+end
+
+function _is_call_through(@nospecialize(fr))
+    fr isa Base.StackTraces.StackFrame || return false
+    mi = _frame_mi(fr)
+    return mi isa Core.MethodInstance && mi.def isa Method &&
+        mi.def.name in (:_call_through, :_invoke_through) && mi.def.module === StrictMode
+end
+
+# The function and argument types a backend that takes those is handed for the item `(f, types)`:
+# the item itself, or for a `StrictMode._Spec` the wrapper that runs its specialization
+# (`StrictMode._spec_call`, which raises when no wrapper does).
+_backend_call(@nospecialize(f), @nospecialize(types)) =
+    f isa StrictMode._Spec ? StrictMode._spec_call(f, Tuple(types)) : (f, types)
+
+# A JET entry point (`report_opt`, `report_call`) for `f(types...)`: by the signature for a callable
+# object known by its type alone, and by the specialization itself for a `StrictMode._Spec`.
+_jet_target(report, @nospecialize(f), @nospecialize(types); kwargs...) =
+    f isa StrictMode._Spec ? report(f.mi; kwargs...) :
+    f isa StrictMode._Callable ? report(StrictMode._sigtype(f, types); kwargs...) : report(f, types; kwargs...)
+
 # `StrictMode.ignore_throw()` (default true): don't count allocations on never-taken error/throw branches
 # (BoundsError etc.) — they are not on the hot path and produce false positives on
 # runtime-zero-alloc code.
@@ -123,12 +359,10 @@ function _raw_allocs_unfiltered(@nospecialize(f), @nospecialize(types))
     world = Base.get_world_counter()
     # AllocCheck and the walk infer outside the compiler's cache. Inferring the entry into it makes
     # the record that lets these sites hold in a later world.
-    entry() = (Base.return_types(f, Tuple{types...}; world); Base.method_instance(f, types; world))
-    return _kept(_SITES_MEMO, StrictMode._sigtype(f, types), world, entry) do
-        vcat(
-            AllocCheck.check_allocs(f, types; ignore_throw = StrictMode.ignore_throw()),
-            _native_dispatches(f, types)
-        )
+    entry() = StrictMode._base_return_types(f, types; world)
+    return _kept(_SITES_MEMO, StrictMode._entry_key(f, types), world, entry) do
+        dispatches, caught = _native_walk(f, types)
+        vcat(_check_allocs(f, types; caught), dispatches)
     end
 end
 
@@ -141,39 +375,51 @@ end
 # record of the specialization it was read from is valid: Julia ends that record when a method or a
 # binding that the inference of the specialization, or of anything it calls statically, depended on
 # changes. A specialization the compiler holds no record of is read again in every new world.
+# A read kept by signature also needs the signature to dispatch to the same specialization still
+# (`StrictMode._read_holds`): the record of a method that was replaced stays valid. A read kept by
+# specialization names its subject, and is reached only from a caller whose own record ends when the
+# call resolves elsewhere.
 # Every setting a proof reads (`ignore_throw`, the barriers, the exemptions) clears StrictMode's
 # cache when it is changed, which advances `_GENERATION` and ends every kept read.
 struct _Stamp
-    world::UInt
+    read::StrictMode._ReadStamp
     generation::UInt
-    record::Union{Nothing, Core.CodeInstance}
 end
 
-function _holds(s::_Stamp)
+function _holds(s::_Stamp, @nospecialize(key))
     s.generation == StrictMode._GENERATION[] || return false
+    key isa Core.MethodInstance || return StrictMode._read_holds(s.read, key)
     world = Base.get_world_counter()
-    s.world == world && return true
-    r = s.record
+    s.read.world == world && return true
+    r = s.read.record
     return !isnothing(r) && r.min_world <= world <= r.max_world
 end
 
 const _MEMO_LOCK = ReentrantLock()
-# By signature type: the sites of `_raw_allocs_unfiltered`.
+# By the entry's body key (`StrictMode._entry_key`): the sites of `_raw_allocs_unfiltered`.
 const _SITES_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
-# By specialization: what the native walk reads from its body (`_walk_body`).
+# By specialization: what the native walk reads from its body (`_walk_body`), outside and inside a
+# caught context.
 const _WALK_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
+const _WALK_CAUGHT_MEMO = IdDict{Any, Tuple{_Stamp, Any}}()
 
-# `read()`, or what an earlier call kept under `key`. `world` is the world `read` reads in, and
-# `entry()` the specialization it reads from, asked after the read because the read is often what
-# makes the compiler record it. A read that raises keeps nothing.
+# `read()`, or what an earlier call kept under `key`, a signature type or a specialization. `world`
+# is the world `read` reads in. `entry()` is called after the read and makes the compiler record the
+# specialization read from, where the read itself does not. A read that raises keeps nothing.
 function _kept(read, memo::IdDict, @nospecialize(key), world::UInt, entry)
     hit = @lock _MEMO_LOCK get(memo, key, nothing)
-    !isnothing(hit) && _holds(hit[1]) && return hit[2]
+    if !isnothing(hit) && _holds(hit[1], key)
+        now = Base.get_world_counter()
+        hit[1].read.world == now ||
+            @lock _MEMO_LOCK (memo[key] = (_Stamp(StrictMode._as_of(hit[1].read, now), hit[1].generation), hit[2]))
+        return hit[2]
+    end
     generation = StrictMode._GENERATION[]
     value = read()
-    mi = entry()
+    entry()
+    mi = key isa Core.MethodInstance ? key : StrictMode._sig_instance(key, world)
     record = mi isa Core.MethodInstance && Base.get_world_counter() == world ? StrictMode._record_of(mi, world) : nothing
-    @lock _MEMO_LOCK (memo[key] = (_Stamp(world, generation, record), value))
+    @lock _MEMO_LOCK (memo[key] = (_Stamp(StrictMode._ReadStamp(world, mi, record), generation), value))
     return value
 end
 
@@ -191,69 +437,113 @@ end
 #
 # The bodies are read as the native interpreter optimizes them: the entry's, then each `:invoke`
 # target's, to the end of the call graph. A `:call` whose callee is not a builtin is compiled to
-# `jl_apply_generic`. Statements that only lead to a throw, or are only reached from a `catch`, are
-# skipped under `ignore_throw()`, as AllocCheck skips them. A body that cannot be read raises, so the
-# verdict is "unproven" and not a pass.
+# `jl_apply_generic`. Statements that only lead to a throw are skipped under `ignore_throw()`, as
+# AllocCheck skips them; a handler that can return is not one, though AllocCheck skips it too
+# (`_check_allocs` puts its sites back). A body that cannot be read raises, so the verdict is
+# "unproven" and not a pass.
 #
 # What this does not report: a value boxed to be passed to a widened callee, with no dispatch.
-function _native_dispatches(@nospecialize(f), @nospecialize(types))
+_native_dispatches(@nospecialize(f), @nospecialize(types)) = first(_native_walk(f, types))
+
+# The dispatches `_native_dispatches` reports, and whether a body it read holds a statement a caught
+# throw reaches (`_caught_mask`). A callee called from a try region whose handler can return is read
+# in a caught context, with no statement skipped, as the scan reads it (`StrictMode._skip_mask`).
+function _native_walk(@nospecialize(f), @nospecialize(types))
     CC = Base.Compiler
     world = Base.get_world_counter()
     interp = CC.NativeInterpreter(world)
-    entry = Base.method_instance(f, types; world)
+    entry = f isa StrictMode._Spec ? f.mi : f isa StrictMode._Callable ?
+        ccall(:jl_method_lookup_by_tt, Any, (Any, Csize_t, Any), StrictMode._sigtype(f, types), world, nothing) :
+        Base.method_instance(f, types; world)
     out = Any[]
+    caught = false
     entry isa Core.MethodInstance || error("the native dispatch walk found no single specialization for the signature")
-    parent = IdDict{Any, Any}(entry => nothing)
-    work = Any[entry]
+    # Every caller of each body, in the order found. A backtrace is built once all are known.
+    parents = IdDict{Any, Vector{Core.MethodInstance}}()
+    found = Tuple{Core.MethodInstance, Symbol}[]
+    visited = Set{Tuple{Core.MethodInstance, Any}}([(entry, false)])
+    work = Tuple{Core.MethodInstance, Any}[(entry, false)]
     while !isempty(work)
-        mi = pop!(work)
-        for step in _walk_body(interp, world, mi)
-            if step isa Core.MethodInstance
-                haskey(parent, step) && continue
-                parent[step] = mi
-                push!(work, step)
+        mi, incaught = pop!(work)
+        steps, c = _walk_body(interp, world, mi, incaught)
+        caught |= c | (incaught !== false)
+        for step in steps
+            if step isa Tuple
+                callee, ctx = step
+                ps = get!(() -> Core.MethodInstance[], parents, callee)
+                mi in ps || push!(ps, mi)
+                (callee, ctx) in visited && continue
+                push!(visited, (callee, ctx))
+                push!(work, (callee, ctx))
             else
-                bt = Base.StackTraces.StackFrame[]
-                m = mi
-                while !isnothing(m)
-                    d = m.def
-                    push!(
-                        bt, d isa Method ?
-                            Base.StackTraces.StackFrame(d.name, d.file, Int(d.line), m, false, false, 0) :
-                            Base.StackTraces.StackFrame(Symbol("top-level scope"), :none, 0, m, false, false, 0)
-                    )
-                    m = parent[m]
-                end
-                push!(out, AllocCheck.DynamicDispatch(bt, step))
+                push!(found, (mi, step))
             end
         end
     end
-    return out
+    for (mi, name) in found
+        push!(out, AllocCheck.DynamicDispatch(_native_backtrace(mi, entry, parents), name))
+    end
+    return out, caught
 end
 
-# What the walk reads from one optimized body, in statement order: the specialization of each
-# `:invoke` (a `MethodInstance`) and the callee name of each dynamic call (a `Symbol`).
-function _walk_body(interp, world::UInt, mi::Core.MethodInstance)
-    return _kept(_WALK_MEMO, mi, world, () -> mi) do
-        src = Base.Compiler.typeinf_code(interp, mi, true)
-        src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
-        skip = StrictMode.ignore_throw() ? StrictMode._deadend_mask(src.code) .| _catch_only_mask(src.code) :
-            falses(length(src.code))
-        steps = Any[]
-        for (i, st) in pairs(src.code)
-            skip[i] && continue
-            if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
-                callee = StrictMode._invoke_mi(st.args[1])
-                isnothing(callee) || push!(steps, callee)
-            elseif Meta.isexpr(st, :call)
-                ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
-                ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
-                c = StrictMode._static_callee(src, st.args[1])
-                push!(steps, c isa Function ? nameof(c) : Symbol(ft))
-            end
+# The backtrace of a dispatch in the body `mi`: its callers up to `entry`, while there is one caller
+# to name. A body with several callers ends it with the frame AllocCheck ends its own with there,
+# "multiple call sites", so a reader places the site by the call graph and not by one of the paths.
+function _native_backtrace(mi::Core.MethodInstance, entry::Core.MethodInstance, parents::IdDict)
+    bt = Base.StackTraces.StackFrame[]
+    m = mi
+    while true
+        d = m.def
+        push!(
+            bt, d isa Method ?
+                Base.StackTraces.StackFrame(d.name, d.file, Int(d.line), m, false, false, 0) :
+                Base.StackTraces.StackFrame(Symbol("top-level scope"), :none, 0, m, false, false, 0)
+        )
+        m === entry && break
+        ps = get(parents, m, nothing)
+        if isnothing(ps) || length(ps) != 1 || length(bt) > length(parents)
+            push!(bt, Base.StackTraces.StackFrame("multiple call sites", "unknown", 0))
+            break
         end
-        steps
+        m = only(ps)
     end
+    return bt
+end
+
+# What the walk reads from one optimized body: in statement order, each `:invoke` as its
+# specialization and whether it is called in a caught context, and the callee name of each dynamic
+# call (a `Symbol`); and whether a statement read is one a caught throw reaches (`_caught_mask`). In a
+# caught context (`incaught`, `StrictMode._join_caught`) that returns whatever is thrown no statement
+# is an error path; in one that returns only for a type, the way to a throw known to be no such type
+# still is. Each callee is read in the context of its call. A body read in a type's context is not
+# kept: such a context is rare, and the memos hold the other two.
+function _walk_body(interp, world::UInt, mi::Core.MethodInstance, incaught = false)
+    read() = _walk_body_read(interp, mi, incaught)
+    incaught isa Type && return read()
+    return _kept(read, incaught ? _WALK_CAUGHT_MEMO : _WALK_MEMO, mi, world, Returns(nothing))
+end
+
+function _walk_body_read(interp, mi::Core.MethodInstance, incaught)
+    src = Base.Compiler.typeinf_code(interp, mi, true)
+    src isa Core.CodeInfo || error("the native dispatch walk could not read the optimized body of $(mi)")
+    skip = StrictMode.ignore_throw() && incaught !== true
+    dead = skip ? StrictMode._deadend_mask(src.code, src, mi.specTypes, incaught) : falses(length(src.code))
+    caught = skip && any(_caught_mask(src.code, dead))
+    region = skip ? StrictMode._caught_contexts(src.code, dead, src) : nothing
+    steps = Any[]
+    for (i, st) in pairs(src.code)
+        dead[i] && continue
+        if Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)
+            callee = StrictMode._invoke_mi(st.args[1])
+            isnothing(callee) || push!(steps, (callee, isnothing(region) ? incaught : StrictMode._join_caught(incaught, region[i])))
+        elseif Meta.isexpr(st, :call)
+            ft = StrictMode._unwrap_lattice(StrictMode._stmt_arg_type(src, mi.specTypes, st.args[1]))
+            ft isa Type && ft <: Union{Core.Builtin, Core.IntrinsicFunction, Core.OpaqueClosure} && continue
+            c = StrictMode._static_callee(src, st.args[1])
+            push!(steps, c isa Function ? nameof(c) : Symbol(ft))
+        end
+    end
+    return (steps, caught)
 end
 
 # Statements reached only through a `catch`: not reachable from the first statement without taking an
@@ -286,8 +576,8 @@ function _raw_allocs(@nospecialize(f), @nospecialize(types))
     # attributed to the guard frame or to the kernel, and the guard branch builds diagnostic strings
     # through exactly such shared helpers. Saying so is the difference between a verdict a reader
     # can act on and one that blames the kernel for StrictMode's own code.
-    if length(kept) < length(all) && any(_is_unattributed, kept)
-        n = count(_is_unattributed, kept)
+    n = _guard_unattributed(all, kept)
+    if n > 0
         @warn "StrictModeTest: `$(StrictMode._func_name(f))` contains a StrictMode guard, and " *
             "AllocCheck could not attribute $n of its $(length(kept)) remaining allocation(s) to " *
             "a single call site. Those may belong to the guard rather than to the code it guards. " *
@@ -298,10 +588,17 @@ function _raw_allocs(@nospecialize(f), @nospecialize(types))
 end
 
 # Runtime calls AllocCheck lists as allocating that do not allocate. `jl_hrtime` (behind `time_ns`)
-# reads the system clock and returns an integer: a call measured at 0 bytes.
-const _NONALLOCATING_RUNTIME = (:jl_hrtime,)
+# reads the system clock and returns an integer: a call measured at 0 bytes. `jl_current_exception`
+# (a handler reading the exception it caught) loads it from the task's exception stack, and the
+# runtime declares it `JL_NOTSAFEPOINT`, which an allocating function cannot be.
+const _NONALLOCATING_RUNTIME = (:jl_hrtime, :jl_current_exception)
 _nonallocating_runtime_call(@nospecialize(a)) =
     a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) in _NONALLOCATING_RUNTIME
+
+# How many of the `kept` sites AllocCheck could not attribute, counted only when `all` holds a site of
+# the guard frame. Other filters drop sites too (`_nonallocating_runtime_call`), and a body without a
+# guard has no guard to blame for what it cannot attribute.
+_guard_unattributed(all, kept) = any(_is_guard_alloc, all) ? count(_is_unattributed, kept) : 0
 
 # Does this instance's attribution stop at AllocCheck's shared-call-site marker?
 _is_unattributed(@nospecialize(inst)) =
@@ -357,12 +654,13 @@ function _c_varargs_call(@nospecialize(inst))
     for fr in inst.backtrace
         mi = _frame_mi(fr)
         mi isa Core.MethodInstance || continue
-        ci = StrictMode._typed_body(mi.specTypes)
+        key = StrictMode._callee_key(mi)
+        ci = StrictMode._typed_body(key)
         isnothing(ci) && return false
         any(st -> Meta.isexpr(st, :foreigncall) && st.args[4] isa Int && st.args[4] > 0, ci.code) || return false
         own = Base.IdSet{Any}()
-        push!(own, mi.specTypes)
-        return !StrictMode._scan_ci(ci, mi.specTypes, 0, own, :boxing)[2]
+        push!(own, key)
+        return !StrictMode._scan_ci(ci, key, 0, own, :boxing)[2]
     end
     return false
 end
@@ -370,54 +668,336 @@ end
 # Barrier-aware wrapper around `_raw_allocs`. A call that reaches a one-time-init allocation barrier
 # (StrictMode's `barrier` signal) keeps AllocCheck's all-paths proof; only the sites the barrier
 # accounts for are dropped. A site is the barrier's when its backtrace passes through the barrier's
-# own frame, or when no frame of it lies outside Base and Core: AllocCheck merges the lock and task
-# internals of a once-guard into "multiple call sites" with no caller left to name (24 of 52 sites on
-# a `OncePerProcess` calibrator), and those are the guard's. Every other site stands, so a buffer
-# grown later through the barrier's accessor is still reported where it grows: excusing the whole call
-# on the barrier signal hid exactly that, because the scan it fell back on stops two calls deep.
-# A call whose scan already finds allocation, boxing or an abstract-eltype container gets the
-# unfiltered proof, so the proof is never more permissive than the scan. Returns `(allocs, exempted)`.
+# own frame, or when its function is reached only through a barrier (`_only_through_barrier`). The
+# second covers a function compiled once for several callers: AllocCheck ends its backtrace at
+# "multiple call sites", which names no caller, so only the call graph can place it (24 of 52 sites
+# on a `OncePerProcess` calibrator are the guard's lock and task internals, merged this way). A
+# merged site the call also reaches outside a barrier, such as a lock wait in a stream write two
+# callers share, is the call's own, and so is every site when the call graph outside the barriers
+# cannot be read in full. Every other site stands, so a buffer grown later through the barrier's
+# accessor is still reported where it grows; the value-free scan stops two calls deep and cannot see
+# it.
+# The filter applies to every site, whichever AllocCheck run found it. When the scan finds allocation,
+# boxing or an abstract-eltype container and the filter leaves no site, the unfiltered proof is
+# returned, so the proof is never more permissive than the scan. Returns `(allocs, exempted, unplaced)`;
+# `unplaced` are the sites kept because the call graph does not name their specialization (`_off_graph`).
 function _checked_allocs(@nospecialize(f), @nospecialize(types::Tuple))
     allocs = _not_own_excused(f, _raw_allocs(f, types))
-    _IGNORE_BARRIER[] || return (allocs, false)
+    _IGNORE_BARRIER[] || return (allocs, false, empty(allocs))
     sig = StrictMode._alloc_signals(f, types)
-    (sig.barrier && !sig.alloc && !sig.boxing && isnothing(sig.abscontainer)) || return (allocs, false)
-    kept = filter(a -> !_through_barrier(a) && _has_user_frame(a), allocs)
+    sig.barrier || return (allocs, false, empty(allocs))
+    kept = filter(!_through_barrier, allocs)
+    unplaced = empty(allocs)
+    if !isempty(kept)
+        nodes = Base.IdSet{Core.MethodInstance}()
+        inside = _only_through_barrier(StrictMode._entry_key(f, types), nodes)
+        if !isnothing(inside)
+            filter!(a -> !(_site_mi(a) in inside), kept)
+            unplaced = filter(a -> _off_graph(a, nodes), kept)
+        end
+    end
+    isempty(kept) && (sig.alloc || sig.boxing || !isnothing(sig.abscontainer)) && return (allocs, false, unplaced)
     excused = length(allocs) - length(kept)
     if excused > 0
         name = something(_barrier_frame_name(allocs), :barrier)
-        @info "StrictModeTest: `$(f)` reaches `$name`, a one-time-init allocation barrier; " *
+        @info "StrictModeTest: `$(StrictMode._func_name(f))` reaches `$name`, a one-time-init allocation barrier; " *
             "$excused allocation site(s) inside it are excused, $(length(kept)) other(s) checked as " *
             "usual. Disable with set_ignore_barrier!(false)." maxlog = 1
     end
-    return (kept, isempty(kept) && excused > 0)
+    return (kept, isempty(kept) && excused > 0, unplaced)
+end
+
+# Whether the call graph `nodes` does not name the specialization compiled around the site `a`. The
+# graph is read to reproduce what AllocCheck compiles, so each site's specialization is one of its
+# nodes. One that is not shows the two disagree about the code, and the graph then says nothing
+# about how that site is reached.
+function _off_graph(@nospecialize(a), nodes)
+    hasproperty(a, :backtrace) || return false
+    mi = _site_mi(a)
+    return mi isa Core.MethodInstance && !(mi in nodes)
+end
+
+# What a failure says of the sites the call graph does not name.
+function _unplaced_note(unplaced)
+    isempty(unplaced) && return ""
+    specs = unique!(String[sprint(show, _site_mi(a)) for a in unplaced])
+    return " " * string(length(unplaced)) * " site(s) could not be matched to the call graph and are " *
+        "counted as the call's own: the graph does not name " * join(("`" * s * "`" for s in specs), ", ") *
+        ". The graph is StrictModeTest's reading of what AllocCheck compiled, so this is a defect in " *
+        "that reading; please report it."
 end
 
 # Running pending finalizers is not the call's own allocation. Base's `unlock` does it on every lock,
 # `Condition` and `Threads.Event`; finalizers are code registered elsewhere, and they run at other GC
 # points too. A Base slow path that allocates for its own sake (a contended lock) is still judged.
-# An `@strict_exempt` callee is NOT excused here: `@test_noalloc` proves no allocation on any path,
-# and a pool that grows on first use is gated by `@test_steady_state` instead.
+# An `@strict_exempt` callee is NOT dropped here: `@test_noalloc` proves no allocation on any path.
+# A call whose every site is inside one is reported as that (`_exempt_split`, SM0018), which is a
+# failure unless the caller passes `allow_exempt = true`; a pool that grows on first use is
+# gated on what it does once warm by `@test_steady_state`.
 function _not_own_excused(@nospecialize(f), allocs)
     fin(a) = a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) === :jl_gc_run_pending_finalizers
     kept = filter(!fin, allocs)
     nfin = length(allocs) - length(kept)
-    nfin > 0 && @info "StrictModeTest: `$(f)`: $nfin site(s) that run pending finalizers (from Base's " *
+    nfin > 0 && @info "StrictModeTest: `$(StrictMode._func_name(f))`: $nfin site(s) that run pending finalizers (from Base's " *
         "`unlock`) excused: finalizers are code registered elsewhere, not this call's allocation." maxlog = 1
     return kept
 end
 
 _frame_mi(@nospecialize(fr)) = (l = fr.linfo; l isa Core.CodeInstance ? l.def : l)
 
+# The allocation sites split by owner: `(own, by, unplaced)`, the sites that are the call's own, the exempt
+# functions that account for the rest, each with the reason its exemption gave, and the own sites the
+# call graph was asked about and does not name (`_off_graph`). A site is taken from
+# the call only when the call graph places it in an exempt function; any other site is the call's.
+# A site is an exempt function's when its
+# backtrace passes through a frame whose METHOD an exemption covers for `:noalloc`: matched on the
+# method's module and name, so a function of the same name elsewhere excuses nothing. Only an
+# exemption declared in a module names a method. One declared with no module, from a session,
+# covers by name in every module and excuses no site here, though the scan still notes it. An exempt
+# callee that was inlined has no frame with a specialization of its own, so its site reads as the
+# caller's and the result is an ordinary failure.
+# A site reached through a function or closure the exempt function was handed is the caller's too
+# (`_runs_handed_in`). A site whose backtrace has no exempt frame, as when AllocCheck ends it at a
+# function compiled once for several callers, is the exempt function's when the call `sig` reaches
+# its specialization only through that exempt callee (`_only_through_exempt`).
+function _exempt_split(allocs, @nospecialize(sig))
+    by = Pair{String, String}[]
+    own = empty(allocs)
+    unplaced = empty(allocs)
+    inside = nothing
+    nodes = Base.IdSet{Core.MethodInstance}()
+    for a in allocs
+        if !hasproperty(a, :backtrace)
+            push!(own, a)
+            continue
+        end
+        e = nothing
+        framed = false
+        for (k, fr) in enumerate(a.backtrace)
+            fr isa Base.StackTraces.StackFrame || continue
+            mi = _frame_mi(fr)
+            mi isa Core.MethodInstance || continue
+            e = StrictMode._mi_exemption(mi; declared_in_module = true)
+            isnothing(e) && continue
+            framed = true
+            # The exemption covers the exempt function's own code and what that calls. A function
+            # or closure it was HANDED is the caller's code, and what that allocates is the
+            # caller's allocation, whichever frame ran it. An exempt frame further out may still
+            # account for the site, so the walk goes on.
+            _runs_handed_in(a, k, mi) ? (e = nothing) : break
+        end
+        if isnothing(e) && !framed
+            isnothing(inside) && (inside = something(_only_through_exempt(sig, nodes), IdDict{Core.MethodInstance, Any}()))
+            e = get(inside, _site_mi(a), nothing)
+            # An empty `nodes` is a graph that was not read in full, which places no site.
+            isempty(nodes) || !_off_graph(a, nodes) || push!(unplaced, a)
+        end
+        if isnothing(e)
+            push!(own, a)
+        else
+            p = String(e.func) => e.reason
+            p in by || push!(by, p)
+        end
+    end
+    return own, Tuple(by), unplaced
+end
+
+# Whether the allocation site `a`, under the exempt function at backtrace frame `k`, runs code that
+# function's caller handed in: a frame inside it belongs to a call the exempt code makes of a value
+# loaded from one of its arguments (`StrictMode._handed_code`, the scan's own reading of the same
+# signature). A frame that kept its specialization is matched on the called value's type; an inlined
+# one has only a name, and is matched on the names of that type's methods. When that reading is
+# incomplete (a body it could not read, or a handed value reaching a call whose target is not
+# resolved), every site in or below the exempt frame counts, as in the scan.
+function _runs_handed_in(@nospecialize(a), k::Int, mi::Core.MethodInstance)
+    bt = a.backtrace
+    found, complete = StrictMode._handed_code(StrictMode._callee_key(mi))
+    complete || return true
+    (isempty(found) || k <= 1) && return false
+    types = Any[(Base.unwrap_unionall(StrictMode._key_sig(h))::DataType).parameters[1] for h in found]
+    names = Set{Symbol}()
+    for T in types
+        isconcretetype(T) || continue
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+        ms isa Vector || continue
+        for match in ms
+            push!(names, match.method.name)
+        end
+        T <: Function && isdefined(T, :instance) && push!(names, nameof(T.instance))
+    end
+    for j in 1:(k - 1)
+        fr = bt[j]
+        fr isa Base.StackTraces.StackFrame || continue
+        inner = _frame_mi(fr)
+        if inner isa Core.MethodInstance
+            F = (inner.specTypes::DataType).parameters[1]
+            any(T -> T === F, types) && return true
+        elseif fr.func in names
+            return true
+        end
+    end
+    return false
+end
+
 _through_barrier(@nospecialize(a)) = any(a.backtrace) do fr
     mi = _frame_mi(fr)
     mi isa Core.MethodInstance && StrictMode._mi_is_barrier(mi)
 end
 
-_has_user_frame(@nospecialize(a)) = any(a.backtrace) do fr
-    mi = _frame_mi(fr)
-    mi isa Core.MethodInstance && mi.def isa Method &&
-        !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
+# The specialization compiled around an allocation site: its first frame that was not inlined.
+function _site_mi(@nospecialize(a))
+    for fr in a.backtrace
+        mi = _frame_mi(fr)
+        mi isa Core.MethodInstance && return mi
+    end
+    return nothing
+end
+
+# Most bodies `_invoke_reach` reads before it gives up.
+const _BARRIER_WALK_MAX = 4096
+
+# The specializations the call `sig` (a body key, `StrictMode._entry_key`) reaches only by entering a
+# barrier: reached from a barrier, and
+# not from the call along any path that avoids one. A function called from several places is
+# compiled once, and AllocCheck ends the backtrace of its sites at a frame named "multiple call
+# sites", so the backtrace cannot say whether the barrier is on every path to it; this call graph
+# can. `nothing` when the graph outside the barriers could not be read in full, since an edge the
+# walk did not see may reach any site. `nodes` receives every specialization the graph names.
+function _only_through_barrier(@nospecialize(sig), nodes = Base.IdSet{Core.MethodInstance}())
+    root = StrictMode._key_instance(sig, Base.get_world_counter())
+    root isa Core.MethodInstance || return nothing
+    outside, barriers, complete = _invoke_reach(Core.MethodInstance[root], true)
+    (complete && !isempty(barriers)) || return nothing
+    inside, _, _ = _invoke_reach(collect(barriers), false)
+    union!(nodes, outside, barriers, inside)
+    return Base.IdSet{Core.MethodInstance}(mi for mi in inside if !(mi in outside))
+end
+
+# The specializations the call `sig` reaches only by entering a callee exempt from `:noalloc` whose
+# handed-in code is read in full (`StrictMode._handed_code`), each mapped to that callee's exemption.
+# The code it calls that its caller handed in, and all that this reaches, is the caller's, and so is
+# not in the result. `nothing` when the graph could not be read in full. `nodes` receives every
+# specialization the graph names, and stays empty when it could not be read in full.
+function _only_through_exempt(@nospecialize(sig), nodes = Base.IdSet{Core.MethodInstance}())
+    root = StrictMode._key_instance(sig, Base.get_world_counter())
+    root isa Core.MethodInstance || return nothing
+    excuses(mi) = !isnothing(StrictMode._mi_exemption(mi; declared_in_module = true)) &&
+        StrictMode._handed_code(StrictMode._callee_key(mi))[2]
+    outside, stops, complete = _invoke_reach(Core.MethodInstance[root], true; isstop = excuses)
+    (complete && !isempty(stops)) || return nothing
+    handed = Core.MethodInstance[]
+    for ex in stops, h in first(StrictMode._handed_code(StrictMode._callee_key(ex)))
+        mi = StrictMode._key_instance(h, Base.get_world_counter())
+        mi isa Core.MethodInstance || return nothing
+        push!(handed, mi)
+    end
+    if !isempty(handed)
+        theirs, _, done = _invoke_reach(handed, false)
+        done || return nothing
+        union!(outside, theirs)
+    end
+    out = IdDict{Core.MethodInstance, Any}()
+    seen = copy(outside)
+    for ex in stops
+        e = StrictMode._mi_exemption(ex; declared_in_module = true)
+        reached, _, done = _invoke_reach(Core.MethodInstance[ex], true; isstop = mi -> any(x -> x === mi, handed))
+        done || return nothing
+        union!(seen, reached)
+        for mi in reached
+            mi in outside || haskey(out, mi) || (out[mi] = e)
+        end
+    end
+    union!(nodes, seen, stops)
+    return out
+end
+
+# The specializations reached from `roots` along the `:invoke` edges of their optimized bodies,
+# which are the static calls AllocCheck compiles and follows. Each edge leads to the specialization
+# AllocCheck compiles for it (`_compiled_callee`), so a site's specialization (`_site_mi`) is one
+# the walk names. It also leads to the specialization the statement itself names, which is the
+# one Julia's own compiler runs and the native walk reports a dispatch in (`_native_walk`). A call left to
+# run-time dispatch is not such an edge: AllocCheck reports the dispatch itself and compiles nothing
+# behind it. With `stop`, a barrier is recorded rather than entered. Returns `(reached, barriers, complete)`;
+# `complete` is false when a body could not be read, when the specialization an edge leads to could
+# not be determined, when a call could still be compiled statically
+# without an `:invoke` (`Core.invoke` and its kin, a `@cfunction`, an opaque closure), or when the
+# walk reached `_BARRIER_WALK_MAX` bodies. `isstop` names what counts as a barrier.
+function _invoke_reach(roots::Vector{Core.MethodInstance}, stop::Bool; isstop = StrictMode._mi_is_barrier)
+    reached = Base.IdSet{Core.MethodInstance}(roots)
+    barriers = Base.IdSet{Core.MethodInstance}()
+    queue = copy(roots)
+    complete = true
+    while !isempty(queue)
+        length(reached) > _BARRIER_WALK_MAX && return (reached, barriers, false)
+        mi = pop!(queue)
+        ci = _reach_body(mi)
+        if !(ci isa Core.CodeInfo)
+            complete = false
+            continue
+        end
+        for st in ci.code
+            st isa Expr || continue
+            if st.head === :invoke || st.head === :invoke_modify
+                named = StrictMode._invoke_mi(st.args[1])
+                callee = isnothing(named) ? nothing : _compiled_callee(ci, mi, st, named)
+                if isnothing(callee)
+                    complete = false
+                    continue
+                end
+                for c in (callee, named)
+                    (c in reached || c in barriers) && continue
+                    if stop && isstop(c)
+                        push!(barriers, c)
+                    else
+                        push!(reached, c)
+                        push!(queue, c)
+                    end
+                end
+            elseif st.head === :call
+                v = StrictMode._sw_callee_value(st.args[1])
+                v isa Core.Builtin && nameof(v) in StrictMode._SW_DYNAMIC_BUILTINS && (complete = false)
+            elseif st.head in (:cfunction, :new_opaque_closure)
+                complete = false
+            end
+        end
+    end
+    return (reached, barriers, complete)
+end
+
+# The optimized body of the specialization `mi`, or `nothing` when it cannot be read: the scan's
+# own read of the same specialization (`StrictMode._callee_key`).
+_reach_body(mi::Core.MethodInstance) = StrictMode._typed_body(StrictMode._callee_key(mi))
+
+# The specialization AllocCheck compiles for the `:invoke` statement `st` in the body `ci` of
+# `caller`, or `nothing` when it cannot be determined. Julia's own optimizer names the callee's
+# compilation signature there, which widens an argument the method does not specialize on;
+# AllocCheck's names the specialization for the argument types inferred at the statement
+# (`_native_dispatches`), and that one holds the sites.
+function _compiled_callee(ci, caller::Core.MethodInstance, st::Expr, callee::Core.MethodInstance)
+    # A specialization for concrete types is the only one its call can lead to.
+    Base.isdispatchtuple(callee.specTypes) && return callee
+    m = callee.def
+    (m isa Method && st.head === :invoke) || return nothing
+    ats = Any[]
+    for a in Iterators.drop(st.args, 1)
+        T = if Meta.isexpr(a, :static_parameter)
+            v = caller.sparam_vals[a.args[1]::Int]
+            v isa TypeVar ? nothing : Core.Typeof(v)
+        elseif a isa Expr
+            nothing
+        else
+            Base.Compiler.widenconst(StrictMode._stmt_arg_type(ci, caller.specTypes, a))
+        end
+        T isa Type || return nothing
+        push!(ats, T)
+    end
+    tt = Core.apply_type(Tuple, ats...)
+    tt == callee.specTypes && return callee
+    tt <: callee.specTypes || return nothing
+    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), tt, m.sig)::Core.SimpleVector
+    env[1] === Union{} && return nothing
+    spec = Base.specialize_method(m, env[1], env[2]::Core.SimpleVector)
+    return spec isa Core.MethodInstance ? spec : nothing
 end
 
 # The name of the first barrier frame any site passes through, for the note.
@@ -426,9 +1006,15 @@ function _barrier_frame_name(allocs)
         mi = _frame_mi(fr)
         (mi isa Core.MethodInstance && mi.def isa Method && StrictMode._mi_is_barrier(mi)) || continue
         ps = mi.specTypes.parameters
-        # A registered barrier is named by its function; a Base once-guard by its type, since its
-        # frame is a generated init closure.
+        # A registered barrier is named by its function, or by its type for a callable object; a
+        # Base once-guard by its type, since its frame is a generated init closure. A keyword call
+        # reaches the registered callable through `Core.kwcall` or its keyword body, which carry it
+        # past parameter 1.
         StrictMode._is_registered_callee(ps[1]) && return StrictMode._demangle(mi.def.name)
+        for f in StrictMode._barrier_functions()
+            any(p -> StrictMode._barrier_covers(f, p), ps) &&
+                return StrictMode._demangle(StrictMode._callable_name(f))
+        end
         return nameof(Base.unwrap_unionall(ps[2]))
     end
     return nothing
@@ -448,19 +1034,51 @@ end
 
 # An allocation site that lies in Base's task, lock or condition code: on the way from the allocation out
 # to the nearest frame of the package's own code, the calls pass through that code. This is what a wait,
-# a yield or a lock does, and what the value-free scan reports as its own kind.
+# a yield or a lock does, and what the value-free scan reports as its own kind. A callable the
+# scheduler was handed (the function given to `lock(f, l)`) is its caller's code whoever defined its
+# type, so the walk ends where a scheduler frame calls one of its own arguments (`_calls_argument`).
 function _scheduler_site(@nospecialize(a))
     hasproperty(a, :backtrace) || return false
     sched = false
+    prev = nothing
     for fr in a.backtrace
         mi = _frame_mi(fr)
         if mi isa Core.MethodInstance && mi.def isa Method &&
                 !(Base.moduleroot(mi.def.module) === Base || Base.moduleroot(mi.def.module) === Core)
             break
         end
-        fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES && (sched = true)
+        # An inlined frame carries no method instance, only its file. Base's own files are recorded
+        # relative to the image ("./lock.jl"): any other file is the package's code (the function
+        # given to `lock`, inlined into it), and the walk ends there too.
+        if fr isa Base.StackTraces.StackFrame && isnothing(mi) && fr.inlined &&
+                !startswith(string(fr.file), "./")
+            break
+        end
+        if fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES
+            mi isa Core.MethodInstance && !isnothing(prev) && _calls_argument(mi, prev) && break
+            sched = true
+        end
+        prev = fr
     end
     return sched
+end
+
+# Whether frame `inner`, just inside scheduler frame `mi`, is a call of one of `mi`'s arguments. An
+# inlined frame has no method instance, only its function's name, which is matched against the methods
+# of each argument type.
+function _calls_argument(mi::Core.MethodInstance, @nospecialize(inner))
+    imi = _frame_mi(inner)
+    imi isa Core.MethodInstance && return StrictMode._calls_argument(mi.specTypes, imi.specTypes)
+    inner isa Base.StackTraces.StackFrame || return false
+    sig = Base.unwrap_unionall(mi.specTypes)
+    sig isa DataType || return false
+    world = Base.get_world_counter()
+    for P in Iterators.drop(sig.parameters, 1)
+        (P isa DataType && isconcretetype(P)) || continue
+        ms = Base._methods_by_ftype(Tuple{P, Vararg{Any}}, -1, world)
+        ms isa Vector && any(m -> m.method.name === inner.func, ms) && return true
+    end
+    return false
 end
 
 # First source location among allocation sites (any / boxing-only), pulled from the backtraces.
@@ -501,9 +1119,10 @@ function _bail_frame_dispatches(@nospecialize(rep))
     mi isa Core.MethodInstance || return out
     where = mi.def isa Method ? string(mi.def.module, ".", mi.def.name) : string(mi)
     cis = try
-        Base.code_typed_by_type(mi.specTypes; optimize = true)
+        StrictMode._code_typed_of(StrictMode._callee_key(mi); optimize = true)
     catch
-        return out
+        # Unread is not clean: JET reported nothing from this frame's body either.
+        return push!(out, "$where: its body could not be read")
     end
     for pair in cis
         ci = pair isa Pair ? pair.first : pair
@@ -529,7 +1148,7 @@ end
 # propagating raw from inside JET (see `AnalysisError`).
 function _opt_reports(target::AbstractString, @nospecialize(f), @nospecialize(types::Tuple))
     try
-        return filter(r -> !_is_guard_report(r) && !_is_foreign_opt_failure(r), JET.get_reports(JET.report_opt(f, types)))
+        return filter(r -> !_is_guard_report(r) && !_is_foreign_opt_failure(r), JET.get_reports(_jet_target(JET.report_opt, f, types)))
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
     end
@@ -563,7 +1182,7 @@ function _call_reports(
     try
         return filter(
             _is_call_defect,
-            JET.get_reports(JET.report_call(f, types; target_modules = (mod,)))
+            JET.get_reports(_jet_target(JET.report_call, f, types; target_modules = (mod,)))
         )
     catch err
         throw(AnalysisError(target, "(" * join(types, ", ") * ")", err))
@@ -731,9 +1350,9 @@ const _TRIM_CHILD_STDERR = Ref("")
 # package, because that is what `using` can load.
 function _trim_child_modules(@nospecialize(f), argtypes::Vector)
     mods = Symbol[]
-    _push_module!(mods, parentmodule(f))
+    _push_module!(mods, parentmodule(f isa Function || f isa Type ? f : StrictMode._ftype(f)))
     try
-        _push_module!(mods, which(f, Tuple{argtypes...}).module)
+        _push_module!(mods, StrictMode._which(f, Tuple{argtypes...}).module)
     catch
     end
     for T in argtypes
@@ -899,6 +1518,7 @@ TrimCheck verifier against this session's own Base, which rejects some code juli
 (issue #19).
 """
 function _trim_validate(@nospecialize(f), @nospecialize(types))
+    f, types = _backend_call(f, _argtypes(types))
     argtypes = _argtypes(types)
     if _JULIAC_PATCHES[]
         cached = get(_TRIM_BATCH, (f, argtypes), nothing)
@@ -906,7 +1526,7 @@ function _trim_validate(@nospecialize(f), @nospecialize(types))
         r = _trim_validate_subprocess([(f, argtypes)])
         isnothing(r) || isnothing(r[1]) || return (r[1]..., :patched)
         @warn "StrictModeTest: could not run the patched trim verification in a subprocess for " *
-            "`$(nameof(f))` (a closure, a function the child cannot load, or a build shipping no " *
+            "`$(StrictMode._func_name(f))` (a closure, a function the child cannot load, or a build shipping no " *
             "juliac patches). Falling back to STOCK Base in this process, which rejects some code " *
             "juliac builds clean — a failure here may be a false alarm (issue #19)." *
             (isempty(_TRIM_CHILD_STDERR[]) ? "" : "\n  child stderr: " * first(_TRIM_CHILD_STDERR[], 500)) maxlog = 3
@@ -917,7 +1537,7 @@ end
 # The verification itself, in whatever process calls it. The child runs this with the patches
 # applied; the parent runs it against stock Base.
 function _trim_validate_here(@nospecialize(f), argtypes::Vector)
-    rts = Base.return_types(f, Tuple{argtypes...})
+    rts = StrictMode._base_return_types(f, argtypes)
     if length(rts) != 1
         return (
             false, [
@@ -932,7 +1552,7 @@ function _trim_validate_here(@nospecialize(f), argtypes::Vector)
         TrimCheck.hook_verify_typeinf_trim() do
             _typeinf_toplevel(
                 Comp,
-                Any[Core.svec(ret_type, Tuple{typeof(f), argtypes...})],
+                Any[Core.svec(ret_type, StrictMode._sigtype(f, argtypes))],
                 [Base.get_world_counter()],
             )
         end
@@ -1101,23 +1721,33 @@ end
 # ── the proof engine ─────────────────────────────────────────────────────────────────────────────
 
 """
-    StrictModeTest.proof_findings(f, types; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+    StrictModeTest.proof_findings(f, types; guarantees = (:typestable, :noalloc), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 One [`StrictMode.StrictFinding`](@ref) per requested guarantee, computed with the proofs rather
 than StrictMode's value-free scan. `f` is never called. This is the data half of the gating API;
 `test_signatures`/`test_compiled`/`test_registered` add the raise.
 """
-proof_findings(@nospecialize(f), @nospecialize(types::Tuple); guarantees = (:typestable, :noalloc)) =
-    _proof_findings(f, types, guarantees)
+proof_findings(
+    @nospecialize(f), @nospecialize(types::Tuple);
+    guarantees = (:typestable, :noalloc), allow_exempt::Bool = false
+) = _proof_findings(f, types, guarantees; allow_exempt)
 
-function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
-    fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
+# What a caller is told to do about an exempt-only result.
+const _EXEMPT_ONLY_FIX = "every allocation is inside a function exempted from :noalloc. Accept " *
+    "the exemptions listed for this check with `allow_exempt = true`, or remove the " *
+    "allocation or the exemption"
+
+function _proof_findings(
+        @nospecialize(f), @nospecialize(types::Tuple), guarantees; allow_exempt::Bool = false
+    )
+    fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(f, types), StrictMode._mod_sym(f, types)
     target = fn * sg
     # AllocCheck runs at most once per signature even when both allocation guarantees are asked
     # for: the boxing verdict is a filter over the same instance list.
-    allocs, alloc_error = if :noalloc in guarantees || :noboxing in guarantees
+    checked, alloc_error = if :noalloc in guarantees || :noboxing in guarantees
         try
-            (first(_checked_allocs(f, types)), nothing)
+            (_checked_allocs(f, types), nothing)
         catch err
             err isa StrictViolation && rethrow()
             (nothing, sprint(showerror, err))
@@ -1125,6 +1755,9 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
     else
         (nothing, nothing)
     end
+    allocs = isnothing(checked) ? nothing : checked[1]
+    # The sites kept because the call graph does not name their specialization (`_off_graph`).
+    unplaced = isnothing(checked) ? Any[] : checked[3]
     out = StrictFinding[]
     for g in guarantees
         shared = StrictMode._compiled_output_finding(g, f, types, md, fn, sg; tier = :proof)
@@ -1136,25 +1769,47 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             if isnothing(allocs)
                 push!(out, _unproven(md, fn, sg, g, "AllocCheck could not analyze this signature: $alloc_error"))
             else
-                file, line = _first_loc(allocs, false)
-                if !isempty(allocs) && all(_scheduler_site, allocs)
+                # The sites inside functions exempt from `:noalloc` are set aside first, as the scan
+                # sets them aside, and the call's own sites decide the result: none of its own is
+                # the exempt-only result, own sites that all wait are a wait, anything else is an
+                # allocation.
+                own, by, offgraph = _exempt_split(allocs, StrictMode._entry_key(f, types))
+                note = _unplaced_note(filter(a -> any(u -> u === a, unplaced) || any(u -> u === a, offgraph), own))
+                file, line = _first_loc(isempty(own) ? allocs : own, false)
+                nexempt = length(allocs) - length(own)
+                if !isempty(own) && all(_scheduler_site, own)
                     push!(
                         out, _mkproof(
                             md, fn, sg, g, true,
-                            "blocks in the task scheduler: AllocCheck reports $(length(allocs)) site(s), all in " *
+                            "blocks in the task scheduler: AllocCheck reports $(length(own)) site(s)" *
+                                (nexempt > 0 ? " outside functions exempt from :noalloc" : "") * ", all in " *
                                 "Base's task, lock and condition code (first: $(basename(file)):$line). It " *
-                                "waits for another task, so it can allocate.",
+                                "waits for another task, so it can allocate." * note,
                             file, line,
                             "if the wait is a pool join that is expected, register the function that joins " *
                                 "with `register_alloc_barrier!` or exempt it with `@strict_exempt` by name";
                             cause = :scheduler
                         )
                     )
+                elseif isempty(own) && !isempty(allocs)
+                    # Every site lies inside a function exempt from `:noalloc`. That is not a
+                    # proof of no allocation, so it is a FAILURE with its own code: counted by
+                    # `nfailures`, failed by every gate, not a pass to any reader of the status.
+                    # A caller that accepts the exemptions by name gets the note in its place.
+                    push!(
+                        out, StrictMode.StrictFinding(
+                            md, fn, sg, g, allow_exempt ? :info : :fail, file, line,
+                            "allocates only inside " * (length(by) == 1 ? "a function" : "functions") *
+                                " exempt from :noalloc ($(length(allocs)) site(s)): " *
+                                join(("`" * n * "`" * (isempty(r) ? "" : " (" * r * ")") for (n, r) in by), ", "),
+                            allow_exempt ? "" : _EXEMPT_ONLY_FIX, :proof, :SM0018, "", by
+                        )
+                    )
                 else
                     push!(
                         out, _mkproof(
                             md, fn, sg, g, !isempty(allocs),
-                            "allocates ($(length(allocs)) site(s))", file, line
+                            "allocates ($(length(allocs)) site(s))" * (isempty(note) ? "" : "." * note), file, line
                         )
                     )
                 end
@@ -1177,7 +1832,7 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             # the construct frequently lives in a dependency, and a finding pointing at the function
             # under test cannot say so — a rewrite there would not change the verdict.
             m = try
-                which(f, types)
+                StrictMode._which(f, types)
             catch
                 nothing
             end
@@ -1192,14 +1847,15 @@ function _proof_findings(@nospecialize(f), @nospecialize(types::Tuple), guarante
             throw(ArgumentError("unknown guarantee :$g; expected one of $(StrictMode._GUARANTEES)"))
         end
     end
-    return out
+    # A proof of a signature that returns on no path proved nothing about one that does.
+    return StrictMode._always_throws(f, types) ? StrictMode._mark_always_throws(out) : out
 end
 
 # Two layers, both authoritative here: the inferred return type must be concrete, and JET's
 # optimization analysis must be clean. StrictMode's own `:typestable` uses an IR boxing signal for
 # the second layer, which is why it only warns; this is the proof that replaces it.
 function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg)
-    rts = Base.return_types(f, Tuple{types...})
+    rts = StrictMode._base_return_types(f, types)
     if length(rts) != 1 || !StrictMode._is_typestable_return(only(rts))
         rt = isempty(rts) ? "none" : (length(rts) == 1 ? string(only(rts)) : string(rts))
         cause = StrictMode._instability_cause(f, types)

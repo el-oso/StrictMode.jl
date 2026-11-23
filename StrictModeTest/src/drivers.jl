@@ -15,12 +15,18 @@ function _trim_sigs(items)
     sigs = Tuple{Any, Vector{Any}}[]
     for (f, types, guarantees) in items
         (:trim_compatible in guarantees) || continue
-        push!(sigs, (f, _argtypes(Tuple{types...})))
+        f isa StrictMode._UncheckedMethod && continue   # reported by `_map_findings`, not compiled
+        g, gtypes = try
+            _backend_call(f, types)
+        catch
+            continue       # `_trim_validate` raises for it on its own
+        end
+        push!(sigs, (g, _argtypes(gtypes)))
     end
     return sigs
 end
 
-function _gate(items, kind::Symbol, target::AbstractString)
+function _gate(items, kind::Symbol, target::AbstractString; allow_exempt::Bool = false)
     isempty(items) && @warn "StrictModeTest.$kind: nothing to prove for `$target` (0 signatures). " *
         "This result is green because it checked nothing, not because anything passed. A module " *
         "sweep needs its kernels exercised first (a concrete specialization must exist), and an " *
@@ -31,10 +37,15 @@ function _gate(items, kind::Symbol, target::AbstractString)
     # can never outlive the gate that asked for it.
     fs = try
         _trim_batch!(_trim_sigs(items))
-        StrictMode._map_findings(_proof_findings, items)
+        # An exempt-only result is a failure from the proof unless this gate's caller accepted
+        # the exemptions.
+        StrictMode._map_findings(_proof_analyzer(allow_exempt), items)
     finally
         empty!(_TRIM_BATCH)
     end
+    # A listed signature is one its author expects to return; in a sweep, a signature that always
+    # throws is an error helper and stays a note.
+    kind === :test_signatures && (fs = StrictMode._gate_always_throws(fs))
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return fs
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -42,7 +53,8 @@ function _gate(items, kind::Symbol, target::AbstractString)
 end
 
 """
-    test_signatures(pairs; guarantees = (:typestable, :noalloc)) -> Vector{StrictFinding}
+    test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 Prove `guarantees` for an explicit list of `(f, types)` pairs, and throw a
 `StrictMode.StrictViolation` collecting every failure. Returns the findings when all pass.
@@ -58,35 +70,56 @@ test_signatures([
     (gemm!, (Matrix{Float64}, Matrix{Float64}, Matrix{Float64})),
 ])
 ```
+
+A signature that allocates only inside functions exempted from `:noalloc` is not a pass: the proof
+reports it as a failure with code SM0018 that lists the exempt functions and their reasons, and this
+gate, like `test_compiled`, `test_registered` and `@test_noalloc`, fails on it. `allow_exempt = true`
+accepts the exemptions for this gate: the result is then a note, and the gate passes when nothing
+else allocates.
+Only an exemption declared in the function's own module counts; a session-wide one, which covers by
+name, leaves its caller an ordinary failure.
 """
-function test_signatures(pairs; guarantees = (:typestable, :noalloc))
+function test_signatures(pairs; guarantees = (:typestable, :noalloc), allow_exempt::Bool = false)
+    # A name no guarantee has is a mistake in the call, not a failing signature.
+    StrictMode._check_guarantees(guarantees)
     items = Any[(f, Tuple(types), guarantees) for (f, types) in pairs]
-    return _gate(items, :test_signatures, "signatures")
+    return _gate(items, :test_signatures, "signatures"; allow_exempt)
 end
 
 """
-    test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+                  allow_exempt = false)
         -> Vector{StrictFinding}
 
 Prove `guarantees` for every concrete method instance `mod`'s functions have **actually compiled**
 (during your tests, a run, or the precompile workload), and throw a `StrictMode.StrictViolation`
 collecting every failure.
 
+Only the methods written in `mod` itself are swept: its own functions' methods, and the methods it
+defines on a function another module owns (`Base.getproperty`, `Base.size`), without that
+function's other methods. A submodule or a package extension is a module of its own, swept by
+`test_compiled` on that module, with its own exemptions.
+
 No annotation needed, but coverage is whatever executed, and a module that mixes hot and cold
 (plan-time) helpers will be noisy — cold helpers that legitimately allocate show up too. Scope it
 with `only` / `exempt`, each a collection of functions / name `Symbol`s, a **`Regex`** matched
-against the (demangled) name, or a predicate `f -> Bool`. `@strict_exempt` names are always
+against the (demangled) name, or a predicate `f -> Bool`; for a callable object with no instance
+the predicate receives the type its method declares for it (`Reader`, `Boxed`). `@strict_exempt` names are always
 excluded, so `exempt = r"^_plan"` scales a mixed hot/cold library without a hand-listed set.
 
 This is the gate. [`StrictMode.audit`](@ref) is the reporting counterpart for the same scope.
 """
-function test_compiled(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+function test_compiled(
+        mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+        allow_exempt::Bool = false
+    )
     items = StrictMode._compiled_items(mod; guarantees, only, exempt)
-    return _gate(items, :test_compiled, string(nameof(mod)))
+    return _gate(items, :test_compiled, string(nameof(mod)); allow_exempt)
 end
 
 """
-    test_registered(; guarantees = nothing, modules = nothing) -> Vector{StrictFinding}
+    test_registered(; guarantees = nothing, modules = nothing, allow_exempt = false)
+        -> Vector{StrictFinding}
 
 Re-prove every signature in StrictMode's mark-once registry — everything `@strict_function`,
 `@strict module`, or `register_strict!` declared — and throw a `StrictMode.StrictViolation`
@@ -95,16 +128,17 @@ override.
 
 The registry is process-global and keyed on `(f, types)` with no module of its own, so a dependency
 loaded from source in the same session (a Revise or `dev` setup) contributes its declarations too —
-and your gate would then judge its kernels. `modules = [MyPkg]` scopes the sweep by each registered
-function's defining module. Unscoped, the reported count is broken down per module so an unexpected
-one is visible rather than silent.
+and your gate would then judge its kernels. `modules = [MyPkg]` scopes the sweep by the module that
+wrote the method each declaration reaches, which is the module its findings name: a declaration on
+`Base.getproperty` for one of your types is yours. Unscoped, the reported count is broken down per
+module so an unexpected one is visible rather than silent.
 
 It reports how many signatures it proved, because the registry is populated at *declaration* time
 and an implausibly small count is the signal that something did not register. A declaration made in
 a package's own `src/` is stored in that package, so it survives the package's cached load and is
 counted here; one made by a direct `register_strict!` call belongs to the session that made it.
 """
-function test_registered(; guarantees = nothing, modules = nothing)
+function test_registered(; guarantees = nothing, modules = nothing, allow_exempt::Bool = false)
     StrictMode.assert_enabled()
     items = StrictMode._registry_items(guarantees; modules)
     if isempty(items)
@@ -120,11 +154,12 @@ function test_registered(; guarantees = nothing, modules = nothing)
         @info "StrictModeTest: re-proving $(length(items)) registered signature(s) — " *
             join(("$m: $n" for (m, n) in by_mod), ", ")
     end
-    return _gate(items, :test_registered, "registry")
+    return _gate(items, :test_registered, "registry"; allow_exempt)
 end
 
 """
-    proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+                   allow_exempt = false)
         -> Vector{StrictFinding}
 
 Every concrete method instance `mod`'s functions have **actually compiled**, proved and returned as
@@ -135,17 +170,33 @@ Reach for it when you want the proofs but not the raise: `test_compiled` returns
 when everything passes and throws a `StrictViolation` carrying a formatted string otherwise, so it
 cannot hand you structured findings for a package that is currently failing — which is exactly when
 an agent wants them.
+
+A signature that allocates only inside functions exempted from `:noalloc` is a failure with code
+SM0018, as in every gate; `allow_exempt = true` accepts those exemptions, and the result is then a
+note (`:info`, same code, same `exempt_by`).
 """
-proof_findings(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ()) =
-    StrictMode._findings_compiled(_proof_findings, mod; guarantees, only, exempt)
+proof_findings(
+    mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = (),
+    allow_exempt::Bool = false
+) = StrictMode._findings_compiled(_proof_analyzer(allow_exempt), mod; guarantees, only, exempt)
+
+# `_proof_findings` as the `analyze(f, types, guarantees)` callable the shared drivers take, with
+# the caller's acceptance of exempt-only results applied to every signature they reach.
+_proof_analyzer(allow_exempt::Bool) =
+    (f, types, gs) -> _proof_findings(f, types, gs; allow_exempt)
 
 """
     proof_audit(target = :registered; guarantees = nothing, sweep = false,
-                require = nothing, only = nothing, exempt = ()) -> Vector{StrictFinding}
+                require = nothing, only = nothing, exempt = (), allow_exempt = false)
+        -> Vector{StrictFinding}
 
 [`StrictMode.audit`](@ref) with the proofs behind it: same targets, same scoping, and the same
-`Vector{StrictFinding}` back, and it likewise **never throws and never sets an exit status**. The
-only difference is the engine — AllocCheck, JET and TrimCheck instead of the value-free scan.
+`Vector{StrictFinding}` back, and it likewise **never throws on a violation and never sets an exit
+status**. The only difference is the engine — AllocCheck, JET and TrimCheck instead of the
+value-free scan. An argument that names nothing raises an `ArgumentError`, as in `audit`: an
+unknown guarantee, a `target` that is neither `:registered` nor a module, an invalid `require`,
+`format`/`io`, and an `only` or `exempt` entry that matches no function with a method in the
+module.
 
 That is the whole point of it existing. `audit`'s allocation verdicts are structural guesses, which
 is fine for discovery but means an agent cannot tell a real regression from noise; the `test_*`
@@ -160,9 +211,13 @@ using MyPkg, StrictMode, StrictModeTest
 fs = proof_audit(MyPkg; sweep = true, exempt = r"^_plan")
 nfailures(fs)        # proved failures, not guesses
 ```
+
+A signature that allocates only inside functions exempted from `:noalloc` is a failure with code
+SM0018; `allow_exempt = true` accepts those exemptions for every signature the audit proves, and the
+result is then a note (`:info`, same code, same `exempt_by`).
 """
-proof_audit(target = :registered; kwargs...) =
-    StrictMode._audit(_proof_findings, "proof_audit", target; kwargs...)
+proof_audit(target = :registered; allow_exempt::Bool = false, kwargs...) =
+    StrictMode._audit(_proof_analyzer(allow_exempt), "proof_audit", target; kwargs...)
 
 """
     test_coverage(mod::Module; require = :all, only = nothing, exempt = ())
@@ -259,7 +314,7 @@ function test_exemptions(mod::Module; only = nothing)
         _name_hit(only, e.func) || continue
         for (f, tt) in _exempt_signatures(mod, e)
             gs = isnothing(e.guarantees) ? StrictMode._DEFAULT_POLICY : e.guarantees
-            sg = StrictMode._sig_string(tt)
+            sg = StrictMode._sig_string(f, tt)
             fs = try
                 proof_findings(f, tt; guarantees = gs)
             catch err
@@ -300,8 +355,8 @@ _name_hit(spec, name::Symbol) =
     spec isa Function ? spec(name) :
     name in Set{Symbol}(x isa Symbol ? x : nameof(x) for x in spec)
 
-# The signatures an exemption should be judged on: the one it names, or every concrete signature the
-# function has compiled.
+# The signatures an exemption should be judged on: the one it names, once, for the method that
+# signature selects, or every concrete signature the function has compiled.
 function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
     out = Tuple{Any, Tuple}[]
     ms, _ = StrictMode.module_methods(mod; include_exempt = true)   # the subject IS the exempt code
@@ -314,11 +369,18 @@ function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
             continue
         end
         if isnothing(e.types)
-            for tt in StrictMode._method_signatures(m)
-                push!(out, (f, Tuple(tt)))
+            append!(out, StrictMode._method_entries(m, f))
+        elseif StrictMode._exemption_method(e, m.sig) === m
+            # A signature that is not a dispatch tuple, as the definition form records for a
+            # generic method, is proved at the compiled rows within it.
+            if Base.isdispatchtuple(Tuple{e.types...})
+                push!(out, (f, e.types))
+            else
+                range = StrictMode._exemption_sig(e, m.sig)
+                for (g, tt) in StrictMode._method_entries(m, f)
+                    Tuple{StrictMode._ftype(f), tt...} <: range && push!(out, (g, tt))
+                end
             end
-        else
-            push!(out, (f, e.types))
         end
     end
     return out
@@ -331,7 +393,7 @@ function _call_findings(mod::Module; only = nothing, exempt = ())
     out = StrictMode.StrictFinding[]
     for (f, tt, _) in StrictMode._compiled_items(mod; guarantees = (:typestable,), only, exempt)
         types = Tuple(tt)
-        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(types), StrictMode._mod_sym(f)
+        fn, sg, md = StrictMode._func_name(f), StrictMode._sig_string(f, types), StrictMode._mod_sym(f, types)
         reps = _call_reports("test_calls", f, types, mod)
         if isempty(reps)
             push!(out, StrictMode._mkfinding(md, fn, sg, :calls, false, "", "", 0; tier = :proof))
@@ -339,7 +401,7 @@ function _call_findings(mod::Module; only = nothing, exempt = ())
         end
         for rep in reps
             m = try
-                first(methods(f, types))
+                StrictMode._which(f, types)
             catch
                 nothing
             end
@@ -471,9 +533,13 @@ Prove that no method in `mod` leaves Julia's safety guarantees, and throw a
 `StrictMode.StrictViolation` naming every one that does.
 
 The Julia form of Rust's `#![forbid(unsafe_code)]`. A module that must stay inside the language
-declares it by calling this; `ccall`, `pointer`, and any function whose name begins with `unsafe_`
-are what it looks for. Julia cannot enforce this on its own, since those are ordinary calls that any
-module may make.
+declares it by calling this. Julia cannot enforce it on its own, since a `ccall` and an
+`unsafe_load` are ordinary calls that any module may make.
+
+`ccall`, `@cfunction`, `pointer`, any function whose name begins with `unsafe_`, the pointer
+intrinsics, `llvmcall`, `cglobal`, the C allocator and a pointer made from an integer are what it
+looks for, in any spelling: a plain call, a broadcast, a `map`, a splat, a keyword call or a local
+alias. [`StrictMode.unsafe_report`](@ref) has the full table.
 
 `allow` names the constructs this module may use anyway, so a deliberate, reviewed escape is
 recorded where the policy is written rather than silently tolerated:
@@ -624,8 +690,16 @@ end
     StrictModeTest.AllocEntry
 
 One entry point of a function and what an allocation proof says about it. `kind` is `:positional`
-or `:keyword`. `status` is `:pass`, `:fail`, or `:unproven` when no proof ran: the signature names
-no concrete types to run one against, which is always so for a `:keyword` entry.
+or `:keyword`. `status` is one of:
+
+- `:pass` — the proof found no allocation.
+- `:fail` — the proof failed: it found an allocation, or AllocCheck could not analyze the
+  signature; `reason` says which.
+- `:unproven` — nothing was proved: the signature names no concrete types to run a proof against,
+  which is always so for a `:keyword` entry; it always throws, so no returning path was checked; or
+  the proof raised before producing a verdict.
+- `:info` — the proof's exempt-only result (SM0018) accepted with `allow_exempt = true`: every
+  allocation is inside a function exempted from `:noalloc`, and `reason` names them. Not a pass.
 """
 struct AllocEntry
     sig::Any
@@ -653,22 +727,27 @@ end
 _kw_entries(@nospecialize(f)) =
     collect(methods(Core.kwcall, Tuple{Any, Core.Typeof(f), Vararg{Any}}))
 
-function _positional_entry(@nospecialize(f), sig)
+function _positional_entry(@nospecialize(f), sig; allow_exempt::Bool = false)
     Base.isdispatchtuple(sig) || return AllocEntry(
         sig, :positional, :unproven,
         "the signature names no concrete argument types — prove it at the types a caller uses " *
             "with `test_signatures([(f, (T1, T2, …))])` or `@test_noalloc f(args…)`"
     )
     fs = try
-        _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,))
+        _proof_findings(f, Tuple(sig.parameters[2:end]), (:noalloc,); allow_exempt)
     catch e
         return AllocEntry(
             sig, :positional, :unproven, "the proof could not run: " * sprint(showerror, e)
         )
     end
     failed = filter(StrictMode._failed, fs)
-    isempty(failed) && return AllocEntry(sig, :positional, :pass, "")
-    return AllocEntry(sig, :positional, :fail, join((f.reason for f in failed), "; "))
+    isempty(failed) || return AllocEntry(sig, :positional, :fail, join((f.reason for f in failed), "; "))
+    # A note is not a pass: a signature that always throws had nothing on a returning path checked,
+    # and an accepted exempt-only result still allocates inside the exempt functions.
+    notes = filter(x -> x.status !== :pass, fs)
+    isempty(notes) && return AllocEntry(sig, :positional, :pass, "")
+    status = any(x -> x.code === :SM0208, notes) ? :unproven : :info
+    return AllocEntry(sig, :positional, status, join((x.reason for x in notes), "; "))
 end
 
 # A `Core.kwcall` method declares its keyword `NamedTuple` abstract, so its signature is never one
@@ -695,10 +774,10 @@ r = StrictModeTest.alloc_entry_report(gemm!)
 filter(e -> e.status === :unproven, r.entries)
 ```
 """
-function alloc_entry_report(@nospecialize(f))
+function alloc_entry_report(@nospecialize(f); allow_exempt::Bool = false)
     entries = AllocEntry[]
     for m in methods(f)
-        push!(entries, _positional_entry(f, m.sig))
+        push!(entries, _positional_entry(f, m.sig; allow_exempt))
     end
     for m in _kw_entries(f)
         push!(entries, _keyword_entry(m.sig))

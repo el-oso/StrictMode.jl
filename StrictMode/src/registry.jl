@@ -54,8 +54,14 @@ function _local_store!(mod::Module, name::Symbol, empty)
     store = empty
     Core.eval(root, :(const $name = $store))
     _STORES[(root, name)] = store
+    push!(_STORES_CREATED, store)
     return store
 end
+
+# The stores this process created. While a package image is being written these are the ones that
+# are written with it: a store that was already there belongs to a package loaded from its own
+# cache, and what is pushed onto it now is in no image.
+const _STORES_CREATED = Base.IdSet{Any}()
 
 # Every module that may hold a store: the loaded packages, plus `Main` for a REPL session, which is
 # not one of them.
@@ -67,38 +73,227 @@ function _store_modules()
     return mods
 end
 
-"""
-    StrictMode.declarations() -> Dict
+# A registration a verdict depends on (a trust boundary, a scoped type), kept where it survives.
+# The session's own set is lost when a package registers at its top level and is then loaded from
+# its cache: StrictMode comes from its own image by then, and holds nothing the package added
+# while it precompiled. So each registration is also pushed onto a constant in the package's root
+# module, which is serialized with the package, and every reader takes the union.
+const _REGISTRATION_GEN = Ref(0)
+const _REGISTRATION_MEMO = Dict{Symbol, Tuple{UInt, Int, Int, Vector{Any}}}()
+const _REGISTRATION_LOCK = ReentrantLock()
 
-Every declaration in scope: `(f, types) => (; guarantees)`. The union of what this session
-registered directly and what each loaded package declared in its own `src/`.
+function _keep_registration!(@nospecialize(x), mod::Module, name::Symbol, call::AbstractString)
+    @lock _REGISTRATION_LOCK _REGISTRATION_GEN[] += 1
+    # Only while a package image is being written. In a session the session's own set is the
+    # registration, and a constant added to a loaded module would outlive a caller that empties
+    # that set to take a registration back.
+    ccall(:jl_generating_output, Cint, ()) == 1 || return nothing
+    _persist_registration!(x, mod, name, call)
+    return nothing
+end
 
-A package's declarations live in a `const` of the package itself, because a declaration made during
-its precompile cannot be stored in StrictMode — StrictMode is loaded from its own cache by then, and
-the mutation does not survive the declaring package's next cached load.
-"""
-# A declaration is looked up by the identity of its function and of its argument types. Hashing the
+# Put `x` where it is written into the image of the package being precompiled, or raise. A
+# registration that is in force for the precompile and gone at every load after it is the failure
+# the package-local stores exist to prevent.
+function _persist_registration!(@nospecialize(x), mod::Module, name::Symbol, call::AbstractString)
+    # A dependency's `__init__` also runs while another package precompiles. That call is made
+    # again in every process that loads the dependency, so the session's set is the whole
+    # registration and there is nothing to store.
+    _called_from_init() && return nothing
+    kept = try
+        store = _local_store!(mod, name, Any[])
+        if store in _STORES_CREATED
+            any(y -> y === x, store) || push!(store, x)
+            true
+        else
+            false
+        end
+    catch
+        false
+    end
+    # A package's own code registering its own function while ANOTHER package precompiles (a
+    # table registered on first use, first used by a dependent's precompile workload) runs again
+    # in every process that calls it. The session's set is the whole registration, as it is for
+    # an `__init__`, and nothing of the dependent's is lost.
+    (kept || _registered_by_owner(mod)) || _registration_lost(mod, call)
+    return nothing
+end
+
+# The method a stack frame runs, or `nothing` for a frame that has none of its own (top-level
+# code, or a call that was inlined).
+function _frame_method(fr::Base.StackTraces.StackFrame)
+    li = fr.linfo
+    li isa Core.CodeInstance && (li = li.def)
+    li isa Core.MethodInstance && (li = li.def)
+    return li isa Method ? li : nothing
+end
+
+# Whether a module's initializer is running: the zero-argument `__init__` of the module that
+# defines it, which is what the loader calls. Another function of that name is not one.
+function _called_from_init()
+    for fr in stacktrace()
+        fr.func === :__init__ || continue
+        m = _frame_method(fr)
+        (m isa Method && _is_module_init(m)) && return true
+    end
+    return false
+end
+
+_is_module_init(m::Method) = m.nargs == 1 && isdefined(m.module, :__init__) &&
+    m.sig === Tuple{typeof(getglobal(m.module, :__init__))}
+
+# Whether the code that called the registration function belongs to the package that owns `mod`,
+# judged by the first frame outside StrictMode and Base. A frame that runs a method of its own
+# belongs to that method's package. One without a method (an inlined call, or top-level code) keeps
+# only its file, which must lie in the directory of the owner's own source file. The owner's
+# directory as a whole is not enough: an extension in `ext/` and a package nested under it are
+# other packages, and a registration they make is lost like any other dependent's.
+function _registered_by_owner(mod::Module)
+    root = Base.moduleroot(mod)
+    path = pathof(root)
+    isnothing(path) && return false
+    src = joinpath(dirname(path), "")
+    for fr in stacktrace()
+        file = String(fr.file)
+        # Base's own frames carry a relative path.
+        (isabspath(file) && !startswith(file, @__DIR__)) || continue
+        m = _frame_method(fr)
+        m isa Method && return Base.moduleroot(m.module) === root
+        return startswith(file, src)
+    end
+    return false
+end
+
+# The module that owns what is being registered: a function's or a type's own, and for a callable
+# object the module of its type.
+_owner_module(@nospecialize(x)) =
+    (x isa Function || x isa Type || x isa Module) ? parentmodule(x) : parentmodule(typeof(x))
+
+# Only the package being precompiled is written, so only its module can take the registration.
+_registration_lost(mod::Module, call::AbstractString) = throw(
+    ArgumentError(
+        "$call: the registration could not be stored in `$(nameof(Base.moduleroot(mod)))`. " *
+            "Only the package being precompiled is written to its cache, and that module " *
+            "belongs to another one, so the registration would be lost when this package is " *
+            "next loaded. Name the package making it: `$call` with `mod = @__MODULE__`."
+    )
+)
+
+# This session's registrations and each loaded package's own, in one vector. Rebuilt when the
+# session's set changes size, when anything registers, or when the world moves, which a package
+# load does.
+function _registrations(session, name::Symbol)
+    w = Base.get_world_counter()
+    n = length(session)
+    return @lock _REGISTRATION_LOCK begin
+        m = get(_REGISTRATION_MEMO, name, nothing)
+        if !isnothing(m) && m[1] == w && m[2] == n && m[3] == _REGISTRATION_GEN[]
+            m[4]
+        else
+            out = Any[]
+            for x in session
+                push!(out, x)
+            end
+            for mod in _store_modules()
+                s = _store_for(mod, name)
+                s isa AbstractVector || continue
+                for x in s
+                    any(y -> y === x, out) || push!(out, x)
+                end
+            end
+            _REGISTRATION_MEMO[name] = (w, n, _REGISTRATION_GEN[], out)
+            out
+        end
+    end
+end
+
+# A declaration is looked up by the identity of its function's type and of its argument types: a
+# function's type has one instance, and a callable object is analyzed by its type, so a declaration
+# made on an instance answers for the sweep's row of that type. Hashing the
 # `(f, types)` tuple itself compiles a method of `hash` for every distinct tuple type, which is one
 # compilation per signature a module check looks up: 7.8 ms each, 0.6 s for a module of 80 methods.
-_decl_key(@nospecialize(f), @nospecialize(types)) = (objectid(f), objectid(Tuple(types)))
+# A `_Spec` is keyed by its MethodInstance, so a signature declaration matches none: only a method
+# declaration, through the rows it is expanded into, names one.
+_decl_key(@nospecialize(f), @nospecialize(types)) =
+    (objectid(f isa _Spec ? f.mi : _ftype(f)), objectid(Tuple(types)))
 
+# Each signature declaration, and each compiled row of a declared method, by `_decl_key`.
 function _declaration_index(decls)
     index = Dict{Tuple{UInt, UInt}, Any}()
     for p in decls
         key = getfield(p, :first)
         index[_decl_key(getfield(key, 1), getfield(key, 2))] = getfield(p, :second)
     end
+    for (m, meta) in method_declarations()
+        for it in _method_items(m, meta.guarantees)
+            f = getfield(it, 1)
+            f isa _UncheckedMethod && continue
+            key = _decl_key(f, getfield(it, 2))
+            haskey(index, key) || (index[key] = meta)
+        end
+    end
     return index
 end
 
+"""
+    StrictMode.declarations() -> Dict
+
+Every signature declaration in scope: `(f, types) => (; guarantees)`. The union of what this
+session registered directly and what each loaded package declared in its own `src/`. A method
+declaration is in [`StrictMode.method_declarations`](@ref) instead.
+
+A package's declarations live in a `const` of the package itself, because a declaration made during
+its precompile cannot be stored in StrictMode — StrictMode is loaded from its own cache by then, and
+the mutation does not survive the declaring package's next cached load.
+"""
 function declarations()
     out = Dict{Any, @NamedTuple{guarantees::Any, source::String}}()
-    for m in _store_modules()
-        d = _store_for(m, _LOCAL_DECLS)
-        d isa AbstractDict && merge!(out, d)
-    end
-    merge!(out, STRICT_REGISTRY)      # a direct call wins: it is this session's explicit say
+    _union_declarations!(out, k -> !(k isa Method))
     return out
+end
+
+# The stores hold both kinds of declaration: `(f, types)` for a signature and the `Method` itself
+# for a method. `keep` picks one kind. A direct call wins: it is this session's explicit say.
+function _union_declarations!(out, keep)
+    for d in Iterators.flatten(((_store_for(m, _LOCAL_DECLS) for m in _store_modules()), (STRICT_REGISTRY,)))
+        d isa AbstractDict || continue
+        for (k, v) in d
+            keep(k) && (out[k] = v)
+        end
+    end
+    return out
+end
+
+"""
+    StrictMode.method_declarations() -> IdDict{Method, …}
+
+Every method declaration in scope, `m => (; guarantees, source)`: what
+[`register_strict!(m::Method)`](@ref register_strict!) recorded, in this session and in each
+loaded package's own `src/`. A declaration of a method that was since redefined with the same
+signature in the same module answers for the method defined now. One whose method is gone is kept
+as it was, and the drivers report it as a failure.
+"""
+function method_declarations()
+    out = IdDict{Method, @NamedTuple{guarantees::Any, source::String}}()
+    for (m, v) in _union_declarations!(IdDict{Any, Any}(), k -> k isa Method)
+        out[something(_live_method(m), m)] = v
+    end
+    return out
+end
+
+# The method a declaration of `m` names now: `m` while it is defined, else the method defined in
+# its place with the same signature in the same module, else `nothing`.
+function _live_method(m::Method)
+    ms = Base._methods_by_ftype(m.sig, -1, Base.get_world_counter())
+    ms isa AbstractVector || return nothing
+    for x in ms
+        x.method === m && return m
+    end
+    for x in ms
+        y = x.method
+        (y.module === m.module && y.sig == m.sig) && return y
+    end
+    return nothing
 end
 
 """
@@ -133,6 +328,8 @@ function clear_declarations!()
         s = _store_for(m, _LOCAL_EXEMPT)
         isnothing(s) || empty!(s)
     end
+    _EXEMPT_GEN[] += 1
+    clear_cache!()
     return nothing
 end
 
@@ -163,11 +360,45 @@ function register_strict!(
         @warn "register_strict!: skipping $(_func_name(f))$(_sig_string(tt)) — non-concrete argument types."
         return nothing
     end
-    store = isnothing(mod) ? STRICT_REGISTRY :
-        _local_store!(mod, _LOCAL_DECLS, Dict{Any, @NamedTuple{guarantees::Any, source::String}}())
-    store[(f, tt)] = (; guarantees = gs, source = String(source))
+    _declaration_store(mod)[(f, tt)] = (; guarantees = gs, source = String(source))
     return nothing
 end
+
+"""
+    register_strict!(m::Method; guarantees = (:typestable, :noalloc), mod = nothing)
+    register_strict!(f, m::Method; ...)
+
+Declare the method `m`, as `which(f, (A, Integer))` gives it, rather than one signature of it.
+Every specialization of `m` compiled in the session is then a row of its own: the drivers read them
+from the method table when they run and check each one by its own body. That includes a
+specialization compiled only through `invoke(f, Tuple{A, Integer}, …)` for argument types another
+method answers, which no signature can declare. The coverage gate counts every compiled row of `m`
+as declared, and no row of another method.
+
+A generic method's declaration is never checked at its own abstract signature, which infers to
+`Any`. A declared method with nothing compiled is reported as a failure by `audit(:registered)` and
+`StrictModeTest.test_registered`, since there is no row to check: run a workload or a `precompile`
+statement that compiles it first.
+
+The second form also checks that `m` is a method of `f`. `mod` is as for the signature form.
+"""
+function register_strict!(
+        m::Method; guarantees = (:typestable, :noalloc), mod::Union{Nothing, Module} = nothing,
+        source::AbstractString = ""
+    )
+    gs = _check_guarantees(guarantees)
+    _declaration_store(mod)[m] = (; guarantees = gs, source = String(source))
+    return nothing
+end
+
+function register_strict!(@nospecialize(f), m::Method; kwargs...)
+    any(x -> x === m, methods(f)) ||
+        throw(ArgumentError("register_strict!: `$m` is not a method of `$(_func_name(f))`"))
+    return register_strict!(m; kwargs...)
+end
+
+_declaration_store(mod::Union{Nothing, Module}) = isnothing(mod) ? STRICT_REGISTRY :
+    _local_store!(mod, _LOCAL_DECLS, Dict{Any, @NamedTuple{guarantees::Any, source::String}}())
 
 """
     StrictMode.guarantee_names() -> Tuple{Symbol, …}
@@ -218,7 +449,8 @@ end
     registered_strict() -> Dict
 
 The declarations made in **this session**, by a direct [`register_strict!`](@ref) call:
-`(f, types) => (; guarantees)`. Mutable, so a test can `empty!` it.
+`(f, types) => (; guarantees)`, and `m::Method => (; guarantees)` for a method declaration.
+Mutable, so a test can `empty!` it.
 
 A package's own declarations are not here — they live in the package, which is what makes them
 survive its cached load. [`StrictMode.declarations`](@ref) is the union every driver reads.
@@ -265,22 +497,38 @@ end
 # `exemptions()` walks each loaded package's store, so the result is kept until the world advances
 # (a package load or a method definition, which is how a package's stored exemptions appear) or
 # this session records one.
-# Bumped by every `_exempt!`. A module's exemption goes to that module's own store, which changes
-# neither the world counter nor `STRICT_EXEMPT`, so neither can tell the memo below it is stale.
+# Bumped by every change to the exemptions in scope: by `_exempt!` and `clear_declarations!`, and by
+# `_sync_exemptions!` when the session vector changed. A module's exemption goes to that module's own
+# store, which changes neither the world counter nor `STRICT_EXEMPT`, so neither can tell the memo
+# below it is stale.
 const _EXEMPT_GEN = Ref(0)
+
+# `exempt_strict()` hands out the live session vector, and a caller that changes it directly calls
+# nothing here. Its content is hashed on every read instead: a hash that moved bumps `_EXEMPT_GEN`
+# and clears the findings cache and the scan memos, every one of which may hold a verdict that read
+# an exemption. Hashing is by content, so an equal-length replacement is seen as a change.
+const _EXEMPT_SEEN = Ref{UInt}(hash(Exemption[]))
+function _sync_exemptions!()
+    h = hash(STRICT_EXEMPT)
+    h == _EXEMPT_SEEN[] && return nothing
+    _EXEMPT_SEEN[] = h
+    _EXEMPT_GEN[] += 1
+    clear_cache!()
+    return nothing
+end
 
 # The `:noalloc` exemptions, each with the package root that declared it, or `nothing` for one this
 # session declared. A package's exemption covers that package's methods only: matched by name alone,
 # exempting a method of `Base.string` excused every caller of every `string`.
-const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Int, Vector{Tuple{Union{Nothing, Module}, Exemption}}}}(
-    (typemax(UInt), -1, -1, Tuple{Union{Nothing, Module}, Exemption}[])
+const _NOALLOC_EXEMPT_MEMO = Ref{Tuple{UInt, Int, Vector{Tuple{Union{Nothing, Module}, Exemption}}}}(
+    (typemax(UInt), -1, Tuple{Union{Nothing, Module}, Exemption}[])
 )
 function _noalloc_exemptions()
+    _sync_exemptions!()
     w = Base.get_world_counter()
-    n = length(STRICT_EXEMPT)
     gen = _EXEMPT_GEN[]
     m = _NOALLOC_EXEMPT_MEMO[]
-    (m[1] == w && m[2] == n && m[3] == gen) && return m[4]
+    (m[1] == w && m[2] == gen) && return m[3]
     covers(e) = isnothing(e.guarantees) || :noalloc in e.guarantees
     v = Tuple{Union{Nothing, Module}, Exemption}[]
     for mod in _store_modules()
@@ -293,7 +541,7 @@ function _noalloc_exemptions()
     for e in STRICT_EXEMPT
         covers(e) && push!(v, (nothing, e))
     end
-    _NOALLOC_EXEMPT_MEMO[] = (w, n, gen, v)
+    _NOALLOC_EXEMPT_MEMO[] = (w, gen, v)
     return v
 end
 
@@ -301,30 +549,128 @@ end
 # you opt the rare cold helper out, rather than opting the hot code in.
 const STRICT_EXEMPT = Exemption[]
 
-# Whether `e` covers this function, signature and guarantee. A field left `nothing` matches
+# Whether `e` covers the item `(f, types)` for guarantee `g`. A field left `nothing` matches
 # anything, so the common whole-function form keeps its meaning while a narrow one binds tightly.
-function _covers(e::Exemption, name::Symbol, @nospecialize(types), g::Union{Nothing, Symbol})
+# `types` may also be one `Method`, or `nothing` for the whole function.
+#
+# An exemption with `types` names a method: the one its signature selects, as `invoke` would for
+# that signature. It covers a body of that method whose argument types are within the signature,
+# and nothing else. A specialization of a wider method compiled through `invoke` for the same
+# argument types is another method's body, so it stays judged.
+function _covers(e::Exemption, name::Symbol, @nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
     e.func === name || return false
     isnothing(e.guarantees) || isnothing(g) || g in e.guarantees || return false
-    isnothing(e.types) || isnothing(types) || Tuple(types) == e.types || return false
-    return true
+    (isnothing(e.types) || isnothing(types)) && return true
+    types isa Method && return _exemption_method(e, types.sig) === types
+    # A signature is read by dispatch, so its own types name the method it reads.
+    !(f isa _Spec) && Tuple(types) == e.types && return true
+    key = try
+        _entry_key(f, types)
+    catch
+        return false
+    end
+    sig = key isa Core.MethodInstance ? key.specTypes : key
+    m = _key_method(key)
+    return !isnothing(m) && _exemption_method(e, sig) === m && sig <: _exemption_sig(e, sig)
 end
 
-# The coarse question the module sweeps ask: is this function opted out of everything? A narrow
-# exemption must NOT answer yes here — it would silence guarantees it never claimed.
-function _is_exempt(@nospecialize(f))
-    name = _demangle(_callable_name(f))
-    for (mod, e) in _scoped_exemptions()
-        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && _exempt_in(mod, e, f, nothing) && return true
-    end
-    return false
+# The signature `e` names, on the callee type of `sig`, and the method that signature selects.
+_exemption_sig(e::Exemption, @nospecialize(sig)) =
+    Base.rewrap_unionall(Tuple{Base.unwrap_unionall(sig).parameters[1], e.types...}, sig)
+_exemption_method(e::Exemption, @nospecialize(sig)) = try
+    _key_method(_exemption_sig(e, sig))
+catch
+    nothing
 end
+
+# Whether `e`'s signature names the method `m` and spans all of it, as the definition form records.
+_names_whole(e::Exemption, m::Method) =
+    _exemption_method(e, m.sig) === m && m.sig <: _exemption_sig(e, m.sig)
+
+# The coarse question the module sweeps ask: is this function, or its method `at`, opted out of
+# everything? A narrow exemption must NOT answer yes here — it would silence guarantees it never
+# claimed. One that excuses every guarantee for the whole of a method answers yes for that method,
+# and for the function when it answers yes for every method of it.
+function _is_exempt(@nospecialize(f), at::Union{Nothing, Method} = nothing)
+    name = _demangle(_callable_name(f))
+    by_method = false
+    for (mod, e) in _scoped_exemptions()
+        (e.func === name && isnothing(e.guarantees)) || continue
+        if isnothing(e.types)
+            _exempt_in(mod, e, f, at) && return true
+        elseif at isa Method
+            _names_whole(e, at) && _exempt_in(mod, e, f, at) && return true
+        else
+            by_method = true
+        end
+    end
+    (by_method && isnothing(at)) || return false
+    ms = try
+        methods(f)
+    catch
+        return false
+    end
+    return !isempty(ms) && all(m -> _is_exempt(f, m), ms)
+end
+
+# The argument types of `m`'s own signature, each with the type variables it uses bound, so that an
+# exemption with these `types` names `m` and spans exactly it. A signature whose type variables tie
+# two arguments together (`f(x::T, y::T) where T`) has no such tuple.
+function _method_exempt_types(m::Method)
+    sig = Base.unwrap_unionall(m.sig)::DataType
+    types = Tuple(Base.rewrap_unionall(p, m.sig) for p in sig.parameters[2:end])
+    full = Base.rewrap_unionall(Tuple{sig.parameters[1], types...}, m.sig)
+    (_key_method(full) === m && m.sig <: full && full <: m.sig) || throw(
+        ArgumentError(
+            "@strict_exempt: `$m` ties its argument types together through a type variable, so " *
+                "no `types = (...)` names exactly that method. Exempt the function by name " *
+                "(`@strict_exempt $(_demangle(m.name))`), or name a range with `types = (...)`."
+        )
+    )
+    return types
+end
+
+# The definition and block forms record the world before their definitions here, and
+# `_exempt_defined!` reads it afterwards to find the methods those definitions added.
+# ponytail: one slot, so two tasks evaluating `@strict_exempt` definitions at once would race.
+const _EXEMPT_SINCE = Ref{UInt}(typemax(UInt))
+_exempt_mark!() = (_EXEMPT_SINCE[] = Base.get_world_counter(); nothing)
+
+# Exempt each method of the functions `fvs` that `mod` defined since `_exempt_mark!`: the ones the
+# definitions wrote, including the extra positional methods of default arguments and the body of a
+# keyword method. Each is recorded with its own signature, so another method of the function stays
+# judged. `fvs` and `names` pair each function with the name it is exempted under.
+function _exempt_defined!(
+        mod::Module, fvs::Tuple, names::Tuple;
+        guarantees = nothing, reason::AbstractString = "", file::AbstractString = "", line::Integer = 0
+    )
+    since = _EXEMPT_SINCE[]
+    _EXEMPT_SINCE[] = typemax(UInt)
+    fresh(m) = m.primary_world > since && m.module === mod
+    for (fv, name) in zip(fvs, names)
+        ms = Method[m for m in methods(fv) if fresh(m)]
+        for k in methods(Core.kwcall, Tuple{Any, Core.Typeof(fv), Vararg{Any}})
+            fresh(k) || continue
+            body = _kwcall_body(k)
+            isnothing(body) || append!(ms, (m for m in methods(body) if fresh(m)))
+        end
+        isempty(ms) && throw(
+            ArgumentError("@strict_exempt: the definition of `$name` added no method to `$mod`, so it names nothing to exempt")
+        )
+        for m in ms
+            _exempt!(name, mod; types = _method_exempt_types(m), guarantees, reason, file, line)
+        end
+    end
+    return nothing
+end
+_exempt_defined!(mod::Module, @nospecialize(fv), name::Symbol; kwargs...) =
+    _exempt_defined!(mod, (fv,), (name,); kwargs...)
 
 # The precise question a verdict asks: is THIS signature opted out of THIS guarantee?
 function _is_exempt(@nospecialize(f), @nospecialize(types), g::Union{Nothing, Symbol})
     name = _demangle(_callable_name(f))
     for (mod, e) in _scoped_exemptions()
-        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return true
+        _covers(e, name, f, types, g) && _exempt_in(mod, e, f, types) && return true
     end
     return false
 end
@@ -347,32 +693,35 @@ end
 
 # An exemption covers the declaring module's own code only: the function it owns, or its method of a
 # function it extends. Matched by name alone, one module's exemption of `build_q` silenced the checks
-# on every other module's `build_q`. One declared outside any module matches by name.
+# on every other module's `build_q`. One declared outside any module matches by name. `types` is a
+# signature, one `Method`, or `nothing` for the whole function, which a function another module owns
+# has covered only when every method of it is the declaring module's: the sweeps drop a function the
+# coarse question excuses, with every method another module wrote for it.
 function _exempt_in(store::Union{Nothing, Module}, e::Exemption, @nospecialize(f), @nospecialize(types))
     mod = something(e.mod, store, Some(nothing))
     isnothing(mod) && return true
     root = mod
     owner = try
-        parentmodule(f isa Type ? f : Core.Typeof(f))
+        parentmodule(f isa Type ? f : f isa _Spec ? _ftype(_spec_callee(f)) : _ftype(f))
     catch
         nothing
     end
     owner === root && return true
-    ms = if isnothing(types)
-        try
+    types isa Method && return types.module === root
+    if isnothing(types)
+        ms = try
             methods(f)
         catch
             Method[]
         end
-    else
-        m = try
-            which(f, Tuple{types...})
-        catch
-            nothing
-        end
-        isnothing(m) ? Method[] : [m]
+        return !isempty(ms) && all(m -> m.module === root, ms)
     end
-    return any(m -> m.module === root, ms)
+    m = try
+        _which(f, Tuple{types...})
+    catch
+        nothing
+    end
+    return !isnothing(m) && m.module === root
 end
 
 function _exempt!(
@@ -393,7 +742,8 @@ end
 """
     exempt_strict() -> Vector{Exemption}
 
-The opt-outs recorded in **this session**. Mutable, so a test can `empty!` it.
+The opt-outs recorded in **this session**. Mutable, so a test can `empty!` it; the next check notices
+the change and drops every cached verdict that an exemption could have decided.
 [`StrictMode.exemptions`](@ref) adds each loaded package's own.
 """
 exempt_strict() = STRICT_EXEMPT
@@ -403,7 +753,7 @@ exempt_strict() = STRICT_EXEMPT
 # method it never checked, which is the same "could not check" == "is fine" conflation that made a
 # crashed backend report `:pass`. Emit a failing finding naming the method and the error instead.
 function _errored_findings(@nospecialize(f), @nospecialize(types::Tuple), gs, err)
-    fn, sg, md = _func_name(f), _sig_string(types), _mod_sym(f)
+    fn, sg, md = _func_name(f), _sig_string(f, types), _mod_sym(f, types)
     why = "analysis errored for this signature: " * sprint(showerror, err)
     return StrictFinding[_unevaluated(md, fn, sg, g, why) for g in gs]
 end
@@ -432,6 +782,10 @@ function _map_findings_body(analyze, items)
         f = getfield(it, 1)
         types = getfield(it, 2)
         gs = getfield(it, 3)
+        if f isa _UncheckedMethod
+            append!(out, _unchecked_findings(f, gs))
+            continue
+        end
         # A narrowed exemption is honored HERE, at the one funnel both tiers run through, so the
         # scan and the proofs answer alike — the same arrangement `ignore_throw` has. An exempted
         # guarantee is reported as `:info` rather than dropped: an opt-out nobody can see in the
@@ -456,26 +810,21 @@ end
 # made directly carries no source and the field stays empty.
 _restamp(x::StrictFinding, source::AbstractString) = StrictFinding(
     x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason, x.suggestion,
-    x.tier, x.code, String(source)
+    x.tier, x.code, String(source), x.exempt_by
 )
 
 function _with_policy(fs, decls, @nospecialize(f), @nospecialize(types))
     (isempty(fs) || isempty(decls)) && return fs
     meta = get(decls, _decl_key(f, types), nothing)
     (isnothing(meta) || meta.source == "") && return fs
-    return [
-        StrictFinding(
-            x.mod, x.func, x.signature, x.guarantee, x.status, x.file, x.line, x.reason,
-            x.suggestion, x.tier, x.code, meta.source
-        ) for x in fs
-    ]
+    return [_restamp(x, meta.source) for x in fs]
 end
 
 # `(guarantees still to check, :info findings for the exempted ones)`.
 function _split_exempt(@nospecialize(f), @nospecialize(types), gs)
     live = Symbol[]
     notes = StrictFinding[]
-    md, fn, sg = _mod_sym(f), _func_name(f), _sig_string(Tuple(types))
+    md, fn, sg = _mod_sym(f, types), _func_name(f), _sig_string(f, Tuple(types))
     for g in gs
         e = _matching_exemption(f, types, g)
         if isnothing(e)
@@ -498,7 +847,7 @@ end
 function _matching_exemption(@nospecialize(f), @nospecialize(types), g::Symbol)
     name = _demangle(_callable_name(f))
     for (mod, e) in _scoped_exemptions()
-        _covers(e, name, types, g) && _exempt_in(mod, e, f, types) && return e
+        _covers(e, name, f, types, g) && _exempt_in(mod, e, f, types) && return e
     end
     return nothing
 end
@@ -516,25 +865,99 @@ end
 # overrides each entry's own setting when given. `StrictModeTest.test_registered` re-runs exactly
 # this list against the proofs, so both tiers agree on what "registered" means.
 #
-# `modules` scopes the sweep by the defining module of each registered function. The registry is
-# process-global and keyed on `(f, types)` with no module of its own, so a dependency loaded from
-# source in the same session — a Revise/`dev` setup — contributes its own declarations to it. Left
-# unscoped, one package's gate then judges another package's kernels. `_registry_breakdown` makes
-# that visible even when nobody scopes.
+# `modules` scopes the sweep by the module that wrote the method each declaration reaches, the
+# module a finding is named after, so a declaration on `Base.getproperty` for a package type belongs
+# to that package. The registry is process-global and keyed on `(f, types)` with no module of its
+# own, so a dependency loaded from source in the same session — a Revise/`dev` setup — contributes
+# its own declarations to it. Left unscoped, one package's gate then judges another package's
+# kernels. `_registry_breakdown` makes that visible even when nobody scopes.
+#
+# A method declaration contributes the rows `_method_items` expands it into, scoped by the method's
+# own module. A row a signature declaration also names is checked once, with that declaration's
+# guarantees.
 function _registry_items(guarantees = nothing; modules = nothing)
+    isnothing(guarantees) || _check_guarantees(guarantees)
     names = isnothing(modules) ? nothing : Set{Symbol}(m isa Module ? nameof(m) : Symbol(m) for m in modules)
-    return Any[
+    decls = declarations()
+    items = Any[
         (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
-            for ((f, types), meta) in declarations()
-            if !_is_exempt(f) && (isnothing(names) || _mod_sym(f) in names)
+            for ((f, types), meta) in decls
+            if !_is_exempt(f) && (isnothing(names) || _mod_sym(f, types) in names)
     ]
+    seen = Set{Tuple{UInt, UInt}}(_decl_key(f, types) for (f, types) in keys(decls))
+    for (m, meta) in method_declarations()
+        isnothing(names) || nameof(m.module) in names || continue
+        F = _method_function(m)
+        F isa DataType && _is_exempt(isdefined(F, :instance) ? F.instance : F, m) && continue
+        for it in _method_items(m, isnothing(guarantees) ? meta.guarantees : guarantees)
+            f = getfield(it, 1)
+            (f isa _UncheckedMethod || !(_decl_key(f, getfield(it, 2)) in seen)) && push!(items, it)
+        end
+    end
+    return items
+end
+
+# A declared method the drivers have nothing to check for: it has no compiled specialization, or it
+# is no longer defined. It is an item of its own, so that it is reported as a failure in both tiers
+# rather than leaving no item behind, which would read as a pass.
+struct _UncheckedMethod
+    m::Method
+    why::String
+end
+
+_mod_sym(u::_UncheckedMethod, @nospecialize(types)) = nameof(u.m.module)
+
+function _unchecked_findings(u::_UncheckedMethod, gs)
+    m = u.m
+    sig = try
+        _sig_string(Tuple(Base.unwrap_unionall(m.sig).parameters[2:end]))
+    catch
+        ""
+    end
+    return StrictFinding[
+        _unevaluated(nameof(m.module), string(_method_label(m)), sig, g, u.why; file = string(m.file), line = Int(m.line))
+            for g in gs
+    ]
+end
+
+# The items `(f, types, gs)` a declaration of the method `m` stands for: each specialization of it
+# compiled in this session, named as `_entry_of` names it, so a row compiled only through `invoke` is
+# a `_Spec` and is read as `m`. The method's own signature is never an item, since a generic one
+# infers to `Any`. With nothing to check, one `_UncheckedMethod` item says why.
+function _method_items(m::Method, gs)
+    live = _live_method(m)
+    isnothing(live) && return Any[
+        (
+            _UncheckedMethod(
+                m, "the declared method `$m` is no longer defined, so the declaration names " *
+                    "nothing to check. Declare the method that is defined now."
+            ), (), gs,
+        ),
+    ]
+    rows = _compiled_rows(live)
+    isempty(rows) && return Any[
+        (
+            _UncheckedMethod(
+                live, "`$live` is declared, and has no compiled specialization in this session, " *
+                    "so there is no row to check. Run a workload that calls it, or a `precompile` " *
+                    "statement for the argument types it must hold for, before this check."
+            ), (), gs,
+        ),
+    ]
+    out = Any[]
+    for mi in rows
+        ps = (mi.specTypes::DataType).parameters
+        push!(out, (_entry_of(_callee(ps[1]), mi), Tuple(ps[2:end]), gs))
+    end
+    return out
 end
 
 # `module => count` over the registry, for a driver to report what it is about to sweep.
 function _registry_breakdown(items)
     counts = Dict{Symbol, Int}()
-    for (f, _, _) in items
-        counts[_mod_sym(f)] = get(counts, _mod_sym(f), 0) + 1
+    for (f, types, _) in items
+        md = _mod_sym(f, types)
+        counts[md] = get(counts, md, 0) + 1
     end
     return sort!(collect(counts); by = first)
 end
@@ -566,11 +989,7 @@ end
 # Findings for the *registered* (declared-guarantee) functions belonging to `mod` — the "check
 # what I promised" scope, as opposed to the whole-module sweep.
 function _registered_findings_in(analyze, mod::Module; guarantees = nothing)
-    items = Any[
-        (f, types, isnothing(guarantees) ? meta.guarantees : guarantees)
-            for ((f, types), meta) in declarations()
-            if _mod_sym(f) === nameof(mod) && !_is_exempt(f)   # cold / @strict_exempt → skip
-    ]
+    items = _registry_items(guarantees; modules = (mod,))
     # Through `_map_findings`, so a signature whose analysis throws becomes a failing finding
     # naming the error rather than vanishing. This feeds `_auto_check_module` — the `@strict module`
     # load gate — where a dropped signature is a method that loads clean without being checked.
@@ -666,12 +1085,24 @@ function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
     for p in declarations()
         key = getfield(p, :first)
         f = getfield(key, 1)
-        _mod_sym(f) === nameof(mod) && (declared[_decl_key(f, getfield(key, 2))] = getfield(p, :second).guarantees)
+        _mod_sym(f, getfield(key, 2)) === nameof(mod) && (declared[_decl_key(f, getfield(key, 2))] = getfield(p, :second).guarantees)
     end
+    mdecls = method_declarations()
     items = Any[]
     ms, _ = module_methods(mod; only, exempt)
     for m in ms
         base = Base.unwrap_unionall(m.sig)
+        md = get(mdecls, m, nothing)
+        # A declared method's compiled rows are checked with its declaration's guarantees. Those
+        # are rows something has already compiled, such as a `precompile` statement above the
+        # policy line; one with none is reported by the drivers, which run after a workload.
+        if !isnothing(md) && !(base isa DataType && Base.isdispatchtuple(base))
+            for it in _method_items(m, md.guarantees)
+                rf, rt = getfield(it, 1), getfield(it, 2)
+                rf isa _UncheckedMethod || push!(items, (rf, rt, get(declared, _decl_key(rf, rt), md.guarantees)))
+            end
+            continue
+        end
         base isa DataType && Base.isdispatchtuple(base) || continue
         ft = _method_function(m)
         f = try
@@ -680,7 +1111,7 @@ function _module_load_items(mod::Module, policy; only = nothing, exempt = ())
             continue
         end
         tt = Tuple(base.parameters[2:end])
-        push!(items, (f, tt, isempty(declared) ? policy : get(declared, _decl_key(f, tt), policy)))
+        push!(items, (f, tt, get(declared, _decl_key(f, tt), isnothing(md) ? policy : md.guarantees)))
     end
     return items
 end
@@ -690,16 +1121,62 @@ end
 # later version errors on. Callers with no policy of their own resolve it here, a world later.
 function _auto_check_module(
         mod::Module, policy = module_policy(mod), source::AbstractString = "";
-        only = nothing, exempt = ()
+        only = nothing, exempt = (), require_methods::Bool = false
     )
     CHECKS_ENABLED || return nothing
-    fs = _map_findings(_scan_findings, _module_load_items(mod, policy; only, exempt))
+    # A `@strict_policy` line checks the methods defined above it. With none there, a filter has
+    # nothing to match yet, so this is asked before the names are.
+    if require_methods
+        ms, skipped = module_methods(mod; include_exempt = true)
+        (isempty(ms) && iszero(sum(values(skipped); init = 0))) &&
+            throw(ArgumentError(_policy_checked_nothing(mod, 0)))
+    end
+    items = _module_load_items(mod, policy; only, exempt)
+    if require_methods && isempty(items)
+        unaccounted = _policy_unaccounted(mod, policy; only, exempt)
+        isnothing(unaccounted) || throw(ArgumentError(_policy_checked_nothing(mod, unaccounted)))
+    end
+    fs = _map_findings(_scan_findings, items)
     # The policy is the requirement here, so its line is what a reader needs; a signature with its
     # own declaration keeps that one, which `_map_findings` has already stamped.
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
     _report_at_load(fs, :strict_module, string(nameof(mod)))
     _release_after_load_check()
     return nothing
+end
+
+# For a policy line that had no concrete method to check: `nothing` when some method above it is
+# accounted for anyway, else how many methods it left unread. Accounted for means the policy has
+# an answer for the method without checking it here: it is exempt (by `@strict_exempt` from every
+# guarantee in `policy`, across one or more exemptions, or by this line's own `exempt`), its
+# instantiations are declared with `@strict_function signatures = [...]`, or it is a macro, a
+# constructor or a callable object's method, none of which the policy judges. Only generic methods
+# nobody declared are left unread. An exemption narrowed with `types = (...)` counts here like a
+# declared instantiation when its signature selects this method (`_covers`).
+function _policy_unaccounted(mod::Module, policy; only = nothing, exempt = ())
+    ms, skipped = module_methods(mod; only, exempt)
+    (get(skipped, :exempt, 0) > 0 || get(skipped, :constructor, 0) > 0) && return nothing
+    decls = _declared_methods(keys(declarations()))
+    for m in ms
+        _method_declared(m, decls) && return nothing
+        startswith(String(m.name), "@") && return nothing
+        ft = _method_function(m)
+        (ft isa DataType && isdefined(ft, :instance)) || return nothing   # a callable object's
+        all(g -> _is_exempt(ft.instance, m, g), policy) && return nothing
+    end
+    return length(ms)
+end
+
+# A policy line that read no method. Loading on would look like a module that satisfies its
+# policy, with everything defined below the line unread.
+function _policy_checked_nothing(mod::Module, defined::Int)
+    what = defined == 0 ? "no method is defined above this line in `$(nameof(mod))`" :
+        "$defined method(s) are defined above this line in `$(nameof(mod))`, and none is checked " *
+        "or accounted for: none has a concrete signature, an exemption, or instantiations " *
+        "declared with `@strict_function signatures = [...]`"
+    return "@strict_policy checked nothing: $what. A policy checks the methods defined above " *
+        "it, so place `@strict_policy` at the end of the module, or use `@strict module`. To " *
+        "record a policy without checking, write `check = false`."
 end
 
 # Split on `_guarantee_gates`: a check that observes compiled output throws, an inference warns.
@@ -786,9 +1263,11 @@ function _rewrite_strict_stmt(stmt, source::AbstractString = "")
                 nothing
             end
             fname = (sig !== nothing && Meta.isexpr(sig, :call) && sig.args[1] isa Symbol) ? sig.args[1] : nothing
-            out = Any[inner]
-            fname === nothing || push!(out, :($(_exempt!)($(QuoteNode(fname)), @__MODULE__)))
-            return out
+            isnothing(fname) && return Any[inner]
+            return Any[
+                :($(_exempt_mark!)()), inner,
+                :($(_exempt_defined!)(@__MODULE__, $fname, $(QuoteNode(fname)))),
+            ]
         end
         name = inner isa QuoteNode ? inner.value : inner
         return name isa Symbol ? Any[:($(_exempt!)($(QuoteNode(name)), @__MODULE__))] : Any[stmt]
@@ -846,11 +1325,102 @@ end
 
 # The name a callable answers to. A function has one; a callable object — an instance of a struct
 # with a call method, which a sweep meets in the method table like any function — has no `nameof`,
-# and is named by its type, as it is in a stack trace.
-_callable_name(@nospecialize(f)) = f isa Function ? nameof(f) :
+# and is named by its type, as it is in a stack trace. A keyword body answers to the callable it
+# implements (`_kwbody_owner`).
+_callable_name(@nospecialize(f)) = f isa _Spec ? _callable_name(_spec_callee(f)) :
+    f isa Function ? _function_name(f) :
     _is_closure_type(f) ? _closure_owner(f) :
     f isa Type ? _type_name(f) :                        # a constructor answers to its type's name
-    nameof(Core.Typeof(f))
+    nameof(_ftype(f))
+
+function _function_name(@nospecialize(f::Function))
+    owner = _kwbody_owner(typeof(f))
+    return isnothing(owner) ? nameof(f) : _callable_name(something(owner))
+end
+
+# A keyword method `f(x; k)` lowers to a body function, which the `Core.kwcall` method for `f`
+# calls. A function's body is named after it (`#f#8`), but the body of a constructor or of a
+# callable object is named `_` (`#_#4`), a name no `only` entry or exemption can spell. So a body
+# answers to the callable whose `kwcall` method calls it: the type a constructor builds, the
+# callable's type, or the function. `nothing` when `B` is not a keyword body, `Some(owner)`
+# otherwise.
+function _kwbody_owner(@nospecialize(B::Type))
+    (B isa DataType && isdefined(B, :instance) && occursin(r"^#.+#\d+$", String(nameof(B)))) ||
+        return nothing
+    return get(_kwbody_index(parentmodule(B)), B, nothing)
+end
+
+# Every keyword body a module's `kwcall` methods call, keyed on the body's type. It reads the
+# method table, so it is rebuilt once a method has been defined since.
+const _KWBODY_INDEX = Dict{Module, Tuple{UInt, IdDict{Any, Any}}}()
+const _KWBODY_LOCK = ReentrantLock()
+
+function _kwbody_index(mod::Module)
+    world = Base.get_world_counter()
+    return lock(_KWBODY_LOCK) do
+        hit = get(_KWBODY_INDEX, mod, nothing)
+        !isnothing(hit) && first(hit) == world && return last(hit)
+        idx = IdDict{Any, Any}()
+        Base.visit(Core.methodtable) do m
+            (m isa Method && m.module === mod) || return nothing
+            sig = Base.unwrap_unionall(m.sig)
+            (sig isa DataType && length(sig.parameters) >= 3 && sig.parameters[1] === typeof(Core.kwcall)) ||
+                return nothing
+            body = _kwcall_body(m)
+            isnothing(body) && return nothing
+            self = Base.unwrap_unionall(sig.parameters[3])
+            self isa DataType || return nothing
+            idx[typeof(body)] = Some{Any}(
+                self <: Type ? self.parameters[1] : isdefined(self, :instance) ? self.instance : self
+            )
+            return nothing
+        end
+        _KWBODY_INDEX[mod] = (world, idx)
+        return idx
+    end
+end
+
+# The body function a `kwcall` method returns the call of, or `nothing` when its lowered code does
+# not end in one. The callee is a global for a function's body and a quoted instance for an inner
+# constructor's; a splatted call wraps it in `Core._apply_iterate`.
+function _kwcall_body(m::Method)
+    ci = try
+        Base.uncompressed_ast(m)
+    catch
+        return nothing
+    end
+    resolve(x) = x isa Core.SSAValue ? resolve(ci.code[x.id]) :
+        x isa QuoteNode ? x.value :
+        x isa GlobalRef ? (isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : nothing) : x
+    ret = ci.code[end]
+    (ret isa Core.ReturnNode && isdefined(ret, :val) && ret.val isa Core.SSAValue) || return nothing
+    call = ci.code[ret.val.id]
+    (call isa Expr && call.head === :call && !isempty(call.args)) || return nothing
+    callee = resolve(call.args[1])
+    callee === Core._apply_iterate && length(call.args) >= 3 && (callee = resolve(call.args[3]))
+    return callee isa Function && !(callee isa Core.Builtin) ? callee : nothing
+end
+
+# Whether the module sweep's census leaves the function type `F` alone: a type Julia named (the name
+# starts with `#`) other than the keyword body of a callable written as a type — a constructor, a
+# callable object, a `struct K <: Function`. That is a closure, an anonymous function or a generator,
+# which belong to the function they are written in, or a keyword body of one of those. A named
+# function and its keyword body also answer yes; the sweep meets both through their bindings.
+function _is_inner_function(@nospecialize(F))
+    (F isa DataType && F <: Function && startswith(String(nameof(F)), "#")) || return false
+    owner = _kwbody_owner(F)
+    isnothing(owner) && return true
+    o = something(owner)
+    return o isa Function && startswith(String(nameof(typeof(o))), "#")
+end
+
+# The name a method answers to: its function's, with a keyword body named after its owner.
+function _method_label(m::Method)
+    n = _demangle(m.name)
+    n === :_ || return n
+    F = _method_function(m)
+    return !isnothing(F) && isdefined(F, :instance) ? _demangle(_callable_name(F.instance)) : n
+end
 
 _type_name(T::Type) = (U = Base.unwrap_unionall(T); U isa DataType ? nameof(U) : Symbol(string(T)))
 
@@ -880,6 +1450,58 @@ function _name_matcher(spec)
     set = Set{Symbol}(_asname(x) for x in spec)
     return f -> _demangle(_callable_name(f)) in set
 end
+
+# The names an `only` or `exempt` entry can match in `mod`: every function with a method there,
+# under the name its keyword bodies and closures answer to.
+function _module_function_names(mod::Module)
+    scope = _scope_modules(mod)
+    out = Set{Symbol}()
+    Base.visit(Core.methodtable) do m
+        m isa Method || return nothing
+        any(s -> _in_module_tree(m.module, s), scope) || return nothing
+        push!(out, _method_label(m))
+        F = try
+            _method_function(m)
+        catch
+            nothing
+        end
+        if F isa DataType
+            _is_closure_type(F) ? push!(out, _closure_owner(F)) :
+                isdefined(F, :instance) && F.instance isa Function && push!(out, _demangle(_callable_name(F.instance)))
+        end
+        return nothing
+    end
+    return out
+end
+
+# An `only` or `exempt` entry that matches no function in `mod` is a mistake in the call. A
+# misspelled `only` scopes a sweep to nothing and a misspelled `exempt` exempts nothing, and both
+# return a result that reads like the one the caller asked for. A predicate function cannot be
+# judged this way and is taken as given.
+function _check_name_filters(mod::Module; only = nothing, exempt = ())
+    judged(spec) = !(spec === nothing || spec isa Function || (!(spec isa Regex) && isempty(spec)))
+    (judged(only) || judged(exempt)) || return nothing
+    names = _module_function_names(mod)
+    for (what, spec) in (("only", only), ("exempt", exempt))
+        judged(spec) || continue
+        if spec isa Regex
+            any(n -> occursin(spec, string(n)), names) || throw(
+                ArgumentError(_no_such_function(what, repr(spec), mod))
+            )
+            continue
+        end
+        for x in spec
+            _asname(x) in names || throw(ArgumentError(_no_such_function(what, "`" * string(_asname(x)) * "`", mod)))
+        end
+    end
+    return nothing
+end
+
+_no_such_function(what::String, entry::String, mod::Module) =
+    "`$what` names $entry, which matches no function with a method in `$(nameof(mod))`. " * (
+    what == "only" ? "A sweep scoped to nothing checks nothing and returns a clean result." :
+        "An exemption that matches nothing exempts nothing."
+) * " Check the spelling, or drop the entry."
 
 # --- the census: every method a module defines ------------------------------------------------
 
@@ -935,7 +1557,7 @@ function _census_skip(m::Method)
 end
 
 """
-    StrictMode.module_methods(mod::Module; only = nothing, exempt = (), include_exempt = false)
+    StrictMode.module_methods(mod::Module; only = nothing, exempt = (), include_exempt = false, keep = ())
         -> (methods::Vector{Method}, skipped::Dict{Symbol, Int})
 
 Every method `mod` (or a module beneath it, or one of its loaded extensions) defines, with the ones
@@ -945,12 +1567,30 @@ no declaration could name counted in `skipped` by reason rather than dropped sil
 subject *is* the exempt code: `StrictModeTest.test_exemptions`, which asks whether an exemption is
 still needed.
 
+`keep` names skip reasons whose methods are returned anyway, for a scan that reads every method's
+code rather than asking what a declaration covers: `:constructor` (a constructor answers `only` and
+`exempt` by its type's name), `:closure` and `:unreadable` (a method whose callable has no type to
+name it by, such as `(k::Union{A, B})(x)`; it matches no `only`). Any other entry raises.
+
+`only` and `exempt` take what the module sweeps take. A predicate is asked about a function with
+the function, and about a callable object with no instance with the type its method declares for
+the callable (`Reader`, `Boxed`, `Boxed{<:Integer}`). A capturing closure is not asked about and
+stays in the census.
+
 It reads the global method table, not the module's bindings, because a method on a **foreign**
 function — `Base.getindex`, `Base.size`, `Base.show` — belongs to the module that wrote it while
 its name is bound in `Base`. Those are frequently a package's hottest methods. Measured on
 StrictMode itself: 574 methods here, of which a walk over `names(mod; all = true)` finds 363.
 """
-function module_methods(mod::Module; only = nothing, exempt = (), include_exempt::Bool = false)
+function module_methods(
+        mod::Module; only = nothing, exempt = (), include_exempt::Bool = false, keep = ()
+    )
+    for k in keep
+        k in (:constructor, :closure, :unreadable) || throw(
+            ArgumentError("module_methods: `keep` names `$k`; accepted: :constructor, :closure, :unreadable")
+        )
+    end
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
     scope = _scope_modules(mod)
@@ -961,22 +1601,26 @@ function module_methods(mod::Module; only = nothing, exempt = (), include_exempt
         m isa Method || return nothing
         any(s -> _in_module_tree(m.module, s), scope) || return nothing
         reason = _census_skip(m)
-        isnothing(reason) || return bump!(reason)
+        isnothing(reason) || reason in keep || return bump!(reason)
         F = try
             _method_function(m)
         catch
             nothing
         end
-        f = isdefined(F, :instance) ? F.instance : nothing
-        # A capturing closure has no instance. A filter by name still answers for it through its
-        # type; a filter that is the caller's own function expects a function, so it cannot, and the
-        # closure stays in the census.
-        isnothing(f) && _is_closure_type(F) && !(only isa Function) && !(exempt isa Function) &&
-            (f = F)
+        f = reason === :constructor ? F.parameters[1] : isdefined(F, :instance) ? F.instance : nothing
+        # A capturing closure or a callable object with fields has no instance. A filter by name, and
+        # an exemption, still answer for it through its type. A predicate is asked about a callable
+        # object with the type its method declares for it (`Boxed`, `Boxed{<:Integer}`); a closure
+        # has no type a caller could name, so the predicate is not asked and it stays in the census.
+        typed = isnothing(f) && F isa DataType
+        typed && (f = F)
+        closure = typed && _is_closure_type(F)
+        pf = typed && !closure ? Base.rewrap_unionall(Base.unwrap_unionall(m.sig).parameters[1], m.sig) : f
+        reason === :unreadable && !isnothing(onlypred) && return bump!(:filtered)
         if !isnothing(f)
-            ((!include_exempt && _is_exempt(f)) || (!isnothing(exemptpred) && exemptpred(f))) &&
-                return bump!(:exempt)
-            isnothing(onlypred) || onlypred(f) || return bump!(:filtered)
+            (!include_exempt && _is_exempt(f, m)) && return bump!(:exempt)
+            !isnothing(exemptpred) && !(closure && exempt isa Function) && exemptpred(pf) && return bump!(:exempt)
+            isnothing(onlypred) || (closure && only isa Function) || onlypred(pf) || return bump!(:filtered)
         end
         push!(out, m)
         return nothing
@@ -985,19 +1629,34 @@ function module_methods(mod::Module; only = nothing, exempt = (), include_exempt
 end
 
 # Shared module-sweep core: every `(f, tt)` pair — a concrete dispatch-tuple specialization `mod`
-# has actually compiled — across its own functions matching `only`/`exempt`. The compiled sweep,
+# has actually compiled — of a method WRITTEN in `mod`: its own functions matching `only`/`exempt`,
+# and the methods it defines on a function another module owns (`Base.getproperty`, `Base.size`),
+# which are often a package's hottest code and which no walk over the module's names meets. Those
+# come from the census, `module_methods`, and only the method written here is swept, not the
+# function's others. A method written in a submodule or an extension belongs to that module's own
+# sweep and never to its parent's: the parent does not apply the submodule's exemptions, and both
+# would list the same method. The compiled sweep,
 # `static_ownership_suggestions(mod)`, and `inline_suggestions(mod)` all walk the exact same set;
 # this is the one place that does it, so scoping/filtering bugs get fixed once.
+#
+# Each specialization is handed over as the item that names it (`_entry_of`): one compiled only
+# through an `invoke` of a wider method is a `_Spec`, since its argument types dispatch to another.
 function _module_specializations(f!::Function, mod::Module; only = nothing, exempt = ())
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
+    # The functions the walk over names meets. The census below skips exactly these, so a callable
+    # whose type subtypes `Function` but which no name in `mod` holds is still swept once.
+    walked = Base.IdSet{Any}()
     for nm in names(mod; all = true)
         isdefined(mod, nm) || continue
         f = getfield(mod, nm)
         (f isa Function && parentmodule(f) === mod) || continue
+        push!(walked, f)
         (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
         onlypred === nothing || onlypred(f) || continue
         for mth in methods(f)
+            (mth.module === mod && !_is_exempt(f, mth)) || continue
             for mi in _specializations(mth)
                 tt = try
                     Tuple((mi.specTypes::DataType).parameters[2:end])
@@ -1005,8 +1664,23 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
                     continue
                 end
                 Base.isdispatchtuple(Tuple{tt...}) || continue
-                f!(f, tt)
+                f!(_entry_of(f, mi), tt)
             end
+        end
+    end
+    for mth in first(module_methods(mod; only, exempt))
+        mth.module === mod || continue
+        F = _method_function(mth)
+        isdefined(F, :instance) && F.instance in walked && continue
+        # A closure, an anonymous function, a generator, or a keyword body of one of those is part of
+        # the function it is written in, and is not swept. A callable object is: each specialization
+        # names its concrete type, which is the callee. So is the keyword body of a constructor or a
+        # callable object, under the callable's name.
+        (_is_closure_type(F) || (parentmodule(F) === mod && _is_inner_function(F))) && continue
+        for mi in _specializations(mth)
+            sig = mi.specTypes
+            (sig isa DataType && Base.isdispatchtuple(sig)) || continue
+            f!(_entry_of(_callee(sig.parameters[1]), mi), Tuple(sig.parameters[2:end]))
         end
     end
     return nothing
@@ -1017,6 +1691,9 @@ end
 # module that mixes hot and cold helpers is noisy unless scoped with `only`/`exempt`.
 # `StrictModeTest.test_compiled` builds the same list, so both tiers sweep the same set.
 function _compiled_items(mod::Module; guarantees = (:typestable, :noalloc), only = nothing, exempt = ())
+    # Before the sweep, not per method: a module with nothing compiled would never reach the
+    # per-method check, and a misspelled guarantee would return an empty, passing sweep.
+    _check_guarantees(guarantees)
     items = Any[]
     _module_specializations(mod; only, exempt) do f, tt
         push!(items, (f, tt, guarantees))
@@ -1033,54 +1710,91 @@ function _findings_compiled(analyze, mod::Module; guarantees = (:typestable, :no
     return _map_findings(analyze, items)
 end
 
-# Whether a declaration in the registry speaks for this method. A declaration names a signature,
-# so it covers `m` when that signature is one `m` would be dispatched for — which is also how a
-# `signatures = [...]` list covers a generic declaration it instantiates.
-function _method_declared(m::Method, keys)
+# The methods the declarations `keys` name, each with the signatures that name it. A declaration
+# names the method its signature dispatches to, which is the method the registry checks, and no
+# other: a wider method the signature also matches is not declared by it, since a call with that
+# signature never runs it. A `signatures = [...]` list declares the generic method it instantiates
+# the same way. A method declaration in scope (`method_declarations`) names its method by the
+# method's own signature, which every compiled row of it is within, the rows `invoke` compiled
+# included.
+function _declared_methods(keys)
+    out = IdDict{Method, Vector{Any}}()
     for (f, types) in keys
-        Tuple{typeof(f), types...} <: m.sig && return true
-    end
-    return false
-end
-
-# The concrete signatures this method has actually compiled. A generic method has as many as it has
-# been called with argument types for, and only these can carry a verdict: the declaration itself
-# infers to `Any`.
-function _method_signatures(m::Method)
-    out = Vector{Any}[]
-    for mi in _specializations(m)
-        tt = try
-            collect(Any, (mi.specTypes::DataType).parameters[2:end])
+        sig = try
+            _sigtype(f, types)
         catch
             continue
         end
-        Base.isdispatchtuple(Tuple{tt...}) || continue
-        tt in out || push!(out, tt)
+        m = _key_method(sig)
+        isnothing(m) || push!(get!(Vector{Any}, out, m), sig)
+    end
+    for m in Base.keys(method_declarations())
+        push!(get!(Vector{Any}, out, m), m.sig)
     end
     return out
 end
 
-# Whether a declaration names this exact compiled signature of `m`.
-function _signature_declared(m::Method, tt::Vector{Any}, keys)
-    want = Tuple{tt...}
-    for (f, types) in keys
-        Tuple{typeof(f), tt...} <: m.sig || continue
-        want <: Tuple{types...} && return true
+# Whether a declaration names the method `m`, given `_declared_methods`.
+_method_declared(m::Method, index::IdDict{Method, Vector{Any}}) = haskey(index, m)
+
+# Whether a declaration of the method `m` names its compiled signature `sig`.
+_signature_declared(m::Method, @nospecialize(sig), index::IdDict{Method, Vector{Any}}) =
+    any(d -> sig <: d, get(index, m, ()))
+
+# The concrete specializations this method has actually compiled. A generic method has as many as
+# it has been called with argument types for, and only these can carry a verdict: the declaration
+# itself infers to `Any`.
+_compiled_rows(m::Method) = Core.MethodInstance[
+    mi for mi in _specializations(m) if mi.specTypes isa DataType && Base.isdispatchtuple(mi.specTypes)
+]
+
+# The items `(f, types)` for the specializations `_compiled_rows` lists, each named as `_entry_of`
+# names it, so that a reader of `m`'s code reads `m` and not the method its argument types
+# dispatch to.
+function _method_entries(m::Method, @nospecialize(f))
+    out = Tuple{Any, Tuple}[]
+    for mi in _compiled_rows(m)
+        push!(out, (_entry_of(f, mi), Tuple(mi.specTypes.parameters[2:end])))
     end
-    return false
+    return out
 end
 
-# One `:coverage` failure, naming the method and the signature it was reached with.
-function _coverage_finding(mod::Module, m::Method, sig::AbstractString)
-    fname = string(_demangle(m.name))
+# The call that declares the method `m`, as a test setup would write it.
+function _declare_method_call(m::Method)
+    base = Base.unwrap_unionall(m.sig)
+    F = base.parameters[1]
+    F isa DataType && isdefined(F, :instance) && F.instance isa Function ||
+        return "StrictMode.register_strict!(which($(m.sig)))"
+    tt = Base.rewrap_unionall(Tuple{base.parameters[2:end]...}, m.sig)
+    return "StrictMode.register_strict!(which($(_method_label(m)), $tt))"
+end
+
+# One `:coverage` failure, naming the method and the compiled specialization `mi` of it. A
+# specialization compiled through `invoke` of `m` for argument types that dispatch to another method
+# is named as a sweep names it, and only a declaration of `m` itself covers it.
+function _coverage_finding(mod::Module, m::Method, mi::Core.MethodInstance)
+    fname = string(_method_label(m))
+    tt = Tuple(mi.specTypes.parameters[2:end])
+    item = _entry_of(nothing, mi)
+    sig = _sig_string(item, tt)
+    declare = _declare_method_call(m)
+    item isa _Spec && return StrictFinding(
+        nameof(mod), fname, sig, :coverage, :fail, string(m.file), Int(m.line),
+        "`$fname$sig` has no registered StrictMode guarantee: this method runs for these argument " *
+            "types only through `invoke`, and a signature declaration names the method its " *
+            "signature dispatches to, which is another method of `$fname`",
+        "declare the method, which covers every row of it that compiles: `$declare` in the test " *
+            "setup. `StrictModeTest.test_registered` and `audit(:registered)` then check this row " *
+            "as this method. Opt it out visibly with `@strict_exempt $fname` if it is cold by design."
+    )
     return StrictFinding(
         nameof(mod), fname, sig, :coverage, :fail, string(m.file), Int(m.line),
         "`$fname$sig` has no registered StrictMode guarantee",
         "declare this signature: `StrictMode.register_strict!($fname, $sig; guarantees = " *
-            "(:typestable, :noalloc))` in the test setup. A generic definition needs each " *
-            "instantiation that runs (`signatures = [(T1, …), …]`) — declaring one says nothing " *
-            "about the others. Opt it out visibly with `@strict_exempt $fname` if it is cold by " *
-            "design."
+            "(:typestable, :noalloc))` in the test setup, or the method, which covers every row of " *
+            "it that compiles: `$declare`. A generic definition needs each instantiation that " *
+            "runs (`signatures = [(T1, …), …]`) — declaring one says nothing about the others. " *
+            "Opt it out visibly with `@strict_exempt $fname` if it is cold by design."
     )
 end
 
@@ -1095,25 +1809,26 @@ end
 # declaration exists, which is a fact, not an inference.
 function _coverage_all_findings(mod::Module; only = nothing, exempt = ())
     ms, skipped = module_methods(mod; only, exempt)
-    keys_ = collect(keys(declarations()))
+    index = _declared_methods(keys(declarations()))
     out = StrictFinding[]
     for m in ms
         # Every concrete signature this method has compiled must be declared, not just one of them:
         # a declaration names a signature, and one instantiation says nothing about the others that
         # reach the same body. Declaring `f(Float64)` leaves `f(Int32)` unchecked, and a gate that
-        # counted the method as covered would hide exactly that.
-        sigs = _method_signatures(m)
-        if !isempty(sigs)
-            for tt in sigs
-                _signature_declared(m, tt, keys_) && continue
-                push!(out, _coverage_finding(mod, m, _sig_string(Tuple(tt))))
+        # counted the method as covered would hide exactly that. A declaration counts only for the
+        # method it dispatches to (`_declared_methods`).
+        rows = _compiled_rows(m)
+        if !isempty(rows)
+            for mi in rows
+                _signature_declared(m, mi.specTypes, index) && continue
+                push!(out, _coverage_finding(mod, m, mi))
             end
             continue
         end
         # Nothing has compiled, so there is no signature to name: the only claim available is that
         # some declaration speaks for the method at all.
-        _method_declared(m, keys_) && continue
-        fname = string(_demangle(m.name))
+        _method_declared(m, index) && continue
+        fname = string(_method_label(m))
         # The argument types, rendered as every other finding renders them. A method's `sig` also
         # carries the function's own type as its first parameter, which a reader does not need.
         sig = try
@@ -1156,9 +1871,14 @@ end
 # exempted. Turns "every kernel declares its guarantees" from a convention into a red test.
 # Not a checkable guarantee — findings are built directly, never routed through the engines.
 function _coverage_findings(mod::Module; only = nothing, exempt = ())
+    _check_name_filters(mod; only, exempt)
     exemptpred = _name_matcher(exempt)
     onlypred = _name_matcher(only)
     registered = Set{Any}(k[1] for k in keys(declarations()))
+    for m in keys(method_declarations())
+        F = _method_function(m)
+        F isa DataType && isdefined(F, :instance) && push!(registered, F.instance)
+    end
     out = StrictFinding[]
     for nm in names(mod)   # exported + `public` on 1.12; macros/gensyms filtered below
         s = String(nm)
@@ -1192,9 +1912,10 @@ const _REVISE_UNWATCH = Ref{Any}(nothing)
 """
     watch()
 
-Start the live re-checking loop: after each Revise edit, re-check the strict registry and print
-violations. Requires Revise — `using Revise` (which loads the StrictMode↔Revise extension) before
-calling. The human counterpart to [`audit`](@ref) (the agent path).
+Start the live re-checking loop: after each Revise edit, re-check every declaration in scope
+([`StrictMode.declarations`](@ref)) and print violations. Requires Revise — `using Revise` (which
+loads the StrictMode↔Revise extension) before calling. The human counterpart to [`audit`](@ref)
+(the agent path).
 """
 function watch()
     _REVISE_WATCH[] === nothing && return @info "StrictMode.watch() needs Revise: run `using Revise` first."

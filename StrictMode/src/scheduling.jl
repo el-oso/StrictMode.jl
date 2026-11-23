@@ -16,10 +16,13 @@
 # pure read (`_FORWARDER_PURE`). Work that inlines makes no call — a loop of intrinsics, a store
 # into a global — so counting calls alone read such a body as a forwarder and checked its callee
 # instead. A body that does any real work, and a wrapper a user wrote, is read as itself.
+#
+# `sig` is a body key (`_entry_key`), and so is the result: the key itself when it is not a
+# forwarder, and the signature its forwarder calls otherwise.
 function _forwarded_sig(@nospecialize(sig))
     for _ in 1:8                       # a chain of trailing defaults forwards once per default
         cts = try
-            _code_typed_by_type(sig; optimize = true)
+            _code_typed_of(sig; optimize = true)
         catch
             return sig
         end
@@ -42,8 +45,11 @@ function _forwarded_sig(@nospecialize(sig))
         mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
         mi isa Core.MethodInstance || return sig
         target = mi.specTypes
+        # A callee whose signature dispatches to another method, as an `invoke` of a wider method
+        # names, is not one a forwarder calls, and reading its signature would read that other method.
+        _callee_key(mi) === target || return sig
         callee = target.parameters[1]
-        callee === sig.parameters[1] || _is_kwbody_of(callee, sig) || return sig
+        callee === _key_sig(sig).parameters[1] || _is_kwbody_of(callee, sig) || return sig
         sig = target
     end
     return sig
@@ -63,30 +69,26 @@ function _forwarder_trivial(@nospecialize(s))
     return (c.mod === Core || c.mod === Base) && c.name in _FORWARDER_PURE
 end
 
-# Whether `callee` is the keyword body (`#f#N`) of the method `sig` dispatches to, recognized by its
-# name. `Base.bodyfunction` is not used: it returns the last function a method calls, so on a body
+# Whether `callee` is the keyword body (`#f#N`) of the method the body key `sig` names, recognized by
+# its name. `Base.bodyfunction` is not used: it returns the last function a method calls, so on a body
 # method it names an ordinary callee, and following that reads the callee with the caller's own
 # values arriving as arguments — the escape analysis then sees a handle passed in rather than made.
 function _is_kwbody_of(@nospecialize(callee), @nospecialize(sig))
     (callee isa DataType && isdefined(callee, :instance)) || return false
     cn = nameof(callee.instance)
     startswith(string(cn), "#") || return false
-    m = try
-        Base.which(sig)
-    catch
-        return false
-    end
+    m = _key_method(sig)
     return m isa Method && _demangle(cn) === m.name
 end
 
 # The function and argument types a check should read for the call `f(types...)`.
 function _forwarded_call(@nospecialize(f), @nospecialize(types::Tuple))
-    sig = _sigtype(f, types)
+    sig = _entry_key(f, types)
     fsig = _forwarded_sig(sig)
     fsig === sig && return (f, types)
     ft = fsig.parameters[1]
-    (ft isa DataType && isdefined(ft, :instance)) || return (f, types)
-    return (ft.instance, Tuple(fsig.parameters[2:end]))
+    ft isa DataType || return (f, types)
+    return (_callee(ft), Tuple(fsig.parameters[2:end]))
 end
 
 _forwarded_types(@nospecialize(f), @nospecialize(types::Tuple)) = last(_forwarded_call(f, types))
@@ -150,7 +152,9 @@ function _invoke_callees(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _assert_vectorized(target, @nospecialize(f), @nospecialize(types::Tuple))
-    _vectorized(f, types) && return nothing
+    ir = _llvm_ir(f, types)
+    isempty(ir) && return _fail(:vectorized, target, _output_unread(f, types))
+    _ir_vectorized(ir) && return nothing
     # `@assert_vectorized` inspects the *leaf* compiled body. A thin dispatcher has no vector ops of
     # its own — point the user at the non-inlined callees where the SIMD actually is (F11).
     callees = _invoke_callees(f, types)
@@ -186,7 +190,7 @@ diagnostics when a loop vectorizes but is still slow.
 ```
 """
 macro assert_vectorized(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_vectorized", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_vectorized needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_vectorized; types = get(opts, :types, nothing))
@@ -196,6 +200,7 @@ end
 # --- @assert_effects (via Base.infer_effects) -------------------------------------------------
 
 function _assert_effects(target, @nospecialize(f), @nospecialize(types::Tuple), required)
+    isnothing(_typed_body(_entry_key(f, types))) && return _fail(:effects, target, _NO_BODY_WHY)
     eff = effects(f, types)
     missing_eff = Symbol[s for s in required if !effect_holds(eff, s)]
     isempty(missing_eff) || _fail(
@@ -210,7 +215,8 @@ end
 
 Fail unless the compiler infers the requested [effects](https://docs.julialang.org/en/v1/base/base/#Base.@assume_effects)
 for `f(args...)`, via `Base.infer_effects`. Effects are one or more of `:nothrow`, `:effect_free`,
-`:terminates`, `:consistent`, `:nonoverlayed`. This is the *verify* side of effects; to *declare*
+`:terminates`, `:consistent`, `:nonoverlayed`, `:notaskstate`, `:noub`, `:inaccessiblememonly` and
+`:nortcall`. A signature no method matches fails: there is no code to have effects. This is the *verify* side of effects; to *declare*
 them (and influence codegen), use `Base.@assume_effects`. Each argument is evaluated once.
 
 ```julia
@@ -218,7 +224,7 @@ them (and influence codegen), use `Base.@assume_effects`. Each argument is evalu
 ```
 """
 macro assert_effects(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_effects", args, (:types,))
     length(pos) >= 2 || throw(ArgumentError("@assert_effects needs a call expression and a required-effects tuple"))
     call, required = pos[1], pos[2]
     checked = _guarantee_expr(call, _assert_effects, esc(required); types = get(opts, :types, nothing))
@@ -288,11 +294,67 @@ Base.@kwdef struct KernelReport
     ordered_reduce_ops::Int = 0
 end
 
+# A call runs the code compiled for its concrete argument types. For a signature that is not
+# concrete, `code_llvm` and `code_native` print the matching method compiled for the abstract types
+# (under "WARNING: This code may not match what actually runs"): one method's body, dispatching at
+# run time where the abstract types leave a call open, and not the code any concrete call runs.
+# `_llvm_ir` and `_native_asm` therefore return "" for it, as they do when the printer raises, and a
+# guarantee reports an empty text as unevaluated (`_output_unread`), never as a pass or a failure.
+#
+# The signature judged is the one asked about, not the one read. A forwarder is read at its
+# callee's compilation signature, which widens an argument the callee does not specialize on and is
+# still the code the call runs.
+function _has_compiled_body(@nospecialize(f), @nospecialize(types::Tuple))
+    return try
+        Base.isdispatchtuple(_key_sig(_entry_key(f, types)))
+    catch
+        false
+    end
+end
+
+# Why `_llvm_ir` or `_native_asm` came back empty for `f(types...)`.
+_output_unread(@nospecialize(f), @nospecialize(types::Tuple)) =
+    _has_compiled_body(f, types) ?
+    "the compiled output could not be read (`code_llvm` / `code_native` raised or printed nothing)" :
+    "the signature is not concrete, so it names no compiled body to read; give the argument " *
+    "types a call would have"
+
+# `code_llvm` (`native = false`) or `code_native` for a signature, with the keywords `_llvm_ir` and
+# `_native_asm` pass. Julia 1.12's printers take a function value only, so there this is their body
+# with the method instance found by the signature.
+@static if VERSION >= v"1.13.0-"
+    _print_code_by_type(io::IO, @nospecialize(tt), native::Bool) = native ?
+        InteractiveUtils.code_native(io, tt; debuginfo = :none) :
+        InteractiveUtils.code_llvm(io, tt; debuginfo = :none, optimize = true)
+else
+    _print_code_by_type(io::IO, @nospecialize(tt), native::Bool) =
+        _print_code_of(io, Base.specialize_method(Base._which(tt; world = Base.get_world_counter())), native)
+end
+
+# `code_llvm` or `code_native` of the specialization `mi`, with the same settings.
+function _print_code_of(io::IO, mi::Core.MethodInstance, native::Bool)
+    world = Base.get_world_counter()
+    src = Base.Compiler.typeinf_code(Base.Compiler.NativeInterpreter(world), mi, true)
+    src isa Core.CodeInfo || error("failed to infer source for $mi")
+    params = Base.CodegenParams(;
+        debug_info_kind = Cint(0), debug_info_level = Cint(2), safepoint_on_entry = false, gcstack_arg = false
+    )
+    IU = InteractiveUtils
+    print(
+        io, native ? IU._dump_function_native_assembly(mi, src, false, :intel, :none, false, false, params) :
+            IU._dump_function_llvm(mi, src, false, true, false, true, :none, params)
+    )
+    return nothing
+end
+
 function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
+        f isa _Spec ? _print_code_of(io, f.mi, false) :
+            f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), false) :
+            InteractiveUtils.code_llvm(io, f, types; debuginfo = :none, optimize = true)
     catch
         return ""
     end
@@ -300,14 +362,27 @@ function _llvm_ir(@nospecialize(f), @nospecialize(types::Tuple))
 end
 
 function _native_asm(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
-        InteractiveUtils.code_native(io, f, types; debuginfo = :none)
+        f isa _Spec ? _print_code_of(io, f.mi, true) :
+            f isa _Callable ? _print_code_by_type(io, _sigtype(f, types), true) :
+            InteractiveUtils.code_native(io, f, types; debuginfo = :none)
     catch
         return ""
     end
     return String(take!(io))
+end
+
+# The text a public report is built from, or a raise. A report built from no text shows zero
+# spills, no scalar loop and no vector work, which is how a clean kernel reads.
+function _report_text(
+        reader, report::Symbol, @nospecialize(f), @nospecialize(types::Tuple)
+    )
+    s = reader(f, types)
+    isempty(s) && throw(_UnanalyzableSignature(report, f, types, _output_unread(f, types)))
+    return s
 end
 
 function _kr_bound(r::KernelReport)
@@ -401,7 +476,9 @@ from `@simd`/`@fastmath` — counted into `fp_ops` like any other FP work, but a
 separately and printed as an explicit warning: these flags permit floating-point reassociation and
 NaN/Inf assumptions that can change numerical RESULTS, not just codegen, so a nonzero count is a
 numerics-risk signal worth a second look, not just a tuning note).
-**Heuristic and advisory** — it never fails, and does not replace a profiler/roofline.
+**Heuristic and advisory** — it judges nothing, and does not replace a profiler/roofline. IR that
+cannot be read raises `_UnanalyzableSignature`, naming the signature and the reason, rather than
+returning a report of zeros: that is the case for a signature that is not concrete.
 
 Pass `working_set_bytes` to get a cache-residency annotation: if the working set fits L1/L2,
 low intensity is expected and acceptable; if it spills L2 and the kernel is already
@@ -419,7 +496,10 @@ function kernel_report(
         @nospecialize(f), @nospecialize(types::Tuple);
         working_set_bytes::Union{Nothing, Int} = nothing
     )
-    return _kernel_report(_func_name(f) * _sig_string(types), _llvm_ir(f, types), working_set_bytes)
+    return _kernel_report(
+        _func_name(f) * _sig_string(f, types), _report_text(_llvm_ir, :kernel_report, f, types),
+        working_set_bytes
+    )
 end
 
 # `kernel_report` over text IR: the classification depends on the IR alone, so IR captured on one
@@ -537,8 +617,9 @@ const _VEC_RE = r"<(?:vscale x )?\d+ x "
 const _VECTORIZER_SCAFFOLD_RE = r"\b(?:vector\.ph|vector\.body|middle\.block|scalar\.ph|min\.iters\.check|bc\.resume\.val)\b"
 
 # Split the optimized text IR into loop regions. A loop is a back-edge: a `br … label %X` whose target
-# label `X` is defined *at or before* the branch line. The region is the IR text from the loop header
-# (label `X`) through the back-edge line — enough to scan that one loop for vector vs scalar ops.
+# label `X` is defined *at or before* the branch line. Every label a `br` names is a candidate: a
+# conditional latch lists its loop header first as often as last. The region is the IR text from the
+# loop header (label `X`) through the back-edge line — enough to scan that one loop for vector vs scalar ops.
 # Coarse (text, not a CFG), but enough to reason per-loop instead of whole-function.
 function _loop_regions(ir::AbstractString)
     lines = split(ir, '\n')
@@ -549,7 +630,8 @@ function _loop_regions(ir::AbstractString)
     end
     regions = String[]
     for (i, l) in enumerate(lines)
-        for m in eachmatch(r"\bbr\b[^\n]*\blabel %([A-Za-z0-9._]+)", l)
+        occursin(r"\bbr\b", l) || continue
+        for m in eachmatch(r"\blabel %([A-Za-z0-9._]+)", l)
             j = get(labelpos, m.captures[1], 0)
             0 < j <= i && push!(regions, join(view(lines, j:i), '\n'))   # back-edge ⇒ loop region
         end
@@ -585,10 +667,12 @@ function's numeric intent was already fully vectorized by hand, so a second, sep
 loop is real glue work even if LLVM partially rescued it with its own vectorization attempt.
 
 Use it as a triage signal: a `true` result means "look here for a vectorization opportunity"; a
-`false` result does not prove every loop is vectorized. See [`@assert_vectorized`](@ref) for
+`false` result does not prove every loop is vectorized. IR that cannot be read (a signature that is
+not concrete names no compiled body) raises `_UnanalyzableSignature` rather than returning `false`. See [`@assert_vectorized`](@ref) for
 per-kernel vectorization enforcement and [`@assert_no_scalar_loops`](@ref) for the guarded form.
 """
-scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool = _scalar_fp_loops(_llvm_ir(f, types))
+scalar_fp_loops(@nospecialize(f), @nospecialize(types::Tuple))::Bool =
+    _scalar_fp_loops(_report_text(_llvm_ir, :scalar_fp_loops, f, types))
 
 function _scalar_fp_loops(s::AbstractString)
     isempty(s) && return false
@@ -621,7 +705,9 @@ function _scalar_fp_loops(s::AbstractString)
 end
 
 function _assert_no_scalar_loops(target, @nospecialize(f), @nospecialize(types::Tuple))
-    scalar_fp_loops(f, types) || return nothing
+    ir = _llvm_ir(f, types)
+    isempty(ir) && return _fail(:no_scalar_loops, target, _output_unread(f, types))
+    _scalar_fp_loops(ir) || return nothing
     _fail(
         :no_scalar_loops, target,
         "scalar hot loop (FP or integer) detected in a numeric path that did not vectorize. " *
@@ -649,7 +735,7 @@ to the bare call.
 ```
 """
 macro assert_no_scalar_loops(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_no_scalar_loops", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_no_scalar_loops needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_no_scalar_loops; types = get(opts, :types, nothing))
@@ -829,11 +915,13 @@ A saturated kernel with spills (32/32, N > 0) is at the LLVM portable-compiler c
 more ILP will only spill further and may regress. The last ~15% over LLVM-compiled Rust requires
 hand-written assembly.
 
-Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros.
+Only meaningful for x86-64 AVX-512 kernels; non-AVX-512 targets return zeros. Assembly that
+cannot be read raises `_UnanalyzableSignature` rather than returning zeros, so a zero count always
+describes assembly that was read.
 """
 function register_report(@nospecialize(f), @nospecialize(types::Tuple))
-    c = _zmm_counts(_native_asm(f, types))
-    return RegisterReport(_func_name(f) * _sig_string(types), c.used, c.total, c.spills)
+    c = _zmm_counts(_report_text(_native_asm, :register_report, f, types))
+    return RegisterReport(_func_name(f) * _sig_string(f, types), c.used, c.total, c.spills)
 end
 
 # --- @assert_no_spill: vector-register spill diagnostic as a hard gate --------------------------
@@ -849,8 +937,18 @@ end
 # writes `#` and names `xmm`/`ymm`/`zmm`; AArch64 writes `//` (`;` on macOS) and names its
 # floating-point and vector registers `b`/`h`/`s`/`d`/`q`/`v`, SVE's `z` and SME's `za`.
 const _SPILL_RELOAD_RE = r"(?:#|//|;).*\b(?:Spill|Reload)\b"
-_vec_reg_re(arch::Symbol) = arch === :aarch64 ? r"\b(?:[bhsdqvz]\d+|za\w*)\b" : r"\b(?:xmm|ymm|zmm)\d+\b"
-const _VEC_REG_RE = _vec_reg_re(Sys.ARCH)
+# Any other architecture has no pattern: its spill lines name registers neither pattern matches, so
+# reading them with one would count zero spills.
+function _vec_reg_re(arch::Symbol)
+    arch === :aarch64 && return r"\b(?:[bhsdqvz]\d+|za\w*)\b"
+    arch in (:x86_64, :i686) && return r"\b(?:xmm|ymm|zmm)\d+\b"
+    return nothing
+end
+
+# Why vector spills cannot be counted on `arch`, or `nothing` when they can.
+_spill_arch_unread(arch::Symbol = Sys.ARCH) = isnothing(_vec_reg_re(arch)) ?
+    "vector spills cannot be counted on $arch: StrictMode knows the vector register names of x86 " *
+    "and AArch64 only" : nothing
 
 """
     SpillReport
@@ -920,8 +1018,11 @@ A nonzero count means the kernel needs more live vector registers than the targe
 the codegen analogue of an allocation: still correct, but paying stack traffic on every spill/
 reload instead of running from registers. Complements [`register_report`](@ref) (which reads
 zmm-saturation specifically) and [`kernel_report`](@ref) (which works from pre-allocation LLVM IR
-and can't see spills at all). Empty/unavailable `code_native` output reports zero spills, matching
-[`scalar_fp_loops`](@ref)'s "can't analyze ⇒ don't fail" convention.
+and can't see spills at all). Assembly that cannot be read raises
+`_UnanalyzableSignature`, naming the signature and the reason, rather than reporting zero spills:
+that is the case for a signature that is not concrete, which names no compiled body.
+On an architecture other than x86 and AArch64, whose vector register names it does not know, it
+raises too.
 
 Each spill is placed by the loop its block is in, from LLVM's own loop annotations. `loop_spills`
 leaves out code that runs once per call — the prologue and the epilogue that stores a tile's
@@ -930,10 +1031,16 @@ results — where a spill costs one store and one load per call rather than per 
 so it is not the same as the hot loop.
 """
 function spill_report(@nospecialize(f), @nospecialize(types::Tuple))
-    target = _func_name(f) * _sig_string(types)
-    s = _native_asm(f, types)
-    isempty(s) && return SpillReport(target, 0, 0, 0)
-    total, inloop, ininner = _spill_counts(split(s, '\n'), Sys.ARCH)
+    why = _spill_arch_unread()
+    isnothing(why) || throw(_UnanalyzableSignature(:spill_report, f, types, why))
+    return _spill_report(
+        _func_name(f) * _sig_string(f, types), _report_text(_native_asm, :spill_report, f, types)
+    )
+end
+
+function _spill_report(target::AbstractString, asm::AbstractString)
+    isempty(asm) && return SpillReport(target, 0, 0, 0)
+    total, inloop, ininner = _spill_counts(split(asm, '\n'), Sys.ARCH)
     return SpillReport(target, total, inloop, ininner)
 end
 
@@ -943,6 +1050,7 @@ end
 # marked `Spill` by LLVM. x86-64 has no callee-saved vector register, so those lines are not counted.
 function _spill_counts(lines::AbstractVector{<:AbstractString}, arch::Symbol)
     re = _vec_reg_re(arch)
+    isnothing(re) && throw(ArgumentError(_spill_arch_unread(arch)))
     depth, inner = _asm_loop_depths(lines)
     total = 0
     inloop = 0
@@ -992,7 +1100,11 @@ function Base.show(io::IO, r::SpillReport)
 end
 
 function _assert_no_spill(target, @nospecialize(f), @nospecialize(types::Tuple), scope::Symbol = :loops)
-    r = spill_report(f, types)
+    why = _spill_arch_unread()
+    isnothing(why) || return _fail(:no_spill, target, why)
+    asm = _native_asm(f, types)
+    isempty(asm) && return _fail(:no_spill, target, _output_unread(f, types))
+    r = _spill_report(_func_name(f) * _sig_string(f, types), asm)
     n = _spill_count(r, scope)
     iszero(n) && return nothing
     where_ = scope === :function ? "" : scope === :loops ? " inside a loop" : " inside an innermost loop"
@@ -1010,7 +1122,7 @@ end
 
 Fail if `f(args...)` compiled to code that **spills a vector register to the stack**
 (**best-effort**): StrictMode scans the post-register-allocation `code_native` output for LLVM's
-`# ... Spill`/`# ... Reload` annotations on a line naming a vector register (`xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64). This is
+`# ... Spill`/`# ... Reload` annotations on a line naming a vector register (`xmm`/`ymm`/`zmm` on x86, `b`/`h`/`s`/`d`/`q`/`v`/`z`/`za` on AArch64; any other architecture fails, since its registers would read as no spill). This is
 the codegen analogue of [`@assert_noalloc`](@ref) — a kernel can be type-stable, allocation-free,
 and vectorized, and still be "correct but slower" because it needs more live vector registers than
 the target ISA provides (LLVM's portable register allocator has no choice but to spill). A
@@ -1031,7 +1143,7 @@ loops only, which can include a remainder loop; `:function` counts every spill.
 ```
 """
 macro assert_no_spill(args...)
-    pos, opts = _macro_call(args, (:types, :scope))
+    pos, opts = _macro_call("@assert_no_spill", args, (:types, :scope))
     isempty(pos) && throw(ArgumentError("@assert_no_spill needs a call expression"))
     call = pos[1]
     scope = get(opts, :scope, QuoteNode(:loops))

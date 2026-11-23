@@ -39,8 +39,15 @@ findings(dot3, (NTuple{3,Float64}, NTuple{3,Float64}))   # all :pass
 Nothing actually runs here; the analysis works purely from the types. That means it is happy even
 with calls you wouldn't want to execute for real — a `10000×10000` signature costs nothing.
 
-`findings` never throws: it is the data half of the API, and the caller decides what a finding is
-worth. To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
+`findings` also takes the whole signature as one tuple type, `Tuple{F, argtypes...}`, where `F` is
+the type of the callable. That form needs no instance, which is how a callable object's method is
+checked from its type alone: for `(r::Reader)(x::Int)`, `findings(Tuple{Reader, Int})` reads what
+`findings(Reader(1), (Int,))` reads, and both name the finding `Reader`.
+
+`findings` never throws on a violation: it is the data half of the API, and the caller decides what
+a finding is worth. An argument that names nothing to check raises an `ArgumentError`: an unknown
+guarantee, or a signature type with free type parameters or no callable (`Tuple{Vector{T}, Int} where
+T`, `Tuple{}`). To **gate** on the same signatures, add `StrictModeTest` to the test environment. Its
 `test_signatures` takes the same list, runs AllocCheck and JET instead of the value-free scan, and
 throws a `StrictViolation` collecting every failure:
 
@@ -73,6 +80,24 @@ end
 
 It reads the module's methods rather than rewriting its body, which is why definitions inside an
 `include`d file are covered.
+
+A policy checks only the methods defined above it: the check runs at the line where the macro is
+written, and a method defined below is not read. That is why it goes last. A policy raises when no
+method above its line is checked or accounted for: nothing is defined above it, or only generic
+methods that nobody declared. Written first, it would otherwise load cleanly over a module it never
+looked at. A method is accounted for when it is exempt, when its instantiations are declared with
+`@strict_function signatures = [...]`, or when it is a constructor, a macro or a callable object's
+method. Exempt means exempt from every guarantee the policy names, by one exemption or several: under
+`:default`, `@strict_exempt :noalloc` alone leaves `:typestable` and `:noboxing` unanswered and does
+not count. An exemption narrowed to a signature with `types = (...)` counts, as a declared
+instantiation does. `@strict module … end` wraps the whole module and has no such position, and
+`check = false` records a policy without checking.
+
+A policy does not check the method of a callable object with fields at load. Such an object,
+`(c::Reader)(x)`, has no instance when the module loads, so there is nothing to call it on; the
+module sweeps (`audit(mod; sweep = true)`, `test_compiled`) and the proofs check it from its
+compiled specializations instead. A singleton callable, `struct Op end; (::Op)(x::Int)`, has an
+instance and is checked at load like a function.
 
 ### Declaring a narrower set, rather than excusing a guarantee
 
@@ -114,12 +139,22 @@ end
     make_workspace(n::Int) = Workspace(Vector{Float64}(undef, n))
 end
 
-@strict_exempt reason = "plan-time file" include("plan.jl")   # everything that file defines
+@strict_exempt reason = "plan-time file" include("plan.jl")   # each method that file defines
 ```
 
 The `include` form calls the file's own `include`, so relative paths resolve as they would have,
-and it finds the definitions by comparing the module's methods before and after — which is why a
+and it finds the methods the file defined by the world they were defined in — which is why a
 nested `include` inside `plan.jl` is covered too.
+
+The block and `include` forms exempt each method written inside them by its own signature, so a
+method of the same name written outside the block or file is still checked. In a file, a method
+whose type variables tie two arguments together (`f(x::T, y::T) where T`) has no signature that
+names exactly it, so its function is exempted by name instead, with a warning that names the
+method; in a block it is an error, as for a single definition.
+
+A single definition, `@strict_exempt plan(n::Int) = collect(1:n)`, exempts the method it writes and
+no other: its own signature is recorded, so a separate `plan(n::Integer)` elsewhere in the module is
+still checked. The name form, `@strict_exempt plan`, exempts every method of the function.
 
 A guarantee named before the subject narrows the exemption. The subject is the **last** positional
 argument, which is what keeps `@strict_exempt :foo` meaning the function `foo`.
@@ -190,6 +225,43 @@ test_compiled(MyPkg; guarantees = (:noalloc, :noboxing))          # prove and ga
 Coverage is only as good as what actually ran, and the walk through compiler reflection is
 best-effort and defensive. In return, it needs no marks at all.
 
+The sweep covers the methods written in the module itself: its own functions' methods, and the
+methods it defines on a function another module owns, such as its `Base.getproperty`, `Base.size`
+or `Base.:*` methods. Only the method the module wrote is swept, not the function's other methods.
+`only` and `exempt` name such a method by the function's name, as they do the module's own.
+
+Each specialization is checked as the method that compiled it. `invoke(f, Tuple{Any, Integer}, x, n)`
+compiles the method `f(x, n::Integer)` for `(Int64, Int64)` even when a more specific `f(x, n::Int)`
+answers a call with those types. The sweep then has two rows for the same argument types, and the
+one for the wider method is reported under the signature
+`(Int64, Int64) via invoke of (Any, Integer)`, so each has its own [`key`](@ref). Both tiers read
+that row's body from the specialization itself, never by dispatching its argument types.
+
+A submodule or a package extension is a module of its own: sweep it by name
+(`audit(MyPkg.Sub; sweep = true)`, `test_compiled(Base.get_extension(MyPkg, :MyPkgExt))`), and
+its own `@strict_exempt` declarations apply. Its methods never appear in the parent's sweep, so no
+method is listed twice. The coverage gate below still counts them as the package's.
+
+A callable object's method, `(r::Reader)(x)`, is swept too, once for each concrete type it compiled
+for: `Reader`, and `Boxed{Int}` and `Boxed{Float64}` separately for `(b::Boxed)(x)`. The sweep has
+no instance of the object, and needs none: it checks the signature `Tuple{Reader, typeof(x)}`, as
+[`findings`](@ref) does. Its findings name it by its type with the type's parameters, `Reader`,
+`Boxed{Int64}` and `Boxed{Float64}`, so each instantiation has its own [`StrictMode.key`](@ref) and
+a comparison of two runs keeps them apart. `only`, `exempt` and `@strict_exempt` name it by the
+type's name alone, `Reader` or `Boxed`, which matches every instantiation. An `only` or `exempt`
+that is a predicate function receives, for a callable object with no instance, the type its method
+declares for the callable: `Reader`, `Boxed` for `(b::Boxed)(x)`, `Boxed{<:Integer}` for
+`(b::Boxed{<:Integer})(x)`. So `only = f -> f === Reader` or `exempt = f -> f isa Type && f <: Boxed`
+selects it, and a predicate written for functions alone excludes it from `only` and keeps it under
+`exempt`. A callable whose type subtypes `Function` is swept whether or not a name in the module
+holds an instance of it. The predicate is asked once per method, so it selects or drops every
+instantiation of that method together. The body Julia generates for a keyword method answers to
+what the method was written on: the body of `Tracker{T}(x; c) where {T}`, an inner constructor, is
+named `Tracker`, and the body of `(s::Scaled)(x; by)` is named `Scaled`, in its findings and for
+`only`, `exempt` and `@strict_exempt` alike. A closure, whether or not it captures,
+an anonymous function, a generator, and the keyword body of any of these are part of the function
+they are written in, and are not swept on their own.
+
 ## The coverage gate — default-deny
 
 The drivers above check what was *declared* (registry) or what *ran* (sweep) — neither notices a
@@ -236,6 +308,18 @@ per method:
   `(Float64,)` leaves `(Int32)` reported, because nothing checked it.
 - A method nothing has compiled yet has no signature to name, so the gate falls back to asking
   whether any declaration speaks for the method at all.
+- A declaration counts for the method its signature dispatches to, which is the method
+  `test_registered` checks, and for no other. With `f(x, n::Integer)` and `f(x, n::Int)`,
+  declaring `(Int, Int)` covers the second. A row the sweep lists as
+  `(Int64, Int64) via invoke of (Any, Integer)` belongs to the first, and no signature dispatches
+  to it, so a signature declaration cannot cover it: declare the method instead, or opt it out with
+  `@strict_exempt f`.
+- A declaration of a **method**, `register_strict!(which(f, (Any, Integer)))`, covers every row of
+  that method that has compiled, the `invoke` row included, and no row of another method.
+  `test_registered` and `audit(:registered)` read those rows from the method table when they run
+  and check each one by its own body; the method's abstract signature is never checked, since it
+  infers to `Any`. A declared method with no compiled row fails there, because nothing was
+  checked: run a workload or a `precompile` statement that compiles it first.
 
 Coverage therefore follows what actually ran. A signature that appears for the first time in a
 later run is reported then — which is the point: it was not checked before either.

@@ -14,12 +14,20 @@
     StrictDivergence
 
 The result of [`divergence_report`](@ref): an IP-free record of where the scan and the proof disagree.
-`isempty(d.diverged)` is `true` when the two engines agree. Safe to send to the StrictMode maintainers —
-contains no source, no user type names, and no field values. `show` it, or write it with
-`StrictModeTest.save_divergence(d, path)`.
+
+- `diverged` lists `(guarantee, scan_failed, proof_failed)` for each guarantee one engine fails and
+  the other does not. `isempty(d)` is `isempty(d.diverged)`: it reads only this field.
+- `cause_diverged` lists `(guarantee, scan_code, proof_code)` for each guarantee both engines fail
+  with different diagnostic codes, such as the scan's SM0207 (it could not read the whole call tree)
+  against the proof's SM0002 (the call allocates). The verdicts agree there, so it does not make `d` non-empty; the two engines name
+  different causes for the same failure.
+
+Safe to send to the StrictMode maintainers — contains no source, no user type names, and no field
+values. `show` it, or write it with `StrictModeTest.save_divergence(d, path)`.
 """
 struct StrictDivergence
     diverged::Vector{Tuple{Symbol, Bool, Bool}}   # (guarantee, scan_failed, proof_failed)
+    cause_diverged::Vector{Tuple{Symbol, Symbol, Symbol}}   # (guarantee, scan_code, proof_code)
     signature::String                             # anonymized, e.g. "Tuple{T1, Vector{Float64}, Int64}"
     return_category::String                       # concrete / abstract / small-isbits-union / union / Any / …
     scan_signals::Vector{String}                  # category labels (no source)
@@ -64,7 +72,7 @@ function _anon_signature(@nospecialize(types::Tuple))
 end
 
 function _return_category(@nospecialize(f), @nospecialize(types::Tuple))
-    rts = Base.return_types(f, Tuple{types...})
+    rts = StrictMode._base_return_types(f, types)
     length(rts) == 1 || return "inference-multiple($(length(rts)))"
     R = only(rts)
     R === Any && return "Any"
@@ -128,7 +136,8 @@ end
 
 Run StrictMode's value-free scan and this package's proof on `f` for the concrete signature `types`, and
 return a [`StrictDivergence`](@ref) capturing every guarantee where the two **disagree** (one says pass,
-the other fail). The result is **IP-free** — anonymized signature shape, signal *categories*, and
+the other fail). A guarantee both engines fail with different diagnostic codes is listed in the
+result's `cause_diverged` field, which `isempty` does not read. The result is **IP-free** — anonymized signature shape, signal *categories*, and
 versions only — so you can send it to us to fix the heuristic.
 
 `isempty(result)` is `true` when the engines agree. `f` is never called.
@@ -149,14 +158,30 @@ function divergence_report(
     # what this function is for. What matters here is whether the engine flagged the call at all.
     fmap = Dict(x.guarantee => StrictMode._failed(x) for x in ff)
     lmap = Dict(x.guarantee => StrictMode._failed(x) for x in fl)
+    fcode = Dict(x.guarantee => x.code for x in ff if StrictMode._failed(x))
+    lcode = Dict(x.guarantee => x.code for x in fl if StrictMode._failed(x))
+    # A call that allocates only inside exempt functions gets a note from the scan and the
+    # exempt-only failure (SM0018) from the proof. Both name the same exempt callee, so that is the
+    # two engines agreeing, in their own words.
+    if any(x -> x.guarantee === :noalloc && x.code === :SM0018, fl) &&
+            !isnothing(StrictMode._alloc_signals(f, types).exempt) && !get(fmap, :noalloc, true)
+        lmap[:noalloc] = false
+    end
     diverged = Tuple{Symbol, Bool, Bool}[]
     for g in guarantees
         a = get(fmap, g, false)
         b = get(lmap, g, false)
         a != b && push!(diverged, (g, a, b))
     end
+    cause_diverged = Tuple{Symbol, Symbol, Symbol}[]
+    for g in guarantees
+        a = get(fcode, g, nothing)
+        b = get(lcode, g, nothing)
+        (isnothing(a) || isnothing(b) || a === b) && continue
+        push!(cause_diverged, (g, a, b))
+    end
     return StrictDivergence(
-        diverged, _anon_signature(types), _return_category(f, types),
+        diverged, cause_diverged, _anon_signature(types), _return_category(f, types),
         _scan_signals(f, types), _proof_signals(f, types), _version_block(),
     )
 end
@@ -164,6 +189,9 @@ end
 function Base.show(io::IO, d::StrictDivergence)
     if isempty(d)
         print(io, "StrictDivergence: none — the scan and the proof agree")
+        for (g, a, b) in d.cause_diverged
+            print(io, "\n  ", rpad(string(g), 15), "both fail, different cause: scan=", a, "   proof=", b)
+        end
         return
     end
     println(io, "StrictDivergence — the scan and the proof disagree (IP-free; safe to send to the StrictMode maintainers)")
@@ -172,6 +200,9 @@ function Base.show(io::IO, d::StrictDivergence)
     println(io, "  return       : ", d.return_category)
     for (g, a, b) in d.diverged
         println(io, "  ", rpad(string(g), 15), "scan=", a ? "FAIL" : "pass", "   proof=", b ? "FAIL" : "pass")
+    end
+    for (g, a, b) in d.cause_diverged
+        println(io, "  ", rpad(string(g), 15), "both fail, different cause: scan=", a, "   proof=", b)
     end
     println(io, "  scan signals : ", isempty(d.scan_signals) ? "(none)" : join(d.scan_signals, ", "))
     println(io, "  proof signals: ", isempty(d.proof_signals) ? "(none)" : join(d.proof_signals, ", "))

@@ -59,9 +59,8 @@ function _assert_noalloc_scan(target, @nospecialize(f), @nospecialize(types::Tup
     _unread_fail(:noalloc, target, sig) && return nothing
     if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
         _fail(:noalloc, target, _alloc_message(f, types, sig, "allocates / boxes (value-free IR scan)"))
-    elseif _truncated_fail(:noalloc, target, sig)
     else
-        _barrier_info(:noalloc, target, sig.barrier_box)
+        _truncated_fail(:noalloc, target, sig)
     end
     return nothing
 end
@@ -81,9 +80,8 @@ function _assert_noalloc(target, @nospecialize(f), @nospecialize(types::Tuple), 
         _unread_fail(:noalloc, target, sig) && return val
         if sig.alloc || sig.boxing || !isnothing(sig.abscontainer)
             _fail(:noalloc, target, _alloc_message(f, types, sig, "allocates / boxes (value-free IR scan)"))
-        elseif _truncated_fail(:noalloc, target, sig)
         else
-            _barrier_info(:noalloc, target, sig.barrier_box)
+            _truncated_fail(:noalloc, target, sig)
         end
         return val
     end
@@ -136,7 +134,7 @@ name the real call-site specialization.
 ```
 """
 macro assert_noalloc(args...)
-    pos, opts = _macro_call(args, (:static, :types))
+    pos, opts = _macro_call("@assert_noalloc", args, (:static, :types))
     mode = _noalloc_mode(haskey(opts, :static) ? opts[:static]::Bool : nothing)
     isempty(pos) && throw(ArgumentError("@assert_noalloc needs a call expression"))
     call = pos[1]
@@ -199,7 +197,7 @@ disabled builds expand to the bare call.
 ```
 """
 macro assert_noboxing(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_noboxing", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_noboxing needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_noboxing; types = get(opts, :types, nothing))
@@ -218,7 +216,7 @@ function _assert_owned(
     sig = _alloc_signals(f, types; depth = depth)
     _unread_fail(:owned, target, sig; gates) && return nothing
     # The ordinary walk stopped short: follow the package's own code to the end.
-    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(_sigtype(f, types)) : :clean
+    deep = (!sig.dictlookup && sig.truncated) ? _owned_deep(_entry_key(f, types)) : :clean
     if sig.dictlookup || deep === :lookup
         _fail(
             :owned, target,
@@ -269,7 +267,7 @@ batch API honor.
 ```
 """
 macro assert_owned(args...)
-    pos, opts = _macro_call(args, (:types, :depth))
+    pos, opts = _macro_call("@assert_owned", args, (:types, :depth))
     isempty(pos) && throw(ArgumentError("@assert_owned needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -292,7 +290,7 @@ function _assert_noescape(
         target, @nospecialize(f), @nospecialize(types::Tuple);
         gates::Bool = _guarantee_gates(:noescape)
     )
-    r = _escaping_scoped(Tuple{typeof(f), types...})
+    r = _escaping_scoped(_entry_key(f, types))
     if !isempty(r.escaped)
         _fail(
             :noescape, target,
@@ -351,7 +349,7 @@ handle it came from stays marked unconfined. A bare handle — created in the fr
 wrapped — is answered soundly in both directions.
 """
 macro assert_noescape(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_noescape", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_noescape needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -367,10 +365,14 @@ end
 
 # --- @assert_noalias: a written argument must not share memory with another argument ---
 
-# Julia's convention is that a trailing `!` marks a function that mutates its first argument
-# (`mul!`, `copyto!`, `ldiv!`), and that is the only default this can justify. A name without `!`
-# carries no such claim, so the caller must name the written positions: guessing would compare the
-# wrong pair and find nothing, which reads identically to "no aliasing here".
+# A trailing `!` says a function mutates at least one argument, and by convention the first
+# (`mul!(C, A, B)`, `copyto!(dest, src)`). That is the only default the name can justify, and it
+# is not always right: `ldiv!(F, B)` writes its second argument, `axpy!(a, x, y)` its third, and
+# `lmul!(a, B)`, `map!(f, dest, src)` and `rand!(rng, A)` write none of their first. So the default
+# is checked before it is used: an argument 1 that holds no memory cannot be what is written, and
+# the call is rejected until `mutates` names the position. A name without `!` carries no claim at
+# all, so the caller must name the written positions: guessing would compare the wrong pair and
+# find nothing, which reads identically to "no aliasing here".
 #
 # Resolved from the SOURCE name at expansion where the callee is written as a plain symbol, so the
 # passing path builds nothing. A computed or qualified callee (`ws.kernel!`, `(f())`) is not a name
@@ -388,6 +390,12 @@ function _check_mutates(mutates, nargs::Int)
     applicable(iterate, mutates) || throw(
         ArgumentError("@assert_noalias: mutates must be a collection of argument positions, got $(typeof(mutates))")
     )
+    isempty(mutates) && throw(
+        ArgumentError(
+            "@assert_noalias: mutates names no argument, so the check would compare no pair and " *
+                "pass every call. Name the positions the call writes, or drop the assertion."
+        )
+    )
     for p in mutates
         p isa Integer || throw(
             ArgumentError("@assert_noalias: each mutates entry must be an argument position, got $(repr(p))")
@@ -403,29 +411,399 @@ const _NOALIAS_NO_BANG = "does not end in `!`, so which arguments it writes is n
     "them — `mutates = (1,)` — or drop the assertion. Defaulting to \"nothing is written\" would " *
     "compare no pair and pass every call."
 
+# Whether a value can be written through at all. A plain number, a function, a type or a string
+# holds no memory a kernel could write, so naming one as the written argument compares nothing.
+# A plain-data value that carries a pointer does (an array type built on a `Ptr`), and so does a
+# number that is not plain data (`BigInt`, `BigFloat`).
+@inline _holds_memory(x) = isbits(x) ? _carries_pointer(typeof(x)) :
+    !(x isa Union{Type, Module, Function, Symbol, AbstractString, Nothing, Missing})
+
+# Whether a value can reach memory another argument writes. A closure is not written, but it reads
+# what it captured, so it is read through its fields as any struct is.
+@inline _reads_memory(x) = _holds_memory(x) || (x isa Function && !isbits(x))
+
+# Whether a plain-data type has a `Ptr` in it. Decided from the type, so it folds away for the
+# arguments of a call.
+Base.@assume_effects :foldable function _carries_pointer(@nospecialize(T::Type), depth::Int = 0)
+    T <: Ptr && return true
+    (T isa DataType && depth < 4) || return false
+    for F in fieldtypes(T)
+        _carries_pointer(F, depth + 1) && return true
+    end
+    return false
+end
+
+# Base's own array types define `dataids`, the protocol `Base.mightalias` reads. An array type that
+# does not is answered by the fallback, the object's own identity, which never matches the buffer
+# the wrapper holds.
+const _DeclaredArray = Union{Array, Memory, SubArray, Base.ReshapedArray, PermutedDimsArray, Base.ReinterpretArray, BitArray}
+@inline function _declares_ids(x::AbstractArray)
+    x isa _DeclaredArray && return true
+    ids = Base.dataids(x)
+    return !(ids isa Tuple{UInt} && ids[1] === UInt(objectid(x)))
+end
+
+const _ALIAS_FIELD_DEPTH = 3
+
+# The address of an array's first element, its element size, and its strides in elements, or
+# `nothing` when they are not known. A Base strided array answers itself. An array type built on a
+# pointer answers from that pointer, and only when it defines `Base.strides`: without it the
+# pointer says where the elements start, not where they lie. A view with range indices into
+# either answers from its parent.
+function _layout(@nospecialize(x::AbstractArray))
+    isbitstype(eltype(x)) || return nothing
+    x isa StridedArray && return (UInt(pointer(x)), Base.elsize(x), Tuple(strides(x)))
+    i = _data_pointer_field(typeof(x))
+    if i != 0
+        hasmethod(strides, Tuple{typeof(x)}) || return nothing
+        p = getfield(x, i)::Ptr
+        p == C_NULL && return nothing
+        return (UInt(p), sizeof(eltype(x)), Tuple(strides(x)))
+    end
+    x isa SubArray || return nothing
+    P, idx = parent(x), parentindices(x)
+    length(idx) == ndims(P) || return nothing
+    all(i -> i isa Union{Integer, AbstractRange{<:Integer}}, idx) || return nothing
+    pl = _layout(P)
+    isnothing(pl) && return nothing
+    off = 0
+    st = Int[]
+    for d in eachindex(idx)
+        i = idx[d]
+        off += (first(i) - first(axes(P, d))) * pl[3][d]
+        i isa Integer || push!(st, step(i) * pl[3][d])
+    end
+    return (pl[1] + (off * pl[2]) % UInt, pl[2], Tuple(st))
+end
+
+# Where a non-empty array's elements lie: within `[lo, hi)`, and when `run > 0` exactly there:
+# `count` runs of `run` contiguous bytes, the first at `lo` and each `step` bytes after the one
+# before. A vector, a strided vector and a matrix with contiguous columns are described exactly;
+# any other layout only by its span.
+struct _Region
+    lo::UInt
+    hi::UInt
+    run::Int
+    count::Int
+    step::Int
+end
+
+function _memory_region(@nospecialize(x::AbstractArray))
+    isempty(x) && return nothing
+    l = _layout(x)
+    isnothing(l) && return nothing
+    p, es, st = l
+    sz = size(x)
+    length(st) == length(sz) || return nothing
+    lo = hi = p
+    for (n, s) in zip(sz, st)
+        span = (n - 1) * s * es
+        span < 0 ? (lo -= UInt(-span)) : (hi += UInt(span))
+    end
+    dims = [(n, s) for (n, s) in zip(sz, st) if n > 1 && s != 0]
+    run, nruns, gap = if isempty(dims)
+        (es, 1, es)
+    elseif length(dims) == 1
+        abs(dims[1][2]) == 1 ? (dims[1][1] * es, 1, es) : (es, dims[1][1], abs(dims[1][2]) * es)
+    elseif length(dims) == 2 && dims[1][2] == 1 && dims[2][2] > 0
+        (dims[1][1] * es, dims[2][1], dims[2][2] * es)
+    else
+        (0, 0, 0)
+    end
+    return _Region(lo, hi + UInt(es), run, nruns, gap)
+end
+
+# `:yes` when two regions share a byte, `:none` when they share none, and `:maybe` when their spans
+# meet and where the elements of one lie within its span is not known. For two runs patterns the
+# runs of the one with fewer are each tested against the other's arithmetic progression.
+function _regions_meet(a::_Region, b::_Region)
+    (a.lo < b.hi && b.lo < a.hi) || return :none
+    (a.run > 0 && b.run > 0) || return :maybe
+    a.count > b.count && ((a, b) = (b, a))
+    d = reinterpret(Int, a.lo - b.lo)
+    for j in 0:(a.count - 1)
+        o = d + j * a.step
+        k_lo = max(0, cld(o - b.run + 1, b.step))
+        k_hi = min(b.count - 1, fld(o + a.run - 1, b.step))
+        k_lo <= k_hi && return :yes
+    end
+    return :none
+end
+
+# The index of the field that holds an array type's data: its one `Ptr{eltype}` field, or with none
+# of those its one `Ptr` field of any type (a C wrapper's `Ptr{Cvoid}`). Otherwise 0, since which
+# pointer is the data is not known.
+function _data_pointer_field(@nospecialize(T::Type))
+    (T isa DataType && T <: AbstractArray && isbitstype(eltype(T))) || return 0
+    typed = untyped = ntyped = nptr = 0
+    for (i, F) in pairs(fieldtypes(T))
+        F <: Ptr || continue
+        nptr += 1
+        untyped = i
+        F === Ptr{eltype(T)} && (ntyped += 1; typed = i)
+    end
+    ntyped == 1 && return typed
+    return ntyped == 0 && nptr == 1 ? untyped : 0
+end
+
+# What `_collect_memory!` finds in an argument: the arrays that declare their ids, which are taken
+# at their word; the regions of the arrays whose layout is known; the data pointers of arrays
+# built on a pointer whose layout is not, whose elements lie somewhere in that pointer's
+# allocation; and the raw pointers, which say where memory starts and not how far it reaches.
+struct _Reached
+    arrays::Vector{Any}
+    regions::Vector{_Region}
+    starts::Vector{UInt}
+    ptrs::Vector{UInt}
+end
+_Reached() = _Reached(Any[], _Region[], UInt[], UInt[])
+Base.isempty(r::_Reached) =
+    isempty(r.arrays) && isempty(r.regions) && isempty(r.starts) && isempty(r.ptrs)
+
+# Anything that is not one of those (a wrapper array with no `dataids` method, a workspace struct,
+# a factorization, a closure) is read through its fields. An array built on a pointer covers only
+# its elements: its other fields are a handle or the object that keeps the memory alive, which two
+# arrays can share without sharing an element.
+function _collect_memory!(r::_Reached, @nospecialize(x), depth::Int)
+    if x isa Ptr
+        x == C_NULL || push!(r.ptrs, UInt(x))
+        return nothing
+    end
+    _reads_memory(x) || return nothing
+    if x isa AbstractArray
+        if !isbits(x) && _declares_ids(x)
+            push!(r.arrays, x)
+            return nothing
+        end
+        isempty(x) && return nothing
+        g = _memory_region(x)
+        if !isnothing(g)
+            push!(r.regions, g)
+            return nothing
+        end
+        i = _data_pointer_field(typeof(x))
+        if i != 0
+            p = getfield(x, i)::Ptr
+            p == C_NULL || push!(r.starts, UInt(p))
+            return nothing
+        end
+    end
+    depth <= 0 && return nothing
+    for i in 1:nfields(x)
+        isdefined(x, i) || continue
+        _collect_memory!(r, getfield(x, i), depth - 1)
+    end
+    return nothing
+end
+
+# The array at the bottom of a chain of wrappers, which holds the allocation the wrappers share.
+function _root_array(@nospecialize(x::AbstractArray), depth::Int = 0)
+    p = parent(x)
+    return (p === x || depth >= 16) ? x : _root_array(p, depth + 1)
+end
+
+# Where the elements of a declared array may lie, from the array at the bottom of its wrappers:
+# that root's region, or, for a root built on a pointer whose layout is not known, the address its
+# data starts at. `nothing` when neither is known. With `allocation`, an `Array` root answers with
+# its whole `Memory`.
+function _root_place(@nospecialize(x::AbstractArray); allocation::Bool = false)
+    root = _root_array(x)
+    (allocation && root isa Array) && (root = root.ref.mem)
+    isempty(root) && return nothing
+    g = _memory_region(root)
+    isnothing(g) || return g
+    i = _data_pointer_field(typeof(root))
+    i == 0 && return nothing
+    p = getfield(root, i)::Ptr
+    return p == C_NULL ? nothing : UInt(p)
+end
+
+# Whether a region meets a declared array: `:yes`/`:none` by the array's own region where it has
+# one. Otherwise (a view whose indices are not ranges) the array's elements lie somewhere in its
+# root's memory, so a meet there is `:maybe`.
+function _region_meets_array(g::_Region, @nospecialize(x::AbstractArray))
+    isempty(x) && return :none
+    own = _memory_region(x)
+    isnothing(own) || return _regions_meet(g, own)
+    w = _root_place(x)
+    w isa _Region && return _regions_meet(g, w) === :none ? :none : :maybe
+    w isa UInt && return :maybe
+    return any(id -> g.lo <= id < g.hi, Base.dataids(x)) ? :maybe : :none
+end
+
+# Whether an address lies in the memory a declared array covers (`own`), or in the allocation the
+# array belongs to (`!own`). Where the array's own elements lie is not always known; then the
+# address is tested against its root's memory.
+function _address_in_array(p::UInt, @nospecialize(x::AbstractArray), own::Bool)
+    isempty(x) && return false
+    g = own ? _memory_region(x) : nothing
+    isnothing(g) || return g.lo <= p < g.hi
+    w = _root_place(x; allocation = !own)
+    # Only Julia's own allocations have known bounds; a root built on a pointer covers part of one.
+    (w isa _Region && !own && !(_root_array(x) isa Union{Array, Memory})) && return true
+    w isa _Region && return w.lo <= p < w.hi
+    w isa UInt && return !own || p == w
+    return p in Base.dataids(x)
+end
+
+# Whether the data pointer of an array whose layout is not known may reach memory the other
+# argument covers. Its elements stay inside the allocation it points into, so a declared array
+# whose allocation does not hold it is apart. A region or another such pointer may be in that
+# allocation, which nothing here can rule out.
+_start_meets(p::UInt, r::_Reached) =
+    !isempty(r.regions) || !isempty(r.starts) || p in r.ptrs ||
+    any(x -> _address_in_array(p, x, false), r.arrays)
+
+# Whether a raw pointer points at memory the other argument reaches. How far the pointer's own
+# memory extends is not known, so this is evidence of sharing and not a comparison of two ranges.
+_pointer_meets(p::UInt, r::_Reached) =
+    p in r.ptrs || p in r.starts || any(g -> g.lo <= p < g.hi, r.regions) ||
+    any(x -> _address_in_array(p, x, true), r.arrays)
+
+# `:yes`, `:maybe` or `:none` for the memory two collections cover.
+function _reached_meet(ra::_Reached, rb::_Reached)
+    any(x -> any(y -> Base.mightalias(x, y), rb.arrays), ra.arrays) && return :yes
+    maybe = false
+    for g in ra.regions, h in rb.regions
+        v = _regions_meet(g, h)
+        v === :yes && return :yes
+        maybe |= v === :maybe
+    end
+    for (gs, xs) in ((ra.regions, rb.arrays), (rb.regions, ra.arrays)), g in gs, x in xs
+        v = _region_meets_array(g, x)
+        v === :yes && return :yes
+        maybe |= v === :maybe
+    end
+    maybe && return :maybe
+    (any(p -> _start_meets(p, rb), ra.starts) || any(p -> _start_meets(p, ra), rb.starts)) &&
+        return :maybe
+    (any(p -> _pointer_meets(p, rb), ra.ptrs) || any(p -> _pointer_meets(p, ra), rb.ptrs)) &&
+        return :maybe
+    return :none
+end
+
+# Whether the memory two arguments reach overlaps, by the evidence there is. Two arrays found
+# inside them are asked of `Base.mightalias`, exactly as two plain arguments are, so disjoint views
+# of one parent inside two wrappers do not overlap. An array whose layout is known is compared
+# element by element where `_Region` describes it exactly, and by span otherwise. What cannot be
+# placed exactly, and may meet the other's memory, is `:undecided`.
+@noinline function _deep_overlap(@nospecialize(a), @nospecialize(b))
+    ra = _Reached()
+    _collect_memory!(ra, a, _ALIAS_FIELD_DEPTH)
+    isempty(ra) && return :none
+    rb = _Reached()
+    _collect_memory!(rb, b, _ALIAS_FIELD_DEPTH)
+    v = _reached_meet(ra, rb)
+    v === :yes && return (a isa AbstractArray && b isa AbstractArray) ? :arrays : :fields
+    return v === :maybe ? :undecided : :none
+end
+
+# How two arguments share memory: `:arrays` when both are arrays, `:fields` when the shared buffer
+# sits in a field of an argument that is not an array, `:undecided` when the memory that may meet
+# could not be placed exactly, `:none` otherwise. Two arrays that declare their ids are answered by
+# `Base.mightalias` alone, which knows disjoint views of one parent apart and allocates nothing.
+# It answers `false` for any plain-data array, whatever it points at, so those are compared by
+# where their elements lie.
+@inline function _overlap(a, b)
+    if a isa AbstractArray && b isa AbstractArray
+        Base.mightalias(a, b) && return :arrays
+        (!isbits(a) && !isbits(b) && _declares_ids(a) && _declares_ids(b)) && return :none
+    end
+    (_reads_memory(a) && _reads_memory(b)) || return :none
+    return _deep_overlap(a, b)
+end
+
+@noinline function _noalias_unwritable(target, @nospecialize(f), @nospecialize(arg), p::Int, default::Bool)
+    what = "argument $p is a `$(typeof(arg))`, which holds no memory to write"
+    throw(
+        ArgumentError(
+            default ?
+                "@assert_noalias $target: $what, so it is not what `$(_func_name(f))` writes, and " *
+                "the `!` convention names no other argument. Name the written positions, for " *
+                "example `mutates = ($(p + 1),)`." :
+                "@assert_noalias $target: mutates = $p, but $what. Name the argument the call writes."
+        )
+    )
+end
+
+@noinline function _noalias_number_default(target, @nospecialize(f), @nospecialize(args::Tuple), p::Int)
+    q = something(findfirst(x -> x isa AbstractArray, args))
+    throw(
+        ArgumentError(
+            "@assert_noalias $target: argument $p is a `$(typeof(args[p]))`, a number, and the call " *
+                "also takes an array, so the `!` convention does not say which of them " *
+                "`$(_func_name(f))` writes. Name the written positions, for example " *
+                "`mutates = ($q,)`."
+        )
+    )
+end
+
 function _assert_noalias(
         target, @nospecialize(f), @nospecialize(args::Tuple);
-        mutates = nothing, gates::Bool = _guarantee_gates(:noalias)
+        mutates = nothing, default::Bool = isnothing(mutates), gates::Bool = _guarantee_gates(:noalias)
     )
     n = length(args)
     pos = isnothing(mutates) ? _runtime_mutated(f, n) : _check_mutates(mutates, n)
     isnothing(pos) &&
         throw(ArgumentError("@assert_noalias: `$(_func_name(f))` " * _NOALIAS_NO_BANG))
+    # A position that cannot be written compares nothing, and passing would say the call was checked.
+    for p in pos
+        _holds_memory(args[p]) || _noalias_unwritable(target, f, args[p], Int(p), default)
+        # A `BigFloat` holds memory, and as the scale factor of `scale!(a, v)` it is no more the
+        # written argument than a `Float64` is. The name alone does not say which the call
+        # writes, so the caller does.
+        (default && args[p] isa Number && any(x -> x isa AbstractArray, args)) &&
+            _noalias_number_default(target, f, args, Int(p))
+    end
     # The scan returns on the first overlap and builds the message in a separate frame: a call that
     # satisfies the assertion must allocate nothing, or the assertion changes what it measures.
     for i in pos, j in 1:n
         i == j && continue
-        Base.mightalias(args[i], args[j]) && return _noalias_fail(target, args, pos, n, gates)
+        _overlap(args[i], args[j]) === :none || return _noalias_fail(target, args, pos, n, gates)
     end
     return nothing
 end
 
 @noinline function _noalias_fail(target, @nospecialize(args::Tuple), pos, n::Int, gates::Bool)
     overlaps = String[]
+    undecided = String[]
+    arrays = false
     for i in pos, j in 1:n
         i == j && continue
-        Base.mightalias(args[i], args[j]) && push!(overlaps, "argument $i (written) and argument $j")
+        kind = _overlap(args[i], args[j])
+        kind === :none && continue
+        arrays |= kind === :arrays
+        if kind === :undecided
+            push!(undecided, "argument $i (written) and argument $j")
+            continue
+        end
+        # The argument that is not an array is the one whose field holds the shared buffer.
+        holder = args[j] isa AbstractArray ? i : j
+        push!(
+            overlaps, kind === :arrays ? "argument $i (written) and argument $j" :
+                "argument $i (written) and argument $j (a buffer held in a field of argument " *
+                "$holder, a `$(typeof(args[holder]))`)"
+        )
     end
+    # Memory that could not be placed exactly and may meet the other argument's: reported, since
+    # nothing compared says the two do not overlap, and never raised on.
+    if isempty(overlaps)
+        _fail(
+            :noalias, target,
+            "arguments may share memory: " * join(undecided, ", ") * ". Where the elements of " *
+                "one of them lie is not known exactly, and that memory may meet the other's, so " *
+                "the overlap could not be decided either way. A raw pointer says where memory " *
+                "starts and not how far it reaches; an array type built on a pointer gives its " *
+                "layout through `Base.strides`, and is placed only within its allocation without " *
+                "it; a view whose indices are not ranges is placed only within its parent, and a " *
+                "layout other than a vector or a matrix with contiguous columns within its span.";
+            gates = false
+        )
+        return nothing
+    end
+    isempty(undecided) || append!(overlaps, undecided .* " (not decided)")
+    # Two arrays that overlap are what the kernel reads and writes. A buffer inside a struct
+    # argument is shared memory the kernel may never read, so that overlap alone reports.
     _fail(
         :noalias, target,
         "arguments share memory: " * join(overlaps, ", ") * ". A function that writes one " *
@@ -434,7 +812,7 @@ end
             "answer differently under another loop order, blocking, or Julia version. Pass a copy " *
             "of the input, write to a separate destination, or call an in-place form documented " *
             "to accept the overlap.";
-        gates = gates
+        gates = gates && arrays
     )
     return nothing
 end
@@ -458,8 +836,38 @@ engine to answer and no entry in [`StrictMode.guarantee_names`](@ref) — it can
 the one `Base.unalias` uses to decide whether to copy.
 
 Which arguments are written comes from the name — a trailing `!` means argument 1 — and anything
-else must say so with `mutates = (…)`. A call that gives neither is rejected rather than passed,
-since "nothing is written" would compare no pair and accept everything.
+else must say so with `mutates = (…)`. A call that gives neither, or an empty `mutates`, is
+rejected rather than passed, since "nothing is written" would compare no pair and accept everything. So is a written position
+that holds no memory: `axpy!(a, x, y)` takes a scalar first, so the `!` default names nothing a
+kernel could write, and the call raises an `ArgumentError` asking for `mutates = (3,)`. The
+convention is not checked beyond that: `ldiv!(F, B)` writes its second argument, and the default
+still compares argument 1 against the rest, which for a two-argument call is the same pair.
+
+An argument is compared by the memory it reaches. Two arrays are compared with `Base.mightalias`.
+An array type that defines no `Base.dataids` method (a wrapper struct around a `Vector`) and an
+argument that is not an array (a workspace struct, a factorization, a closure) are read through
+their fields, three levels down, and the arrays found there are compared the same way, so disjoint
+views inside two wrappers do not overlap. Arrays held as ELEMENTS, as in `[y, z]` or a `Dict`, are
+not followed.
+
+An array type built on a pointer (a plain-data struct whose one `Ptr{T}` field, or whose only
+`Ptr` field, is its data) is compared by where its elements lie. That is known when the type
+defines `Base.strides`, which together with the pointer and the size gives its layout; a view of
+it with range indices is placed the same way. A vector, a strided vector and a matrix with
+contiguous columns are compared element by element, so two submatrices with a leading dimension
+whose spans interleave are told apart; another layout is compared by its span. Its other fields (a
+library handle, the vector that keeps the memory alive) are not memory it covers.
+
+What cannot be placed exactly, and may meet the other argument's memory, warns that the arguments
+may share memory and never raises: an array built on a pointer with no `Base.strides`, which is
+placed only within the allocation its pointer points into; a view whose indices are not ranges,
+placed within its parent; a layout compared by its span; and a raw pointer that is not an array's
+data (a field of a struct, a `BigInt`'s limbs), which says where memory starts and not how far it
+reaches, and is reported when it equals another pointer or points into memory the other argument
+reaches.
+
+An overlap between two arrays raises. An overlap with a buffer held in a field of a non-array
+argument warns: the memory is shared, but nothing says the kernel reads that field.
 
 ```julia
 A = rand(8, 8); C = similar(A)
@@ -470,8 +878,9 @@ A = rand(8, 8); C = similar(A)
 @assert_noalias mutates=(1, 2) swap!(x, y) # neither the name nor one position is enough
 ```
 
-A call that satisfies the assertion allocates nothing: the pair scan returns on the first overlap
-and the message is built in another frame. Costs about 2 ns per pair.
+A call on arrays that satisfies the assertion allocates nothing: the pair scan returns on the
+first overlap and the message is built in another frame. Costs about 2 ns per pair. Reading a
+struct argument through its fields allocates.
 
 Overlap is checked for the call that runs, not for every call the method could receive, so this
 narrows the property one site at a time rather than proving it once. Rust decides the same question
@@ -483,7 +892,7 @@ value is returned. Keyword-argument calls are not supported, since `mutates` nam
 positions and a keyword has none.
 """
 macro assert_noalias(args...)
-    pos, opts = _macro_call(args, (:mutates,))
+    pos, opts = _macro_call("@assert_noalias", args, (:mutates,))
     isempty(pos) && throw(ArgumentError("@assert_noalias needs a call expression"))
     call = pos[1]
     fexpr, argexprs, kwexprs = _callinfo(call)
@@ -506,6 +915,7 @@ macro assert_noalias(args...)
     else
         nothing
     end
+    isdefault = !haskey(opts, :mutates)
 
     fe = esc(fexpr)
     argsyms = [gensym(:arg) for _ in eachindex(argexprs)]
@@ -514,7 +924,7 @@ macro assert_noalias(args...)
     checked = quote
         $(binds...)
         local _f = $fe
-        $(_assert_noalias)($target, _f, ($(argsyms...),); mutates = $mutates_expr)
+        $(_assert_noalias)($target, _f, ($(argsyms...),); mutates = $mutates_expr, default = $isdefault)
         _f($(argsyms...))
     end
     return _gate(checked, esc(call))

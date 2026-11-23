@@ -85,3 +85,32 @@ end
     # g allocates a Vector, so noalloc fails either way; the point is the override drives the signature.
     @test_throws StrictViolation @test_noalloc g(Float64) types = (Type{Float64},)
 end
+
+@testitem "the scan skips a branch guarded by `x === x` being false" begin
+    using StrictMode, StrictModeTest, LinearAlgebra
+    V = SubArray{Float64, 1, Vector{Float64}, Tuple{UnitRange{Int64}}, true}
+    # A triangular solve in place inlines `C === B ? C : copyto!(C, B)` with C and B the same
+    # value, so the copy, whose unaliasing allocates, can never run.
+    @noinline function gram_solve!(R::Matrix{Float64}, rhs::AbstractVector{Float64}, k::Int)
+        b = view(rhs, 1:k)
+        U = UpperTriangular(view(R, 1:k, 1:k))
+        ldiv!(adjoint(U), b)
+        ldiv!(U, b)
+        return rhs
+    end
+    gt = (Matrix{Float64}, V, Int)
+    @test !any(StrictMode._failed, findings(gram_solve!, gt; guarantees = (:noalloc,)))
+    @test !any(StrictMode._failed, StrictModeTest.proof_findings(gram_solve!, gt; guarantees = (:noalloc,)))
+
+    # Two arguments are not the same value, so the copy can run: two views of one parent that
+    # overlap allocate, and both tiers must say so.
+    @noinline cp!(d, s) = copyto!(d, s)
+    @test any(StrictMode._failed, findings(cp!, (V, V); guarantees = (:noalloc,)))
+    @test any(StrictMode._failed, StrictModeTest.proof_findings(cp!, (V, V); guarantees = (:noalloc,)))
+    @noinline cp_unless_same!(d, s) = d === s ? d : copyto!(d, s)
+    @test any(StrictMode._failed, findings(cp_unless_same!, (V, V); guarantees = (:noalloc,)))
+    @test any(StrictMode._failed, StrictModeTest.proof_findings(cp_unless_same!, (V, V); guarantees = (:noalloc,)))
+    x = collect(1.0:10.0)
+    cp!(view(x, 1:5), view(x, 3:7))
+    @test (@allocated cp!(view(x, 1:5), view(x, 3:7))) > 0
+end

@@ -100,6 +100,10 @@ function _unopt_callee(ci, @nospecialize(a))
 end
 
 function _call_callee_and_args(ci, st)
+    # Unoptimized IR keeps a local as a slot, and a call whose result is stored in one is the
+    # right-hand side of an assignment: `b = unsafe_trust(u)` is `_3 = (%1)(_2)`. Read as a
+    # statement that is no call, it hid every read whose result was given a name.
+    Meta.isexpr(st, :(=)) && (st = st.args[2])
     Meta.isexpr(st, :call) && return _unopt_callee(ci, st.args[1]), st.args[2:end]
     # `:invoke_modify` carries an `:invoke`'s layout and is what the atomic read-modify-write forms
     # lower to, so a scan that omits it reads `@atomic x.f += v` as no call at all.
@@ -221,10 +225,18 @@ allocating function, and `:noalloc` cannot express what it really guarantees: "f
 growths, then nothing" is a property of the call sequence rather than of the code, so an all-paths
 proof must report the growth path forever. Excuse it visibly with
 `@strict_exempt :noalloc reason = "…"` and assert the real property where it can be measured — warm
-the call, then check that a second identical call allocates nothing.
+the call, then check that a second identical call allocates nothing
+(`StrictModeTest.@test_steady_state`). The allocation proof then reports a caller whose only
+allocations are inside such exempt functions as its own result, SM0018, listing each exempt
+function with its reason. That is not a pass: `@test_noalloc` and the `test_*` gates fail it unless
+they are given `allow_exempt = true`, and a caller with one allocation of its own fails either way.
+The exemption has to be declared in the module that defines the function, as `@strict_exempt` in
+its source is: one declared with no module covers by name and excuses nothing in the proof.
 
-**A barrier excuses allocation, and nothing else.** Every other guarantee still reads `f` itself: a
-dictionary lookup or a boxed value inside `f` is reported when `f` is checked, once. A caller whose
+**A barrier excuses allocation, and nothing else.** Under `:noalloc` a box is an allocation, so a
+caller passes whatever `f` allocates or boxes. Every other guarantee still reads `f` itself: a
+dictionary lookup (`:owned`) or a boxed value (`:noboxing`) inside `f` is reported when `f` is
+checked, once. A caller whose
 only such cause lies inside `f` is neither failed again nor passed as if it had been checked: it
 gets an `:info` finding that names `f`, so the reader can follow it to the one place it is reported.
 A `:owned` failure on a `OncePerTask` accessor is the usual case: the lookup is the price of
@@ -233,6 +245,23 @@ per-task state, and it belongs to the accessor, not to every kernel that reaches
 Registering is a whole-session, function-identity-keyed decision (not per-call-site), and clears
 the findings cache (it changes `:noalloc`/`:noboxing` verdicts for every caller of `f`).
 
+A callable object is registered as its type, `register_alloc_barrier!(Table)`, and that covers a
+call of every `Table`: the scan reads the callee's type and has no value to tell one instance from
+another. Passing one instance, `register_alloc_barrier!(Table(4))`, raises for that reason, as does
+a closure that captures a variable. A function is the only instance of its type and is passed as
+itself. Registering a type does not cover its constructor.
+
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
+registering a function another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. So does a
+call made by the owning package's own code while another package precompiles, such as a
+registration on first use that a dependent's precompile workload triggers. In a
+session the registration lasts for the session.
+
 ```julia
 @noinline function _my_calibrator()
     ...   # measures something once, memoizes it in a Ref/const
@@ -240,17 +269,33 @@ end
 register_alloc_barrier!(_my_calibrator)
 ```
 """
-function register_alloc_barrier!(@nospecialize(f))
-    push!(_ALLOC_BARRIERS, f)
-    # The registry above lives in this session. A package that registers at its own precompile loses it
-    # at the next load, so the registration is also kept in the package that owns the function, which
-    # is serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
-    try
-        store = _local_store!(parentmodule(f), _LOCAL_BARRIERS, Any[])
-        any(g -> g === f, store) || push!(store, f)
-    catch
-        # A module that is closed to writes keeps the session registration only.
+function register_alloc_barrier!(@nospecialize(f); mod::Module = _owner_module(f))
+    # A barrier is recognized by the type of the callee, which is all the scan has. One instance
+    # of a type with several would stand for all of them without saying so.
+    (f isa Type || isdefined(typeof(f), :instance)) || throw(
+        ArgumentError(
+            "register_alloc_barrier!: this is one instance of `$(_type_name(typeof(f)))`, and a " *
+                "barrier is matched on the callee's type, so it would cover every " *
+                "`$(_type_name(typeof(f)))`. Register the type, which says so: " *
+                "`register_alloc_barrier!($(_type_name(typeof(f))))`."
+        )
+    )
+    # `_ALLOC_BARRIERS` lives in this session. A package that registers at its own precompile loses
+    # it at the next load, so the registration is also kept in the package named by `mod`, which is
+    # serialized with it, and read back with the other loaded packages' (`_barrier_functions`).
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
+    if ccall(:jl_generating_output, Cint, ()) == 1
+        _persist_registration!(f, mod, _LOCAL_BARRIERS, "register_alloc_barrier!($(_func_name(f)))")
+    else
+        # A module that is closed to writes keeps the session registration only, which is all a
+        # session needs.
+        try
+            store = _local_store!(mod, _LOCAL_BARRIERS, Any[])
+            any(g -> g === f, store) || push!(store, f)
+        catch
+        end
     end
+    push!(_ALLOC_BARRIERS, f)
     _BARRIER_GEN[] += 1
     clear_cache!()
     return nothing
@@ -286,7 +331,12 @@ end
 # merely appears as an ordinary argument elsewhere (e.g. passed as a callback) — that distinction
 # matters here in a way it doesn't for the `Base` types below, since a registered function is an
 # arbitrary user function that could legitimately be passed around as a value.
-_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> p === typeof(f), _barrier_functions())
+_is_registered_callee(@nospecialize(p)) = p isa Type && any(f -> _barrier_covers(f, p), _barrier_functions())
+
+# Whether a registration covers a callee of type `p`: a function covers its own type, and a
+# registered type covers every instance of it. `Type{T}`, the callee of a constructor call, is
+# not an instance of `T`.
+_barrier_covers(@nospecialize(f), @nospecialize(p)) = f isa Type ? (p isa Type && p <: f) : p === typeof(f)
 
 # `(::OncePerProcess)()` (and OncePerThread) are themselves `@inline`d away in Base —
 # the fast (already-initialized) path is inlined directly into the caller, so the only surviving
@@ -308,18 +358,28 @@ _is_base_barrier_type(@nospecialize(p)) = p isa Type && any(bt -> p <: bt, _BASE
 _mi_is_strictmode(mi::Core.MethodInstance) =
     mi.def isa Method && Base.moduleroot(mi.def.module) === @__MODULE__
 
+# The type of the callable whose keyword body `mi` is, or `nothing` for any other method. Lowering
+# passes a keyword body its keyword values first and the callable after them, and records how many
+# keyword values there are in the method's `nkw`. The name is no guide: a callable object's keyword
+# body is named `#_#N`.
+function _kwbody_self(mi::Core.MethodInstance)
+    m = mi.def
+    (m isa Method && m.nkw > 0) || return nothing
+    st = mi.specTypes
+    st isa DataType || return nothing
+    ps = st.parameters
+    return length(ps) >= m.nkw + 2 ? ps[m.nkw + 2] : nothing
+end
+
 # A registered function called with keywords is reached through two more methods: `Core.kwcall`, which
-# carries the function at parameter 3, and the keyword-sorted body `#f#N`, which carries it after the
-# keyword values. Both are the barrier: the allocation is the registered function's own.
+# carries the function at parameter 3, and the keyword body, which carries it after the keyword
+# values (`_kwbody_self`). Both are the barrier: the allocation is the registered function's own.
 function _is_registered_kw_callee(mi::Core.MethodInstance, ps)
     bs = _barrier_functions()
     (isempty(bs) || !(mi.def isa Method)) && return false
     ps[1] === typeof(Core.kwcall) && return length(ps) >= 3 && _is_registered_callee(ps[3])
-    name = _demangle(mi.def.name)
-    for f in bs
-        nameof(f) === name && any(p -> p === typeof(f), ps) && return true
-    end
-    return false
+    self = _kwbody_self(mi)
+    return !isnothing(self) && _is_registered_callee(self)
 end
 
 function _mi_is_barrier(mi::Core.MethodInstance)
@@ -353,13 +413,17 @@ const _SCAN_BODY_BUDGET = Ref(1000)
 # Base's task, lock and condition code. Its run-time dispatch is the scheduler's own, off the call's
 # hot path, and AllocCheck reports none there, so a callee reached only through it is not boxing.
 const _SCHEDULER_FILES = ("task.jl", "condition.jl", "lock.jl", "locks-mt.jl", "partr.jl")
-_in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && mi.def.module === Base &&
-    basename(string(mi.def.file)) in _SCHEDULER_FILES
+_method_in_scheduler(m::Method) = Base.moduleroot(m.module) === Base && basename(string(m.file)) in _SCHEDULER_FILES
+_in_scheduler(mi::Core.MethodInstance) = mi.def isa Method && _method_in_scheduler(mi.def)
 
-# A callee the scan follows below the Base levels: one defined outside Base and Core, or a Base
-# method handed the package's code or types to run (a closure given to `map`).
-function _enters_user_code(mi::Core.MethodInstance)
+# A callee the scan follows below the Base levels: one defined outside Base and Core, a Base method
+# handed the package's code or types to run (a closure given to `map`), or Base's task, lock and
+# condition code. Whether a wait allocates is decided several scheduler calls down (a task queue that
+# grows, a work queue made on first use), and how many depends on what Base inlines, which differs
+# between Julia releases: read to a fixed depth, the same `yield()` allocates on one and not another.
+function _followed_to_end(mi::Core.MethodInstance)
     mi.def isa Method || return false
+    _in_scheduler(mi) && return true
     root = Base.moduleroot(mi.def.module)
     return !(root === Base || root === Core) || _carries_user_type(mi.specTypes)
 end
@@ -423,7 +487,8 @@ const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, _AllocSign
 function _alloc_signals(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
     )
-    sig = _sigtype(f, types)
+    _sync_exemptions!()   # the memo key cannot see a change to `exempt_strict()`
+    sig = _entry_key(f, types)
     key = (depth, Base.get_world_counter(), mode)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
@@ -442,12 +507,12 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
     # callee of another, and a body is read once.
     topci = _typed_body(sig)
     seen = Base.IdSet{Any}()
-    push!(seen, sig)
+    push!(seen, (sig, mode, false))
     alloc, boxing, dictlookup, abscontainer, barrier, unionphi, exempt, barrier_dict, barrier_box, truncated =
         isnothing(topci) ? (false, false, false, nothing, false, false, nothing, nothing, nothing, false) :
         _scan_ci(topci, sig, depth, seen, mode, true)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
@@ -458,6 +523,32 @@ function _alloc_signals_uncached(@nospecialize(f), @nospecialize(types::Tuple), 
         unread = isnothing(topci), barrier_dict, barrier_box, truncated,
     )
 end
+
+# When something was read from a signature: the world, the specialization the signature dispatched
+# to, and the compiler's record of that specialization (`_record_of`).
+struct _ReadStamp
+    world::UInt
+    mi::Union{Nothing, Core.MethodInstance}
+    record::Union{Nothing, Core.CodeInstance}
+end
+
+# Whether what was read from the body `key` (`_callee_key`) at `s` is what would be read now. It is
+# in the world of the read. In a later world it is while both hold: the compiler's record is valid,
+# which Julia ends when anything the inference of the specialization depended on changes (a callee,
+# a binding); and `key` still names that specialization. The second is not implied by the first:
+# Julia ends the records of the callers of a replaced method and leaves the replaced method's own
+# record valid, and a more specific method added later takes over a signature without touching the
+# record of the method that used to answer it.
+function _read_holds(s::_ReadStamp, @nospecialize(key), world::UInt = Base.get_world_counter())
+    s.world == world && return true
+    r = s.record
+    (!isnothing(r) && r.min_world <= world <= r.max_world) || return false
+    return _key_instance(key, world) === s.mi
+end
+
+# `s` as of `world`, for a read found to hold there: the next question in that world is answered
+# by the first comparison, without asking dispatch again.
+_as_of(s::_ReadStamp, world::UInt) = s.world == world ? s : _ReadStamp(world, s.mi, s.record)
 
 # --- issue #17: escape analysis, so the `:new` rule stops flagging what LLVM elides -------------
 #
@@ -486,7 +577,10 @@ end
 # `Core.Compiler.EscapeAnalysis` is a compiler internal with no stability guarantee across Julia
 # versions, so EVERY failure here falls back to `false` — "assume it escapes", i.e. the behavior
 # without this. A missing analysis must never quiet a guarantee.
-const _ESCAPE_MEMO = IdDict{Any, Bool}()
+#
+# Kept while the read it came from holds (`_read_holds`): the analysis reads the signature's own
+# inferred body, so a redefinition changes the answer in either direction.
+const _ESCAPE_MEMO = IdDict{Any, Tuple{_ReadStamp, Bool}}()
 const _ESCAPE_MEMO_LOCK = ReentrantLock()
 
 # The pass `code_ircode_by_type` must stop at, by the name this compiler uses for it. The compiler
@@ -499,11 +593,16 @@ const _INLINING_PASS = let CC = Core.Compiler
     isnothing(i) ? "Inlining" : names[i]
 end
 
-function _all_news_nonescaping(@nospecialize(sig))
-    cached = @lock _ESCAPE_MEMO_LOCK get(_ESCAPE_MEMO, sig, nothing)
-    isnothing(cached) || return cached
+function _all_news_nonescaping(@nospecialize(key))
+    world = Base.get_world_counter()
+    cached = @lock _ESCAPE_MEMO_LOCK get(_ESCAPE_MEMO, key, nothing)
+    if !isnothing(cached) && _read_holds(cached[1], key, world)
+        cached[1].world == world ||
+            @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[key] = (_as_of(cached[1], world), cached[2]))
+        return cached[2]
+    end
     v = try
-        _compute_all_news_nonescaping(sig)
+        _compute_all_news_nonescaping(key)
     catch err
         # `false` is the conservative answer — it only declines to suppress a finding — which is why
         # this failing is invisible in a verdict. Say it once: when the compiler renamed its
@@ -514,13 +613,15 @@ function _all_news_nonescaping(@nospecialize(sig))
             sprint(showerror, err) maxlog = 1
         false
     end
-    @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[sig] = v)
+    mi = _key_instance(key, world)
+    stamp = _ReadStamp(world, mi, isnothing(mi) ? nothing : _record_of(mi, world))
+    @lock _ESCAPE_MEMO_LOCK (_ESCAPE_MEMO[key] = (stamp, v))
     return v
 end
 
-function _compute_all_news_nonescaping(@nospecialize(sig))
+function _compute_all_news_nonescaping(@nospecialize(key))
     EA = Core.Compiler.EscapeAnalysis
-    irs = _code_ircode_by_type(sig)
+    irs = _code_ircode_of(key)
     isempty(irs) && return false
     ir = first(irs)[1]
     # `Returns(false)` is the conservative cache callback: an `:invoke` callee with no cached escape
@@ -552,6 +653,15 @@ An error path is every statement from which no path reaches a `return` carrying 
 the throw, so counting only the throw's own block reported `print_to_string`'s allocation for text no
 successful call ever builds. A loop is never an error path: a statement is live when *some* path from
 it returns.
+
+A throw that a catch handles is not an error path when the catch can return: every statement in the try
+body has the handler as a successor, so the message it builds and the exception it boxes count, and so
+does the handler. A throw raised inside a callee the try body calls counts too: the callee, and
+everything it calls, is read with no statement skipped as an error path.
+
+A handler that begins `err isa T || rethrow()` returns only for a `T`: a throw whose exception type is
+known, concrete and not a `T` ends in that rethrow, so the path to it is an error path, in the try body
+and in the callees below it.
 """
 ignore_throw() = _IGNORE_THROW[]
 
@@ -583,20 +693,43 @@ end
 # A statement is alive when one of its successors is, and a `ReturnNode` carrying a value is alive: the
 # fixed point of that, taken over the statements from the last to the first until nothing changes. A
 # loop cannot fool it: a statement is alive when *some* path from it returns, and everything left over
-# leads only to a throw or to an unreachable terminator. No per-statement storage: a body is a few
-# thousand statements and this runs for every body a walk reads.
-function _deadend_mask(code::Vector{Any})
+# leads only to a throw or to an unreachable terminator. No per-statement storage outside a `try`: a
+# body is a few thousand statements and this runs for every body a walk reads.
+#
+# A throw that a catch handles is not an error path: every statement in a try region also has the
+# region's handler as a successor, so it is alive when the handler can return. A handler that
+# returns only for a type `T` (`_handler_filter`) is a successor only of the statements that may
+# throw something other than an exception known to be no `T` (`_rethrown`).
+#
+# `caught` is the context the body runs in (`_join_caught`): with a type `T`, a statement that may
+# throw, or the `unreachable` after a throw, is alive unless what it throws is known to be no `T`.
+# `ci` and `sig` give the statement types and flags those tests read; without them every handler
+# is taken to return whatever is thrown.
+function _deadend_mask(code::Vector{Any}, ci = nothing, @nospecialize(sig) = nothing, caught = false)
     n = length(code)
     iszero(n) && return falses(0)
     alive = falses(n)
+    handlers = _try_handlers(code)
+    filters = isnothing(handlers) || isnothing(ci) ? nothing : Dict{Int, Any}()
+    filter_of(d) = isnothing(filters) ? nothing : get!(() -> _handler_filter(code, d), filters, d)
+    thrown = Dict{Int, Union{Nothing, Vector{Any}}}()
+    # Held in a `RefValue{Any}`: a closure capturing `sig` itself is a new type for every signature,
+    # and each one compiles its own `any` below.
+    sigref = Base.RefValue{Any}(sig)
+    rethrown(i, T) = !isnothing(ci) && _rethrown(ci, sigref[], i, T, thrown)
+    via(i, d) = (T = filter_of(d); isnothing(T) || (_maythrow(ci, i) && !rethrown(i, T)))
     changed = true
     while changed
         changed = false
         for i in n:-1:1
             alive[i] && continue
             st = code[i]
-            up = if st isa Core.ReturnNode
-                isdefined(st, :val)
+            up = if !isnothing(handlers) && any(d -> alive[d] && via(i, d), handlers[i])
+                true
+            elseif caught isa Type && _maythrow(ci, i) && !rethrown(i, caught)
+                true
+            elseif st isa Core.ReturnNode
+                isdefined(st, :val) || (caught isa Type && !(i > 1 && rethrown(i - 1, caught)))
             elseif st isa Core.GotoNode
                 1 <= st.label <= n && alive[st.label]
             elseif st isa Core.GotoIfNot
@@ -604,6 +737,11 @@ function _deadend_mask(code::Vector{Any})
             elseif Meta.isexpr(st, :gotoifnot)
                 t = st.args[2]
                 (t isa Integer && 1 <= t <= n && alive[t]) || (i < n && alive[i + 1])
+            elseif st isa Core.EnterNode
+                # A throw in the try body continues at the handler, so a catch that returns keeps
+                # everything before the `try` live.
+                d = st.catch_dest
+                (1 <= d <= n && alive[d]) || (i < n && alive[i + 1])
             else
                 i < n && alive[i + 1]                    # falls through
             end
@@ -616,6 +754,245 @@ function _deadend_mask(code::Vector{Any})
     return map(!, alive)
 end
 
+# For each statement, the handlers (`catch_dest`s) of the try regions it lies in, or `nothing` for a
+# body with no `try`. A region is what the body of an `EnterNode` reaches before the `:leave` that
+# names it, a nested handler included, since a throw there still lands in the outer one. A
+# `ReturnNode` is left out: a `return` cannot throw, and an `unreachable` never executes.
+function _try_handlers(code::Vector{Any})
+    n = length(code)
+    handlers = nothing
+    for e in 1:n
+        st = code[e]
+        (st isa Core.EnterNode && 1 <= st.catch_dest <= n) || continue
+        isnothing(handlers) && (handlers = [Int[] for _ in 1:n])
+        seen = falses(n)
+        work = [e + 1]
+        while !isempty(work)
+            i = pop!(work)
+            (1 <= i <= n && !seen[i]) || continue
+            seen[i] = true
+            s = code[i]
+            Meta.isexpr(s, :leave) && any(==(Core.SSAValue(e)), s.args) && continue
+            s isa Core.ReturnNode && continue
+            push!(handlers[i], st.catch_dest)
+            if s isa Core.GotoNode
+                push!(work, s.label)
+            elseif s isa Core.GotoIfNot
+                push!(work, s.dest, i + 1)
+            elseif Meta.isexpr(s, :gotoifnot)
+                t = s.args[2]
+                t isa Integer && push!(work, t)
+                push!(work, i + 1)
+            elseif s isa Core.EnterNode
+                1 <= s.catch_dest <= n && push!(work, s.catch_dest)
+                push!(work, i + 1)
+            else
+                push!(work, i + 1)
+            end
+        end
+    end
+    return handlers
+end
+
+# Is statement `c` the call `x === x`, one value compared with itself? Egal is reflexive, so it is
+# true whatever `x` holds. Only an SSA value or an argument counts as "the same value": two
+# separate arguments may or may not be the same object, and that is not known without values.
+function _reflexive_egal(code::Vector{Any}, @nospecialize(c))
+    c isa Core.SSAValue && 1 <= c.id <= length(code) || return false
+    st = code[c.id]
+    Meta.isexpr(st, :call) && length(st.args) == 3 || return false
+    _static_callee(nothing, st.args[1]) === (===) || return false
+    a, b = st.args[2], st.args[3]
+    return (a isa Core.SSAValue || a isa Core.Argument) && a == b
+end
+
+# Statements no execution reaches from the entry, reading a `goto … if not` whose condition is
+# `x === x` as never jumping. Inlining a callee that takes the same value twice leaves exactly that
+# guard: a triangular `ldiv!(U, b)` forwards to `_ldiv!(b, U, b)` and inlines to
+# `b === b ? b : copyto!(b, b)`, and the copy, whose unaliasing allocates, never runs. The optimizer keeps the comparison and LLVM folds it, so AllocCheck sees
+# no copy; without this the scan counts code that cannot execute. Every other branch keeps both
+# successors, so the mask only removes a path that egal's reflexivity rules out.
+function _unreachable_mask(code::Vector{Any})
+    n = length(code)
+    reached = falses(n)
+    work = [1]
+    while !isempty(work)
+        i = pop!(work)
+        (1 <= i <= n && !reached[i]) || continue
+        reached[i] = true
+        st = code[i]
+        if st isa Core.ReturnNode
+            continue
+        elseif st isa Core.GotoNode
+            push!(work, st.label)
+        elseif st isa Core.GotoIfNot
+            _reflexive_egal(code, st.cond) || push!(work, st.dest)
+            push!(work, i + 1)
+        elseif Meta.isexpr(st, :gotoifnot)
+            t = st.args[2]
+            t isa Integer && push!(work, t)
+            push!(work, i + 1)
+        elseif st isa Core.EnterNode
+            # The catch destination is reached by a throw from anywhere in the try body.
+            iszero(st.catch_dest) || push!(work, st.catch_dest)
+            push!(work, i + 1)
+        else
+            push!(work, i + 1)
+        end
+    end
+    return map(!, reached)
+end
+
+# The statements a scan of one body skips: those no execution reaches, and, under `ignore_throw()`,
+# those from which no path returns normally. A body scanned in a caught context (`caught`) is called
+# from a try region whose handler can return, so a throw anywhere in it ends in that handler and no
+# statement of it is an error path.
+_skip_mask(code::Vector{Any}, caught = false, ci = nothing, @nospecialize(sig) = nothing) =
+    ignore_throw() && caught !== true ? _deadend_mask(code, ci, sig, caught) .| _unreachable_mask(code) :
+    _unreachable_mask(code)
+
+# The statements of a try region whose handler is not an error path (`dead`): a call there whose
+# callee throws continues at a handler that can return, so the callee is scanned in a caught context.
+# `nothing` for a body with no such region.
+function _caught_region_mask(code::Vector{Any}, dead::BitVector)
+    ctx = _caught_contexts(code, dead)
+    isnothing(ctx) && return nothing
+    return BitVector(c !== false for c in ctx)
+end
+
+# The caught context of each statement's callees (`_join_caught`): `false` outside a try region whose
+# handler can return, else what its handlers return for. `nothing` for a body with no such region.
+# Without `ci`, every handler is taken to return whatever is thrown.
+function _caught_contexts(code::Vector{Any}, dead::BitVector, ci = nothing)
+    handlers = _try_handlers(code)
+    isnothing(handlers) && return nothing
+    filters = Dict{Int, Any}()
+    ctx = Any[false for _ in eachindex(code)]
+    for i in eachindex(code), d in handlers[i]
+        dead[d] && continue
+        T = isnothing(ci) ? nothing : get!(() -> _handler_filter(code, d), filters, d)
+        ctx[i] = _join_caught(ctx[i], isnothing(T) ? true : T)
+    end
+    return any(c -> c !== false, ctx) ? ctx : nothing
+end
+
+# A caught context says what happens to an exception a body throws: `false`, nothing catches it, so
+# under `ignore_throw()` its path is an error path; `true`, a handler that can return catches
+# anything; a type `T`, a handler returns for a `T` and rethrows anything else (`_handler_filter`), so
+# the path to a throw known to be no `T` is still an error path. Two contexts join to what either
+# returns for.
+_join_caught(a, b) = (a === true || b === true) ? true : a === false ? b : b === false ? a : Union{a, b}
+
+# Whether a throw of an `E` in the caught context `ctx` (`_join_caught`) continues at a handler that
+# returns normally.
+_returns_for(ctx, @nospecialize(E)) = ctx === true || (ctx isa Type && E <: ctx)
+
+# Whether `st` is `memoryrefnew(ref, i)` or `memoryrefnew(ref, i, boundscheck)` on a memory reference,
+# an `Int` and a `Bool`. The compiler proves such a call cannot throw except by its bounds check
+# (`memoryref_builtin_common_nothrow`), and the check throws a `BoundsError`. On Julia 1.12 under
+# `--check-bounds=yes`, codegen emits the check even when `boundscheck` is `false`.
+function _bounds_checked_ref(ci, @nospecialize(sig), @nospecialize(st))
+    (Meta.isexpr(st, :call) && 3 <= length(st.args) <= 4 && _static_callee(ci, st.args[1]) === Core.memoryrefnew) ||
+        return false
+    t(k) = _unwrap_lattice(_stmt_arg_type(ci, sig, st.args[k]))
+    r, i = t(2), t(3)
+    (r isa Type && r <: Core.GenericMemoryRef && i isa Type && i <: Int) || return false
+    length(st.args) == 3 && return true
+    b = t(4)
+    return b isa Type && b <: Bool
+end
+
+# The exception type the handler at `d` returns for, when it begins `catch err; err isa T || rethrow()`:
+# its first test is `isa` of the caught exception against a constant type, and the branch where the
+# test fails only rethrows. `nothing` for any other handler, which is taken to return whatever is
+# thrown.
+function _handler_filter(code::Vector{Any}, d::Int)
+    n = length(code)
+    i = _skip_nothing(code, d)
+    (i <= n && Meta.isexpr(code[i], :the_exception)) || return nothing
+    e = Core.SSAValue(i)
+    i = _skip_nothing(code, i + 1)
+    i < n || return nothing
+    st = code[i]
+    (Meta.isexpr(st, :call) && length(st.args) == 3 && _static_callee(nothing, st.args[1]) === Core.isa &&
+        st.args[2] == e) || return nothing
+    a = st.args[3]
+    T = a isa Type ? a : _static_callee(nothing, a)
+    T isa Type || return nothing
+    br = code[i + 1]
+    (br isa Core.GotoIfNot && br.cond == Core.SSAValue(i)) || return nothing
+    return _only_rethrows(code, br.dest, e) ? T : nothing
+end
+
+function _skip_nothing(code::Vector{Any}, i::Int)
+    while i <= length(code) && code[i] === nothing
+        i += 1
+    end
+    return i
+end
+
+# Whether the statements from `j` rethrow the caught exception `e` and stop: `rethrow()` or
+# `throw(e)`, then `unreachable`.
+function _only_rethrows(code::Vector{Any}, j::Int, e::Core.SSAValue)
+    j = _skip_nothing(code, j)
+    j < length(code) || return false
+    st = code[j]
+    ok = if Meta.isexpr(st, :invoke)
+        mi = _invoke_mi(st.args[1])
+        !isnothing(mi) && mi.def isa Method && mi.def.name === :rethrow && mi.def.module === Base &&
+            length(st.args) == 2
+    elseif Meta.isexpr(st, :call)
+        c = _static_callee(nothing, st.args[1])
+        (c === Core.throw && length(st.args) == 2 && st.args[2] == e) || (c === Base.rethrow && length(st.args) == 1)
+    else
+        false
+    end
+    ok || return false
+    r = code[_skip_nothing(code, j + 1)]
+    return r isa Core.ReturnNode && !isdefined(r, :val)
+end
+
+# Whether statement `i` may throw: the optimizer did not prove it cannot. Without the flags, it may.
+const _IR_FLAG_NOTHROW = Base.Compiler.IR_FLAG_NOTHROW
+_maythrow(ci, i::Int) = isnothing(ci) || iszero(ci.ssaflags[i] & _IR_FLAG_NOTHROW)
+
+# Whether statement `i` throws only exceptions known to be no `T`: each type it can throw is known
+# (`_thrown_types`) and none is a `T`. `memo` keeps the thrown types by statement.
+function _rethrown(ci, @nospecialize(sig), i::Int, @nospecialize(T), memo::Dict{Int, Union{Nothing, Vector{Any}}})
+    ts = get!(() -> _thrown_types(ci, sig, i), memo, i)
+    return !isnothing(ts) && all(E -> !(E <: T), ts)
+end
+
+# The types the statement `i` can throw, when every one is known and concrete: `throw(x)` with `x` of a
+# concrete type, a bounds-checked `memoryrefnew` (`_bounds_checked_ref`), which throws only a
+# `BoundsError`, or a call that always throws into a body whose every throw is one (a few levels
+# deep, as `throw_boundserror` is one). `nothing` otherwise.
+function _thrown_types(ci, @nospecialize(sig), i::Int, level::Int = 0)
+    st = ci.code[i]
+    _bounds_checked_ref(ci, sig, st) && return Any[BoundsError]
+    if Meta.isexpr(st, :call) && length(st.args) == 2 && _static_callee(ci, st.args[1]) === Core.throw
+        E = _unwrap_lattice(_stmt_arg_type(ci, sig, st.args[2]))
+        return E isa DataType && isconcretetype(E) ? Any[E] : nothing
+    elseif Meta.isexpr(st, :invoke) && ci.ssavaluetypes[i] === Union{} && level < 4
+        mi = _invoke_mi(st.args[1])
+        isnothing(mi) && return nothing
+        body = _typed_body(_callee_key(mi))
+        isnothing(body) && return nothing
+        out = Any[]
+        for j in eachindex(body.code)
+            r = body.code[j]
+            r isa Core.ReturnNode || continue
+            isdefined(r, :val) && return nothing
+            j > 1 || return nothing
+            ts = _thrown_types(body, mi.specTypes, j - 1, level + 1)
+            isnothing(ts) && return nothing
+            append!(out, ts)
+        end
+        return isempty(out) ? nothing : out
+    end
+    return nothing
+end
+
 # Session memo for the per-signature scan: the callee recursion re-visits shared helpers (Base
 # internals especially) from every caller, and each visit pays a `code_typed_by_type`. Without
 # this, `:fast`'s median went 2.9 ms → 73 ms on the corpus study. Invalidated with the findings
@@ -624,7 +1001,7 @@ end
 # Identity-keyed on the signature type: concrete signature DataTypes are interned by the runtime
 # (structurally equal ⇒ ===), and `hash(::DataType)` walks the whole type — on deeply-nested
 # kernel signatures that hashing alone cost more than the scan (profiled: ~half the runtime).
-const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
+const _SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol, Any}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}}()
 const _SIGNAL_MEMO_LOCK = ReentrantLock()
 
 # A body already on this walk contributes nothing a second time, so a result computed below such a
@@ -633,13 +1010,17 @@ const _SIGNAL_MEMO_LOCK = ReentrantLock()
 # therefore counts its cuts, and only a body whose subtree met none is memoized.
 _cut_counter() = get!(() -> Ref(0), task_local_storage(), :strictmode_scan_cuts)::Base.RefValue{Int}
 
-function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full)
-    if sig in seen
+# A body is scanned once per context and mode: what it allocates on its throw paths counts only in a
+# caught context (`_skip_mask`), and a body below an exempt callee is also read for boxing alone, so
+# the walk records and memoizes each separately.
+function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, caught = false)
+    visit = (sig, mode, caught)
+    if visit in seen
         _cut_counter()[] += 1
         return (false, false, false, nothing, false, false, nothing, nothing, nothing, false)
     end
-    push!(seen, sig)
-    key = (depth, Base.get_world_counter(), mode)   # any new method definition invalidates (coarse, safe)
+    push!(seen, visit)
+    key = (depth, Base.get_world_counter(), mode, caught)   # any new method definition invalidates (coarse, safe)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_SIGNAL_MEMO, sig, nothing)
         bysig === nothing ? nothing : get(bysig, key, nothing)
@@ -647,43 +1028,54 @@ function _signals_by_type(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any},
     memo === nothing || return memo
     cuts = _cut_counter()
     before = cuts[]
-    r = _signals_by_type_uncached(sig, depth, seen, mode)
+    r = _signals_by_type_uncached(sig, depth, seen, mode, caught)
     cuts[] == before || return r
-    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
+    @lock _SIGNAL_MEMO_LOCK get!(Dict{Tuple{Int, UInt64, Symbol, Any}, Tuple{Bool, Bool, Bool, Any, Bool, Bool, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Union{Nothing, Symbol}, Bool}}, _SIGNAL_MEMO, sig)[key] = r
     return r
 end
 
-# The optimized body of a signature, or `nothing` when none can be read. Inferring a body is most of
-# what a scan costs, and the same body is reached again by every walk that passes through it, at
-# each depth and from every entry point, so it is read once. An entry stays valid while the compiler's
-# own record of the signature does (a method defined elsewhere does not end it), or, for a signature
-# the compiler holds no record of, while the world is the one it was read in.
+# The optimized body `key` names (`_callee_key`), or `nothing` when none can be read. Inferring a
+# body is most of what a scan costs, and the same body is reached again by every walk that passes
+# through it, at each depth and from every entry point, so it is read once. An entry stays valid
+# while what it was read from does (`_read_holds`; a method defined elsewhere does not end it).
 #
 # A body is taken from where it already exists, and inferred only when it exists nowhere: the
 # compiler's own record first, then what the scan's inference kept while it inferred a caller.
-const _BODY_MEMO = IdDict{Any, Tuple{UInt, Any, Any}}()
+const _BODY_MEMO = IdDict{Any, Tuple{_ReadStamp, Any}}()
 
-function _typed_body(@nospecialize(sig))
+function _typed_body(@nospecialize(key))
     world = Base.get_world_counter()
-    hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
-    if !isnothing(hit)
-        rec = hit[3]
-        (hit[1] == world || (rec isa Core.CodeInstance && rec.min_world <= world <= rec.max_world)) && return hit[2]
+    hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, key, nothing)
+    if !isnothing(hit) && _read_holds(hit[1], key, world)
+        hit[1].world == world ||
+            @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[key] = (_as_of(hit[1], world), hit[2]))
+        return hit[2]
     end
-    mi = _sig_instance(sig, world)
+    mi = _key_instance(key, world)
     ci = isnothing(mi) ? nothing : _compiled_body(mi, world)
     isnothing(ci) && !isnothing(mi) && (ci = _scan_source(mi, world))
     isnothing(ci) && !isnothing(mi) && (ci = _infer_body(mi, world))
     if isnothing(ci)
         cts = try
-            _code_typed_by_type(sig; optimize = true)
+            _code_typed_of(key; optimize = true)
         catch
             Any[]
         end
         ci = isempty(cts) ? nothing : first(cts[1])
     end
+    # A compiled body keeps no record of what was inlined into each statement, and a scheduler body that
+    # runs a callable it was handed needs one to tell that callable's statements from its own
+    # (`_stmt_in_scheduler`), so it is read again with them.
+    if !isnothing(ci) && !_has_inlining_info(ci) && _runs_handed_callable(key)
+        src = try
+            _code_typed_of(key; optimize = true, debuginfo = :source)
+        catch
+            Any[]
+        end
+        isempty(src) || (ci = first(src[1]))
+    end
     rec = (isnothing(ci) || isnothing(mi)) ? nothing : _record_of(mi, world)
-    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[sig] = (world, ci, rec))
+    @lock _SIGNAL_MEMO_LOCK (_BODY_MEMO[key] = (_ReadStamp(world, mi, rec), ci))
     return ci
 end
 
@@ -726,6 +1118,55 @@ function _sig_instance(@nospecialize(sig), world::UInt)
     return mi isa Core.MethodInstance ? mi : nothing
 end
 
+# --- which body a call runs ----------------------------------------------------------------------
+#
+# A walk of the call graph names each body by a KEY, and a key names exactly one specialization:
+#
+#   - a signature type names the specialization that signature dispatches to. An entry point is one:
+#     a call `f(args...)` dispatches.
+#   - a `MethodInstance` names itself. A callee is named this way when its own signature dispatches
+#     to another specialization. `invoke(f, Tuple{wider}, args...)` runs such a callee: a more
+#     specific method answers the signature of the method it selects, and a read by signature
+#     would be of that other method.
+#
+# The invariant: a walk never dispatches the signature of a callee it found in a body. It takes the
+# callee's key from `_callee_key`, reads through the key (`_typed_body`, `_code_typed_of`,
+# `_code_ircode_of`, `_key_method`), keeps its memo entries and visited sets under the key, and
+# asks `_key_sig` only for the argument types. A callee is then read as the code the call runs,
+# whichever method its signature would select.
+
+# The key of the callee `mi` an `:invoke` statement or an inlining edge names: its signature where
+# that dispatches to `mi`, so that a callee and an entry point of the same signature share their
+# reads, and `mi` itself otherwise.
+#
+# The read of the signature's body records what the signature dispatches to in this world, so the
+# question costs no second method lookup.
+function _callee_key(mi::Core.MethodInstance)
+    sig = mi.specTypes
+    _typed_body(sig)
+    hit = @lock _SIGNAL_MEMO_LOCK get(_BODY_MEMO, sig, nothing)
+    return (!isnothing(hit) && hit[1].mi === mi) ? sig : mi
+end
+
+# The signature of the specialization `key` names: the types of its arguments.
+_key_sig(@nospecialize(key)) = key isa Core.MethodInstance ? key.specTypes : key
+
+# The specialization `key` names in `world`, or `nothing` for a signature that dispatches to no
+# single one.
+_key_instance(@nospecialize(key), world::UInt) =
+    key isa Core.MethodInstance ? key : _sig_instance(key, world)
+
+# The method `key` names, or `nothing` for a signature that dispatches to no single one.
+function _key_method(@nospecialize(key))
+    key isa Core.MethodInstance && return key.def isa Method ? key.def : nothing
+    m = try
+        Base._which(key; raise = false)
+    catch
+        nothing
+    end
+    return isnothing(m) ? nothing : m.method
+end
+
 # The compiler's record of a specialization in `world`: the cached `CodeInstance` that says in which
 # worlds its inference holds.
 function _record_of(mi::Core.MethodInstance, world::UInt)
@@ -753,6 +1194,37 @@ function _compiled_body(mi::Core.MethodInstance, world::UInt)
     return nothing
 end
 
+# What a walk of the call graph reads below the callee `mi`. Every walk that decides or explains an
+# allocation verdict asks here (`_scan_ci`, `_signal_origin`, `_nonscheduler_origin`), so they excuse
+# the same code:
+#
+#   - `:barrier`: an allocation barrier (`_mi_is_barrier`). Nothing below it is the caller's.
+#   - `:exempt`: a callee exempt from `:noalloc` whose handed-in code was read in full
+#     (`_handed_code`). Only `handed`, the code its caller handed it and that it calls, is the
+#     caller's. `:boxing`, which `:noboxing` reads, knows no exemption.
+#   - `:own`: the callee is the caller's code. An exempt callee whose handed-in code could not be
+#     read in full is of this kind, so it excuses nothing; `handed` is what was found of it.
+#
+# The invariant: a body counts toward a caller's verdict exactly when the caller reaches it along
+# some path that enters no `:barrier` or `:exempt` callee, in whatever order the walk meets the
+# paths. A walk therefore never marks a body as visited on the strength of a read made below an
+# excused callee (`_excused_signals`).
+const _NO_HANDED = Any[]
+function _callee_excusal(mi::Core.MethodInstance, mode::Symbol)
+    _mi_is_barrier(mi) && return (; kind = :barrier, handed = _NO_HANDED, name = nothing)
+    name = mode === :boxing ? nothing : _mi_exempt_name(mi)
+    isnothing(name) && return (; kind = :own, handed = _NO_HANDED, name)
+    handed, whole = _handed_code(_callee_key(mi))
+    return (; kind = whole ? :exempt : :own, handed, name)
+end
+
+# The signals of an excused callee's subtree, read for what is reported about it (the exemption or
+# barrier a caller is pointed to) and for the guarantees the excusal does not cover. It marks a
+# copy of `seen`: the caller's walk reads every body below the callee again if it reaches that body
+# another way. This is the only place a walk reads below an excused callee.
+_excused_signals(mi::Core.MethodInstance, depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught) =
+    _signals_by_type(_callee_key(mi), depth, copy(seen), mode, caught)
+
 # Where the scan finds what it reports: for every body of the call graph whose own statements set the
 # signal `mode` asks about, the callees that lead to it and the statements. `_alloc_signals` says that
 # something allocates; this says which statement, in which callee, reached from where.
@@ -760,16 +1232,16 @@ function _signal_origin(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
         stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
-    top = _sigtype(f, types)
+    top = _entry_key(f, types)
     parent = IdDict{Any, Any}()
-    queue = Any[(top, _FAST_ALLOC_DEPTH[])]
+    queue = Any[(top, _FAST_ALLOC_DEPTH[], false, mode)]
     seen = Base.IdSet{Any}()
     out = Any[]
     while !isempty(queue) && length(seen) < _SCAN_BODY_BUDGET[]
-        s, depth = popfirst!(queue)
-        s in seen && continue
-        push!(seen, s)
-        trace, callees = _origin_node(s, mode)
+        s, depth, caught, m = popfirst!(queue)
+        (s, caught, m) in seen && continue
+        push!(seen, (s, caught, m))
+        trace, callees = _origin_node(s, m, caught)
         if !isempty(trace)
             path = Any[]
             c = s
@@ -780,34 +1252,42 @@ function _signal_origin(
             push!(out, (; signature = s, path, statements = trace))
             first_only && break
         end
-        for mi in callees
+        for (mi, c) in callees
             mi = mi::Core.MethodInstance
-            if _mi_is_barrier(mi)
+            ex = _callee_excusal(mi, m)
+            if ex.kind === :barrier
                 isnothing(stops) || push!(stops, mi.specTypes)
                 continue
             end
-            isnothing(_mi_exempt_name(mi)) || continue
             # The scan's own rule: the package's code to the end, Base to `depth` levels.
-            user = _enters_user_code(mi)
+            user = _followed_to_end(mi)
             (depth > 0 || (depth < 0 && user)) || continue
-            haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, (mi.specTypes, user ? depth : (depth > 1 ? depth - 1 : -1)))
+            sub = user ? depth : (depth > 1 ? depth - 1 : -1)
+            k = _callee_key(mi)
+            haskey(parent, k) || (parent[k] = s)
+            for h in ex.handed
+                haskey(parent, h) || (parent[h] = k)
+                push!(queue, (h, sub, c, m))
+            end
+            ex.kind === :exempt || push!(queue, (k, sub, c, m))
         end
     end
     return out
 end
 
 # One body of the walk above: the statements of its own that set `mode`'s signal, and the callees it
-# invokes off its throw paths. Every warning walks the call graph below its call, and the calls of
-# one package share most of that graph, so a body is scanned once per world and not once per warning.
+# invokes off its throw paths, each with whether it is called in a caught context (`_skip_mask`) and
+# the statement that calls it.
+# Every warning walks the call graph below its call, and the calls of one package share most of that
+# graph, so a body is scanned once per world and context and not once per warning.
 # Emptied with the other scan memos.
-const _ORIGIN_MEMO = IdDict{Any, Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
+const _ORIGIN_MEMO = IdDict{Any, Dict{Tuple{Symbol, Any}, Tuple{UInt, Vector{Any}, Vector{Any}}}}()
 
-function _origin_node(@nospecialize(s), mode::Symbol)
+function _origin_node(@nospecialize(s), mode::Symbol, caught = false)
     world = Base.get_world_counter()
     hit = @lock _SIGNAL_MEMO_LOCK begin
         bymode = get(_ORIGIN_MEMO, s, nothing)
-        isnothing(bymode) ? nothing : get(bymode, mode, nothing)
+        isnothing(bymode) ? nothing : get(bymode, (mode, caught), nothing)
     end
     (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3]
     trace = Any[]
@@ -817,19 +1297,20 @@ function _origin_node(@nospecialize(s), mode::Symbol)
         # `push!` and not `IdSet{Any}([s])`: a vector literal of a type is a method compiled for that type.
         own = Base.IdSet{Any}()
         push!(own, s)
-        _scan_ci(ci, s, 0, own, mode, false, trace)
-        dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+        _scan_ci(ci, s, 0, own, mode, false, trace; caught)
+        dead = _skip_mask(ci.code, caught, ci, _key_sig(s))
+        region = caught === true || !ignore_throw() ? nothing : _caught_contexts(ci.code, dead, ci)
         for (j, st) in enumerate(ci.code)
             (Meta.isexpr(st, :invoke) && !dead[j]) || continue
             a1 = st.args[1]
             mi = a1 isa Core.CodeInstance ? a1.def : a1
             (mi isa Core.MethodInstance && mi.def isa Method) || continue
             _mi_is_strictmode(mi) && continue
-            push!(callees, mi)
+            push!(callees, (mi, isnothing(region) ? caught : _join_caught(caught, region[j]), j))
         end
     end
     @lock _SIGNAL_MEMO_LOCK begin
-        get!(Dict{Symbol, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[mode] = (world, trace, callees)
+        get!(Dict{Tuple{Symbol, Any}, Tuple{UInt, Vector{Any}, Vector{Any}}}, _ORIGIN_MEMO, s)[(mode, caught)] = (world, trace, callees)
     end
     return trace, callees
 end
@@ -846,7 +1327,7 @@ function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbo
     x = first(o)
     # A wait is the nearest only because the walk meets it first: when the call also allocates
     # outside the scheduler, that allocation is the one to name.
-    if _sig_in_scheduler(x.signature)
+    if _origin_in_scheduler(x)
         y = try
             _nonscheduler_origin(f, types)
         catch
@@ -855,21 +1336,40 @@ function _origin_note(@nospecialize(f), @nospecialize(types::Tuple); mode::Symbo
         (isnothing(y) || ismissing(y)) || (x = y)
     end
     st = first(x.statements)
-    via = join((first(string(p), 70) for p in last(x.path, 3)), " -> ")
-    return "; first at " * first(string(x.signature), 110) * " [" * first(string(st[2]), 90) * "]" *
+    via = join((first(string(_key_sig(p)), 70) for p in last(x.path, 3)), " -> ")
+    return "; first at " * first(string(_key_sig(x.signature)), 110) * " [" * first(string(st[2]), 90) * "]" *
         (isempty(via) ? "" : ", reached through " * via)
 end
 
-# Whether a signature is Base's task, lock or condition code.
-function _sig_in_scheduler(@nospecialize(sig))
-    m = try
-        Base._which(sig; raise = false)
-    catch
-        nothing
+# Whether the body `key` names (`_callee_key`) is Base's task, lock or condition code.
+function _sig_in_scheduler(@nospecialize(key))
+    m = _key_method(key)
+    return !isnothing(m) && _method_in_scheduler(m)
+end
+
+# Whether an origin `_signal_origin` found is the scheduler's: in its code, or in Base code its code
+# reached. A callable the scheduler was handed (the function given to `lock`) is its caller's code
+# whoever defined its type, and so is everything below it, inlined into the scheduler call or not;
+# a wait that callable makes is the scheduler's again.
+function _origin_in_scheduler(o)
+    chain = Any[o.path..., o.signature]
+    k = findlast(_sig_in_scheduler, chain)
+    isnothing(k) && return false
+    if k < length(chain)
+        _calls_argument(chain[k], chain[k + 1]) && return false
+        return !any(_sig_runs_user_code, @view chain[(k + 1):end])
     end
-    isnothing(m) && return false
-    meth = m.method
-    return meth.module === Base && basename(string(meth.file)) in _SCHEDULER_FILES
+    ci = _typed_body(chain[k])
+    isnothing(ci) && return false
+    unsplit = _unsplit(ci, chain[k])
+    return all(st -> _stmt_in_scheduler(ci, chain[k], st[1], true, unsplit), o.statements)
+end
+
+function _sig_runs_user_code(@nospecialize(key))
+    m = _key_method(key)
+    isnothing(m) && return true
+    root = Base.moduleroot(m.module)
+    return !(root === Base || root === Core) || _carries_user_type(_key_sig(key))
 end
 
 # The nearest allocation or boxing the call reaches outside Base's task, lock and condition code:
@@ -879,18 +1379,24 @@ end
 # Base is followed to the end here, not to the scan's depth. The scan's verdict needs only one
 # allocation and stops at the first; the claim that a call does nothing but wait is about all of
 # them, and an allocation three Base calls down (`copyto!` to `unalias` to `unaliascopy`) is past
-# the depth the verdict reads to. What the scheduler's own code calls is the scheduler's.
+# the depth the verdict reads to. What the scheduler's own code calls is the scheduler's, except a
+# callable it was handed (`_calls_argument`): a scheduler body is read for that code alone, and its
+# callees only when they are that callable or are called from it inlined, since following the rest
+# reads the whole scheduler.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     parent = IdDict{Any, Any}()
-    queue = Any[_sigtype(f, types)]
+    queue = Any[(_entry_key(f, types), false, false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
-        s = popfirst!(queue)
-        s in seen && continue
+        s, caught, sched = popfirst!(queue)
+        (s, caught, sched) in seen && continue
         length(seen) < _SCAN_BODY_BUDGET[] || return missing
-        push!(seen, s)
-        isnothing(_typed_body(s)) && return missing
-        trace, callees = _origin_node(s, :alloc)
+        push!(seen, (s, caught, sched))
+        ci = _typed_body(s)
+        isnothing(ci) && return missing
+        trace, callees = _origin_node(s, :alloc, caught)
+        unsplit = sched && _unsplit(ci, s)
+        sched && (trace = filter(st -> !_stmt_in_scheduler(ci, s, st[1], true, unsplit), trace))
         if !isempty(trace)
             path = Any[]
             c = s
@@ -900,11 +1406,19 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             end
             return (; signature = s, path, statements = trace)
         end
-        for mi in callees
+        for (mi, c, j) in callees
             mi = mi::Core.MethodInstance
-            (_mi_is_barrier(mi) || !isnothing(_mi_exempt_name(mi)) || _in_scheduler(mi)) && continue
-            haskey(parent, mi.specTypes) || (parent[mi.specTypes] = s)
-            push!(queue, mi.specTypes)
+            ex = _callee_excusal(mi, :alloc)
+            ex.kind === :barrier && continue
+            arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true, unsplit))
+            (sched && !arg) && continue
+            k = _callee_key(mi)
+            haskey(parent, k) || (parent[k] = s)
+            for h in ex.handed
+                haskey(parent, h) || (parent[h] = k)
+                push!(queue, (h, c, false))
+            end
+            ex.kind === :exempt || push!(queue, (k, c, !arg && _in_scheduler(mi)))
         end
     end
     return nothing
@@ -917,11 +1431,11 @@ end
 function _scheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     origins = _signal_origin(f, types; mode = :alloc)
     isempty(origins) && return nothing
-    all(o -> _sig_in_scheduler(o.signature), origins) || return nothing
+    all(_origin_in_scheduler, origins) || return nothing
     isnothing(_nonscheduler_origin(f, types)) || return nothing
     o = first(origins)
-    via = join((first(string(p), 70) for p in last(o.path, 3)), " -> ")
-    return (; call = first(string(o.signature), 100), statement = first(string(o.statements[1][2]), 80), via)
+    via = join((first(string(_key_sig(p)), 70) for p in last(o.path, 3)), " -> ")
+    return (; call = first(string(_key_sig(o.signature)), 100), statement = first(string(o.statements[1][2]), 80), via)
 end
 
 # The registered barriers the walk from `f` stops at, so a reader can see that one was reached and not
@@ -932,10 +1446,10 @@ function _barrier_stops(@nospecialize(f), @nospecialize(types::Tuple))
     return unique(stops)
 end
 
-function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol)
+function _signals_by_type_uncached(@nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol, caught)
     ci = _typed_body(sig)
     isnothing(ci) && return (false, false, false, nothing, false, false, nothing, nothing, nothing, true)
-    return _scan_ci(ci, sig, depth, seen, mode)
+    return _scan_ci(ci, sig, depth, seen, mode; caught)
 end
 
 # Would a value of this type have to be boxed to flow through a union-typed slot? An isbits type
@@ -1106,12 +1620,16 @@ function _boxing_store(ci, @nospecialize(sig), st::Expr, @nospecialize(callee) =
     return false
 end
 
-# Is statement `pc` inlined from Base's task, lock or condition code, with none of the package's own
-# code inlined inside that? The proof tier asks the same of an allocation site's frames
-# (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
-function _stmt_in_scheduler(ci, pc::Int)
+# Is statement `pc` of the body of `sig` the scheduler's: inlined from Base's task, lock or condition
+# code (or in such a body, `frame`), with neither the package's code nor a callable the scheduler was
+# handed (`_calls_argument`) inlined inside that? The proof tier asks the same of an allocation site's
+# frames (`_scheduler_site`): boxing there is the scheduler's, not the caller's.
+# `unsplit` (`_unsplit`) depends on the body alone, so a caller asking about many statements passes it.
+function _stmt_in_scheduler(ci, @nospecialize(sig), pc::Int, frame::Bool = false, unsplit::Bool = frame && _unsplit(ci, sig))
+    (frame && unsplit) && return false
     di = ci.debuginfo
-    sched = false
+    sched = frame
+    encl = _key_sig(sig)
     for _ in 1:64
         di isa Core.DebugInfo || break
         t = try
@@ -1123,15 +1641,316 @@ function _stmt_in_scheduler(ci, pc::Int)
         (1 <= eidx <= length(di.edges)) || break
         e = di.edges[eidx]
         e isa Core.DebugInfo || break
-        m = e.def isa Core.MethodInstance ? e.def.def : e.def
-        if m isa Method
+        mi = e.def isa Core.MethodInstance ? e.def : nothing
+        m = isnothing(mi) ? e.def : mi.def
+        if sched && !isnothing(mi) && !isnothing(encl) && _calls_argument(encl, mi.specTypes)
+            sched = false
+        elseif m isa Method
             root = Base.moduleroot(m.module)
-            sched = (root === Base || root === Core) && (sched || basename(string(m.file)) in _SCHEDULER_FILES)
+            sched = (root === Base || root === Core) && (sched || _method_in_scheduler(m))
         end
+        encl = isnothing(mi) ? nothing : mi.specTypes
         di = e
         pc = Int(t[3])
     end
     return sched
+end
+
+# Whether a body records the calls inlined into its statements.
+_has_inlining_info(ci) = ci.debuginfo isa Core.DebugInfo && !isempty(ci.debuginfo.edges)
+
+# Whether a scheduler body may run a handed callable and does not record what was inlined: it cannot
+# be split, and every statement is counted as the caller's.
+_unsplit(ci, @nospecialize(sig)) = !_has_inlining_info(ci) && _runs_handed_callable(sig)
+
+# Whether `sig` is a scheduler body handed a callable it may run: an argument whose type has a call
+# method, as the function given to `lock(f, l)` has.
+function _runs_handed_callable(@nospecialize(sig))
+    _sig_in_scheduler(sig) || return false
+    sig = Base.unwrap_unionall(_key_sig(sig))
+    sig isa DataType || return false
+    world = Base.get_world_counter()
+    return any(_handed_params(sig)) do P
+        P isa DataType && isconcretetype(P) || return false
+        ms = Base._methods_by_ftype(Tuple{P, Vararg{Any}}, -1, world)
+        return ms isa Vector && !isempty(ms)
+    end
+end
+
+# Whether `callee` is a call of one of `caller`'s own arguments: the function given to `lock(f, l)`,
+# which is its caller's code whoever defined its type. Only the function position counts, since the
+# lock itself is an argument too and is handed on to the scheduler's own calls.
+function _calls_argument(@nospecialize(caller), @nospecialize(callee))
+    caller = Base.unwrap_unionall(_key_sig(caller))
+    callee = Base.unwrap_unionall(_key_sig(callee))
+    (caller isa DataType && callee isa DataType && !isempty(callee.parameters)) || return false
+    F = callee.parameters[1]
+    return any(P -> P === F, _handed_params(caller))
+end
+
+# The argument types of `sig` that a caller may have handed in, its function excluded. A keyword body
+# `#f#N(kws..., ::typeof(f), args...)` is also passed `f` itself, the function it is the body of:
+# that is its own code calling itself, not a callable it was given.
+function _handed_params(sig::DataType)
+    ps = Iterators.drop(sig.parameters, 1)
+    F = sig.parameters[1]
+    (F isa DataType && isdefined(F, :instance) && F.instance isa Function) || return ps
+    nm = nameof(F.instance)
+    owner = _demangle(nm)
+    owner === nm && return ps
+    return Iterators.filter(ps) do P
+        !(P isa DataType && isdefined(P, :instance) && P.instance isa Function &&
+          nameof(P.instance) === owner && parentmodule(P.instance) === parentmodule(F))
+    end
+end
+
+# The callable types an argument of type `T` carries: a function, a closure, a callable struct (any
+# number of call methods), or one of those held in a field or as an array's elements, at any depth.
+# A type that is not concrete anywhere in that walk (an abstract argument, field or element type,
+# `Any` included) is recorded as itself, since the values it may hold, and so the callables, cannot
+# be listed from the type. A type argument (`Type{T}`, `DataType`) is not a callable here.
+function _callable_types!(out::Vector{Any}, @nospecialize(T), seen::Base.IdSet{Any} = Base.IdSet{Any}())
+    # A signature's `Vararg` tail carries its element type, and a type variable its upper bound.
+    T isa Core.TypeofVararg && return _callable_types!(out, isdefined(T, :T) ? T.T : Any, seen)
+    T isa TypeVar && return _callable_types!(out, T.ub, seen)
+    (T isa Type && T !== Union{}) || return out
+    if T isa Union
+        for U in Base.uniontypes(T)
+            _callable_types!(out, U, seen)
+        end
+        return out
+    end
+    T <: Type && return out
+    T in seen && return out
+    push!(seen, T)
+    if !isconcretetype(T)
+        push!(out, T)
+        return out
+    end
+    if T <: Function
+        push!(out, T)
+    elseif T <: AbstractArray
+        return _callable_types!(out, eltype(T), seen)
+    elseif !(T <: Union{Number, AbstractString, Symbol})
+        ms = Base._methods_by_ftype(Tuple{T, Vararg{Any}}, -1, Base.get_world_counter())
+        (ms isa Vector && !isempty(ms)) && push!(out, T)
+    end
+    if !(T <: Union{AbstractString, Number})
+        for F in fieldtypes(T)
+            _callable_types!(out, F, seen)
+        end
+    end
+    return out
+end
+
+# What an exempt function `sig` runs on its caller's behalf: the code it calls that its caller handed
+# in. A value is HANDED when it is an argument or is loaded from one (a field, an element, an
+# iteration's item, at any depth: `getfield`, `memoryrefget` and the like in the IR). A value the
+# exempt code BUILDS around one (a closure or struct it constructs) only HOLDS it, and loading from
+# that gives a handed value again. A call whose function is a handed value runs the caller's code,
+# and its signature is returned so that it is read as the caller's own callee; so is a callable the
+# arguments name that was inlined, read from the inlining edges. A callee passed a handed or holding
+# value, or whose function holds one, is walked the same way, since it may call what it was given; a
+# callee passed neither is the exempt function's own code. A value whose type can carry no callable
+# (`_callable_types!` finds none) is not followed: a non-concrete field the code never calls, such as
+# the `Any` fields of the task a lock holds, does not stop the exemption.
+# Returns `(found, complete)`. The walk is incomplete, and the exemption then excuses nothing, when a
+# body cannot be read, the body budget runs out, or a handed or holding value reaches a call that is
+# not resolved (a dynamic call, or a builtin that calls a function, such as `_apply_iterate`), whose
+# target cannot be read.
+const _HANDED_MEMO = IdDict{Any, Tuple{UInt, Vector{Any}, Bool}}()
+
+const _HOLDS = 0x01
+const _HANDED = 0x02
+
+# The builtins whose result is loaded from their first argument.
+const _LOAD_BUILTINS = (
+    :getfield, :memoryrefget, :memoryrefnew, :_svec_ref, :swapfield!, :modifyfield!,
+    :replacefield!, :memoryrefswap!, :memoryrefmodify!, :memoryrefreplace!,
+)
+
+function _handed_code(@nospecialize(sig))
+    world = Base.get_world_counter()
+    hit = @lock _SIGNAL_MEMO_LOCK get(_HANDED_MEMO, sig, nothing)
+    (!isnothing(hit) && hit[1] == world) && return hit[2], hit[3]
+    found = Any[]
+    complete = true
+    s0 = Base.unwrap_unionall(_key_sig(sig))
+    if s0 isa DataType
+        carries = IdDict{Any, Bool}()
+        handed = collect(Any, _handed_params(s0))
+        ps = s0.parameters
+        mask = UInt8[
+            (i > 1 && any(P -> P === ps[i], handed) && _carries_callable!(carries, ps[i])) ? _HANDED : 0x00
+                for i in eachindex(ps)
+        ]
+        types = filter(isconcretetype, _handed_types(sig))
+        queue = Any[(sig, mask)]
+        seen = Set{Any}()
+        while !isempty(queue) && any(!iszero, mask)
+            s, m = pop!(queue)
+            (s, m) in seen && continue
+            if length(seen) >= _SCAN_BODY_BUDGET[]
+                complete = false
+                break
+            end
+            push!(seen, (s, m))
+            ci = _typed_body(s)
+            if !isnothing(ci) && !_has_inlining_info(ci)
+                src = try
+                    _code_typed_of(s; optimize = true, debuginfo = :source)
+                catch
+                    Any[]
+                end
+                ci = isempty(src) ? nothing : first(src[1])
+            end
+            if isnothing(ci) || !_handed_body!(found, queue, ci, s, m, types, carries)
+                complete = false
+                break
+            end
+        end
+    end
+    @lock _SIGNAL_MEMO_LOCK (_HANDED_MEMO[sig] = (world, found, complete))
+    return found, complete
+end
+
+# Whether `P` is a type with one instance that is, or holds, one of the callable `types`.
+_holds_handed_type(@nospecialize(P), types) = P isa DataType && Base.issingletontype(P) &&
+    any(T -> any(U -> U === T, types), _callable_types!(Any[], P))
+
+# Whether a value of type `T` may be or hold a callable.
+function _carries_callable!(memo::IdDict{Any, Bool}, @nospecialize(T))
+    T = _unwrap_lattice(T)
+    T isa Type || T isa Core.TypeofVararg || return true
+    return get!(() -> !isempty(_callable_types!(Any[], T)), memo, T)
+end
+
+# One body of `_handed_code`'s walk, with `m` the kind of each argument: records the calls of handed
+# values in `found` and queues the callees passed a handed or holding value. `false` when such a
+# value reaches a call whose target cannot be read.
+function _handed_body!(found, queue, ci, @nospecialize(key), m::Vector{UInt8}, types, carries)
+    s = _key_sig(key)
+    code = ci.code
+    kinds = zeros(UInt8, length(code))
+    dead = _skip_mask(code, false, ci, s)
+    va = !isempty(m) && Base.unwrap_unionall(s).parameters[end] isa Core.TypeofVararg
+    kind(a) = a isa Core.SSAValue ? kinds[a.id] :
+        a isa Core.Argument ? (a.n <= length(m) ? m[a.n] : (va ? m[end] : 0x00)) : 0x00
+    opkind(args) = isempty(args) ? 0x00 : maximum(kind, args)
+    # Phi nodes read values defined later in a loop, so the kinds are propagated to a fixed point.
+    changed = true
+    while changed
+        changed = false
+        for i in eachindex(code)
+            dead[i] && continue
+            st = code[i]
+            k = if st isa Core.PhiNode
+                opkind(Any[st.values[j] for j in eachindex(st.values) if isassigned(st.values, j)])
+            elseif st isa Core.PiNode
+                kind(st.val)
+            elseif st isa Core.UpsilonNode
+                isdefined(st, :val) ? kind(st.val) : 0x00
+            elseif st isa Core.PhiCNode
+                opkind(st.values)
+            elseif Meta.isexpr(st, :invoke)
+                opkind(@view st.args[2:end])
+            elseif Meta.isexpr(st, :call)
+                bn = _builtin_name(st.args[1])
+                if !isnothing(bn) && bn in _LOAD_BUILTINS
+                    length(st.args) >= 2 && kind(st.args[2]) > 0 ? _HANDED : 0x00
+                else
+                    opkind(st.args)
+                end
+            elseif Meta.isexpr(st, :new) || Meta.isexpr(st, :splatnew)
+                opkind(@view st.args[2:end]) > 0 ? _HOLDS : 0x00
+            elseif Meta.isexpr(st, :foreigncall)
+                length(st.args) >= 6 && opkind(@view st.args[6:end]) > 0 ? _HANDED : 0x00
+            elseif st isa Expr
+                opkind(st.args)
+            else
+                0x00
+            end
+            (k > 0 && _carries_callable!(carries, ci.ssavaluetypes[i])) || continue
+            if k > kinds[i]
+                kinds[i] = k
+                changed = true
+            end
+        end
+    end
+    local_types = copy(types)
+    for i in eachindex(code)
+        T = _unwrap_lattice(ci.ssavaluetypes[i])
+        kinds[i] === _HANDED && T isa DataType && isconcretetype(T) && !any(U -> U === T, local_types) &&
+            push!(local_types, T)
+    end
+    _handed_inlined!(found, ci.debuginfo, local_types, 0)
+    for i in eachindex(code)
+        dead[i] && continue
+        st = code[i]
+        if Meta.isexpr(st, :invoke)
+            a1 = st.args[1]
+            mi = a1 isa Core.CodeInstance ? a1.def : a1
+            mi isa Core.MethodInstance || return false
+            ks = UInt8[kind(a) for a in @view st.args[2:end]]
+            # A handed value of a type with one instance may be folded to a constant, which no load
+            # names: it is recognized by its type.
+            ps = (Base.unwrap_unionall(mi.specTypes)::DataType).parameters
+            for j in eachindex(ks)
+                j <= length(ps) && iszero(ks[j]) && _holds_handed_type(ps[j], local_types) && (ks[j] = _HANDED)
+            end
+            if ks[1] === _HANDED
+                k = _callee_key(mi)
+                any(x -> x === k, found) || push!(found, k)
+            elseif any(!iszero, ks)
+                push!(queue, (_callee_key(mi), ks))
+            end
+        elseif Meta.isexpr(st, :call)
+            opkind(st.args) > 0 || continue
+            bn = _builtin_name(st.args[1])
+            (isnothing(bn) || haskey(_CALLING_BUILTIN_ARGS, bn)) && return false
+        elseif Meta.isexpr(st, :foreigncall) && _fcall_name(st) === :jl_new_task && length(st.args) >= 6
+            # A task runs the function it is created with.
+            f = st.args[6]
+            k = kind(f)
+            k > 0 || continue
+            T = _unwrap_lattice(_stmt_arg_type(ci, s, f))
+            (T isa DataType && isconcretetype(T)) || return false
+            if k === _HANDED
+                any(x -> x === Tuple{T}, found) || push!(found, Tuple{T})
+            else
+                push!(queue, (Tuple{T}, UInt8[k]))
+            end
+        end
+    end
+    return true
+end
+
+function _handed_types(@nospecialize(sig))
+    types = Any[]
+    s = Base.unwrap_unionall(_key_sig(sig))
+    s isa DataType || return types
+    for P in Iterators.drop(s.parameters, 1)
+        _callable_types!(types, P)
+    end
+    return types
+end
+
+# The specializations of `types` inlined into a body, read from the record of its inlined calls.
+# Below one of them is the callable's own code, which reading its signature covers.
+function _handed_inlined!(found::Vector{Any}, di, types::Vector{Any}, level::Int)
+    (di isa Core.DebugInfo && level < 64) || return found
+    for e in di.edges
+        e isa Core.DebugInfo || continue
+        mi = e.def
+        if mi isa Core.MethodInstance && (P = Base.unwrap_unionall(mi.specTypes); P isa DataType) &&
+                any(T -> T === P.parameters[1], types)
+            k = _callee_key(mi)
+            any(x -> x === k, found) || push!(found, k)
+        else
+            _handed_inlined!(found, e, types, level + 1)
+        end
+    end
+    return found
 end
 
 # The type a `:new` constructs. Optimized IR may name it with a `GlobalRef` (`%new(Base.ComplexF64, …)`)
@@ -1238,10 +2057,12 @@ function _new_allocates(ci, @nospecialize(sig), ssauses, dead, i::Int, newsdead)
     return !newsdead()
 end
 
+# The signals of the body `ci` of `key` (`_callee_key`) and of the callees the walk follows from it.
 function _scan_ci(
-        ci, @nospecialize(sig), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
-        trace::Union{Nothing, Vector{Any}} = nothing
+        ci, @nospecialize(key), depth::Int, seen::Base.IdSet{Any}, mode::Symbol = :full, top::Bool = false,
+        trace::Union{Nothing, Vector{Any}} = nothing; caught = false
     )
+    sig = _key_sig(key)
     alloc = false
     boxing = false
     dictlookup = false                # a runtime AbstractDict accessor reached on the hot path
@@ -1251,7 +2072,8 @@ function _scan_ci(
     exempt = nothing                  # the first `@strict_exempt :noalloc` callee whose allocation was excused
     # The first registered barrier found to box, or to look up a dictionary, inside itself. A barrier
     # excuses only allocation: what else it does is judged at the barrier, once, and its callers
-    # are pointed there rather than failed again for the same cause.
+    # are pointed there rather than failed again for the same cause. Not read in mode `:alloc`,
+    # where a box is an allocation and so excused with the rest.
     barrier_dict = nothing
     barrier_box = nothing
     truncated = false                 # part of the call graph was left unread
@@ -1260,8 +2082,11 @@ function _scan_ci(
     # only change the verdict at a non-isbits `:new`/`memorynew` that nothing else has flagged yet.
     # Corpus-measured (PureBLAS + PureIPM, 120 specializations): 57 frames reach no such statement.
     escmemo = Ref{Union{Nothing, Bool}}(nothing)
-    newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(sig))::Bool : escmemo[]::Bool
-    dead = ignore_throw() ? _deadend_mask(ci.code) : falses(length(ci.code))
+    newsdead() = escmemo[] === nothing ? (escmemo[] = _all_news_nonescaping(key))::Bool : escmemo[]::Bool
+    dead = _skip_mask(ci.code, caught, ci, sig)
+    # A callee called from a try region whose handler can return is scanned in a caught context.
+    region = caught === true || !ignore_throw() ? nothing : _caught_contexts(ci.code, dead, ci)
+    callee_caught(i) = isnothing(region) ? caught : _join_caught(caught, region[i])
     # Built on demand, like the escape analysis: only a non-isbits `:new` reads it.
     # Both branches are asserted, like `newsdead` above. Without it the memo's `Union{Nothing, …}`
     # is the closure's return type: the `isnothing` check narrows the FIRST load of the `Ref`, and
@@ -1270,13 +2095,21 @@ function _scan_ci(
     # only possible act is to throw on `uses[i]`.
     usememo = Ref{Union{Nothing, _SSAUses}}(nothing)
     ssauses() = isnothing(usememo[]) ? (usememo[] = _ssa_uses(ci))::_SSAUses : usememo[]::_SSAUses
+    # Whether this body is Base's task, lock or condition code. Boxing there is the scheduler's own, off
+    # the call's hot path, and is not counted, except in code the scheduler was handed to run: the
+    # function given to `lock(f, l)` is its caller's, inlined or called (`_calls_argument`).
+    schedmemo = Ref{Union{Nothing, Bool}}(nothing)
+    insched() = isnothing(schedmemo[]) ? (schedmemo[] = _sig_in_scheduler(key))::Bool : schedmemo[]::Bool
+    unsplitmemo = Ref{Union{Nothing, Bool}}(nothing)
+    unsplit() = isnothing(unsplitmemo[]) ? (unsplitmemo[] = _unsplit(ci, key))::Bool : unsplitmemo[]::Bool
+    schedstmt(i) = insched() ? _stmt_in_scheduler(ci, key, i, true, unsplit()) : _stmt_in_scheduler(ci, key, i, false, false)
     for (i, st) in enumerate(ci.code)
         local T = ci.ssavaluetypes[i]
         if top && abscontainer === nothing && _abstract_container(T)
             abscontainer = eltype(T)
         end
         if !boxing && (Meta.isexpr(st, :new) || Meta.isexpr(st, :foreigncall)) && !dead[i] &&
-                _boxing_store(ci, sig, st) && !_stmt_in_scheduler(ci, i)
+                _boxing_store(ci, sig, st) && !schedstmt(i)
             boxing = true
             isnothing(trace) || push!(trace, (i, st, :boxing))
         end
@@ -1338,13 +2171,16 @@ function _scan_ci(
                         # as a barrier. A barrier records `barrier = true`, which grants an allocation
                         # exemption elsewhere; StrictMode's presence in a body says nothing about
                         # whether the caller's own code allocates, so it must leave no trace at all.
-                    elseif _mi_is_barrier(mi)
+                    elseif (ex = _callee_excusal(mi, mode)).kind === :barrier
                         # The callee itself IS a recognized barrier (e.g. `(::OncePerProcess)()`,
                         # or a directly-registered function) — its one-time cold-path allocation
                         # is not a steady-state cost, so recursion stops here rather than seeing it.
+                        # Under `:alloc` that is all of it: a box is an allocation. The other modes
+                        # read a registered barrier for the causes it does not excuse.
                         barrier = true
-                        if depth > 0 && _is_registered_callee(first(mi.specTypes.parameters))
-                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _signals_by_type(mi.specTypes, depth - 1, seen, mode)
+                        registered = depth > 0 && mode !== :alloc && _is_registered_callee(first(mi.specTypes.parameters))
+                        if registered
+                            _, b2, d2, _, _, _, _, bd2, bb2, _ = _excused_signals(mi, depth - 1, seen, mode, callee_caught(i))
                             here = _demangle(mi.def.name)
                             isnothing(barrier_dict) && (barrier_dict = d2 ? here : bd2)
                             isnothing(barrier_box) && (barrier_box = b2 ? here : bb2)
@@ -1367,8 +2203,9 @@ function _scan_ci(
                         # The package's own code is followed to the end of its call graph (bounded by
                         # `_SCAN_BODY_BUDGET`): `depth` counts levels of Base only, since an allocation
                         # reached through a chain of the package's own helpers is as real as one in the
-                        # first. Below the last Base level `depth` is -1, which follows user code alone.
-                        user = _enters_user_code(mi)
+                        # first; so is the scheduler (`_followed_to_end`). Below the last Base level `depth` is -1,
+                        # which follows those alone.
+                        user = _followed_to_end(mi)
                         follows = depth > 0 || (depth < 0 && user)
                         # A callee can still change the answer while `undecided`: `:alloc` is decided by the
                         # first allocation or boxing, `:boxing` by the first boxing, and `:full` also needs the
@@ -1379,23 +2216,34 @@ function _scan_ci(
                             truncated = true
                         elseif follows && undecided
                             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
-                            a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(mi.specTypes, sub, seen, mode)
+                            cc = callee_caught(i)
+                            # A callee exempted from `:noalloc` has its allocation excused here
+                            # too — it is the same allocation, already excused where it is made —
+                            # and so has its boxing, since a box is an allocation. The excusal is
+                            # recorded, so the caller is reported as reaching it rather than as
+                            # clean. The callee's dictionary lookups still count. Code the callee
+                            # was handed by its caller and that it calls is the caller's: each such
+                            # call is read as the caller's own callee (`_callee_excusal`).
+                            if ex.kind === :exempt
+                                a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _excused_signals(mi, sub, seen, mode, cc)
+                                ((a2 || b2) && isnothing(exempt)) && (exempt = ex.name)
+                                a2 = b2 = false
+                            else
+                                a2, b2, d2, _, br2, up2, ex2, bd2, bb2, tr2 = _signals_by_type(_callee_key(mi), sub, seen, mode, cc)
+                            end
                             tr2 && (truncated = true)
                             isnothing(barrier_dict) && (barrier_dict = bd2)
                             isnothing(barrier_box) && (barrier_box = bb2)
-                            # A callee exempted from `:noalloc` has its allocation excused here
-                            # too — it is the same allocation, already excused where it is made —
-                            # and the excusal is recorded, so the caller is reported as reaching it
-                            # rather than as clean. Only allocation is excused: the callee's boxing
-                            # and dictionary lookups still count against the caller.
-                            exname = a2 ? _mi_exempt_name(mi) : nothing
-                            if isnothing(exname)
-                                a2 && (alloc = true)
-                            elseif isnothing(exempt)
-                                exempt = exname
+                            a2 && (alloc = true)
+                            for h in ex.handed
+                                ha, hb, _, _, _, _, _, _, _, htr = _signals_by_type(h, sub, seen, mode, cc)
+                                htr && (truncated = true)
+                                ha && (alloc = true)
+                                hb && (boxing = true)
                             end
                             (isnothing(exempt) && !isnothing(ex2)) && (exempt = ex2)
-                            (b2 && !_in_scheduler(mi)) && (boxing = true)
+                            (b2 && (!insched() || _in_scheduler(mi) || _calls_argument(sig, mi.specTypes) || !schedstmt(i))) &&
+                                (boxing = true)
                             d2 && (dictlookup = true)
                             br2 && (barrier = true)
                             up2 && (unionphi = true)
@@ -1417,9 +2265,16 @@ function _scan_ci(
                 (rt isa Type && rt <: AbstractDict) && (dictlookup = true)
             end
             if !boxing && !dead[i] && (callee === Core.setfield! || callee === Core.memoryrefset! || callee === Core.setglobal!) &&
-                    _boxing_store(ci, sig, st, callee) && !_stmt_in_scheduler(ci, i)
+                    _boxing_store(ci, sig, st, callee) && !schedstmt(i)
                 boxing = true
                 isnothing(trace) || push!(trace, (i, st, :boxing))
+            end
+            # A bounds-checked `memoryrefnew` throws the `BoundsError` it builds itself, so the call is an
+            # allocation wherever that throw returns normally (`_returns_for`).
+            if !(mode === :boxing || alloc || dead[i]) && _maythrow(ci, i) && _bounds_checked_ref(ci, sig, st) &&
+                    (!ignore_throw() || _returns_for(callee_caught(i), BoundsError))
+                alloc = true
+                isnothing(trace) || push!(trace, (i, st, :alloc))
             end
             if callee === Core.memorynew           # 1.12 `Memory` allocation is a builtin :call
                 if !(mode === :boxing || alloc || dead[i] || newsdead())
@@ -1430,7 +2285,7 @@ function _scan_ci(
                 # A splat the optimizer could not unroll (`max(v...)` over a `Vector`): the callee is
                 # looked up at run time for an argument list built at run time, whatever type
                 # inference gives the result.
-                if !dead[i]
+                if !dead[i] && !(insched() && schedstmt(i))
                     boxing = true
                     isnothing(trace) || push!(trace, (i, st, :boxing))
                 end
@@ -1447,9 +2302,11 @@ function _scan_ci(
                 # `Core.getfield(t, i, ...)`, and that genuinely needs boxing (the field's type
                 # varies by which runtime index is read) — that IS the founding runtime-tuple-
                 # index trap `@unroll` exists for, and must keep flagging as boxing.
-                boxing = true
-                isnothing(trace) || push!(trace, (i, st, :boxing))
-            elseif !boxing
+                if !(insched() && schedstmt(i))
+                    boxing = true
+                    isnothing(trace) || push!(trace, (i, st, :boxing))
+                end
+            elseif !boxing && !(insched() && schedstmt(i))
                 # Concrete result but a boxy argument on a non-builtin call = runtime dispatch
                 # that inference resolved only by return type (e.g. `Vec{32,UInt8}(::Tuple{Vararg})`).
                 if !(callee isa Core.Builtin || callee isa Core.IntrinsicFunction)
@@ -1466,7 +2323,15 @@ end
 
 # The name of the function `mi` calls, when an exemption in scope covers `:noalloc` for it at the
 # types it is called with; `nothing` otherwise.
-function _mi_exempt_name(mi::Core.MethodInstance)
+_mi_exempt_name(mi::Core.MethodInstance) =
+    (e = _mi_exemption(mi); isnothing(e) ? nothing : _demangle(mi.def.name))
+
+# The exemption that covers `:noalloc` for the method `mi` is a specialization of, at the types
+# it is called with. One declared in a module is matched on that module as well as the name: a
+# function of the same name elsewhere is another function. One declared with no module, from a
+# session, covers by name wherever the function lives, and `declared_in_module = true` leaves
+# those out, for a caller that needs the exemption to name a method.
+function _mi_exemption(mi::Core.MethodInstance; declared_in_module::Bool = false)
     mi.def isa Method || return nothing
     es = _noalloc_exemptions()
     isempty(es) && return nothing
@@ -1475,13 +2340,16 @@ function _mi_exempt_name(mi::Core.MethodInstance)
     types = length(ps) > 1 ? Tuple(ps[2:end]) : ()
     root = Base.moduleroot(mi.def.module)
     for (mod, e) in es
+        (declared_in_module && isnothing(e.mod) && isnothing(mod)) && continue
         # The declaring module when recorded, else the package root of the store it came from.
         if !isnothing(e.mod)
             mi.def.module === e.mod || continue
         else
             (isnothing(mod) || mod === root) || continue
         end
-        _covers(e, name, types, :noalloc) && return name
+        # The specialization is named by its MethodInstance, as a `_Spec` names it, so an exemption
+        # that names another method of the function does not cover it.
+        _covers(e, name, _Spec(mi), types, :noalloc) && return e
     end
     return nothing
 end
@@ -1494,8 +2362,16 @@ end
 The compiler's inferred effects for `f`'s signature — a cheap (inference-only) read of whether a
 method is `:nothrow`, `:effect_free`, `:terminates`, `:consistent`, etc. Used by the `:fast`
 triage and by `@assert_effects`.
+
+A signature with no typed body (no method matches it, or its generator raised) raises
+`_UnanalyzableSignature`: the compiler answers it with every effect but `:nothrow`, which
+describes no code.
 """
-effects(@nospecialize(f), @nospecialize(types::Tuple)) = _infer_effects(f, types)
+function effects(@nospecialize(f), @nospecialize(types::Tuple))
+    isnothing(_typed_body(_entry_key(f, types))) &&
+        throw(_UnanalyzableSignature(:effects, f, types, _NO_BODY_WHY))
+    return _infer_effects(f, types)
+end
 
 # Predicate by symbol, so callers can ask `effect_holds(eff, :nothrow)`.
 #
@@ -1534,6 +2410,10 @@ end
 # the point the question can be answered.
 const _SCOPED_TYPES = Any[]
 const _SCOPED_LOCK = ReentrantLock()
+const _LOCAL_SCOPED = :__strict_scoped_types__
+
+# Every scoped type in scope: this session's, and each loaded package's own.
+_scoped_types() = _registrations(_SCOPED_TYPES, _LOCAL_SCOPED)
 
 """
     register_scoped!(T::Type) -> T
@@ -1569,9 +2449,22 @@ visible. The two cover different halves and neither subsumes the other.
 Registration is by type because the analysis runs on IR after inlining, where a small accessor has
 been inlined into its caller and the callee boundary no longer exists. The type does.
 
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `T`, so
+registering a type another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. So does a
+call made by the owning package's own code while another package precompiles, such as a
+registration on first use that a dependent's precompile workload triggers. In a
+session the registration lasts for the session.
+
 See also [`@assert_noescape`](@ref), [`register_alloc_barrier!`](@ref).
 """
-function register_scoped!(@nospecialize(T::Type))
+function register_scoped!(@nospecialize(T::Type); mod::Module = _owner_module(T))
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
+    _keep_registration!(T, mod, _LOCAL_SCOPED, "register_scoped!($T)")
     @lock _SCOPED_LOCK begin
         any(S -> S === T, _SCOPED_TYPES) || push!(_SCOPED_TYPES, T)
     end
@@ -1588,7 +2481,7 @@ function _is_scoped_type(@nospecialize(T))
     # skipped, because `Union{A,B} <: A` is false, and a handle hiding in one branch of a producer
     # that did not inline would go unexamined rather than being reported as undecided.
     T isa Union && return _is_scoped_type(T.a) || _is_scoped_type(T.b)
-    @lock _SCOPED_LOCK for S in _SCOPED_TYPES
+    for S in _scoped_types()
         T <: S && return true
     end
     return false
@@ -1597,8 +2490,9 @@ end
 """
     _escaping_scoped(sig) -> (; escaped, undetermined)
 
-The registered scoped types that escape the frame `sig` names, and the ones whose fate this cannot
-decide. Both empty means nothing escaped, which is also the answer when no type is registered.
+The registered scoped types that escape the frame the body key `sig` names, and the ones whose
+fate this cannot decide. Both empty means nothing escaped, which is also the answer when no type
+is registered.
 
 Only a `:new` carries a verdict. The escape state of a value returned by a call comes from the
 conservative cache callback, which assumes an uncached callee escapes its arguments — so a handle
@@ -1608,9 +2502,9 @@ elsewhere has to be asked about where the handle is created.
 """
 function _escaping_scoped(@nospecialize(sig))
     sig = _forwarded_sig(sig)   # a default or keyword forwarder hands the handle to its body
-    isempty(_SCOPED_TYPES) && return (; escaped = String[], undetermined = String[])
+    isempty(_scoped_types()) && return (; escaped = String[], undetermined = String[])
     EA = Core.Compiler.EscapeAnalysis
-    irs = _code_ircode_by_type(sig)
+    irs = _code_ircode_of(sig)
     isempty(irs) && throw(ArgumentError("no IR for $sig"))
     ir = first(irs)[1]
     st = EA.analyze_escapes(
@@ -1656,7 +2550,7 @@ end
 function _noescape_finding(
         @nospecialize(f), @nospecialize(types::Tuple), md, fn, sg; tier::Symbol = :report
     )
-    r = _escaping_scoped(Tuple{typeof(f), types...})
+    r = _escaping_scoped(_entry_key(f, types))
     reason = !isempty(r.escaped) ?
         "a scoped value is not provably confined to this frame: " * join(r.escaped, ", ") *
         " — it is returned, stored, or captured, or handed to a function this analysis " *
@@ -1902,23 +2796,71 @@ end
 # The other readings of the compiler's inference answer under the same interpreter.
 function _return_types(@nospecialize(f), @nospecialize(types))
     world = Base.get_world_counter()
-    mi = _sig_instance(_sigtype(f, types), world)
+    mi = f isa _Spec ? f.mi : _sig_instance(_sigtype(f, types), world)
     isnothing(mi) || _infer_for_image(mi, world)
     n = _window_open()
     interp = _ScanInterpreter()
     try
-        return Base.return_types(f, types; interp)
+        f isa _Spec && return _return_types_of(mi, interp, interp)
+        f isa _Callable || return Base.return_types(f, types; interp)
+        return _return_types_by_type(_sigtype(f, types), interp, interp)
     finally
         _keep_sources(interp)
         _window_close(n)
     end
 end
 
+# `Base.return_types` for the signature `tt`, with its `passed_interp` and `interp`.
+function _return_types_by_type(@nospecialize(tt), passed_interp, interp)
+    matches = Base.invoke_interp_compiler(passed_interp, :_findall_matches, interp, tt)
+    matches === nothing && Base.raise_match_failure(:return_types, tt)
+    return Any[
+        something(Base.invoke_interp_compiler(passed_interp, :typeinf_type, interp, m::Core.MethodMatch), Any)
+            for m in matches.matches
+    ]
+end
+
+# The inferred return type of the specialization `mi`, as `_return_types_by_type` gives a match's.
+_return_types_of(mi::Core.MethodInstance, passed_interp, interp) =
+    Any[something(Base.invoke_interp_compiler(passed_interp, :typeinf_type, interp, mi), Any)]
+
+# `Base.return_types(f, Tuple{types...}; world)` under the default interpreter, for a `_Callable` and
+# a `_Spec` too.
+function _base_return_types(@nospecialize(f), @nospecialize(types); world::UInt = Base.get_world_counter())
+    f isa _Spec && return _return_types_of(f.mi, nothing, Base.invoke_default_compiler(:_default_interp, world))
+    f isa _Callable || return Base.return_types(f, Tuple{types...}; world)
+    return _return_types_by_type(_sigtype(f, types), nothing, Base.invoke_default_compiler(:_default_interp, world))
+end
+
 function _infer_effects(@nospecialize(f), @nospecialize(types))
     n = _window_open()
     interp = _ScanInterpreter()
     try
-        return Base.infer_effects(f, types; interp)
+        if f isa _Spec
+            # `Base.infer_effects` of the one specialization.
+            frame = Base.invoke_interp_compiler(interp, :typeinf_frame, interp, f.mi, true)
+            return frame === nothing ? _CC.Effects() : frame.result.ipo_effects
+        end
+        f isa _Callable || return Base.infer_effects(f, types; interp)
+        # `Base.infer_effects`, read by the signature.
+        tt = _sigtype(f, types)
+        effects = Base.invoke_interp_compiler(interp, :_infer_effects, interp, tt, true)
+        effects === nothing && Base.raise_match_failure(:infer_effects, tt)
+        return effects
+    finally
+        _keep_sources(interp)
+        _window_close(n)
+    end
+end
+
+# `_code_ircode_by_type` for the body `key` names (`_callee_key`).
+function _code_ircode_of(@nospecialize(key))
+    key isa Core.MethodInstance || return _code_ircode_by_type(key)
+    n = _window_open()
+    interp = _ScanInterpreter()
+    try
+        ir, rt = Base.invoke_interp_compiler(interp, :typeinf_ircode, interp, key, _INLINING_PASS)
+        return isnothing(ir) ? Any[] : Any[ir => rt]
     finally
         _keep_sources(interp)
         _window_close(n)
@@ -1945,13 +2887,92 @@ end
 # checked at its own precompile keeps those methods in its image: one per checked signature for each
 # of `signature_type`, `to_tuple_type` and `code_typed`, a few thousand on a package with a few
 # hundred checked kernels.
-_sigtype(@nospecialize(f), @nospecialize(types)) = Core.apply_type(Tuple, Core.Typeof(f), types...)
+_sigtype(@nospecialize(f), @nospecialize(types)) = Core.apply_type(Tuple, _ftype(f), types...)
+
+# A callable object known by its type alone. A compiled specialization of a callable struct's
+# method names the struct's type and holds no instance of it, and every analysis here reads the
+# signature only, so `_Callable{F}()` stands for an instance of `F` wherever the engine takes a
+# function. Base's `(f, types)` reflection reads the type of the value it is handed, so the readers
+# below reach Base by the signature for it.
+struct _Callable{F} end
+
+# The callee for a function type: its singleton instance when it has one, `_Callable{F}()` otherwise.
+_callee(@nospecialize(F)) = (F isa DataType && isdefined(F, :instance)) ? F.instance : _Callable{F}()
+
+# --- the body an item names ----------------------------------------------------------------------
+#
+# An item `(f, types)` is checked as the body it names, and names it by a key (`_callee_key`): the
+# signature `Tuple{typeof(f), types...}`, which names the specialization a call dispatches to. A
+# module sweep also meets specializations that no call dispatches to: `invoke(f, Tuple{wider},
+# args...)` compiles the wider method for argument types a more specific method answers. Such a
+# specialization is an item `(_Spec(mi), types)`, and its key is `mi` itself.
+#
+# The invariant: every guarantee reads an item's body through `_entry_key`, in both tiers, and a
+# `_Spec` cannot be turned into a signature. `_ftype` and `_sigtype` raise on one, so a reader that
+# would dispatch its signature, and judge the other method, fails the item instead of passing it.
+# `_which`, `_code_typed`, `_return_types`, `_base_return_types`, `_infer_effects`, `_llvm_ir` and
+# `_native_asm` read a `_Spec` as its specialization; a backend that takes a function and argument
+# types is driven through `_invoke_through`, whose body runs exactly that specialization.
+struct _Spec
+    mi::Core.MethodInstance
+end
+
+const _SPEC_BY_SIG = "a specialization reached only through `invoke` has no signature that " *
+    "dispatches to it, so it is read by its MethodInstance (`_entry_key`), never by signature"
+
+# The key of the body the item `(f, types)` names.
+_entry_key(@nospecialize(f), @nospecialize(types)) = f isa _Spec ? f.mi : _sigtype(f, types)
+
+# The function a `_Spec` belongs to, as `_callee` gives it.
+_spec_callee(s::_Spec) = _callee((s.mi.specTypes::DataType).parameters[1])
+
+# The item for the compiled specialization `mi` of `f`: `f` itself when its signature dispatches to
+# `mi`, and `_Spec(mi)` when it dispatches to another specialization.
+_entry_of(@nospecialize(f), mi::Core.MethodInstance) =
+    _sig_instance(mi.specTypes, Base.get_world_counter()) === mi ? f : _Spec(mi)
+
+# The argument types `invoke` selects the method of `s` by: the method's own, which only that method
+# answers. `_invoke_through` checks that the call it compiles is of `s.mi` before a backend reads it.
+function _spec_invoke_types(s::_Spec)
+    m = s.mi.def::Method
+    return Base.rewrap_unionall(Tuple{Base.unwrap_unionall(m.sig).parameters[2:end]...}, m.sig)
+end
+
+# The type a call to `f` dispatches on.
+function _ftype(@nospecialize(f))
+    f isa _Spec && throw(ArgumentError(_SPEC_BY_SIG))
+    return f isa _Callable ? typeof(f).parameters[1] : Core.Typeof(f)
+end
+
+# `which(f, types)`, where `types` is a tuple of types or a tuple type.
+function _which(@nospecialize(f), @nospecialize(types))
+    f isa _Spec && return f.mi.def::Method
+    f isa _Callable || return which(f, types)
+    ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
+    return which(_sigtype(f, ps))
+end
 
 function _code_typed(
         @nospecialize(f), @nospecialize(types); optimize::Bool = true, debuginfo::Symbol = :default
     )
+    f isa _Spec && return _code_typed_of(f.mi; optimize, debuginfo)
     ps = types isa Type ? Base.unwrap_unionall(types).parameters : types
-    return _code_typed_by_type(Core.apply_type(Tuple, Core.Typeof(f), ps...); optimize, debuginfo)
+    return _code_typed_by_type(Core.apply_type(Tuple, _ftype(f), ps...); optimize, debuginfo)
+end
+
+# `_code_typed_by_type` for the body `key` names (`_callee_key`): a specialization is inferred as
+# itself, where a signature is dispatched.
+function _code_typed_of(@nospecialize(key); optimize::Bool = true, debuginfo::Symbol = :default)
+    key isa Core.MethodInstance || return _code_typed_by_type(key; optimize, debuginfo)
+    n = _window_open()
+    interp = _ScanInterpreter()
+    try
+        src = Base.invoke_interp_compiler(interp, :typeinf_code, interp, key, optimize)
+        return src isa Core.CodeInfo ? Any[src => src.rettype] : Any[]
+    finally
+        _keep_sources(interp)
+        _window_close(n)
+    end
 end
 
 function _code_typed_by_type(@nospecialize(sig); optimize::Bool = true, debuginfo::Symbol = :default)
@@ -1990,7 +3011,7 @@ function _owned_node(@nospecialize(s))
     hit = @lock _OWNED_DEEP_LOCK get(_OWNED_NODE_MEMO, s, nothing)
     (!isnothing(hit) && hit[1] == world) && return (hit[2], hit[3])
     cts = try
-        _code_typed_by_type(s; optimize = true)
+        _code_typed_of(s; optimize = true)
     catch
         Any[]
     end
@@ -2011,7 +3032,7 @@ function _owned_node(@nospecialize(s))
             root = Base.moduleroot(mi.def.module)
             (root === Base || root === Core) && !_carries_user_type(mi.specTypes) && continue
             (_mi_is_strictmode(mi) || _mi_is_barrier(mi)) && continue
-            push!(succ, mi.specTypes)
+            push!(succ, _callee_key(mi))
         end
     end
     @lock _OWNED_DEEP_LOCK (_OWNED_NODE_MEMO[s] = (world, lookup, succ))

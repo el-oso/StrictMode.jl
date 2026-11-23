@@ -57,7 +57,7 @@ end
     @test only(one_left).func == "raw"
     @test isempty(unsafe_report(FenceAllow; allow = (:ccall, :unsafe_load, :pointer)))
     # …and the name filters work as they do on every other sweep.
-    @test isempty(unsafe_report(FenceAllow; only = r"^nothing_matches$"))
+    @test_throws "matches no function" unsafe_report(FenceAllow; only = r"^nothing_matches$")
     @test only(unsafe_report(FenceAllow; exempt = (:load,))).func == "raw"
 end
 
@@ -129,4 +129,479 @@ end
     @test uc(Assigned.slotassign) == [:pointer, :unsafe_load]
     @test uc(Assigned.cc) == [:ccall]
     @test uc(Assigned.gf) == [:unsafe_load]
+end
+
+@testitem "unsafe_report fails a method whose code it could not read" begin
+    using StrictMode
+
+    module UnreadUnsafe
+    @generated raises(x) = error("the generator raised")
+    @generated loads(p::Ptr{T}) where {T} = :(unsafe_load(p))
+    @generated clean(x::NTuple{N, T}) where {N, T} = :(x[1])
+    end
+
+    # A generator that raises leaves no code to read, which is not the same as code with no unsafe
+    # construct in it: the first is `nothing`, the second an empty list.
+    @test isnothing(StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.raises))))
+    @test isempty(StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.clean))))
+    @test StrictMode._unsafe_constructs(only(methods(UnreadUnsafe.loads))) == [:unsafe_load]
+
+    fs = unsafe_report(UnreadUnsafe)
+    unread = only(filter(x -> x.func == "raises", fs))
+    @test StrictMode._failed(unread)
+    @test unread.code === :SM0203
+    @test occursin("could not be read", unread.reason)
+    @test only(filter(x -> x.func == "loads", fs)).code === :SM0206
+    @test !any(x -> x.func == "clean", fs)
+end
+
+@testitem "unsafe_report catches every spelling of an unsafe construct" begin
+    using StrictMode
+
+    # One method per spelling. Each must be reported, with the construct named.
+    module FenceSpellings
+    plain(p) = unsafe_load(p)
+    kwcall(p) = unsafe_wrap(Array, p, 2; own = false)
+    broadcasted(ps) = unsafe_load.(ps)
+    mapped(ps) = map(unsafe_load, ps)
+    splatted(args) = unsafe_load(args...)
+    aliased(p) = (f = unsafe_load; f(p))
+    returned() = unsafe_load
+    qualified(p) = Base.unsafe_load(p)
+    qualified_mapped(ps) = map(Base.unsafe_load, ps)
+    composed(p) = (identity ∘ unsafe_load)(p)
+    closure(p) = map(q -> unsafe_load(q), [p])
+    doblock(p) = open(devnull) do io
+        unsafe_load(p)
+    end
+    intrinsic_ref(p) = Core.Intrinsics.pointerref(p, 1, 1)
+    intrinsic_set(p) = Core.Intrinsics.pointerset(p, 0.0, 1, 1)
+    llvm(x) = Base.llvmcall("ret i64 %0", Int, Tuple{Int}, x)
+    cglob() = cglobal(:jl_options)
+    cfun() = @cfunction(sin, Float64, (Float64,))
+    malloc() = Libc.malloc(8)
+    free(p) = Libc.free(p)
+    calloc() = Libc.calloc(1, 8)
+    freed_all(ps) = foreach(Libc.free, ps)
+    ptr_from_int(x::Int) = Ptr{Float64}(x)
+    ptr_cvoid(x::UInt) = Ptr{Cvoid}(x)
+    ptr_reinterpret(x::UInt) = reinterpret(Ptr{Float64}, x)
+    ptr_param(::Type{T}, x::UInt) where {T} = Ptr{T}(x)
+    memref_new(v) = Base.memoryrefnew(v.ref, 100, false)
+    memref_get(v) = Base.memoryrefget(v.ref, :not_atomic, false)
+    memref_set(v) = Base.memoryrefset!(v.ref, 0.0, :not_atomic, false)
+    tuple_unchecked(t, i) = getfield(t, i, false)
+    objref(x) = pointer_from_objref(x)
+    stored_qualified(p) = (f = Base.unsafe_load; f(p))
+    stored_libc(p) = (fr = Libc.free; fr(p))
+    stored_intrinsic(p) = (f = Core.Intrinsics.pointerref; f(p, 1, 1))
+    by_getglobal(p) = getglobal(Base, :unsafe_load)(p)
+    stored_getglobal(p) = (f = getglobal(Base, :unsafe_load); f(p))
+    ptr_convert(addr::UInt) = convert(Ptr{Float64}, addr)
+    end
+
+    expect = Dict(
+        "plain" => "unsafe_load", "kwcall" => "unsafe_wrap", "broadcasted" => "unsafe_load",
+        "mapped" => "unsafe_load", "splatted" => "unsafe_load", "aliased" => "unsafe_load",
+        "returned" => "unsafe_load", "qualified" => "unsafe_load",
+        "qualified_mapped" => "unsafe_load", "composed" => "unsafe_load",
+        "intrinsic_ref" => "pointerref", "intrinsic_set" => "pointerset", "llvm" => "llvmcall",
+        "cglob" => "cglobal", "cfun" => "@cfunction", "malloc" => "malloc", "free" => "free",
+        "calloc" => "calloc", "freed_all" => "free", "ptr_from_int" => "Ptr",
+        "ptr_cvoid" => "Ptr", "ptr_reinterpret" => "Ptr", "ptr_param" => "Ptr",
+        "memref_new" => "memoryrefnew", "memref_get" => "memoryrefget",
+        "memref_set" => "memoryrefset!", "tuple_unchecked" => "getfield",
+        "objref" => "pointer_from_objref",
+        "stored_qualified" => "unsafe_load", "stored_libc" => "free",
+        "stored_intrinsic" => "pointerref", "by_getglobal" => "unsafe_load",
+        "stored_getglobal" => "unsafe_load", "ptr_convert" => "Ptr",
+    )
+    fs = unsafe_report(FenceSpellings)
+    by = Dict{String, String}()
+    for f in fs
+        by[f.func] = get(by, f.func, "") * f.reason
+    end
+    for (name, construct) in expect
+        @test haskey(by, name)
+        @test occursin("`" * construct * "`", get(by, name, ""))
+    end
+    # A closure and a `do` block are methods of their own, named after the function that wrote them.
+    @test any(f -> occursin("closure", f.func) && occursin("`unsafe_load`", f.reason), fs)
+    @test any(f -> occursin("doblock", f.func) && occursin("`unsafe_load`", f.reason), fs)
+    @test all(StrictMode._failed, fs)
+
+    # The same shapes with nothing unsafe in them must stay clean.
+    module FenceClean
+    struct Buf
+        data::Vector{Float64}
+    end
+    plain(v) = v[1]
+    kwcall(v) = sort(v; rev = true)
+    broadcasted(v) = abs.(v)
+    mapped(v) = map(abs, v)
+    splatted(args) = max(args...)
+    aliased(v) = (f = sum; f(v))
+    returned() = sum
+    qualified(v) = Base.sum(v)
+    closure(v) = map(q -> q + 1, v)
+    free(b::Buf) = empty!(b.data)             # a package's own `free` is not `Libc.free`
+    release(b::Buf) = free(b)
+    takes_ptr(p::Ptr{Float64}) = p            # passing a pointer along dereferences nothing
+    ptr_typed(v) = Ptr{Float64}[]             # naming the type builds no pointer
+    is_null(p::Ptr{Cvoid}) = p == C_NULL
+    field(t) = getfield(t, 1)
+    field_checked(t, i) = getfield(t, i, true)
+    memref(v) = Base.memoryrefnew(v.ref, 1, true)
+    typed(x)::Float64 = x
+    converts(x) = convert(Float64, x) + reinterpret(Float64, UInt64(x))
+    tuple_get(t) = t[2]
+    stringy(x) = string("unsafe_load(", x, ")")
+    symbolic() = :unsafe_load
+    compares(f) = f === unsafe_load || f == pointer
+    stored_clean(v) = (f = Base.sum; f(v))
+    by_getglobal_clean(v) = getglobal(Base, :sum)(v)
+    qualified_compare(f) = f === Base.unsafe_load
+    converts_number(x) = convert(Int, x)
+    end
+    @test isempty(unsafe_report(FenceClean))
+
+    # `allow` excuses a spelling as it does the plain call, by the construct's name.
+    @test isempty(
+        unsafe_report(
+            FenceSpellings;
+            allow = (
+                :unsafe_load, :unsafe_wrap, :pointerref, :pointerset, :llvmcall, :cglobal,
+                :cfunction, :malloc, :free, :calloc, :Ptr, :memoryrefnew, :memoryrefget,
+                :memoryrefset!, :getfield, :pointer_from_objref,
+            )
+        )
+    )
+    @test_throws "`allow` names `pointr`" unsafe_report(FenceSpellings; allow = (:pointr,))
+    @test_throws "not a construct this scan reports" unsafe_report(FenceSpellings; allow = (:inbound,))
+end
+
+@testitem "unsafe_report follows a module or a pointer type kept in a local" begin
+    using StrictMode
+
+    module FenceLocals
+    module_local(p) = (B = Base; B.unsafe_load(p))
+    module_then_function(p) = (B = Base; f = B.unsafe_load; f(p))
+    type_local(a) = (T = Ptr{Float64}; T(a))
+    type_local_convert(a) = (T = Ptr{Float64}; convert(T, a))
+    # The name is a value of the call, so which function this reads is decided at run time.
+    by_name(p, nm) = getglobal(Base, nm)(p)
+    by_name_qualified(p, nm) = getproperty(Base, nm)(p)
+    by_name_local(p, nm) = (B = Base; getfield(B, nm)(p))
+    end
+    found(nm) = only(f for f in unsafe_report(FenceLocals) if f.func == String(nm)).reason
+    @test occursin("unsafe_load", found(:module_local))
+    @test occursin("unsafe_load", found(:module_then_function))
+    @test occursin("Ptr", found(:type_local))
+    @test occursin("Ptr", found(:type_local_convert))
+    # Not resolved, and said so: a method that passes this scan calls nothing unsafe by name.
+    for nm in (:by_name, :by_name_qualified, :by_name_local)
+        @test occursin("dynamic_global", found(nm))
+    end
+    @test length(unsafe_report(FenceLocals)) == 7
+    @test length(unsafe_report(FenceLocals; allow = (:dynamic_global,))) == 4
+
+    module FenceLocalsClean
+    struct S
+        x::Int
+    end
+    module_local(v) = (B = Base; B.sum(v))
+    type_local(a) = (T = Vector{Float64}; T(a))
+    # A field chosen at run time is a field of a value, not a global of a module.
+    field_by_name(s, nm) = getfield(s, nm)
+    property_by_name(s, nm) = getproperty(s, nm)
+    # A variable assigned twice is not followed to either value; neither names anything unsafe.
+    twice(v, c) = (f = sum; c && (f = prod); f(v))
+    end
+    @test isempty(unsafe_report(FenceLocalsClean))
+end
+
+@testitem "unsafe_report reads getfield's unchecked form with a memory order" begin
+    using StrictMode
+
+    module FenceOrdered
+    unchecked(t, i) = getfield(t, i, :not_atomic, false)
+    checked(t, i) = getfield(t, i, :not_atomic, true)
+    end
+    fs = unsafe_report(FenceOrdered)
+    @test only(fs).func == "unchecked"
+    @test occursin("`getfield`", only(fs).reason)
+end
+
+@testitem "unsafe_report reads constructors, top-level lambdas and union callables" begin
+    using StrictMode
+
+    module CtorFence
+    struct Buf
+        p::Ptr{UInt8}
+    end
+    Buf(n::Int) = Buf(convert(Ptr{UInt8}, Libc.malloc(n)))
+    struct Raw
+        x::Int
+        Raw(v::Vector{Float64}) = new(Int(unsafe_load(pointer(v))))
+    end
+    const LOAD = p -> unsafe_load(p)
+    struct KA end
+    struct KB end
+    (k::Union{KA, KB})(x) = ccall(:abs, Cint, (Cint,), x)
+    end
+
+    fs = unsafe_report(CtorFence)
+    @test length(fs) == 4
+    @test all(StrictMode._failed, fs)
+    reasons = [f.reason for f in fs]
+    @test any(r -> occursin("`malloc`", r) && occursin("`Ptr`", r), reasons)
+    @test any(r -> occursin("`pointer`", r) && occursin("`unsafe_load`", r), reasons)
+    @test count(r -> occursin("`unsafe_load`", r), reasons) == 2
+    @test any(r -> occursin("`ccall`", r), reasons)
+    # A constructor answers to its type's name; a callable with no name of its own matches no `only`.
+    @test length(unsafe_report(CtorFence; only = (:Buf,))) == 1
+    @test length(unsafe_report(CtorFence; exempt = (:Buf, :Raw))) == 2
+
+    # A keyword default is evaluated by the positional method as well as by `Core.kwcall`'s.
+    module KwDefaultFence
+    first_load(p; n = unsafe_load(p)) = n
+    end
+    @test any(f -> f.func == "first_load" && occursin("`unsafe_load`", f.reason), unsafe_report(KwDefaultFence))
+end
+
+@testitem "unsafe_report reads a generated method at each compiled specialization" begin
+    using StrictMode
+
+    module GenTyped
+    @generated sumtup(t::NTuple{N, Float64}) where {N} = Expr(:call, :+, (:(t[$i]) for i in 1:N)...)
+    @generated loadtup(p::NTuple{N, Ptr{Float64}}) where {N} =
+        Expr(:call, :+, (:(unsafe_load(p[$i])) for i in 1:N)...)
+    end
+    # The generator needs the argument types, so before any call there is no code to read.
+    r = only(unsafe_report(GenTyped; only = (:sumtup,)))
+    @test StrictMode._failed(r)
+    @test occursin("could not be read", r.reason)
+
+    @test GenTyped.sumtup((1.0, 2.0)) == 3.0
+    v = [1.0, 2.0]
+    GC.@preserve v begin
+        @test GenTyped.loadtup((pointer(v), pointer(v, 2))) == 3.0
+    end
+    @test isempty(unsafe_report(GenTyped; only = (:sumtup,)))
+    @test occursin("`unsafe_load`", only(unsafe_report(GenTyped; only = (:loadtup,))).reason)
+end
+
+@testitem "unsafe_report follows every module a local can hold" begin
+    using StrictMode
+
+    module FenceLocalsMany
+    twice(p, c::Bool) = (M = Core; c && (M = Base); M.unsafe_load(p))
+    typed(p) = (M::Module = Base; M.unsafe_load(p))
+    twice_by_name(p, c::Bool, nm) = (M = Core; c && (M = Base); getfield(M, nm)(p))
+    end
+    found(nm) = only(f for f in unsafe_report(FenceLocalsMany) if f.func == String(nm)).reason
+    @test occursin("`unsafe_load`", found(:twice))
+    @test occursin("`unsafe_load`", found(:typed))
+    @test occursin("`dynamic_global`", found(:twice_by_name))
+
+    module FenceLocalsManyClean
+    twice(v, c::Bool) = (M = Core; c && (M = Base); M.sum(v))
+    typed(v) = (M::Module = Base; M.sum(v))
+    end
+    @test isempty(unsafe_report(FenceLocalsManyClean))
+end
+
+@testitem "unsafe_report reports code evaluated at run time" begin
+    using StrictMode
+
+    module FenceEval
+    by_eval(p, nm::Symbol) = Core.eval(Base, nm)(p)
+    run_c(x::Int) = @eval ccall(:abs, Cint, (Cint,), $x)
+    own_eval(ex) = eval(ex)
+    by_string(s) = include_string(@__MODULE__, s)
+    end
+    fs = unsafe_report(FenceEval)
+    @test length(fs) == 4
+    @test all(f -> StrictMode._failed(f) && occursin("`eval`", f.reason), fs)
+    @test isempty(unsafe_report(FenceEval; allow = (:eval,)))
+end
+
+@testitem "unsafe_report sees an unsafe function held by a callable constant" begin
+    using StrictMode
+
+    module FenceWrapped
+    const LOAD1 = Base.Fix2(unsafe_load, 1)
+    get1(p) = LOAD1(p)
+    const RELEASE = identity ∘ Libc.free
+    release(p) = RELEASE(p)
+    end
+    found(nm) = only(f for f in unsafe_report(FenceWrapped) if f.func == String(nm)).reason
+    @test occursin("`unsafe_load`", found(:get1))
+    @test occursin("`free`", found(:release))
+
+    module FenceWrappedClean
+    const ADD1 = Base.Fix2(+, 1)
+    inc(x) = ADD1(x)
+    const ABSSUM = sum ∘ abs
+    total(x) = ABSSUM(x)
+    end
+    @test isempty(unsafe_report(FenceWrappedClean))
+end
+
+@testitem "unsafe_report sees a pointer type handed to a higher-order function" begin
+    using StrictMode
+
+    # Each method builds pointers from integers by handing `Ptr{T}` to a call that applies it.
+    module FencePtrApplied
+    mapped(xs) = map(Ptr{Float64}, xs)
+    mapped_into(ys, xs) = map!(Ptr{Float64}, ys, xs)
+    dotted(xs) = Ptr{Float64}.(xs)
+    broadcast_call(xs) = broadcast(Ptr{Float64}, xs)
+    broadcast_into(ys, xs) = broadcast!(Ptr{Float64}, ys, xs)
+    broadcasted_lazy(xs) = Base.broadcasted(Ptr{Float64}, xs)
+    each(xs) = foreach(Ptr{Float64}, xs)
+    piped(x) = x |> Ptr{Float64}
+    composed(x) = (identity ∘ Ptr{Float64})(x)
+    composed_type(x) = ComposedFunction(identity, Ptr{Float64})(x)
+    fixed1(x) = Base.Fix1(Ptr{Float64}, x)
+    fixed2(x) = Base.Fix2(Ptr{Float64}, x)
+    reduced(xs) = mapreduce(Ptr{Float64}, (a, b) -> b, xs)
+    reduced_kw(xs) = mapreduce(Ptr{Float64}, (a, b) -> b, xs; init = C_NULL)
+    folded_left(xs) = mapfoldl(Ptr{Float64}, (a, b) -> b, xs)
+    folded_right(xs) = mapfoldr(Ptr{Float64}, (a, b) -> b, xs)
+    filtered(xs) = filter(Ptr{Float64}, xs)
+    filtered_into(xs) = filter!(Ptr{Float64}, xs)
+    any_of(xs) = any(Ptr{Float64}, xs)
+    all_of(xs) = all(Ptr{Float64}, xs)
+    summed(xs) = sum(Ptr{Float64}, xs)
+    counted(xs) = count(Ptr{Float64}, xs)
+    found(xs) = findall(Ptr{Float64}, xs)
+    lazy(xs) = Iterators.map(Ptr{Float64}, xs)
+    end
+    fs = unsafe_report(FencePtrApplied)
+    reported = Set(f.func for f in fs)
+    for nm in names(FencePtrApplied; all = true)
+        s = String(nm)
+        (isdefined(FencePtrApplied, nm) && getglobal(FencePtrApplied, nm) isa Function &&
+            !startswith(s, "#") && s != "eval" && s != "include") || continue
+        @test s in reported
+    end
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+    @test isempty(unsafe_report(FencePtrApplied; allow = (:Ptr,)))
+
+    # Naming the pointer type, in a call that only names it, builds no pointer.
+    module FencePtrNamed
+    ptr_typed(v) = Ptr{Float64}[]
+    is_ptr(x) = isa(x, Ptr{Float64})
+    ptr_vector() = Vector{Ptr{Float64}}(undef, 2)
+    ref_ptr() = Ref{Ptr{Cvoid}}(C_NULL)
+    eltyped(xs) = map(x -> x isa Ptr{Float64}, xs)
+    mapped_clean(xs) = map(abs, xs)
+    piped_clean(x) = x |> abs
+    counted_types(ts) = count(==(Ptr{Float64}), ts)
+    collected(ps) = map(identity, Ptr{Float64}[])
+    end
+    @test isempty(unsafe_report(FencePtrNamed))
+end
+
+@testitem "unsafe_report sees a pointer type handed to any call that may apply it" begin
+    using StrictMode
+
+    module FencePtrBuilt
+    splatted(xs) = Ptr{Cvoid}(xs...)
+    tupled(n) = ntuple(Ptr{Cvoid}, n)
+    generated(a) = collect(Base.Generator(Ptr{Cvoid}, a))
+    literal(a) = Ptr{Cvoid}[a]
+    shifted(a) = C_NULL + a
+    end
+    @test FencePtrBuilt.tupled(2) == (Ptr{Cvoid}(1), Ptr{Cvoid}(2))
+    @test FencePtrBuilt.literal(UInt(3)) == [Ptr{Cvoid}(3)]
+    fs = unsafe_report(FencePtrBuilt)
+    @test Set(f.func for f in fs) == Set(["splatted", "tupled", "generated", "literal", "shifted"])
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+
+    # Naming the type builds no pointer.
+    module FencePtrNamedMore
+    size_of() = sizeof(Ptr{Float64})
+    either(x) = x::Union{Ptr{Float64}, Nothing}
+    is_sub(T) = T <: Ptr{Float64}
+    converted(a) = Base.cconvert(Ptr{Cvoid}, a)    # returns the integer
+    # A `ccall` converts its pointer arguments through `cconvert` and `unsafe_convert`; the
+    # `ccall` is the finding, and its lowering adds no `Ptr`.
+    strlen(s::String) = ccall(:strlen, Csize_t, (Ptr{UInt8},), s)
+    end
+    @test FencePtrNamedMore.converted(UInt(4)) === UInt(4)
+    fs = unsafe_report(FencePtrNamedMore)
+    @test only(fs).func == "strlen"
+    @test occursin("`ccall`", only(fs).reason) && !occursin("`Ptr`", only(fs).reason)
+end
+
+@testitem "unsafe_report clears a call that only looks at a pointer type" begin
+    using StrictMode
+
+    module FencePtrLooked
+    promoted(T) = promote_type(T, Ptr{Cvoid})
+    similar_to(v) = similar(v, Ptr{Cvoid})
+    null() = zero(Ptr{Cvoid})
+    shown(io) = print(io, Ptr{Cvoid})
+    named() = string(Ptr{Cvoid})
+    bits() = isbitstype(Ptr{Cvoid})
+    signature() = (Ptr{Float64}, Ptr{Float64}, Int)
+    found(f) = which(f, (Ptr{Cvoid},))
+    meets(T) = Base.hasintersect(T, Ptr{Cvoid})
+    end
+    @test isempty(unsafe_report(FencePtrLooked))
+
+    # A tuple holding anything but types can be applied later.
+    module FencePtrHeld
+    held(a) = (Ptr{Cvoid}, a)
+    end
+    @test only(unsafe_report(FencePtrHeld)).func == "held"
+
+    # StrictMode's own precompile workload names a pointer signature as a tuple of types.
+    @test !any(f -> f.func == "_run_workload", unsafe_report(StrictMode))
+end
+
+@testitem "unsafe_report sees an offset on a pointer argument" begin
+    using StrictMode
+
+    module FencePtrOffset
+    offset(p::Ptr{Float64}) = p + 8
+    offset_left(p::Ptr{Float64}) = 8 + p
+    back(p::Ptr{UInt8}) = p - 1
+    generic(p::Ptr{T}) where {T} = p + sizeof(T)
+    intrinsic(p::Ptr{UInt8}) = Core.Intrinsics.add_ptr(p, UInt(1))
+    end
+    @test FencePtrOffset.offset(Ptr{Float64}(16)) == Ptr{Float64}(24)
+    fs = unsafe_report(FencePtrOffset)
+    @test Set(f.func for f in fs) == Set(["offset", "offset_left", "back", "generic", "intrinsic"])
+    @test all(f -> occursin("`Ptr`", f.reason), fs)
+
+    # Integer arithmetic and passing a pointer along build no pointer.
+    module FencePtrNoOffset
+    ints(a::Int, b::Int) = a + b
+    mixed(p::Ptr{Float64}, a::Int) = (p, a + 8)
+    end
+    @test isempty(unsafe_report(FencePtrNoOffset))
+
+    # The difference of two pointer arguments is an integer, and is reported by its own name.
+    module FencePtrDiff
+    diff(p::Ptr{UInt8}, q::Ptr{UInt8}) = p - q
+    end
+    @test FencePtrDiff.diff(Ptr{UInt8}(24), Ptr{UInt8}(16)) == 8
+    d = only(unsafe_report(FencePtrDiff))
+    @test d.func == "diff"
+    @test occursin("pointer difference", d.reason)
+    @test !occursin("`Ptr`", d.reason)
+    @test occursin(":ptr_difference", d.suggestion)
+    @test isempty(unsafe_report(FencePtrDiff; allow = (:ptr_difference,)))
+    @test !isempty(unsafe_report(FencePtrDiff; allow = (:Ptr,)))
+
+    # Comparing two pointers, and subtracting two integers, builds nothing.
+    module FencePtrCompare
+    eqp(p::Ptr{UInt8}, q::Ptr{UInt8}) = p == q
+    lt(p::Ptr{UInt8}, q::Ptr{UInt8}) = p < q
+    intdiff(a::Int, b::Int) = a - b
+    end
+    @test isempty(unsafe_report(FencePtrCompare))
 end

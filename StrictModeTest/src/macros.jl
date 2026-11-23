@@ -9,8 +9,11 @@
 
 # Prove `guarantees` and raise if any fails. `kind` names the macro in the exception, so a
 # composite reports as `@strict`/`@kernel` rather than as whichever of its parts failed first.
-function _test_guarantee(kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple))
-    fs = _proof_findings(f, types, guarantees)
+function _test_guarantee(
+        kind::Symbol, guarantees::Tuple, target, @nospecialize(f), @nospecialize(types::Tuple);
+        allow_exempt::Bool = false
+    )
+    fs = StrictMode._gate_always_throws(_proof_findings(f, types, guarantees; allow_exempt))
     failed = filter(StrictMode._failed, fs)
     isempty(failed) && return nothing
     msg = sprint(io -> StrictMode.format_findings(io, failed; format = :text))
@@ -21,7 +24,7 @@ end
 # prove the guarantees, hand the value back. One `_proof_findings` call covers a composite, so
 # `@test_kernel` runs AllocCheck once rather than once per bundled guarantee.
 function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, args)
-    pos, opts = StrictMode._macro_call(args, (:types,))
+    pos, opts = StrictMode._macro_call(macroname, args, (:types, :allow_exempt))
     isempty(pos) && throw(ArgumentError("$macroname needs a call expression"))
     call = pos[1]
     target = string(call)
@@ -29,7 +32,7 @@ function _test_macro_expr(kind::Symbol, guarantees::Tuple, macroname::String, ar
     return quote
         $(p.binds...)
         local _val = $(p.litcall)
-        $(StrictMode._opaque_function(:($(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types))), p.checkfn))
+        $(StrictMode._opaque_function(:($(_test_guarantee)($(QuoteNode(kind)), $guarantees, $target, $(p.checkfn), $(p.types); allow_exempt = $(esc(get(opts, :allow_exempt, false))))), p.checkfn))
         _val
     end
 end
@@ -47,6 +50,14 @@ or a CI gate should use. Each argument is evaluated once and the macro returns t
 Allocations on never-taken throw branches are ignored by default — see [`StrictMode.set_ignore_throw!`](@ref) —
 as is a call whose only allocation is a recognized one-time-init barrier
 (see [`set_ignore_barrier!`](@ref)).
+
+A call that allocates only inside functions exempted from `:noalloc` with `@strict_exempt`, in the
+module that defines them, is not a pass. It fails, with code SM0018, and the message lists each
+exempt function with the reason its exemption gave. `allow_exempt = true` accepts those exemptions
+for this check: the call then passes if nothing else allocates, and still fails if one site is its
+own.
+An exemption declared with no module (a session-wide one, by name) counts for none of this: its
+caller fails as any allocating call does.
 
 ```julia
 @test_noalloc dot3(a, b)              # ok
@@ -222,7 +233,7 @@ ws = Workspace()
 Each argument is evaluated once, before the warmup calls, so the same values are reused throughout.
 """
 macro test_steady_state(args...)
-    pos, opts = StrictMode._macro_call(args, (:warmups, :repeats, :fresh_task))
+    pos, opts = StrictMode._macro_call("@test_steady_state", args, (:warmups, :repeats, :fresh_task))
     isempty(pos) && throw(ArgumentError("@test_steady_state needs a call expression"))
     call = pos[1]
     p = StrictMode._call_parts(call)
@@ -305,7 +316,7 @@ Each argument is evaluated once, before the warmup calls, so the same values are
 """
 macro test_no_gc_pause(args...)
     pos, opts = StrictMode._macro_call(
-        args, (:samples, :warmups, :max_collections, :max_q99_ms, :slow_factor)
+        "@test_no_gc_pause", args, (:samples, :warmups, :max_collections, :max_q99_ms, :slow_factor)
     )
     isempty(pos) && throw(ArgumentError("@test_no_gc_pause needs a call expression"))
     call = pos[1]
@@ -378,7 +389,7 @@ use [`StrictMode.allocated_bytes`](@ref), which takes the argument tuple.
 ```
 """
 macro test_allocated_zero(args...)
-    pos, opts = StrictMode._macro_call(args, (:warmups, :windows))
+    pos, opts = StrictMode._macro_call("@test_allocated_zero", args, (:warmups, :windows))
     isempty(pos) && throw(ArgumentError("@test_allocated_zero needs a call expression"))
     call = pos[1]
     p = StrictMode._call_parts(call)
@@ -418,10 +429,16 @@ The macro returns the call's value.
 ```
 """
 macro test_reaches(call, g)
+    (Meta.isexpr(g, :(=)) && g.args[1] isa Symbol) &&
+        throw(ArgumentError(StrictMode._unknown_option("@test_reaches", g.args[1], ())))
     p = StrictMode._call_parts(call)
     return quote
         $(p.binds...)
         $(_check_reaches)($(string(call)), $(p.checkfn), $(p.types), $(esc(g)))
         $(p.litcall)
     end
+end
+
+macro test_reaches(args...)
+    return StrictMode._reject_options("@test_reaches", args, "a call and a target function")
 end

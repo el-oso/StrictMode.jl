@@ -17,6 +17,16 @@ These go at a call site. Each one evaluates its arguments once and hands back th
 you can wrap an expression and leave the rest of your code alone. With checks disabled they expand
 to the bare call.
 
+An option is written `name = value` before the call, as in `@assert_noalloc types = (Vector{Float64},) f(x)`.
+A name the macro does not have is an error at macro expansion that lists the accepted ones, so a
+misspelled or removed option is never dropped with the call left to run at its defaults. The same
+holds for a guarantee name in `guarantees = (…)`, which is checked before a sweep starts.
+
+An `only` or `exempt` entry that matches no function with a method in the module raises too, and so
+does a `stop` entry the walk of `reach_report` never meets: a misspelled `only` scopes a sweep to
+nothing and returns the clean result of a module with nothing wrong in it. A predicate function is
+taken as given.
+
 ```@docs
 @assert_noalloc
 @assert_noboxing
@@ -163,7 +173,9 @@ concurrent tasks. `@assert_no_threadid_state` fails on mutable state indexed by
 `Threads.threadid()` that is still in use after a point where the task can be suspended: only there
 can the task move threads, or another run on its thread and reach the same state. `pool_balance_report` is the companion diagnostic for
 thread-pool balance questions. `spin_wait_report` reads how the tasks a call spawns wait, and
-reports a migratable one that spins without ever blocking.
+reports a migratable one that spins without ever blocking. It enters a Base call handed a user
+value, so a `show` that spins behind `repr` is read; an argument typed `Any` is counted as not
+followed.
 
 ```@docs
 @assert_concurrency_safe
@@ -181,6 +193,22 @@ the positional one behind it — can each pass every per-call guarantee and stil
 routes, when one of them calls a shared core with its defaults. `reach_report` lists the functions
 a call reaches after optimization, `@assert_reaches` checks one named target, and `route_parity`
 compares two entries and names what only one of them reaches.
+
+The walk does not enter Base. A Base call on concrete Base types stays in Base and costs nothing;
+one with an argument typed abstractly (`Any`, `AbstractVector{Float64}`) may run a user type's
+methods at run time, so it is counted in `dynamic` and the graph is not complete. Type parameters
+count at every depth: a concrete container of abstract elements (`Vector{Any}`,
+`Dict{Symbol, Any}`, `Vector{Vector{Any}}`) holds values of any type, so `sum` of one is counted
+too. `fetch(t)` returns `Any`, so a route that fetches a task and computes with the result is
+incomplete: there `@assert_reaches` warns about an absent target instead of throwing, and `route_parity` reports
+`:incomplete` rather than `:agree`.
+
+A Base method compiled for `Any` (`@nospecialize`) that is handed a value of a type defined outside
+Base is read at the type it is handed. Base's default `show` of a struct is called this way,
+through a compiler barrier, and the walk reads the barrier's operand, so the `show` of each field
+is reached. When that type would select another method, as an explicit
+`invoke(show, Tuple{IO, Any}, io, x)` does for a type with its own `show`, reading it at that type
+would read the other method, so the call is counted in `dynamic` instead.
 
 ```@docs
 @assert_reaches
@@ -263,6 +291,7 @@ StrictMode.policy_sets
 StrictMode.guarantee_names
 StrictMode.clear_declarations!
 StrictMode.declarations
+StrictMode.method_declarations
 StrictMode.exemptions
 StrictMode._UnanalyzableSignature
 ```
@@ -310,13 +339,19 @@ Checks are gated behind a compile-time setting, on by default. Toggling it write
 [Getting Started](getting_started.md) for the `Project.toml` pattern a shipped application wants.
 
 `banner_enabled` reports the `banner` preference, which controls the tier banner printed at load.
-Set `banner = false` to silence it; with it off `__init__` has no body at all, which is what a
-`juliac --trim` build wants.
+Set `banner = false` to silence the banner. It silences nothing else: a preference key StrictMode
+does not read is still reported at load.
 
 The banner also only prints where StrictMode was chosen: `direct_dependency` asks whether an
 environment this session loads from names StrictMode itself. A package that uses StrictMode inside
 its own `src` is a dependency of projects that never named it, and loading such a package says
 nothing about a tier its users can act on, so those sessions stay silent.
+
+StrictMode reads two preference keys, `checks_enabled` and `banner`. Preferences.jl ignores any
+other key without a word, so `check_enabled = false` leaves checks on. StrictMode names each such key
+in a warning at load, with the file it is in, and `unknown_preferences` returns the same list. The
+warning is given whatever `banner` is set to. A preference file that exists but cannot be read is
+named in a warning of its own, once per session, rather than counted as setting nothing.
 
 ```@docs
 enable_checks!
@@ -324,6 +359,7 @@ disable_checks!
 checks_enabled
 banner_enabled
 StrictMode.direct_dependency
+StrictMode.unknown_preferences
 proofs_loaded
 assert_enabled
 mca_available
@@ -336,15 +372,19 @@ set_ignore_throw!
 `Base.OncePerProcess`/`OncePerThread`-memoized lazy init allocates once, then reads a memoized
 value forever after. The IR scan recognizes those two `Base` once-guard types automatically and
 stops at them instead of counting the initializer, and `StrictModeTest` honors the same
-recognition: `@test_noalloc` substitutes the (already-correct) steady-state scan for AllocCheck's
-all-paths proof on a call whose only allocation risk is the barrier, rather than reporting the
-initializer's one-time allocation as a violation. That substitution is logged once per session via
+recognition: on a call that reaches the barrier, `@test_noalloc` keeps AllocCheck's
+all-paths proof and drops the allocation sites the barrier accounts for, rather than reporting the
+initializer's one-time allocation as a violation. That exemption is logged once per session via
 `@info`, never silently, and `StrictModeTest.set_ignore_barrier!(false)` turns it off.
 
 `register_alloc_barrier!` extends the recognition to a hand-rolled memoization pattern that doesn't
 use one of those two `Base` types (this includes `Base.OncePerTask`, which is **not**
 auto-recognized — its implementation has no detectable non-inlined callee boundary; wrap it in your
 own function and register that instead).
+
+A callable object is registered as its type, `register_alloc_barrier!(Table)`, which covers a call
+of every `Table`. One instance, `register_alloc_barrier!(Table(4))`, is refused: the scan reads the
+type of the callee and cannot tell one instance from another.
 
 ```@docs
 register_alloc_barrier!

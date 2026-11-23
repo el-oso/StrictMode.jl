@@ -346,3 +346,22 @@ end
     sig = Base.signature_type(FakeFwd.kern!, Tuple{Vector{Float64}, Vector{Float64}, Base.RefValue{Float64}})
     @test StrictMode._forwarded_sig(sig) == sig
 end
+
+@testitem "a wider invoke of the same function is not read as a forwarder" begin
+    using StrictMode
+    # The two-argument method calls the `Integer` method by `invoke`; the signature of that callee,
+    # `(V, V, Int)`, dispatches to the `Int` method, which the call does not run. The checks read
+    # the method they were asked about rather than that other one.
+    @noinline function wide_kernel!(y::Vector{Float64}, x::Vector{Float64}, ::Integer)
+        @inbounds @simd for i in eachindex(y, x)
+            y[i] = y[i] * x[i] + x[i]
+        end
+        return y
+    end
+    @noinline wide_kernel!(y::Vector{Float64}, x::Vector{Float64}, ::Int) = y
+    wide_kernel!(y::Vector{Float64}, x::Vector{Float64}) =
+        invoke(wide_kernel!, Tuple{Vector{Float64}, Vector{Float64}, Integer}, y, x, 1)
+    V = Vector{Float64}
+    wide_kernel!(rand(64), rand(64))
+    @test StrictMode._forwarded_types(wide_kernel!, (V, V)) == (V, V)
+end

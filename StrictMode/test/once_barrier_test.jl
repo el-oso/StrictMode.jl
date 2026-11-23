@@ -217,3 +217,103 @@ end
     @test isempty(d)
     @test !any(l -> startswith(l, "proof:alloc-sites="), d.proof_signals)
 end
+
+@testitem "a callable object is a barrier by its type, and registered as the type" begin
+    using StrictMode
+
+    module CallableBarrier
+    struct Table
+        n::Int
+    end
+    @noinline (t::Table)() = zeros(t.n)
+    @noinline (t::Table)(k::Int; scale::Int = 1) = zeros(t.n * k * scale)
+    use4() = Table(4)()[1]
+    use5() = Table(5)()[1]
+    useany(t::Table) = t()[1]
+    usekw(t::Table) = t(2; scale = 3)[1]
+    @noinline singleton() = zeros(3)
+    usesingleton() = singleton()[1]
+    end
+    C = CallableBarrier
+    status(f, T = ()) = only(findings(f, T; guarantees = (:noalloc,))).status
+
+    # The scan sees the callee's type and no value, so one instance cannot be registered apart
+    # from the others. Asking for that is refused, and the message says what can be registered.
+    @test_throws "a barrier is matched on the callee's type, so it would cover every `Table`" register_alloc_barrier!(C.Table(4))
+    @test_throws "register_alloc_barrier!(Table)" register_alloc_barrier!(C.Table(4))
+    captured = let n = 3
+        () -> zeros(n)
+    end
+    @test_throws "would cover every" register_alloc_barrier!(captured)
+    @test isempty(filter(g -> g isa C.Table, StrictMode._barrier_functions()))
+    @test StrictMode._failed(only(findings(C.use4, (); guarantees = (:noalloc,))))
+
+    # The type is every instance, and says so at the call.
+    @test isnothing(register_alloc_barrier!(C.Table))
+    @test status(C.use4) !== :fail
+    @test status(C.use5) !== :fail
+    @test status(C.useany, (C.Table,)) !== :fail
+    @test status(C.usekw, (C.Table,)) !== :fail
+    # Building one is not calling one.
+    build(n) = CallableBarrier.Table(n)
+    @test status(build, (Int,)) === :pass
+
+    # A function is its own type's one instance.
+    @test StrictMode._failed(only(findings(C.usesingleton, (); guarantees = (:noalloc,))))
+    @test isnothing(register_alloc_barrier!(C.singleton))
+    @test status(C.usesingleton) !== :fail
+
+    for f in (C.Table, C.singleton)
+        delete!(StrictMode._ALLOC_BARRIERS, f)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(C)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== f, store)
+    end
+    StrictMode._BARRIER_GEN[] += 1
+    StrictMode.clear_cache!()
+end
+
+@testitem "a callable object is a barrier through its keyword body" begin
+    using StrictMode, StrictModeTest
+
+    module KwBarrier
+    struct KwTable
+        n::Int
+    end
+    # Large enough not to inline, and without `@noinline`: the keyword sorter then inlines into the
+    # caller, and what survives is the keyword body, which lowering names `#_#N`.
+    function (t::KwTable)(k::Int; s::Int = 1)
+        v = zeros(t.n * k * s)
+        for i in eachindex(v), j in 1:k
+            v[i] += sin(i * j)
+        end
+        return sum(v)
+    end
+    u(t::KwTable) = t(2; s = 3)
+    # Another callable's keyword body that takes a `KwTable` argument is not the barrier.
+    struct Other end
+    function (o::Other)(t::KwTable; s::Int = 1)
+        v = zeros(t.n * s)
+        for i in eachindex(v)
+            v[i] += sin(i)
+        end
+        return sum(v)
+    end
+    w(o::Other, t::KwTable) = o(t; s = 2)
+    end
+    K = KwBarrier
+    T = (K.KwTable,)
+    @test StrictMode._failed(only(findings(K.u, T; guarantees = (:noalloc,))))
+    register_alloc_barrier!(K.KwTable)
+    try
+        @test only(findings(K.u, T; guarantees = (:noalloc,))).status !== :fail
+        @test !StrictMode._failed(only(proof_findings(K.u, T; guarantees = (:noalloc,))))
+        @test StrictModeTest._barrier_frame_name(StrictModeTest._raw_allocs(K.u, T)) === :KwTable
+        @test StrictMode._failed(only(findings(K.w, (K.Other, K.KwTable); guarantees = (:noalloc,))))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, K.KwTable)
+        store = StrictMode._store_for(Base.moduleroot(parentmodule(K)), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== K.KwTable, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end

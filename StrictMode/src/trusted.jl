@@ -20,15 +20,26 @@
 Mark `x` as data from outside the program — read from a socket or a file, taken from `ARGS`, or
 handed over by a device.
 
-Nothing can be done with the wrapped value except pass it along or give it to a **trust boundary**:
-a function that validates it and returns a plain value, registered with [`trust_boundary!`](@ref).
-Ordinary methods do not match `Untrusted{T}`, so an accidental use raises a `MethodError` instead
-of quietly succeeding, and `u.x` throws. The one deliberate way out is [`unsafe_trust`](@ref).
+The wrapped value is meant to be passed along or given to a **trust boundary**: a function that
+validates it and returns a plain value, registered with [`trust_boundary!`](@ref). Methods written
+for `T` do not match `Untrusted{T}`, so an accidental use of that kind raises a `MethodError`
+instead of quietly succeeding, and `u.x` and `reinterpret(T, u)` throw. So do the calls that copy
+the bits of an array or a `Ref` of them: `reinterpret(T, [u])`, `reinterpret(reshape, T, [u])`,
+`write(io, [u])`, `write(io, Ref(u))` and `unsafe_write(io, Ref(u), n)`; [`@assert_trusted`](@ref)
+reports them as well. `Serialization.serialize` copies the payload too and does not throw. The one
+deliberate way out is [`unsafe_trust`](@ref).
+
+`show`, `print`, `string`, `repr` and `dump` print the type and `<redacted>` in place of the
+payload, so a log line cannot leak it. `==`, `isequal` and `hash` raise, as `u.x` does, since
+comparing or hashing reads the payload; so do the same calls on a container holding an `Untrusted`
+(`[u] == [v]`), and an `Untrusted` cannot be a `Dict` or `Set` key. `===` is a builtin and cannot be
+overridden: it, `objectid` and `IdDict` compare or hash the bits, so for an `isbits` payload
+`Untrusted(1) === Untrusted(1)` is `true`.
 
 Wrapping is free: `Untrusted{T}` has the same layout as `T` and allocates nothing. Wrapping twice
 returns the same value, so an edge that wraps defensively costs nothing.
 
-[`@assert_trusted`](@ref) fails on any function outside a boundary that reads the payload.
+[`@assert_trusted`](@ref) fails on any function outside a boundary that reads the payload itself.
 
 ```julia
 function parse_header(u::Untrusted{Vector{UInt8}})
@@ -45,10 +56,40 @@ end
 
 Untrusted(u::Untrusted) = u
 
-Base.getproperty(::Untrusted, name::Symbol) = error(
-    "`Untrusted` data has no readable fields (tried `.$name`). Validate it in a function " *
+_untrusted_read_error(tried::String) = error(
+    "`Untrusted` data has no readable fields (tried `$tried`). Validate it in a function " *
         "registered with `trust_boundary!`, which reads the payload with `unsafe_trust`."
 )
+
+Base.getproperty(::Untrusted, name::Symbol) = _untrusted_read_error(".$name")
+
+# Base's generic `reinterpret(T, x)` copies the bits of any `isbits` value, so without this method it
+# would hand out an `isbits` payload. Base's other `reinterpret` methods take an array or a float.
+Base.reinterpret(::Type, ::Untrusted) = _untrusted_read_error("reinterpret")
+
+# An array or a `Ref` of `Untrusted` values holds the payloads' bits inline, and these calls copy
+# those bits out, so they raise as well. `Serialization.serialize` copies them too and is not
+# covered: it is one generic method among many that walk a value's fields.
+Base.reinterpret(::Type, ::AbstractArray{<:Untrusted}) = _untrusted_read_error("reinterpret")
+Base.reinterpret(::typeof(reshape), ::Type, ::AbstractArray{<:Untrusted}) =
+    _untrusted_read_error("reinterpret")
+# Base's `write(::IO, ::StridedArray)` is more specific than an `AbstractArray` method, so the
+# strided form needs its own.
+Base.write(::IO, ::Union{Ref{<:Untrusted}, AbstractArray{<:Untrusted}}) = _untrusted_read_error("write")
+Base.write(::IO, ::StridedArray{<:Untrusted}) = _untrusted_read_error("write")
+Base.unsafe_write(::IO, ::Ref{<:Untrusted}, ::Integer) = _untrusted_read_error("unsafe_write")
+
+# Comparing and hashing read the payload — `hash` of an `isbits` payload depends on its value — so
+# they raise as a field read does. A container compares and hashes its elements with these, so
+# `[u] == [v]` and `Dict(u => 1)` raise too. `===` is a builtin and still compares the bits.
+Base.:(==)(::Untrusted, ::Untrusted) = _untrusted_read_error("==")
+Base.isequal(::Untrusted, ::Untrusted) = _untrusted_read_error("isequal")
+Base.hash(::Untrusted, ::UInt) = _untrusted_read_error("hash")
+
+# Printing is how a payload reaches a log, so the type is shown and the payload is not. `dump`
+# recurses through this four-argument method, so a payload nested in another value is hidden too.
+Base.show(io::IO, u::Untrusted) = print(io, typeof(u), "(<redacted>)")
+Base.dump(io::IOContext, u::Untrusted, ::Int, _) = show(io, u)
 
 """
     unsafe_trust(u::Untrusted)
@@ -63,6 +104,32 @@ check fails on the call site.
 @noinline unsafe_trust(u::Untrusted) = getfield(u, :x)
 
 const _TRUST_BOUNDARIES = Base.IdSet{Any}()
+const _LOCAL_TRUST = :__strict_trust_boundaries__
+
+# Every boundary in scope: this session's, and each loaded package's own. A boundary that takes
+# keywords keeps its code in a body function of its own, `#f#N`, which is the boundary too.
+function _is_trust_boundary(@nospecialize(f))
+    f isa _Spec && return _is_trust_boundary(_spec_callee(f))
+    f in _TRUST_BOUNDARIES && return true
+    bs = _registrations(_TRUST_BOUNDARIES, _LOCAL_TRUST)
+    any(g -> g === f, bs) && return true
+    (f isa Function && startswith(String(nameof(f)), "#")) || return false
+    return any(g -> any(m -> _keyword_body(m) === f, methods(g)), bs)
+end
+
+# The body function a keyword method forwards to, or `nothing` for a method without keywords.
+# `Base.bodyfunction` returns the last function a method calls whatever it is, so its answer counts
+# only when it carries the keyword-body name, `#f#N`, of this method's function.
+function _keyword_body(m::Method)
+    b = try
+        Base.bodyfunction(m)
+    catch
+        nothing
+    end
+    b isa Function || return nothing
+    mt = match(r"^#(.+)#\d+$", String(nameof(b)))
+    return (!isnothing(mt) && mt.captures[1] == String(m.name)) ? b : nothing
+end
 
 """
     trust_boundary!(f) -> f
@@ -73,14 +140,39 @@ Register `f` as a validating crossing: the one place [`@assert_trusted`](@ref) p
 `f` is expected to validate what it reads, and to **copy** anything it hands back — the caller
 still holds the original buffer and can write to it afterwards, which is why the kernel's
 `copy_from_user` copies rather than aliasing. Neither property is checked; registering `f` asserts
-both.
+both. When `f` takes keywords, the body function its keyword methods forward to (`#f#N`) is
+the boundary too.
+
+A registration made at a package's top level, while the package precompiles, is written into that
+package's cache, so it is in force again in every process that loads it. Only the package being
+precompiled is written, and `mod` names it. It defaults to the module that owns `f`, so
+registering a function another package owns needs `mod = @__MODULE__` and raises without it:
+the registration would hold for that precompile and be gone afterwards. A raise registers
+nothing, in that precompile either. A call made from an
+`__init__` runs again at every load, so it registers for the session and stores nothing. So does a
+call made by the owning package's own code while another package precompiles, such as a
+registration on first use that a dependent's precompile workload triggers. In a
+session the registration lasts for the session.
+
+Clears the findings cache, since a registration changes `:trusted` results.
 """
-trust_boundary!(@nospecialize(f)) = (push!(_TRUST_BOUNDARIES, f); f)
+function trust_boundary!(@nospecialize(f); mod::Module = _owner_module(f))
+    # Stored first: a registration that cannot be kept raises, and must leave the session unchanged.
+    _keep_registration!(f, mod, _LOCAL_TRUST, "trust_boundary!($(_func_name(f)))")
+    push!(_TRUST_BOUNDARIES, f)
+    # A `:trusted` verdict depends on this set, and the findings cache does not key on it.
+    clear_cache!()
+    return f
+end
 
 # The calls that read the payload. `Base.getfield === Core.getfield`, so one entry covers both
 # spellings. `getproperty` is here even though the override above already throws on it: reporting
 # it at check time is more use than a runtime error in whatever session first hits that branch.
 const _DEREF_FUNCS = (Core.getfield, Base.getproperty, unsafe_trust)
+
+# The calls that copy out the bits of an `isbits` value they are given, inside an array or a `Ref`
+# as well as bare.
+const _BYTE_COPIERS = (reinterpret, write, unsafe_write)
 
 # Callee names of the payload reads in `f`'s OWN body — empty when there are none, and `nothing`
 # when the typed IR could not be obtained, which a caller must not read as "no sites".
@@ -103,9 +195,10 @@ end
 # `certain` are reads of a value typed `<:Untrusted`, `erased` are reads of a value whose type
 # merely FAILS TO RULE OUT `Untrusted` — an `Any` carries no `Untrusted` for dispatch to match on,
 # and a type the scan cannot narrow is not a type it has cleared. `nothing` when the typed IR could
-# not be obtained, which a caller must not read as "none".
+# not be obtained, which a caller must not read as "none". `held` names, as "write of T", each call
+# that copies out the bits of a value whose type T can hold an `Untrusted`.
 function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
-    f in _TRUST_BOUNDARIES && return (Symbol[], Symbol[])
+    _is_trust_boundary(f) && return (Symbol[], Symbol[], String[])
     cts = try
         _code_typed(f, types; optimize = false)
     catch
@@ -115,21 +208,566 @@ function _untrusted_deref_sites(@nospecialize(f), @nospecialize(types::Tuple))
     ci = first(cts)[1]
     certain = Symbol[]
     erased = Symbol[]
-    for st in ci.code
+    held = String[]
+    # A value the body also reads ANOTHER field of is not an `Untrusted`, which has one. That is
+    # what a `for` loop does with what `iterate` returned: element at 1, state at 2. Without it a
+    # loop over a loosely typed collection reads as a possible payload read.
+    other = _other_field_reads(ci)
+    overridden = (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3))
+    # A keyword function's positional and `Core.kwcall` methods only forward to its body function,
+    # where the code the caller wrote is; that body is read as part of `f`'s own.
+    m = ci.parent isa Core.MethodInstance ? ci.parent.def : nothing
+    body = m isa Method ? _keyword_body(m) : nothing
+    for (i, st) in pairs(ci.code)
         callee, args = _call_callee_and_args(ci, st)
+        # `invoke(f, T, args...)` calls `f` on `args`, whichever method `T` selects.
+        if callee === Core.invoke && length(args) >= 2
+            callee, args = _unopt_callee(ci, args[1]), args[3:end]
+        end
+        if !isnothing(body) && callee === body
+            sub = _untrusted_deref_sites(body, Tuple(_unopt_arg_type(ci, a) for a in args))
+            isnothing(sub) && return nothing
+            append!(certain, sub[1])
+            append!(erased, sub[2])
+            append!(held, sub[3])
+            continue
+        end
+        # A comparison or membership test hands a payload-reading function on unless the methods it
+        # calls are followed and none applies it; building a tuple used only in such calls is not
+        # handing it on by itself.
+        if !(callee in _COMPARISONS && !_compare_applies(ci, callee, args)) &&
+                !(callee === Core.tuple && _only_compared(ci, i, st))
+            _handed_on_reads!(certain, erased, ci, st, callee, args, overridden)
+        end
+        # A call that copies out the bits of what it is given reads a payload it can reach:
+        # `reinterpret(T, u)` (which raises at run time, like `u.x`), `reinterpret(T, [u])`,
+        # `write(io, Ref(u))`, `write(io, [u])`. The first operand is the target type or the stream.
+        if callee in _BYTE_COPIERS && length(args) >= 2
+            Ts = [_unopt_arg_type(ci, a) for a in args[2:end]]
+            rs = map(_untrusted_reach, Ts)
+            if :certain in rs
+                push!(certain, nameof(callee))
+            elseif :maybe in rs
+                push!(held, "$(nameof(callee)) of $(Ts[findfirst(==(:maybe), rs)])")
+            end
+            continue
+        end
         (callee in _DEREF_FUNCS && !isempty(args)) || continue
         T = _unopt_arg_type(ci, args[1])
         T isa Type || continue
         if T <: Untrusted
             push!(certain, nameof(callee))
-        elseif typeintersect(T, Untrusted) !== Union{} && _reads_untrusted_field(callee, args)
+            # StrictMode's two-argument `getproperty` raises on an `Untrusted` whatever the name, so on
+            # a value whose type is not known `p.x` reads no payload: it is a field of something else,
+            # or an error. The three-argument form, `getproperty(p, :x, order)`, is Base's, and reads
+            # the field it names. A method a package adds for an `Untrusted` returns what it chooses
+            # whatever the name, so once one exists every erased read of that arity may be a payload read.
+        elseif typeintersect(T, Untrusted) !== Union{} &&
+                _erased_read(callee, args, overridden) &&
+                !_same_value_has_another_field(ci, other, i, args[1]) &&
+                !_iteration_result(ci, args[1])
             push!(erased, nameof(callee))
         end
     end
-    return (certain, erased)
+    return (certain, erased, held)
 end
 
-function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
+const _COMPARISONS = (===, !==, ==, !=, isequal, in, ∉)
+
+# Whether the value statement `i` builds — an SSA value, or the slot it is assigned to — reaches
+# nothing but copies of itself and operands of `_COMPARISONS` calls. Returned, stored, called, or
+# handed to any other call, it does not.
+function _only_compared(ci, i::Int, @nospecialize(st))
+    held = Any[Core.SSAValue(i)]
+    Meta.isexpr(st, :(=)) && st.args[1] isa Core.SlotNumber && push!(held, st.args[1])
+    # A copy `%k = t` or `s = %j` holds the value too; a loop may read a slot before the statement
+    # that assigns it, so this runs to a fixed point.
+    grown = true
+    while grown
+        grown = false
+        for (k, s) in pairs(ci.code)
+            rhs = Meta.isexpr(s, :(=)) ? s.args[2] : s
+            rhs in held || continue
+            for v in (Core.SSAValue(k), Meta.isexpr(s, :(=)) ? s.args[1] : nothing)
+                (v isa Core.SSAValue || v isa Core.SlotNumber) && !(v in held) &&
+                    (push!(held, v); grown = true)
+            end
+        end
+    end
+    for (k, s) in pairs(ci.code)
+        k == i && continue
+        _mentions(s, held) || continue
+        rhs = Meta.isexpr(s, :(=)) ? s.args[2] : s
+        rhs in held && continue
+        callee, _ = _call_callee_and_args(ci, s)
+        (callee in _COMPARISONS && !_mentions(_call_operand(s), held)) || return false
+    end
+    return true
+end
+
+# Whether the comparison `callee(args...)` can apply a payload-reading function one of its operands
+# holds, or hand it back to the caller. `===` is a builtin and does neither; every other comparison
+# is an ordinary function that any package can add a method to, so the methods the call can reach
+# are followed.
+function _compare_applies(ci, @nospecialize(callee), args)
+    callee === (===) && return false
+    Ts = Any[_unopt_arg_type(ci, a) for a in args]
+    tracked = [k + 1 for (k, T) in pairs(Ts) if any(F -> _carries_function(T, F), _DEREF_FUNCS)]
+    isempty(tracked) && return false
+    sig = Core.apply_type(Tuple, Core.Typeof(callee), Ts...)
+    # A recursive call is first read as returning nothing; when one of those readings turns out to
+    # return the value, the whole reading is repeated with that call answering `:returns`.
+    assume = Set{Any}()
+    while true
+        scan = _ApplyScan(Dict{Any, Symbol}(), assume, Set{Any}())
+        r = _may_apply(sig, tracked, scan, 0)
+        (r === :applies || isempty(scan.contradicted)) && return r !== :none
+        union!(assume, scan.contradicted)
+    end
+    return
+end
+
+# `seen` holds each call followed so far: its answer, or `:reading` while its methods are being
+# read and `:reread` once a call within them met it again. A call in `assume` met again while it is
+# being read answers `:returns`, any other `:none`; `contradicted` collects the calls that answered
+# `:none` that way and then returned the value.
+struct _ApplyScan
+    seen::Dict{Any, Symbol}
+    assume::Set{Any}
+    contradicted::Set{Any}
+end
+
+# Calls deeper than this, or reaching more methods than this, are not followed, and count as
+# applying what they are given.
+const _APPLY_DEPTH = 8
+const _APPLY_METHODS = 8
+
+# Builtins that apply none of their operands: `===`, `isa`, `typeof`, `nfields` and `isdefined` return
+# a fact about them, and the others return a value holding them, which is followed in turn.
+const _INERT_BUILTINS = (===, isa, typeof, nfields, Core.isdefined)
+const _HOLDING_BUILTINS = (Core.getfield, Core.tuple, Core.typeassert, Core.ifelse)
+
+# What a call of signature `sig` (the callee's type first) can do with a value it is given at one
+# of the positions `tracked`, or a value read out of or built from one: `:applies` when some method
+# it reaches can call it, hand it to a builtin that does not only read it, or hand it to a call that
+# does either; `:returns` when, short of that, a method can return it; `:none` otherwise. Every
+# method is read from unoptimized typed IR. A call that cannot be resolved to at most
+# `_APPLY_METHODS` methods, a method whose code cannot be read, and a call deeper than
+# `_APPLY_DEPTH` are `:applies`. A call met again while it is being read answers as `_ApplyScan`
+# describes.
+function _may_apply(@nospecialize(sig), tracked::Vector{Int}, scan::_ApplyScan, depth::Int)
+    depth > _APPLY_DEPTH && return :applies
+    key = (sig, tracked)
+    seen = scan.seen
+    if haskey(seen, key)
+        r = seen[key]
+        (r === :reading || r === :reread) || return r
+        key in scan.assume && return :returns
+        seen[key] = :reread
+        return :none
+    end
+    seen[key] = :reading
+    out = _may_apply_methods(sig, tracked, scan, depth)
+    out === :returns && seen[key] === :reread && !(key in scan.assume) && push!(scan.contradicted, key)
+    return (seen[key] = out)
+end
+
+function _may_apply_methods(@nospecialize(sig), tracked::Vector{Int}, scan::_ApplyScan, depth::Int)
+    ms = Base._methods_by_ftype(sig, _APPLY_METHODS, Base.get_world_counter())
+    (ms isa Vector && !isempty(ms)) || return :applies
+    cts = try
+        _code_typed_by_type(sig; optimize = false)
+    catch
+        return :applies
+    end
+    length(cts) == length(ms) || return :applies
+    out = :none
+    for (ci, _) in cts
+        m = ci.parent isa Core.MethodInstance ? ci.parent.def : nothing
+        m isa Method || return :applies
+        # Slot 1 is the callee; the last slot of a vararg method holds every operand from there on.
+        held = Any[Core.SlotNumber(m.isva ? min(p, Int(m.nargs)) : p) for p in tracked if m.isva || p <= m.nargs]
+        r = _applies_held(ci, held, scan, depth)
+        r === :applies && return :applies
+        r === :returns && (out = :returns)
+    end
+    return out
+end
+
+# What the body `ci` can do with the values `held` (see `_may_apply`), extended to every slot and
+# SSA value that copies one, reads a field of one, or is what a call it is handed to returns. A
+# loop may read a slot before the statement that assigns it, so this runs to a fixed point.
+function _applies_held(ci, held::Vector{Any}, scan::_ApplyScan, depth::Int)
+    returns = false
+    grown = true
+    while grown
+        grown = false
+        for (k, st) in pairs(ci.code)
+            _mentions(st, held) || continue
+            st isa Core.GotoIfNot && continue
+            st isa Core.ReturnNode && (returns = true; continue)
+            target = Meta.isexpr(st, :(=)) ? st.args[1] : nothing
+            target isa GlobalRef && return :applies
+            rhs = Meta.isexpr(st, :(=)) ? st.args[2] : st
+            holds = if rhs isa Core.SlotNumber || rhs isa Core.SSAValue || rhs isa Core.PiNode
+                true
+            elseif Meta.isexpr(rhs, :new) || Meta.isexpr(rhs, :splatnew)
+                true
+            elseif Meta.isexpr(rhs, :gc_preserve_begin)
+                false
+            elseif Meta.isexpr(rhs, :call) || Meta.isexpr(rhs, :invoke)
+                op = _call_operand(rhs)
+                _mentions(op, held) && return :applies
+                callee, args = _call_callee_and_args(ci, rhs)
+                # A callee the IR does not name is known by its type, when that is concrete.
+                FT = isnothing(callee) ? _unopt_arg_type(ci, op) : Core.Typeof(callee)
+                (isconcretetype(FT) || FT <: Type) || return :applies
+                r = if callee in _INERT_BUILTINS
+                    :none
+                elseif callee in _HOLDING_BUILTINS
+                    :returns
+                elseif callee === Core._apply_iterate
+                    _splat_applies(ci, args, held, scan, depth)
+                elseif callee isa Core.Builtin
+                    :applies
+                else
+                    Ts = Any[_unopt_arg_type(ci, a) for a in args]
+                    pos = [j + 1 for (j, a) in pairs(args) if _mentions(a, held)]
+                    _may_apply(Core.apply_type(Tuple, FT, Ts...), pos, scan, depth + 1)
+                end
+                r === :applies && return :applies
+                r === :returns
+            else
+                return :applies
+            end
+            holds || continue
+            for v in (Core.SSAValue(k), target)
+                (v isa Core.SSAValue || v isa Core.SlotNumber) && !(v in held) && (push!(held, v); grown = true)
+            end
+        end
+    end
+    return returns ? :returns : :none
+end
+
+# What `Core._apply_iterate(iterate, g, xs...)`, the call `g(xs[1]..., xs[2]..., …)`, can do with
+# `held` (see `_may_apply`). Each splatted operand must be a tuple of known length, so that the
+# positions it fills are known; one that is not is iterated by calls this does not follow, and is
+# `:applies`.
+function _splat_applies(ci, args, held::Vector{Any}, scan::_ApplyScan, depth::Int)
+    length(args) >= 2 || return :applies
+    (_mentions(args[1], held) || _mentions(args[2], held)) && return :applies
+    FT = _unopt_arg_type(ci, args[2])
+    (isconcretetype(FT) || FT <: Type) || return :applies
+    Ts = Any[]
+    pos = Int[]
+    for a in args[3:end]
+        T = _unopt_arg_type(ci, a)
+        (T isa DataType && T <: Tuple && !Base.isvatuple(T)) || return :applies
+        _mentions(a, held) && append!(pos, length(Ts) .+ (2:(length(T.parameters) + 1)))
+        append!(Ts, T.parameters)
+    end
+    isempty(pos) && return :none
+    return _may_apply(Core.apply_type(Tuple, FT, Ts...), pos, scan, depth + 1)
+end
+
+# A payload-reading function handed to a call as a value, bare or held by a callable such as
+# `Base.Fix2(getfield, :x)`, in any operand including the callee: `getfield.([u], :x)`,
+# `getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. The escape
+# hatch reads a payload wherever it is applied, since its one method takes an `Untrusted`. The
+# other two read one only when an `Untrusted` reaches them, so they count by what the call's
+# operands can hold: a site when one holds an `Untrusted`, an erased site when a type cannot rule
+# one out, and nothing when every type rules it out. When the function itself is an operand and the
+# field it is applied with is a constant (`getfield.(xs, :a)`, `getproperty.(xs, :x)`), an erased
+# site is judged by the field rules a direct call is judged by.
+function _handed_on_reads!(
+        certain, erased, ci, @nospecialize(st), @nospecialize(callee), args,
+        overridden::Tuple{Bool, Bool}
+    )
+    op = _call_operand(st)
+    isnothing(op) && return nothing
+    # A direct call of a payload-reading function is judged as a call, where this is called.
+    ops = callee in _DEREF_FUNCS ? collect(Any, args) : Any[op; collect(Any, args)]
+    Ts = Any[_unopt_arg_type(ci, a) for a in ops]
+    carried = [F for F in _DEREF_FUNCS if any(T -> _carries_function(T, F), Ts)]
+    isempty(carried) && return nothing
+    if unsafe_trust in carried
+        push!(certain, nameof(unsafe_trust))
+        return nothing
+    end
+    nm = nameof(first(carried))
+    # A callable this body built from the function itself, such as the `Broadcasted` that
+    # `getfield.(xs, :a)` makes and then materializes, was judged with the operands it was built
+    # from; only the operands it meets here are new.
+    reach = :none
+    for (a, T) in zip(ops, Ts)
+        _built_from(ci, a, carried) || (reach = _max_reach(reach, _untrusted_reach(T)))
+    end
+    reach === :certain && push!(certain, nm)
+    reach === :maybe && !_handed_on_cleared(ci, ops, first(carried), overridden) && push!(erased, nm)
+    return nothing
+end
+
+# Whether `a` is the value of a call in this body that had one of the functions `Fs` itself as an
+# operand.
+function _built_from(ci, @nospecialize(a), Fs)
+    a isa Core.SSAValue || return false
+    _, args = _call_callee_and_args(ci, ci.code[a.id])
+    return any(b -> any(F -> _unopt_arg_type(ci, b) === typeof(F), Fs), args)
+end
+
+# Whether `F`, an operand among `ops`, is applied to the operands after it with a constant field
+# in a way that cannot read the payload. A callable holding `F`, such as `Base.Fix2(getfield, :x)`,
+# carries the field where the operands do not show it, and is never cleared.
+function _handed_on_cleared(ci, ops, @nospecialize(F), overridden::Tuple{Bool, Bool})
+    k = findfirst(a -> _unopt_arg_type(ci, a) === typeof(F), ops)
+    isnothing(k) && return false
+    applied = ops[(k + 1):end]
+    length(applied) >= 2 || return false
+    fld = applied[2]
+    (fld isa QuoteNode || fld isa Symbol || fld isa Int) || return false
+    return !_erased_read(F, applied, overridden)
+end
+
+# The callee operand of a call statement as written, or `nothing` for a statement that is no call.
+function _call_operand(@nospecialize(st))
+    Meta.isexpr(st, :(=)) && (st = st.args[2])
+    Meta.isexpr(st, :call) && return st.args[1]
+    (Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify)) && return st.args[2]
+    return nothing
+end
+
+# Whether a value of type `T` is the function `F`, or a callable holding it in a type parameter.
+function _carries_function(@nospecialize(T), @nospecialize(F), depth::Int = 0)
+    T isa DataType || return false
+    T === typeof(F) && return true
+    depth < 4 || return false
+    return any(p -> _carries_function(p, F, depth + 1), T.parameters)
+end
+
+# What a value of type `T` can hold of an `Untrusted`, where a call applying a function to it can
+# reach: `:certain` when it is one, or a tuple, array or `Ref` whose elements are; `:maybe` when its
+# type does not rule one out (an `Any`, an abstract type) or a field of it can hold one;
+# `:none` when it cannot. A field holding an `Untrusted` is `:maybe`, not `:certain`, since a
+# function applied to the value itself reads that field and not the payload. A type value
+# (`Type{…}`) holds none.
+function _untrusted_reach(@nospecialize(T), depth::Int = 0)
+    T isa Type || return :maybe
+    T === Union{} && return :none
+    T isa Union && return _max_reach(_untrusted_reach(T.a, depth), _untrusted_reach(T.b, depth))
+    T <: Type && return :none
+    T <: Untrusted && return :certain
+    typeintersect(T, Untrusted) === Union{} || return :maybe
+    (isconcretetype(T) && fieldcount(T) == 0) && return :none
+    # A field of a field, eight deep, is not followed further, and is not ruled out.
+    depth < 8 || return :maybe
+    if T isa DataType && T <: Tuple
+        r = :none
+        for p in T.parameters
+            r = _max_reach(r, _untrusted_reach(Base.unwrapva(p), depth + 1))
+        end
+        return r
+    end
+    (T <: AbstractArray || T <: Ref) && return _untrusted_reach(eltype(T), depth + 1)
+    # Any package can subtype an abstract type, `Real` and `IO` included, with a struct holding an
+    # `Untrusted`, so an abstract type rules none out.
+    (T isa DataType && isconcretetype(T)) || return :maybe
+    for F in fieldtypes(T)
+        _untrusted_reach(F, depth + 1) === :none || return :maybe
+    end
+    return :none
+end
+
+_max_reach(a::Symbol, b::Symbol) = (a === :certain || b === :certain) ? :certain :
+    (a === :maybe || b === :maybe) ? :maybe : :none
+
+# Whether an erased call to a payload-reading function reads the `Untrusted` field. `overridden`
+# holds `_untrusted_getproperty_overridden` for two and three arguments.
+function _erased_read(@nospecialize(callee), args, overridden::Tuple{Bool, Bool})
+    if callee === Base.getproperty && length(args) in (2, 3)
+        overridden[length(args) - 1] && return true
+        length(args) == 2 && return false
+    end
+    return _reads_untrusted_field(callee, args)
+end
+
+# Whether an operand is what `iterate` or `indexed_iterate` returned: a tuple of an element and
+# a state, never an `Untrusted`. Destructuring reads only field 1 of the last one, and inference
+# types it `Any` once enough packages have added methods to `indexed_iterate`.
+function _iteration_result(ci, @nospecialize(a))
+    a isa Core.SSAValue || return false
+    callee, _ = _call_callee_and_args(ci, ci.code[a.id])
+    return callee === Base.indexed_iterate || callee === Base.iterate
+end
+
+# Whether some `Untrusted` reaches a `getproperty` method of `nargs` arguments (2, or 3 with a
+# memory order) other than StrictMode's own and Base's generic one: a package that gave its wrapped
+# type a method returning the payload. Read from the method table as it is now, so the answer
+# changes when such a method is defined or deleted.
+function _untrusted_getproperty_overridden(nargs::Int = 2)
+    sig = nargs == 2 ? Tuple{typeof(getproperty), Untrusted, Symbol} :
+        Tuple{typeof(getproperty), Untrusted, Symbol, Symbol}
+    ms = Base._methods_by_ftype(sig, -1, Base.get_world_counter())
+    ms isa Vector || return true
+    return any(match -> !(Base.moduleroot(match.method.module) in (@__MODULE__, Base)), ms)
+end
+
+# Each `getfield` of a field `Untrusted` does not have, as statement index => operand.
+function _other_field_reads(ci)
+    out = Pair{Int, Any}[]
+    for (i, st) in pairs(ci.code)
+        callee, args = _call_callee_and_args(ci, st)
+        (callee === Core.getfield && length(args) >= 2) || continue
+        fld = args[2]
+        fld isa QuoteNode && (fld = fld.value)
+        ((fld isa Int && fld != 1) || (fld isa Symbol && fld !== _UNTRUSTED_FIELD)) && push!(out, i => args[1])
+    end
+    return out
+end
+
+# Whether the operand read at statement `i` is the same VALUE as one a `getfield` reads another
+# field of. The same operand is the same value only along one path: with a branch between the two
+# statements they can sit on different arms of a type test, where the operand is an `Untrusted`
+# on one arm and something else on the other, and a variable assigned between them holds a
+# different value at each. A jump INTO the span is a path that skipped the first read, so the
+# span must hold no jump target either. When the other field is read SECOND, it raises on an
+# `Untrusted` only after the payload read ran, so nothing in between may hand the payload on, and
+# the payload read must not sit in a `try` whose handler can see the payload (`_in_try`).
+function _same_value_has_another_field(ci, other, i::Int, @nospecialize(operand))
+    isempty(other) && return false
+    targets = _jump_targets(ci)
+    for (j, a) in other
+        a == operand || continue
+        i < j && _in_try(ci, i, j) && continue
+        lo, hi = minmax(i, j)
+        straight = !any(t -> lo < t <= hi, targets)
+        for k in lo:(hi - 1)
+            straight || break
+            st = ci.code[k]
+            if st isa Core.GotoNode || st isa Core.GotoIfNot || st isa Core.ReturnNode ||
+                    st isa Core.EnterNode || (st isa Expr && st.head === :(=) && st.args[1] == operand) ||
+                    (k > i && _may_hand_on(ci, st))
+                straight = false
+            end
+        end
+        straight && return true
+    end
+    return false
+end
+
+# Whether a statement can pass a value somewhere: a call other than `getfield`, which only reads,
+# a foreign call, or a store to a global.
+function _may_hand_on(ci, @nospecialize(st))
+    st isa Expr || return false
+    if st.head === :(=)
+        st.args[1] isa GlobalRef && return true
+        st = st.args[2]
+        st isa Expr || return false
+    end
+    st.head === :foreigncall && return true
+    st.head in (:call, :invoke, :invoke_modify) || return false
+    callee, _ = _call_callee_and_args(ci, st)
+    return callee !== Core.getfield
+end
+
+# Whether the payload read at statement `i`, followed by the raising field read at `j`, lies between
+# an `enter` and the catch block it jumps to, and that block can either finish without raising or
+# read a value the payload may be held in by the time `j` raises: the value of statement `i`, and
+# every SSA value and slot in `i:(j - 1)` computed from one already held, so `w = v` and
+# `getfield(v, 1)` carry it on and `n = 0` does not. A slot once held stays held, though a later
+# assignment may overwrite it. A handler runs before it rethrows, so a catch ending in `rethrow()`,
+# or a `finally` (which lowers to one), still hands on a local it reads. Lowering places a `try`
+# body after its `enter` and before its catch; an `enter` with no catch (`catch_dest == 0`, the
+# scope-only form) catches nothing.
+function _in_try(ci, i::Int, j::Int)
+    held = Any[Core.SSAValue(i)]
+    for k in i:(j - 1)
+        st = ci.code[k]
+        (k == i || _mentions(st, held)) || continue
+        push!(held, Core.SSAValue(k))
+        Meta.isexpr(st, :(=)) && st.args[1] isa Core.SlotNumber && push!(held, st.args[1])
+    end
+    return any(1:(i - 1)) do k
+        st = ci.code[k]
+        st isa Core.EnterNode && st.catch_dest > 0 && k < i < st.catch_dest &&
+            (_may_return(ci, st.catch_dest) || _reaches_use(ci, st.catch_dest, held))
+    end
+end
+
+# Whether a statement reachable from statement `s` reads one of the slots or SSA values `vals`.
+function _reaches_use(ci, s::Int, vals)
+    seen = falses(length(ci.code))
+    todo = [s]
+    while !isempty(todo)
+        k = pop!(todo)
+        (1 <= k <= length(ci.code) && !seen[k]) || continue
+        seen[k] = true
+        st = ci.code[k]
+        _mentions(st, vals) && return true
+        if st isa Core.ReturnNode
+        elseif st isa Core.GotoNode
+            push!(todo, st.label)
+        elseif st isa Core.GotoIfNot
+            push!(todo, k + 1, st.dest)
+        elseif st isa Core.EnterNode
+            push!(todo, k + 1, st.catch_dest)
+        elseif !(_call_callee_and_args(ci, st)[1] in (rethrow, throw))
+            push!(todo, k + 1)
+        end
+    end
+    return false
+end
+
+# Whether `x`, a statement or an operand of one, reads one of `vals`. The target of an assignment
+# is written, not read.
+function _mentions(@nospecialize(x), vals)
+    (x isa Core.SlotNumber || x isa Core.SSAValue) && return x in vals
+    x isa Core.ReturnNode && return isdefined(x, :val) && _mentions(x.val, vals)
+    x isa Core.GotoIfNot && return _mentions(x.cond, vals)
+    x isa Core.PiNode && return _mentions(x.val, vals)
+    x isa Core.PhiNode &&
+        return any(k -> isassigned(x.values, k) && _mentions(x.values[k], vals), eachindex(x.values))
+    x isa Expr || return false
+    args = x.head === :(=) ? x.args[2:end] : x.args
+    return any(a -> _mentions(a, vals), args)
+end
+
+# Whether some path from statement `s` reaches a `return` rather than a `throw` or `rethrow`. A
+# `try` inside the path may catch what it raises, so it counts as a return.
+function _may_return(ci, s::Int)
+    seen = falses(length(ci.code))
+    todo = [s]
+    while !isempty(todo)
+        k = pop!(todo)
+        (1 <= k <= length(ci.code) && !seen[k]) || continue
+        seen[k] = true
+        st = ci.code[k]
+        if st isa Core.ReturnNode
+            isdefined(st, :val) && return true
+        elseif st isa Core.EnterNode
+            return true
+        elseif st isa Core.GotoNode
+            push!(todo, st.label)
+        elseif st isa Core.GotoIfNot
+            push!(todo, k + 1, st.dest)
+        elseif !(_call_callee_and_args(ci, st)[1] in (rethrow, throw))
+            push!(todo, k + 1)
+        end
+    end
+    return false
+end
+
+# The statements a jump can land on.
+function _jump_targets(ci)
+    out = Int[]
+    for st in ci.code
+        st isa Core.GotoNode && push!(out, st.label)
+        st isa Core.GotoIfNot && push!(out, st.dest)
+        st isa Core.EnterNode && push!(out, st.catch_dest)
+    end
+    return out
+end
+
+function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol}, held::Vector{String})
     parts = String[]
     isempty(certain) || push!(
         parts,
@@ -144,6 +782,13 @@ function _trusted_reason(certain::Vector{Symbol}, erased::Vector{Symbol})
             "which is the one hole in this guarantee: annotate the value, or move the read into a " *
             "boundary registered with `trust_boundary!`"
     )
+    isempty(held) || push!(
+        parts,
+        "may read an `Untrusted` payload — $(length(held)) call(s) copy out the bits of a value " *
+            "whose type can hold one ($(join(sort(unique(held)), ", "))), so the read cannot be " *
+            "ruled out: give the value a type that holds no `Untrusted`, or move the call into a " *
+            "boundary registered with `trust_boundary!`"
+    )
     return join(parts, "; ")
 end
 
@@ -151,15 +796,15 @@ function _trusted_finding(@nospecialize(f), @nospecialize(types::Tuple), md, fn,
     sites = _untrusted_deref_sites(f, types)
     isnothing(sites) &&
         return _unevaluated(md, fn, sg, :trusted, "no typed IR for this signature"; tier)
-    certain, erased = sites
+    certain, erased, held = sites
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         nothing
     end
     return _mkfinding(
-        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased),
-        _trusted_reason(certain, erased),
+        md, fn, sg, :trusted, !isempty(certain) || !isempty(erased) || !isempty(held),
+        _trusted_reason(certain, erased, held),
         isnothing(m) ? "" : string(m.file), isnothing(m) ? 0 : Int(m.line);
         tier
     )
@@ -171,19 +816,19 @@ function _assert_trusted(target, @nospecialize(f), @nospecialize(types::Tuple))
         _fail(:trusted, target, "no typed IR for this signature, so the guarantee is unchecked")
         return nothing
     end
-    certain, erased = sites
+    certain, erased, held = sites
     if !isempty(certain)
         _fail(
-            :trusted, target, _trusted_reason(certain, erased) * ": move the read into a " *
+            :trusted, target, _trusted_reason(certain, erased, held) * ": move the read into a " *
                 "validating function that returns a plain value, and register it with " *
                 "`trust_boundary!`."
         )
-    elseif !isempty(erased)
+    elseif !isempty(erased) || !isempty(held)
         # An erased object type is inference failing to answer, not the scan observing a read, so
         # this reports where a certain site throws — the same split `_guarantee_gates` draws between
         # a check that OBSERVES and one that cannot. A `getfield` on an `Any` is ordinary code, and
         # aborting a build over one would make the guarantee unusable.
-        _fail(:trusted, target, _trusted_reason(certain, erased) * "."; gates = false)
+        _fail(:trusted, target, _trusted_reason(certain, erased, held) * "."; gates = false)
     end
     return nothing
 end
@@ -194,15 +839,55 @@ end
 Fail if `f`'s own body reads the payload of an [`Untrusted`](@ref) value and `f` is not registered
 as a trust boundary. Passing a wrapped value along is always fine; only reading it is restricted.
 
-The read is any call to `getfield`, `getproperty`, or [`unsafe_trust`](@ref) on an argument
-that inference types as `<:Untrusted`. Registering `f` with [`trust_boundary!`](@ref) permits all of
-them in that one method.
+The read is any call to `getfield`, `getproperty` or [`unsafe_trust`](@ref) on an argument that
+inference types as `<:Untrusted`, directly or through `invoke`, and any call to `reinterpret`,
+`write` or `unsafe_write` handed an `Untrusted` or a tuple, array or `Ref` of them past its first
+operand: `reinterpret(T, u)`, `reinterpret(T, [u])`, `write(io, Ref(u))`, `write(io, [u])` copy
+out the bits of an `isbits` payload. Handed an operand whose type cannot rule one out (`Any`,
+`Vector{Any}`), those three are reads that cannot be ruled out, and the reason names that type.
+Every abstract type is one of those, `Real`, `Integer`, `AbstractString` and `IO` included, since
+any package can subtype it with a struct holding an `Untrusted`: `write(io, x::Real)` and
+`reinterpret(UInt64, x::Integer)` are reported. A concrete type is judged by its fields, so
+`write(io, x::Float64)` is not reported and a struct with a field of type `Any` or `Untrusted` is.
+It is also any of `getfield`, `getproperty` and `unsafe_trust` handed to another call as a value,
+bare or held by a callable: `map(unsafe_trust, us)`, `unsafe_trust.(us)`, `u |> unsafe_trust`, `getfield.([u], :x)`,
+`getfield((u, :x)...)`, `map(getfield, us, names)`, `Base.Fix2(getfield, :x)(u)`. Comparing one
+of the three with a value (`===`, `==`, `isequal`) or testing membership (`in`, `∉`) is not a read
+when it applies nothing, and so is building a tuple of them whose only uses are those calls, as in
+`f in (unsafe_trust, g)`. `===` is a builtin and applies nothing. Every other comparison is read
+through the methods it can call, Base's included, following each call they hand the function on to:
+a method such as `==(g::typeof(unsafe_trust), s::S) = g(s.u)` makes `unsafe_trust == s` a read, and
+makes `f in (unsafe_trust, g)` one too when `f` can be an `S`. A call reaching more than eight
+methods, more than eight calls deep, or whose methods cannot be read counts as applying it, and so
+does one that can return the function it was given.
+`unsafe_trust` handed to any other call is a read, since its one
+method takes an `Untrusted`; that includes a tuple of it that is returned, stored, indexed or
+passed to another call. `getfield` and
+`getproperty` handed on are a read when an operand of that call is an `Untrusted` or a tuple,
+array or `Ref` of them, and a read that cannot be ruled out when an operand's type does not rule
+one out (an `Any`, an abstract type, a struct with such a field). Handed on with a constant field,
+as in `getfield.(xs, :a)`, they are judged by the same field rules as a direct call, so
+`getfield.(xs, :a)` and `getproperty.(xs, :x)` on untyped values are not reported while
+`getfield.(xs, :x)` and `getfield.(xs, 1)` are; a callable holding the field, such as
+`Base.Fix2(getproperty, :a)`, is still a read that cannot be ruled out. Registering `f` with
+[`trust_boundary!`](@ref) permits all of them in that one method. A function with keywords keeps its code in a body function of its own; the
+positional and `Core.kwcall` methods are judged by that body, and a registered boundary's body is
+the boundary.
 
 This is a structural lint in the same family as [`@assert_noboxing`](@ref) — it reads unoptimized
 typed IR, with no execution, backend, or timing — and it **gates**, because it observes a call on a
-type inference has already fixed rather than guessing at a cost. Its limits are all missed
-violations, never false alarms: a payload that infers as `Any` is invisible, only compiled
-specializations are swept, and nothing verifies that a registered boundary really validates or
+type inference has already fixed rather than guessing at a cost. A value inference could not type is handled by what the
+call can do: `unsafe_trust` on it, and `getfield` of the field `:x` or of index 1 (`Untrusted` has
+one field), are reported as reads that cannot be ruled out, and warn. `getfield` of another field
+is not, and neither is a read of field 1 of what `iterate` returned, nor of a value the same
+straight-line code also reads another field of, unless the payload read sits in a `try` whose
+catch can return or reads a local the payload was copied into. `p.x` on it is not reported, since `getproperty` on an `Untrusted` raises whatever the
+name. `getproperty(p, :x, order)` with a memory order is Base's, which reads the field, so it is
+reported like `getfield`. That changes when a package defines its own `getproperty` for an `Untrusted` of its type:
+from then on `p.x`, `p.v` or a property of any name read from an untyped value is reported like
+the other two, since that method returns what it chooses whatever the name. A method for the form
+with a memory order does the same to `getproperty(p, name, order)` of any name. Its other limits are missed violations: only compiled specializations are swept, a read inside any other generic method that copies what it is given, such as
+`Serialization.serialize`, is not seen, and nothing verifies that a registered boundary really validates or
 copies what it returns.
 
 Each argument is evaluated once; the macro evaluates to the call's value; disabled builds expand to
@@ -214,7 +899,7 @@ the bare call.
 ```
 """
 macro assert_trusted(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_trusted", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_trusted needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_trusted; types = get(opts, :types, nothing))

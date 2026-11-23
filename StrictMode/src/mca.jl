@@ -227,15 +227,22 @@ r = mca_report(dot_kernel!, (Vector{Float64}, Vector{Float64}))
 r.ipc            # steady-state instructions/cycle estimate
 r.whole_function # true if no loop region was found (a caveat, not a hard failure)
 ```
+
+Assembly that cannot be read raises `_UnanalyzableSignature`, naming the signature and the reason,
+as [`kernel_report`](@ref) does: that is the case for a signature that is not concrete, which names
+no compiled body.
 """
 function mca_report(
         @nospecialize(f), @nospecialize(types::Tuple);
         mcpu::AbstractString = Sys.CPU_NAME, region::Symbol = :innermost_loop
     )
+    # Read before anything is asked of llvm-mca: assembly that cannot be read has no throughput
+    # to estimate, whether or not the tool is installed.
+    raw_asm = _report_text(_native_asm_att, :mca_report, f, types)
     _require_mca()
-    target = _func_name(f) * _sig_string(types)
+    target = _func_name(f) * _sig_string(f, types)
     resolved_mcpu, fellback = _resolve_mcpu(mcpu)
-    asm = _sanitize_asm_for_mca(_native_asm_att(f, types))
+    asm = _sanitize_asm_for_mca(raw_asm)
     span = region === :innermost_loop ? _innermost_loop_span(asm) : nothing
     whole_function = span === nothing
     input = whole_function ? asm : _wrap_mca_region(asm, span)
@@ -247,6 +254,7 @@ end
 # `_native_asm` (scheduling.jl) defaults to the platform's native syntax (Intel on this Julia); the
 # mca path specifically needs AT&T (`llvm-mca`'s assembler defaults to AT&T parsing).
 function _native_asm_att(@nospecialize(f), @nospecialize(types::Tuple))
+    _has_compiled_body(f, types) || return ""
     f, types = _forwarded_call(f, types)
     io = IOBuffer()
     try
@@ -335,7 +343,7 @@ using LLVM_full_jll
 ```
 """
 macro assert_mca(args...)
-    pos, opts = _macro_call(args, (:types, :mcpu, :region, :max_rthroughput, :min_ipc))
+    pos, opts = _macro_call("@assert_mca", args, (:types, :mcpu, :region, :max_rthroughput, :min_ipc))
     isempty(pos) && throw(ArgumentError("@assert_mca needs a call expression"))
     call = pos[1]
     target = string(call)

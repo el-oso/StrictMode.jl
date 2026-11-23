@@ -40,6 +40,7 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:layer, nothing) => :SM0205,
     (:unsafe, nothing) => :SM0206,
     (:truncated, nothing) => :SM0207,
+    (:always_throws, nothing) => :SM0208,
     (:dispatch, nothing) => :SM0301,
     (:inline_suggestion, nothing) => :SM0302,
     (:static_ownership, nothing) => :SM0303,
@@ -53,6 +54,7 @@ const _CODES = Dict{Tuple{Symbol, Union{Nothing, Symbol}}, Symbol}(
     (:state_branch, nothing) => :SM0311,
     (:history, nothing) => :SM0016,
     (:noalloc, :scheduler) => :SM0017,
+    (:noalloc, :exempt) => :SM0018,
 )
 
 # One line saying what the code IS, for a reader who has only the code. The fix comes from
@@ -76,6 +78,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0015 => "a function the call is declared to reach is not in its call graph after optimization",
     :SM0016 => "the call's result bits change after other calls have run in the same process",
     :SM0017 => "the call can block in the task scheduler (a wait, a yield, a lock), which can allocate",
+    :SM0018 => "the call allocates only inside functions exempt from :noalloc, which is not a proof that it does not allocate",
     :SM0101 => "a closure captured a local that is reassigned, so it is held in a `Core.Box`",
     :SM0102 => "a non-`const` global is read, and its type can change between reads",
     :SM0103 => "a struct field is declared with an abstract type",
@@ -91,6 +94,7 @@ const _CODE_MEANING = Dict{Symbol, String}(
     :SM0205 => "a layer extends a function of, or reads a non-public name from, a layer its declaration does not allow",
     :SM0206 => "the method leaves Julia's safety guarantees — a `ccall`, a `pointer`, an `unsafe_` function, or `@inbounds`",
     :SM0207 => "the scan could not read the whole call tree below the call, so a clean result is not a verdict",
+    :SM0208 => "every path of the signature throws or never returns, so no guarantee was checked on a path that returns",
     :SM0301 => "the call site dispatches at run time, or sits at exactly `max_methods`",
     :SM0302 => "the callee might be worth `@inline`",
     :SM0303 => "a type- or symbol-keyed registry lookup could be static ownership instead",

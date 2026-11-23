@@ -229,3 +229,152 @@ end
     @test !StrictMode._is_exempt(LeakB.build_q, (Int,), :noalloc)
     @test_throws StrictViolation test_compiled(LeakB; guarantees = (:noalloc,))
 end
+
+@testitem "test_signatures fails a signature that always throws; a sweep notes it" begin
+    using StrictMode, StrictModeTest
+
+    module ProofAlwaysThrows
+    bad(x::Int) = x + "a"                               # no `+(::Int, ::String)`
+    kwreq(x::Int; n::Int) = x + n                       # `n` is required
+    wrongsig(v::AbstractVector, k) = v[k] = "s"         # a `String` into a `Vector{Float64}`
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    ok(x::Int) = x + 1
+    end
+    A = ProofAlwaysThrows
+    gs = (:typestable, :noalloc, :noboxing, :trim_compatible)
+
+    for (f, types) in ((A.bad, (Int,)), (A.kwreq, (Int,)), (A.wrongsig, (Vector{Float64}, Int)))
+        fs = proof_findings(f, types; guarantees = gs)
+        @test all(x -> x.status === :info && x.code === :SM0208 && x.tier === :proof, fs)
+        @test_throws StrictViolation test_signatures([(f, types)]; guarantees = gs)
+        @test_throws "always throws" test_signatures([(f, types)]; guarantees = gs)
+    end
+    @test length(test_signatures([(A.ok, (Int,))]; guarantees = gs)) == 4
+
+    # A module's error helper is not a defect, so the sweep carries the note and passes.
+    try
+        A.need(nothing, :a)
+    catch
+    end
+    A.ok(1)
+    swept = test_compiled(A; guarantees = (:typestable, :noalloc))
+    @test any(x -> x.func == "need" && x.code === :SM0208, swept)
+    @test_throws MethodError @test_noalloc A.bad(1)
+end
+
+@testitem "test_compiled covers a method added to another module's function" begin
+    using StrictMode, StrictModeTest, Test
+
+    module ForeignGate
+    using StrictMode
+    struct MyT
+        v::Int
+    end
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    own(x::Int) = x + 1
+    end
+    Untrusted(ForeignGate.MyT(7)).x; ForeignGate.own(1)
+    @test_throws "getproperty" test_compiled(ForeignGate; guarantees = (:trusted,))
+    @test test_compiled(ForeignGate; guarantees = (:trusted,), exempt = (:getproperty,)) isa Vector
+    r = only(StrictModeTest.proof_findings(getproperty, (Untrusted{ForeignGate.MyT}, Symbol); guarantees = (:trusted,)))
+    @test r.mod === :ForeignGate
+    Base.delete_method(which(getproperty, (Untrusted{ForeignGate.MyT}, Symbol)))
+end
+
+@testitem "a definition-form exemption leaves its sibling methods gated" begin
+    using StrictMode, StrictModeTest
+    module DefGate
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    module DefClean
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = Int(n) + 1
+    @strict_exempt spare(n::Integer) = Int(n) + 1     # generic, and needs no exemption
+    end
+    DefGate.grow(3); DefGate.grow(Int32(3)); DefClean.grow(3); DefClean.grow(Int32(3))
+    @test_throws StrictViolation test_compiled(DefGate; guarantees = (:noalloc,))
+    @test test_compiled(DefClean; guarantees = (:noalloc,)) isa Vector
+    # A generic definition is proved at its compiled rows: `(Int64)` here, not the abstract `(Integer)`.
+    DefClean.spare(3)
+    fs = test_exemptions(DefClean)
+    @test only(f.signature for f in fs if f.func == "spare") == "(Int64)"
+    @test occursin("no longer needed", only(f for f in fs if f.func == "spare").reason)
+end
+
+@testitem "a method declaration is proved at its compiled rows" begin
+    using StrictMode, StrictModeTest
+    module MProof
+    w(a::Vector{Float64}, n::Integer) = (Base.donotdelete(Any[a, n]); 0.0)
+    w(a::Vector{Float64}, n::Int) = (a[1] = n; 0.0)
+    via(a, n) = invoke(w, Tuple{Vector{Float64}, Integer}, a, n)
+    c(a::Vector{Float64}, n::Integer) = (a[1] = n; 0.0)
+    c(a::Vector{Float64}, n::Int) = (Base.donotdelete(Any[a, n]); 0.0)
+    viac(a, n) = invoke(c, Tuple{Vector{Float64}, Integer}, a, n)
+    cold(n::Integer) = n + 1
+    end
+    M = MProof
+    A = Vector{Float64}
+    M.via([1.0], 1); M.viac([1.0], 1); M.c([1.0], 1)
+    msg(f) = try
+        f()
+        ""
+    catch err
+        err isa StrictViolation || rethrow()
+        err.details
+    end
+    StrictMode.clear_declarations!()
+    try
+        # The dirty wider method fails at the row only `invoke` compiles.
+        StrictMode.register_strict!(which(M.w, (A, Integer)); guarantees = (:noalloc,))
+        m = msg(() -> test_registered(; modules = [M]))
+        @test occursin("via invoke of", m)
+        StrictMode.clear_declarations!()
+
+        # The clean wider method passes there, and its dirty specific sibling is not covered by it.
+        StrictMode.register_strict!(M.c, which(M.c, (A, Integer)); guarantees = (:noalloc,))
+        fs = test_registered(; modules = [M])
+        @test length(fs) == 1 && occursin("via invoke of", only(fs).signature)
+        m = msg(() -> test_coverage(M; only = [:c]))
+        @test occursin("c(Vector{Float64}, Int64)", m)
+        @test !occursin("via invoke of", m)
+        StrictMode.clear_declarations!()
+
+        # A declared method with nothing compiled fails the gate.
+        StrictMode.register_strict!(which(M.cold, (Integer,)))
+        @test occursin("no compiled specialization", msg(() -> test_registered(; modules = [M])))
+    finally
+        StrictMode.clear_declarations!()
+    end
+end
+
+@testitem "block and include exemptions leave a method written outside them gated" begin
+    using StrictMode, StrictModeTest
+    file = joinpath(mktempdir(), "cold.jl")
+    write(file, "grow(n::Int) = collect(1:n)\n")
+    @eval module BlkDirty
+    using StrictMode
+    @strict_exempt begin
+        grow(n::Int) = collect(1:n)
+    end
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    @eval module IncDirty
+    using StrictMode
+    @strict_exempt include($file)
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    @eval module IncClean
+    using StrictMode
+    @strict_exempt include($file)
+    grow(n::Integer) = Int(n) + 1
+    end
+    for M in (BlkDirty, IncDirty, IncClean)
+        M.grow(3); M.grow(Int32(3))
+    end
+    @test_throws StrictViolation test_compiled(BlkDirty; guarantees = (:noalloc,))
+    @test_throws StrictViolation test_compiled(IncDirty; guarantees = (:noalloc,))
+    @test test_compiled(IncClean; guarantees = (:noalloc,)) isa Vector
+end

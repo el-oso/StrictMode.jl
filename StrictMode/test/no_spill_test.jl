@@ -128,3 +128,14 @@ end
     # The x86 pattern reads none of it: the blind spot this closes.
     @test !any(l -> occursin(StrictMode._vec_reg_re(:x86_64), l), lines)
 end
+
+@testitem "spills on an architecture whose register names are unknown are not counted as zero" begin
+    using StrictMode
+    ppc = ["  stxv 34, 32(1)  # 16-byte Folded Spill"]
+    @test_throws "powerpc64le" StrictMode._spill_counts(ppc, :powerpc64le)
+    @test_throws "vector register names" StrictMode._spill_counts(["  vs1r.v v8, (a0)  # Unknown-size Folded Spill"], :riscv64)
+    @test isnothing(StrictMode._spill_arch_unread(:x86_64))
+    @test isnothing(StrictMode._spill_arch_unread(:i686))
+    @test isnothing(StrictMode._spill_arch_unread(:aarch64))
+    @test occursin("riscv64", StrictMode._spill_arch_unread(:riscv64))
+end

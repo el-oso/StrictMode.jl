@@ -125,10 +125,58 @@ AnalysisError
 
 ### Barriers, juliac patches, and engine divergence
 
-`ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier is exempt
-from AllocCheck's all-paths proof. `divergence_report` / `StrictDivergence` run both engines on one
-signature and capture an **IP-free** record of any disagreement — anonymized signature shape, signal
-*categories*, and versions only — that you can send to the maintainers to fix the scan.
+`ignore_barrier` / `set_ignore_barrier!` decide whether a recognized one-time-init barrier
+is exempt from AllocCheck's all-paths proof. The proof still runs on a call that reaches a
+barrier, and the allocation sites the barrier accounts for are dropped, from either AllocCheck
+run (see "Error paths" in the guarantees page for the second one). When no site is left but the
+value-free scan finds allocation, boxing or an abstract-eltype container in the call, every site
+is kept and reported, the barrier's included, so the proof is never more permissive than the scan.
+A site is the barrier's when its backtrace passes through the barrier, or when its function is
+reached from a barrier and on no path from the call that avoids one. The second case covers a
+helper the barrier calls from several places, and the lock and task internals of a once-guard: it
+is compiled once, and AllocCheck ends its backtrace at a frame named "multiple call sites", so the
+backtrace cannot name the barrier. The call graph is read as AllocCheck compiles it: a call leads
+to the specialization for the argument types inferred there. If the call also reaches that
+helper outside the barrier, its sites are kept, as they are whenever the call graph outside the
+barriers cannot be read in full. A site whose specialization the call graph does not name at all
+is kept too, and the failure's reason says that it could not be matched to the call graph and names
+the specialization: the graph is StrictModeTest's reading of what AllocCheck compiled, so that is a
+defect to report, not a property of your code. `divergence_report` / `StrictDivergence` run both engines on one
+signature and capture an **IP-free** record of any disagreement — anonymized signature shape,
+signal *categories*, and versions only — that you can send to the maintainers to fix the scan.
+Its `diverged` field lists each guarantee one engine fails and the other passes, and `isempty`
+reads only that field. Its `cause_diverged` field lists each guarantee both engines fail with
+different codes. One case is a call tree larger than the scan reads: the scan reports it as unread
+(SM0207), and the proof compiles all of it and reports SM0002 when it allocates.
+
+A function exempted with `@strict_exempt :noalloc` is not a barrier, and its allocation is not
+dropped. A call whose every allocation lies inside such functions gets a result of its own from the
+proof: a failure with code SM0018 and an `exempt_by` field listing each exempt function with the
+`reason` its exemption gave. It is a failure to every reader: `nfailures` counts it, `@test_noalloc`,
+`test_signatures`, `test_compiled` and `test_registered` fail on it, and `alloc_entry_report` lists
+the entry as failing. `allow_exempt = true`, on any of those and on `proof_findings` (signature or
+module) and `proof_audit`, accepts the exemptions for that check; the result is then a note
+(`:info`, same code, same `exempt_by`), which is still not a pass. One allocation outside an exempt function makes it an ordinary failure either way,
+and so does an exempt callee that was inlined, since its allocation then belongs to the caller's
+own code. The sites outside the exempt functions decide which failure, as they do in the scan:
+SM0017 when every one of them is a wait in Base's task, lock and condition code, SM0002
+otherwise. The exemption is matched on the method, so a function of the same name in another
+module excuses nothing.
+
+An exemption covers the exempt function's own code and what that calls. A function or closure the
+exempt function was handed is the caller's code: an allocation made while it runs is the caller's,
+and makes the result an ordinary failure. So `withbuf(b -> sum(zeros(n)) + b[1], n)` fails for an
+exempt `withbuf`, with or without `allow_exempt`, while the pool growth inside `withbuf` is still
+accounted for. The same holds for a callable struct, and for callables held in a field or in an
+array argument. When the exempt function receives a callable whose type is known only at run time
+(an argument declared `Function` or `Any`, a `Vector{Function}`, a field declared `Function`), a
+dynamic call inside it may reach that callable, whose body is not analyzed, so the dynamic call
+is the caller's and the result is an ordinary failure.
+
+Only an exemption declared in a module counts here, which is what `@strict_exempt` written in a
+package's source is. One declared with no module, from a session, covers by name in every module
+and names no method: its caller is an ordinary failure in the proof, with or without
+`allow_exempt`. The reporting scan still notes such a caller as reaching an exempt function.
 
 ```@docs
 ignore_barrier

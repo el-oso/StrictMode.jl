@@ -39,7 +39,7 @@ _is_typestable_return(@nospecialize(T)) =
 const _RETTYPE_MEMO = IdDict{Any, Dict{UInt64, Vector{Any}}}()
 
 function _return_types_memo(@nospecialize(f), @nospecialize(types::Tuple))
-    sig = _sigtype(f, types)
+    sig = _entry_key(f, types)
     world = Base.get_world_counter()
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_RETTYPE_MEMO, sig, nothing)
@@ -146,7 +146,7 @@ g(::Type{T}) where {T} = Vector{T}(undef, 1)
 ```
 """
 macro assert_typestable(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_typestable", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_typestable needs a call expression"))
     call = pos[1]
     target = string(call)

@@ -72,3 +72,37 @@ end
     @test_throws ArgumentError (@test_steady_state use_pool!(pool, 8) warmups = 0)
     @test_throws ArgumentError (@test_steady_state use_pool!(pool, 8) repeats = 0)
 end
+
+@testitem "a proof macro or driver rejects a name it does not know" begin
+    using StrictMode, StrictModeTest
+
+    opt_kernel(x::Vector{Float64}) = sum(x)
+    accepted = Dict(
+        "@test_noalloc" => "`types`, `allow_exempt`", "@test_noboxing" => "`types`, `allow_exempt`",
+        "@test_typestable" => "`types`, `allow_exempt`", "@test_trim_compatible" => "`types`, `allow_exempt`",
+        "@test_strict" => "`types`, `allow_exempt`", "@test_kernel" => "`types`, `allow_exempt`",
+        "@test_steady_state" => "`warmups`, `repeats`, `fresh_task`",
+        "@test_no_gc_pause" => "`samples`, `warmups`, `max_collections`, `max_q99_ms`, `slow_factor`",
+        "@test_allocated_zero" => "`warmups`, `windows`",
+    )
+    for (name, opts) in accepted
+        call = Expr(:macrocall, Symbol(name), LineNumberNode(1), :(bogus_option = 1), :(opt_kernel([1.0])))
+        @test_throws "$name: unknown option `bogus_option`. Accepted options: $opts." macroexpand(@__MODULE__, call)
+    end
+    @test_throws "@test_reaches: unknown option `stop`. It takes no options." @eval @test_reaches opt_kernel([1.0]) sum stop = (:x,)
+    @test (@test_noalloc types = (Vector{Float64},) opt_kernel([1.0])) == 1.0
+
+    module ProofOptValues
+    k(x::Vector{Float64}) = sum(x)
+    end
+    @test_throws "unknown guarantee :noaloc; expected one of" test_signatures([(ProofOptValues.k, (Vector{Float64},))]; guarantees = (:noaloc,))
+    @test_throws "unknown guarantee :noaloc; expected one of" test_compiled(ProofOptValues; guarantees = (:noaloc,))
+    @test_throws "unknown guarantee :noaloc; expected one of" test_registered(; guarantees = (:noaloc,))
+    @test_throws "unknown guarantee :noaloc" proof_findings(ProofOptValues.k, (Vector{Float64},); guarantees = (:noaloc,))
+    @test_throws "require must be :all or :public, got some" test_coverage(ProofOptValues; require = :some)
+    @test_throws MethodError test_registered(; isolate = false)
+    # `allow_exempt` is an option of the gates, and a misspelling of it is not.
+    @test_throws "unknown option `allow_exempts`" @eval @test_noalloc allow_exempts = true opt_kernel([1.0])
+    @test_throws MethodError test_signatures([(ProofOptValues.k, (Vector{Float64},))]; allow_exempts = true)
+    @test (@test_noalloc allow_exempt = true opt_kernel([1.0])) == 1.0
+end

@@ -181,3 +181,19 @@ end
     span = StrictMode._innermost_loop_span(asm)
     @test occursin("LBB0_3", split(asm, '\n')[span[1]])
 end
+
+@testitem "mca_report raises on assembly it could not read" begin
+    using StrictMode
+
+    absf(x::AbstractVector) = sum(x)
+    # A signature that is not concrete names no compiled body. The report says so whether or not
+    # llvm-mca is installed: there is no assembly to hand it.
+    @test_throws StrictMode._UnanalyzableSignature mca_report(absf, (AbstractVector{Float64},))
+    @test_throws "StrictMode mca_report: could not analyze `absf(AbstractVector{Float64})`" mca_report(absf, (AbstractVector{Float64},))
+    @test_throws "the signature is not concrete" mca_report(absf, (AbstractVector{Float64},))
+    @test_throws "compiled output could not be read" mca_report(absf, (Int,))
+    @test isempty(StrictMode._native_asm_att(absf, (AbstractVector{Float64},)))
+    @test !isempty(StrictMode._native_asm_att(absf, (Vector{Float64},)))
+    # A concrete signature gets past the read, to the tool or to the message about installing it.
+    StrictMode.mca_available() || @test_throws "LLVM_full_jll" mca_report(absf, (Vector{Float64},))
+end

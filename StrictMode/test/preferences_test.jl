@@ -149,3 +149,192 @@ end
         end
     end
 end
+
+@testitem "a preference key StrictMode does not read is reported at load" begin
+    using StrictMode
+
+    mktempdir() do dir
+        oldproj, oldload = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH)
+        try
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            Base.set_active_project(joinpath(dir, "Project.toml"))
+            write(joinpath(dir, "Project.toml"), "[deps]\n")
+
+            # Nothing set, and the two keys StrictMode reads: nothing to report.
+            @test isempty(StrictMode.unknown_preferences())
+            prefs = joinpath(dir, "LocalPreferences.toml")
+            write(prefs, "[StrictMode]\nchecks_enabled = true\nbanner = false\n")
+            @test isempty(StrictMode.unknown_preferences())
+
+            # A misspelled key is ignored by Preferences.jl, so checks stay on. It is named, with
+            # its file. Another package's table is not StrictMode's to judge.
+            write(prefs, "[Other]\ncheck_enabled = 1\n\n[StrictMode]\n# a comment\ncheck_enabled = false\n\"baner\" = false\nbanner = true\n\n[Later]\nx = 1\n")
+            unknown = StrictMode.unknown_preferences()
+            @test unknown == ["check_enabled ($prefs)", "baner ($prefs)"]
+
+            # The project file's own table, and a path on `LOAD_PATH` (the `Pkg.test` shape).
+            rm(prefs)
+            write(joinpath(dir, "Project.toml"), "[deps]\n\n[preferences.StrictMode]\nchecks_enable = false\n")
+            @test StrictMode.unknown_preferences() == ["checks_enable ($(joinpath(dir, "Project.toml")))"]
+            Base.set_active_project(nothing)
+            @test isempty(StrictMode.unknown_preferences())
+            push!(Base.LOAD_PATH, dir)
+            @test length(StrictMode.unknown_preferences()) == 1
+
+            # What the load prints. The writer goes to the C `stderr`, so it is read back from a
+            # file the descriptor is pointed at.
+            out = joinpath(dir, "stderr.txt")
+            open(out, "w") do io
+                redirect_stderr(io) do
+                    StrictMode._warn_unknown_preferences()
+                    Libc.flush_cstdio()
+                end
+            end
+            printed = read(out, String)
+            @test occursin("StrictMode: unknown preference checks_enable (", printed)
+            @test occursin("StrictMode reads `checks_enabled` and `banner`", printed)
+
+            # `banner = false` hides the tier banner and nothing else: a misspelled key is
+            # reported whatever the banner is set to, so the warning reads no banner setting.
+            reads_banner(@nospecialize(x)) = x isa GlobalRef ? x.name === :BANNER_ENABLED :
+                x isa Expr ? any(reads_banner, x.args) : false
+            warn_code = only(Base.code_lowered(StrictMode._warn_unknown_preferences, ())).code
+            tier_code = only(Base.code_lowered(StrictMode._announce_tier, ())).code
+            @test !any(reads_banner, warn_code)
+            @test any(reads_banner, tier_code)
+            # The note is a format string for the writer, so it holds no `%`.
+            @test !occursin('%', StrictMode._UNKNOWN_PREFERENCE_NOTE)
+        finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+end
+
+@testitem "unknown_preferences searches the shared environments" begin
+    using StrictMode
+
+    mktempdir() do dir
+        oldproj, oldload, olddepot = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH), copy(Base.DEPOT_PATH)
+        try
+            # No project active: the default environment is the one Preferences.jl reads, and a
+            # named shared environment on `LOAD_PATH` is read as well.
+            default = joinpath(dir, "depot", "environments", StrictMode._DEFAULT_ENV)
+            named = joinpath(dir, "depot", "environments", "tools")
+            for (env, key) in ((default, "check_enabled"), (named, "baner"))
+                mkpath(env)
+                write(joinpath(env, "Project.toml"), "[deps]\n")
+                write(joinpath(env, "LocalPreferences.toml"), "[StrictMode]\n$key = false\n")
+            end
+            empty!(Base.DEPOT_PATH)
+            push!(Base.DEPOT_PATH, joinpath(dir, "depot"))
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, ["@", "@v#.#", "@tools", "@stdlib"])
+            Base.set_active_project(nothing)
+            @test StrictMode.unknown_preferences() == [
+                "check_enabled ($(joinpath(default, "LocalPreferences.toml")))",
+                "baner ($(joinpath(named, "LocalPreferences.toml")))",
+            ]
+        finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+            empty!(Base.DEPOT_PATH)
+            append!(Base.DEPOT_PATH, olddepot)
+        end
+    end
+end
+
+@testitem "unknown_preferences reads every TOML spelling of StrictMode's table" begin
+    using StrictMode
+
+    mktempdir() do dir
+        oldproj, oldload = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH)
+        try
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            proj = joinpath(dir, "Project.toml")
+            prefs = joinpath(dir, "LocalPreferences.toml")
+            Base.set_active_project(proj)
+            write(proj, "[deps]\n")
+            # The project file stays, since it is what makes `dir` the active project.
+            found(text, file) = (write(file, text); r = StrictMode.unknown_preferences(); file == proj ? write(proj, "[deps]\n") : rm(file); r)
+            for text in (
+                    "[StrictMode]  # local overrides\ncheck_enabled = false\n",
+                    "[ StrictMode ]\ncheck_enabled = false\n",
+                    "['StrictMode']\ncheck_enabled = false\n",
+                    "StrictMode.check_enabled = false\n",
+                    "[StrictMode.check_enabled]\nx = 1\n",
+                    "StrictMode = {check_enabled = false}\n",
+                    "StrictMode = { banner = true, \"check_enabled\" = false } # c\n",
+                    "StrictMode = {banner = \"a, } b\", check_enabled = [1, 2]}\n",
+                )
+                @test found(text, prefs) == ["check_enabled ($prefs)"]
+            end
+            for text in (
+                    "[deps]\n\n[preferences.\"StrictMode\"]\ncheck_enabled = false\n",
+                    "[deps]\n\n[preferences]\nStrictMode.check_enabled = false\n",
+                    "[deps]\n\n[ preferences . StrictMode ] # note\ncheck_enabled = false\n",
+                    "[deps]\n\n[preferences]\nStrictMode = {check_enabled = false}\n",
+                    "preferences = {Other = {x = 1}, StrictMode = {check_enabled = false}}\n[deps]\n",
+                )
+                @test found(text, proj) == ["check_enabled ($proj)"]
+            end
+            # Keys StrictMode reads, in the same spellings, and another package's table.
+            @test isempty(found("StrictMode.checks_enabled = false\n[ StrictMode ] # c\nbanner = true\n[Other]\ncheck_enabled = 1\n", prefs))
+            @test isempty(found("[preferences]\nStrictMode.banner = false\nOther.check_enabled = 1\n", proj))
+            @test isempty(found("StrictMode = {checks_enabled = false, banner = true}\nOther = {check_enabled = 1}\n", prefs))
+            @test isempty(found("[preferences]\nOther = {StrictMode = 1, check_enabled = 1}\n", proj))
+            # The whole file is read, however long.
+            @test found("[StrictMode]\n" * "# padding\n"^10_000 * "check_enabled = false\n", prefs) == ["check_enabled ($prefs)"]
+        finally
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+end
+
+@testitem "unknown_preferences names a preference file it cannot read" begin
+    using StrictMode
+
+    # A file that cannot be read is named in a warning, once, and the other files are still
+    # searched: an empty list must not stand for "could not look". Permissions are what make a file
+    # unreadable here, and Windows does not deny reads through them.
+    Sys.iswindows() || mktempdir() do dir
+        oldproj, oldload = Base.ACTIVE_PROJECT[], copy(Base.LOAD_PATH)
+        prefs = joinpath(dir, "LocalPreferences.toml")
+        try
+            empty!(Base.LOAD_PATH)
+            push!(Base.LOAD_PATH, "@")
+            proj = joinpath(dir, "Project.toml")
+            Base.set_active_project(proj)
+            write(proj, "[deps]\n\n[preferences.StrictMode]\nchecks_enable = false\n")
+            write(prefs, "[StrictMode]\nbaner = false\n")
+            chmod(prefs, 0o000)
+            # The fixture really is unreadable; as a superuser it would not be.
+            @test_throws SystemError read(prefs)
+            empty!(StrictMode._UNREADABLE_PREFERENCES)
+
+            out = joinpath(dir, "stderr.txt")
+            printed(f) = (open(io -> redirect_stderr(() -> (r = f(); Libc.flush_cstdio(); r), io), out, "w"), read(out, String))
+            (found, text) = printed(StrictMode.unknown_preferences)
+            @test found == ["checks_enable ($proj)"]
+            @test occursin("StrictMode: could not read the preference file $prefs", text)
+            # Once per file: a second search names it no more.
+            (found2, text2) = printed(StrictMode.unknown_preferences)
+            @test found2 == found
+            @test !occursin(prefs, text2)
+            # The load-time warning reaches the same search, and the text it prints holds no `%`.
+            @test !occursin('%', StrictMode._UNREADABLE_PREFERENCE_NOTE)
+        finally
+            chmod(prefs, 0o644)
+            empty!(StrictMode._UNREADABLE_PREFERENCES)
+            Base.set_active_project(oldproj)
+            empty!(Base.LOAD_PATH)
+            append!(Base.LOAD_PATH, oldload)
+        end
+    end
+end

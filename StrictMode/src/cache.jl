@@ -6,10 +6,17 @@
 # The key names the *checked* method, not its callees, so an edit one level down leaves it
 # identical. That is covered separately: each entry also holds the `CodeInstance`s the verdict was
 # read from, and Julia caps their `max_world` when a callee changes. A method that has never been
-# compiled has no instance to watch, and only there is `clear_cache!()` still needed.
+# compiled has no instance to watch, and neither has a verdict that read the body of a task the
+# method spawns (that code holds no edge to what the task calls), so such an entry answers only in
+# the world it was made in.
+#
+# A registration a verdict reads (a scoped type, a trust boundary, a barrier, an exemption) is also
+# read from the stores of the loaded packages, and loading a package that holds one calls no
+# registration function to clear the cache. So an entry also records how many packages were loaded.
 
-# The findings, plus the `CodeInstance`s they were read from — see `_watch_instances`.
-const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}}}()
+# The findings, the `CodeInstance`s they were read from (see `_watch_instances`), the world, and
+# the number of loaded packages.
+const _CACHE = Dict{Any, Tuple{Vector{StrictFinding}, Vector{Core.CodeInstance}, UInt, Int}}()
 const _CACHE_LOCK = ReentrantLock()
 const _CACHE_HITS = Ref(0)
 const _CACHE_MISSES = Ref(0)
@@ -18,13 +25,23 @@ const _CACHE_MISSES = Ref(0)
 # STRICTLY MORE than a shallower one. Omitting it hands back the shallow verdict to a caller who
 # asked to look deeper — staleness that can only ever lose findings, which is the direction that
 # goes quiet. (`_SIGNAL_MEMO` in effects.jl already keys on depth; this is the outer layer.)
+#
+# Whether a package overrides `getproperty` on an `Untrusted` is part of it too, for `:trusted`. An
+# untyped `p.x` is a dynamic call, and the compiler records no edge for one, so defining that method
+# caps no instance the entry watches.
+#
+# The callable's type is part of it as well: one method serves every instantiation of a parametric
+# callable (`(b::Boxed)(x)` for `Boxed{Int}` and `Boxed{Float64}`) and every type a constructor method
+# covers, and those are different signatures with different verdicts.
 function _cache_key(@nospecialize(f), @nospecialize(types::Tuple), guarantees)
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         return nothing   # no/ambiguous method → don't cache
     end
-    return (objectid(m), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[])
+    overridden = :trusted in guarantees ?
+        (_untrusted_getproperty_overridden(2), _untrusted_getproperty_overridden(3)) : nothing
+    return (objectid(m), objectid(f isa _Spec ? f.mi : _ftype(f)), m.primary_world, types, Tuple(guarantees), _FAST_ALLOC_DEPTH[], overridden)
 end
 
 # What a cached verdict depends on, beyond its key: the compiled code the analysis read. A verdict
@@ -38,18 +55,18 @@ end
 # callee edit and capped after it, while `objectid(which(...))` and `primary_world` were unchanged.
 #
 # A method nothing has compiled yet has no instance to watch, so a verdict for it cannot be
-# invalidated this way — `clear_cache!()` remains the answer there.
+# invalidated this way, and `_entry_valid` keeps it for its own world only.
 function _watch_instances(@nospecialize(f), @nospecialize(types::Tuple))
     out = Core.CodeInstance[]
     m = try
-        which(f, types)
+        _which(f, types)
     catch
         return out
     end
     # Only the instance compiled for THIS signature. A method's other specializations are other
     # verdicts, and one of them going stale says nothing about this one — watching them all turned
     # a 14 ms warm re-audit into 489 ms by invalidating entries that were still good.
-    want = Tuple{typeof(f), types...}
+    want = _key_sig(_entry_key(f, types))
     for mi in Base.specializations(m)
         isnothing(mi) && continue
         mi isa Core.MethodInstance || continue
@@ -63,20 +80,30 @@ end
 
 _instances_valid(cis) = all(ci -> ci.max_world == typemax(UInt), cis)
 
-"""
-    StrictMode.clear_cache!()
+# Packages are never unloaded, so a count that moved means a package was loaded since.
+_loaded_count() = length(Base.loaded_modules)
 
-Drop the incremental `findings` cache.
+# Whether a cache entry made in `world` with `watched`, while `loaded` packages were loaded, still
+# answers. With nothing to watch, any definition since may be an edit to a callee, so only the same
+# world does. A package loaded since may hold a registration the verdict did not read.
+_entry_valid(watched, world::UInt, loaded::Int) = loaded == _loaded_count() &&
+    (isempty(watched) ? world == Base.get_world_counter() : _instances_valid(watched))
 
-A cached verdict is dropped on its own when the compiled code it was read from is invalidated, which
-covers editing a *callee* of a checked method. A method that has not been compiled at all has no
-compiled code to watch, so reach for this after editing a callee of one of those.
-"""
 # What the scan keeps is worth keeping in a session, where the next check reuses it, and not at a
 # precompile, where nothing asks again and a process that is about to write a package image holds
 # it as live heap: 282 MB after a module check of 300 methods.
 _release_after_load_check() = ccall(:jl_generating_output, Cint, ()) == 1 ? clear_cache!() : nothing
 
+"""
+    StrictMode.clear_cache!()
+
+Drop the incremental `findings` cache.
+
+A cached verdict is dropped on its own when the method it names or a callee is edited: the compiled
+code it was read from is invalidated, and a verdict on a method with no compiled code, or one that
+read the body of a task the method spawns, is kept only until the next definition. This is for what no definition announces, such as a changed setting a
+verdict depends on.
+"""
 function clear_cache!()
     @lock _CACHE_LOCK begin
         empty!(_CACHE)
@@ -89,6 +116,7 @@ function clear_cache!()
         empty!(_TOP_SIGNAL_MEMO)
         empty!(_BODY_MEMO)
         empty!(_ORIGIN_MEMO)
+        empty!(_HANDED_MEMO)
         empty!(_SIG_STRING_MEMO)
         empty!(_SCAN_CODE_CACHE)
         empty!(_RETTYPE_MEMO)

@@ -33,7 +33,10 @@ end
     # The entry that chooses a route reaches every branch, including the callee of a spawned task.
     rn = StrictMode.reach_report(R.native, V; mod = R)
     @test names(rn) == Set([:core, :choose, :tune, :serial, :threaded, :strassen, :deep])
-    @test StrictMode.complete(rn)
+    # `fetch` returns `Any`, and the `+` it feeds runs whatever method the task's value has, so the
+    # graph is incomplete.
+    @test rn.dynamic > 0
+    @test !StrictMode.complete(rn)
     @test StrictMode.reaches(rn, R.threaded)
 
     # The entry that takes the defaults reaches the core and the one branch the defaults leave.
@@ -112,6 +115,8 @@ end
     # The target may sit behind the call the scan could not name, so this one is reported.
     r = Ref{Any}(R.hidden)
     @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches R.viaref(r, 1) R.hidden
+    # A route that fetches a task is incomplete, so an absent target warns there too.
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches R.native(x) R.hidden
 
     @test StrictMode._code(:reaches) === :SM0015
 end
@@ -132,4 +137,165 @@ end
     @test StrictMode.reaches(R(via_in, (Int, Int), (hub_in,)), hub_in)   # recorded, not entered
     @test StrictMode.reaches(R(via_out, (Int,), ()), far_leaf)
     @test !StrictMode.reaches(R(via_out, (Int,), (hub_out,)), far_leaf)
+end
+
+@testitem "reach enters a Base callee that runs a user type's methods" begin
+    using StrictMode
+    # `sum` stays an out-of-line call into Base, and reaches `hot` only through `getindex(::Lazy)`.
+    abstract type AbstractLazy <: AbstractVector{Float64} end
+    struct Lazy <: AbstractLazy
+        v::Vector{Float64}
+    end
+    Base.size(l::Lazy) = size(l.v)
+    @noinline hot(x) = 2x
+    Base.getindex(l::Lazy, i::Int) = hot(l.v[i])
+    entry(l::Lazy) = sum(l)
+    @test entry(Lazy([1.0, 2.0])) == 6.0
+    r = StrictMode.reach_report(entry, (Lazy,))
+    @test StrictMode.reaches(r, hot)
+    @test (@assert_reaches entry(Lazy([1.0])) hot) == 2.0
+    @test StrictMode.reaches(StrictMode.reach_report(entry, (Lazy,); stop = (hot,)), hot)
+
+    # A Base call left to run-time dispatch on a user type is followed, or counted.
+    viaref(r::Base.RefValue{AbstractLazy}) = sum(r[])
+    @test viaref(Ref{AbstractLazy}(Lazy([1.0]))) == 2.0
+    rd = StrictMode.reach_report(viaref, (Base.RefValue{AbstractLazy},))
+    @test StrictMode.reaches(rd, hot) || !StrictMode.complete(rd)
+end
+
+@testitem "a Base call on abstract argument types is counted as unread" begin
+    using StrictMode
+    # User code runs behind each of these Base calls at run time, through a value whose type the
+    # signature leaves abstract. The walk does not enter Base, so it counts the call instead.
+    @noinline hot(x) = 2x
+    struct L <: AbstractVector{Float64}
+        v::Vector{Float64}
+    end
+    Base.size(l::L) = size(l.v)
+    Base.getindex(l::L, i::Int) = hot(l.v[i])
+    struct N
+        v::Float64
+    end
+    Base.:+(a::N, b::Float64) = hot(a.v) + b
+    viaabs(r::Base.RefValue{AbstractVector{Float64}}) = sum(r[])
+    viafetch(x::Float64) = (t = Threads.@spawn N(x); fetch(t) + x)
+    viaany(r::Base.RefValue{Any}, x::Float64) = r[] + x
+    @test viaabs(Ref{AbstractVector{Float64}}(L([1.0]))) == 2.0
+    @test viafetch(1.0) == 3.0
+    @test viaany(Ref{Any}(N(1.0)), 1.0) == 3.0
+    for (f, T) in ((viaabs, (Base.RefValue{AbstractVector{Float64}},)), (viafetch, (Float64,)),
+                   (viaany, (Base.RefValue{Any}, Float64)))
+        r = StrictMode.reach_report(f, T)
+        @test !StrictMode.reaches(r, hot)
+        @test r.dynamic > 0
+        @test !StrictMode.complete(r)
+    end
+    # The target may sit behind the abstract call, so its absence warns rather than throws.
+    a = Ref{AbstractVector{Float64}}(L([1.0]))
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches viaabs(a) hot
+
+    # A Base function on concrete Base types stays in Base and is not counted.
+    conc(x::Vector{Float64}) = sum(x)
+    rc = StrictMode.reach_report(conc, (Vector{Float64},))
+    @test StrictMode.complete(rc)
+    @test_throws StrictViolation @assert_reaches conc([1.0]) hot
+    @test !StrictMode._reach_open(Tuple{typeof(sum), Vector{Float64}})
+    @test !StrictMode._reach_open(Tuple{typeof(convert), Type{Int}, Union{Nothing, Int}})
+    @test StrictMode._reach_open(Tuple{typeof(sum), AbstractVector{Float64}})
+    @test StrictMode._reach_open(Tuple{typeof(+), Any, Float64})
+    @test StrictMode._reach_open(Tuple{typeof(print), Vararg{Any}})
+    @test !StrictMode._reach_open(Tuple{typeof(Base._string), String, Vararg{String}})
+
+    # An :invoke is judged by the types at the call site, not by the method instance, which a
+    # `@nospecialize` widens: interpolating an `Int` into an error message stays in Base, and
+    # interpolating an `Any` does not.
+    chk(x::Int) = x > 0 ? x : throw(ArgumentError("bad $x"))
+    @test StrictMode.complete(StrictMode.reach_report(chk, (Int,)))
+    s2(r::Base.RefValue{Any}) = string("a", r[])
+    @test !StrictMode.complete(StrictMode.reach_report(s2, (Base.RefValue{Any},)))
+end
+
+@testitem "a struct's default show is read at the struct's type" begin
+    using StrictMode
+    # `show` of a struct without its own method runs Base's `_show_default`, compiled for `Any` and
+    # called through a compiler barrier. The value is the struct, so it is read at that type.
+    @noinline hot(x) = 2x
+    struct W; v::Int; end
+    Base.show(io::IO, w::W) = print(io, hot(w.v))
+    struct Plain; a::Int; end
+    struct Holds; w::W; end
+    viaplain(p::Plain) = string(p)
+    viaholds(h::Holds) = string(h)
+    @test endswith(viaplain(Plain(1)), "Plain(1)")
+    @test endswith(viaholds(Holds(W(1))), "Holds(2)")
+    rp = StrictMode.reach_report(viaplain, (Plain,))
+    @test rp.dynamic == 0
+    @test StrictMode.complete(rp)
+    rh = StrictMode.reach_report(viaholds, (Holds,))
+    @test StrictMode.reaches(rh, hot)
+end
+
+@testitem "a Base call on a container of abstract elements is counted as unread" begin
+    using StrictMode
+    # A concrete Base container whose type parameter is abstract holds values of any type, and the
+    # Base method runs their methods: `sum` of a `Vector{Any}` runs the `+` of whatever it holds.
+    @noinline hot(x) = 2x
+    struct N
+        v::Float64
+    end
+    Base.:+(a::N, b::N) = N(hot(a.v) + b.v)
+    vany(v::Vector{Any}) = sum(v)
+    vnest(v::Vector{Vector{Any}}) = sum(first(v))
+    @test vany(Any[N(1.0), N(1.0)]).v == 3.0
+    @test vnest([Any[N(1.0), N(1.0)]]).v == 3.0
+    for (f, T) in ((vany, (Vector{Any},)), (vnest, (Vector{Vector{Any}},)))
+        r = StrictMode.reach_report(f, T)
+        @test !StrictMode.reaches(r, hot)
+        @test r.dynamic > 0
+        @test !StrictMode.complete(r)
+    end
+    @test_logs (:warn, r"unknown callee") match_mode = :any @assert_reaches vany(Any[N(1.0)]) hot
+
+    # Parameters are judged at every depth, and a parameter that is not a type is not judged.
+    for T in (Vector{Any}, Dict{Symbol, Any}, Base.RefValue{Any}, Vector{Vector{Any}},
+              Tuple{Vector{Any}}, Vector{AbstractVector{Float64}}, Vector{Vector})
+        @test StrictMode._reach_open(Tuple{typeof(sum), T})
+    end
+    for T in (Vector{Float64}, Vector{Vector{Float64}}, Dict{Symbol, Int},
+              Vector{Union{Nothing, Int}}, Val{:a}, Array{Float64, 2}, Vector{Type{Int}})
+        @test !StrictMode._reach_open(Tuple{typeof(sum), T})
+    end
+end
+
+@testitem "an invoke of a less specific Base method is not read as complete" begin
+    using StrictMode
+    @noinline hot(x) = 2x
+    struct In end
+    Base.show(io::IO, ::In) = print(io, hot(1))
+    struct Out; x::In; end
+    Base.show(io::IO, ::Out) = print(io, "O")
+    # `invoke` selects Base's default `show`, compiled for `Any`, though `Out` has its own method.
+    @noinline dflt(io::IOBuffer, o::Out) = (@noinline invoke(show, Tuple{IO, Any}, io, o))
+    io = IOBuffer(); dflt(io, Out(In()))
+    @test endswith(String(take!(io)), "Out(2)")
+    r = StrictMode.reach_report(dflt, (IOBuffer, Out))
+    @test StrictMode.reaches(r, hot) || !StrictMode.complete(r)
+end
+
+@testitem "reach_report reads the method a wider invoke runs" begin
+    using StrictMode
+    const SINK = Ref{Any}(nothing)
+    @noinline hot(x) = (SINK[] = x; 2x)
+    @noinline to_hot(x::Int, n::Integer) = hot(x)
+    @noinline to_hot(x::Int, n::Int) = x
+    @noinline past_hot(x::Int, n::Integer) = x + n
+    @noinline past_hot(x::Int, n::Int) = hot(x)
+    # `invoke` runs the `Integer` method on an `Int`; `(Int, Int)` dispatches to the other one.
+    reaches_it(x::Int, n::Int) = invoke(to_hot, Tuple{Int, Integer}, x, n)
+    misses_it(x::Int, n::Int) = invoke(past_hot, Tuple{Int, Integer}, x, n)
+    @test reaches_it(1, 1) == 2 && misses_it(1, 1) == 2
+    r = StrictMode.reach_report(reaches_it, (Int, Int))
+    @test StrictMode.reaches(r, hot) && StrictMode.complete(r)
+    r = StrictMode.reach_report(misses_it, (Int, Int))
+    @test !StrictMode.reaches(r, hot) && StrictMode.complete(r)
 end

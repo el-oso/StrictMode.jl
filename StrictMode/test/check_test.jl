@@ -163,3 +163,125 @@ end
     # End to end: the override still pins the positional types, and the call is proved as-is.
     @test (@test_noalloc g(1; k = 2) types = (Int,)) === 3
 end
+
+@testitem "a signature that always throws is a note in a sweep and a failure where it is listed" begin
+    using StrictMode
+
+    module AlwaysThrows
+    using StrictMode
+    bad(x::Int) = x + "a"                               # no `+(::Int, ::String)`
+    kwreq(x::Int; n::Int) = x + n                       # `n` is required
+    wrongsig(v::AbstractVector, k) = v[k] = "s"         # a `String` into a `Vector{Float64}`
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    ok(x::Int) = x + 1
+    end
+    A = AlwaysThrows
+    gs = (:typestable, :noalloc, :noboxing)
+
+    # Nothing on a returning path exists to check, so no guarantee passes: each is the note.
+    for (f, types) in ((A.bad, (Int,)), (A.kwreq, (Int,)), (A.wrongsig, (Vector{Float64}, Int)), (A.need, (Nothing, Symbol)))
+        @test only(Base.return_types(f, types)) === Union{}
+        fs = findings(f, types; guarantees = gs)
+        @test all(x -> x.status === :info && x.code === :SM0208, fs)
+        @test all(x -> occursin("always throws", x.reason), fs)
+        @test !any(StrictMode._failed, fs)
+    end
+    @test all(x -> x.status === :pass, findings(A.ok, (Int,); guarantees = gs))
+    @test occursin("throws", StrictMode.explain(:SM0208))
+
+    # A sweep reports the note and does not fail on it: an error helper is not a defect (#36).
+    try
+        A.need(nothing, :a)
+    catch
+    end
+    A.ok(1)
+    swept = audit(A; sweep = true, guarantees = gs)
+    @test any(x -> x.func == "need" && x.code === :SM0208, swept)
+    @test nfailures(swept) == 0
+    @test_nowarn @eval module AlwaysThrowsPolicy
+    using StrictMode
+    need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    plus(x::Int) = x + 1
+    @strict_policy :default
+    end
+    # So does a declaration on the definition itself.
+    @test_nowarn @eval module AlwaysThrowsDecl
+    using StrictMode
+    @strict_function need(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
+    end
+
+    # A listed signature is one its author expects to return, and none of these forms performs
+    # the call, so the failure is the only thing that says it cannot.
+    struct Impl end
+    @test_throws "always throws" @eval @verify_strict Impl begin
+        AlwaysThrows.kwreq(::Int)                       # the required keyword is left out
+    end
+    @test_throws "always throws" @eval @verify_strict Impl guarantees = (:noalloc,) begin
+        AlwaysThrows.kwreq(::Int)
+    end
+    @test_throws "always throws" @eval @strict_function AlwaysThrows.bad signatures = [(Int,)]
+    @test_throws "always throws" @eval @strict_function AlwaysThrows.bad signatures = [(Int,)] guarantees = (:noalloc,)
+    @test_nowarn @eval @verify_strict Impl begin
+        AlwaysThrows.kwreq(::Int; n::Int)
+        AlwaysThrows.ok(::Int)
+    end
+
+    # A macro that performs its call raises the call's own error, so it gives no verdict to trust.
+    @test_throws MethodError @assert_typestable A.bad(1)
+end
+
+@testitem "a signature that never returns is described as that, not only as throwing" begin
+    using StrictMode
+
+    # A worker loop infers `Union{}` as an error helper does: no path returns. It throws nothing.
+    feed_forever(ch::Channel{Int}) =
+        while true
+            put!(ch, 1)
+        end
+    f = only(findings(feed_forever, (Channel{Int},); guarantees = (:typestable,)))
+    @test f.code === :SM0208
+    @test f.status === :info
+    @test occursin("always throws or never returns", f.reason)
+    @test occursin("a loop that is meant to run until its task ends", f.suggestion)
+    # The advice for the other two readings is still there.
+    @test occursin("matches no method", f.suggestion)
+    @test occursin("never returns", StrictMode.explain(:SM0208))
+end
+
+@testitem "a signature no method matches is unevaluated in both tiers" begin
+    using StrictMode, StrictModeTest
+    h(x::Float64) = x + 1
+    gs = (:owned, :no_threadid_state)
+    # The compiler's effects for a signature with no match start from "every effect holds", and the
+    # scan of no body finds nothing, so either would read as a pass.
+    for fs in (findings(h, (Int,); guarantees = gs), proof_findings(h, (Int,); guarantees = gs))
+        @test length(fs) == 2
+        @test all(StrictMode._failed, fs)
+        @test all(x -> x.code === :SM0203, fs)
+        @test all(x -> occursin("no typed body", x.reason), fs)
+    end
+    @test_throws "no typed body" test_signatures([(h, (Int,))]; guarantees = gs)
+end
+
+@testitem "a signature that is not concrete is not read as one of its methods" begin
+    using StrictMode, StrictModeTest
+    k(x::Real, y::Real) = x + y
+    k(x::Int, y::Int) = Dict(x => y)[x]
+    # A call with concrete types reaches the specific method, and the scan sees what it does.
+    @test StrictMode._failed(only(findings(k, (Int, Int); guarantees = (:owned,))))
+    # The abstract signature matches both methods, and the scan reads one body.
+    for fs in (
+            findings(k, (Real, Real); guarantees = (:noalloc, :noboxing, :owned)),
+            proof_findings(k, (Real, Real); guarantees = (:owned,)),
+        )
+        @test all(StrictMode._failed, fs)
+        @test all(x -> x.code === :SM0203, fs)
+        @test all(x -> occursin("not concrete", x.reason), fs)
+    end
+    # :typestable infers the return over every matching method, so it fails as itself.
+    u(x::Int) = 1
+    u(x::Float64) = "s"
+    f = only(findings(u, (Union{Int, Float64},); guarantees = (:typestable,)))
+    @test StrictMode._failed(f)
+    @test f.code !== :SM0203
+end

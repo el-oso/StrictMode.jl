@@ -1,12 +1,14 @@
 # Agentic feedback: a one-shot, structured counterpart to the Revise loop. An AI coding agent (or a
 # human at a prompt) runs `audit`, reads the machine-readable findings, and drives an
-# edit→check→fix loop. It reports; it never throws, and it never sets an exit status. Its verdicts
+# edit→check→fix loop. It reports; it never throws on a violation, and it never sets an exit status.
+# An invalid argument raises: an unknown guarantee, a target that is neither `:registered` nor a
+# module, an `only` or `exempt` entry that matches no function. Its verdicts
 # come from the value-free engine, whose allocation findings are structural guesses — a tool that
 # reports is allowed to be wrong, a tool that gates is not. `StrictModeTest`'s `test_*` drivers gate.
 
 # An advisory pass that errored on one signature, recorded rather than dropped.
 _advisory_error(@nospecialize(f), @nospecialize(types), err) = StrictFinding(
-    _mod_sym(f), _func_name(f), _sig_string(Tuple(types)), :advisory, :info, "", 0,
+    _mod_sym(f, types), _func_name(f), _sig_string(f, Tuple(types)), :advisory, :info, "", 0,
     "suggestions could not be computed for this signature: " * sprint(showerror, err),
     "This is an advisory pass, not a guarantee — the signature is otherwise unaffected."
 )
@@ -43,7 +45,8 @@ and use its `test_*` drivers, which run the proofs.
 
 `target`:
 - `:registered` — the mark-once registry, the "check what I promised" scope.
-- a `Module` — by default, the registered functions declared in that module. Pass `sweep = true` to
+- a `Module` — by default, the registered signatures whose method that module wrote, including one
+  on a function another module owns (`Base.getproperty` for its own type). Pass `sweep = true` to
   also sweep everything the module has actually compiled. That's
   noisier, so scope it with `only` / `exempt`.
 
@@ -86,6 +89,11 @@ and costs 17.8% of the sweep — one extra typed-IR read per specialization. Pas
 informational "consider static ownership" findings (`guarantee = :static_ownership`,
 `status = :info`) for type/symbol-keyed registry lookups. Also never a failure.
 
+A violation is a finding, never an exception. An argument that names nothing is an exception: an
+unknown guarantee, a `target` that is neither `:registered` nor a module, and an `only` or
+`exempt` entry that matches no function with a method in the module each raise an
+`ArgumentError`, since the sweep they describe would check nothing and return a clean result.
+
 This is the agent-facing path. For live feedback while you edit, use [`watch`](@ref) instead.
 """
 function audit(target = :registered; kwargs...)
@@ -119,6 +127,9 @@ function _audit(
                 "`:json` rendering runs past 100 kB, which is why formatting is the caller's choice."
         )
     )
+    # Checked before anything is swept: a target with no declared or compiled method reaches no
+    # per-method check, and a misspelled guarantee would return an empty result.
+    isnothing(guarantees) || _check_guarantees(guarantees)
     isnothing(require) || require in (:public, :all) ||
         throw(ArgumentError("$name: require must be :public or :all (or nothing), got $(require)"))
     isnothing(require) || target isa Module ||
@@ -127,8 +138,11 @@ function _audit(
     if target === :registered
         append!(fs, _findings_all(analyze; guarantees))
         if inline_suggest || static_ownership_suggest || dispatch_suggest
-            for ((f, types), _) in declarations()
-                _is_exempt(f) && continue
+            # The registry's items: each signature declaration, and each compiled row of a declared
+            # method. An exempt function is already left out.
+            for it in _registry_items()
+                f, types = getfield(it, 1), getfield(it, 2)
+                f isa _UncheckedMethod && continue
                 try
                     inline_suggest && append!(fs, inline_suggestions(f, types))
                     static_ownership_suggest && append!(fs, static_ownership_suggestions(f, types))

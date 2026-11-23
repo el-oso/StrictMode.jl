@@ -311,3 +311,254 @@ end
 
     StrictMode.clear_declarations!()
 end
+
+@testitem "only a module's own initializer counts as running in __init__" begin
+    using StrictMode
+
+    # The loader calls this one: the zero-argument `__init__` of the module that defines it.
+    module RealInit
+    using StrictMode
+    const SEEN = Ref(false)
+    __init__() = (SEEN[] = StrictMode._called_from_init(); nothing)
+    end
+    @test RealInit.SEEN[]
+
+    # A function that merely has the name is not an initializer.
+    module NamedLikeInit
+    using StrictMode
+    function outer()
+        __init__() = StrictMode._called_from_init()
+        return __init__()
+    end
+    struct Builder end
+    __init__(b::Builder) = StrictMode._called_from_init()
+    __init__() = nothing
+    end
+    @test !NamedLikeInit.outer()
+    @test !NamedLikeInit.__init__(NamedLikeInit.Builder())
+    @test !StrictMode._called_from_init()
+end
+
+@testitem "a module sweep covers the methods it adds to another module's function" begin
+    using StrictMode
+
+    module ForeignMethods
+    using StrictMode
+    struct MyT
+        v::Int
+    end
+    # A method of `Base.getproperty`, written here. It reads the payload outside any boundary.
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    struct Grows
+        n::Int
+    end
+    Base.collect(g::Grows) = zeros(g.n)
+    own(x::Int) = x + 1
+    end
+    F = ForeignMethods
+    u = Untrusted(F.MyT(7))
+    u.x; collect(F.Grows(3)); F.own(1)
+
+    swept(; kw...) = audit(F; sweep = true, dispatch_suggest = false, kw...)
+    fs = swept(; guarantees = (:trusted,))
+    read = only(f for f in fs if f.func == "getproperty")
+    @test StrictMode._failed(read)
+    # Named after the module that wrote the method, not the one that owns the function.
+    @test read.mod === :ForeignMethods
+    @test only(findings(getproperty, (Untrusted{F.MyT}, Symbol); guarantees = (:trusted,))).mod === :ForeignMethods
+    @test occursin("reads an `Untrusted` payload", read.reason)
+    @test any(f -> f.func == "own" && f.status === :pass, fs)
+    # Only the method written here: `getproperty` has many others, and they are Base's.
+    @test count(f -> f.func == "getproperty", fs) == 1
+    @test any(f -> f.func == "collect" && f.guarantee === :noalloc && f.status !== :pass, swept(; guarantees = (:noalloc,)))
+    # The filters name it as they name the module's own functions.
+    @test !any(f -> f.func == "getproperty", swept(; guarantees = (:trusted,), exempt = (:getproperty,)))
+    scoped = swept(; guarantees = (:trusted,), only = (:getproperty,))
+    @test !isempty(scoped)
+    @test all(f -> f.func == "getproperty", scoped)
+    Base.delete_method(which(getproperty, (Untrusted{F.MyT}, Symbol)))
+end
+
+@testitem "a module sweep covers the methods written in that module only" begin
+    using StrictMode
+
+    module Nested
+    using StrictMode
+    pf(x::Int) = x + 1
+    module Sub
+    using StrictMode
+    import ..pf
+    struct MyT
+        v::Int
+    end
+    struct Tracker
+        v::Vector{Float64}
+    end
+    Tracker(; n::Int = 3) = Tracker(zeros(n))
+    @strict_exempt :noalloc Tracker
+    Base.getproperty(u::Untrusted{MyT}, s::Symbol) = getfield(u, :x)
+    subf(x::Int) = x + 1
+    pf(x::Float64) = x + 1          # a method of the parent's function, written here
+    end
+    struct Grows
+        n::Int
+    end
+    Base.collect(g::Grows) = zeros(g.n)
+    end
+    N = Nested
+    Untrusted(N.Sub.MyT(1)).x; N.Sub.Tracker(; n = 2); N.Sub.subf(1); N.pf(1); N.pf(1.0)
+    collect(N.Grows(3))
+
+    sweep(m) = audit(m; sweep = true, guarantees = (:trusted, :noalloc), dispatch_suggest = false)
+    parent, sub = sweep(N), sweep(N.Sub)
+    # The census still counts every method in the package, the submodule's among them.
+    census = first(StrictMode.module_methods(N))
+    @test count(m -> m.module === N.Sub, census) >= 4
+    # The parent's sweep has no row for a method the submodule wrote.
+    @test !isempty(parent)
+    @test all(f -> f.mod === :Nested, parent)
+    @test !any(f -> f.func == "pf" && occursin("Float64", f.signature), parent)
+    # A foreign method the parent wrote is still swept.
+    @test any(f -> f.func == "collect" && f.guarantee === :noalloc && StrictMode._failed(f), parent)
+    @test any(f -> f.func == "pf" && occursin("Int", f.signature), parent)
+    # The submodule's own sweep has them, once each, with its exemption applied.
+    @test all(f -> f.mod === :Sub, sub)
+    @test count(f -> f.func == "getproperty" && f.guarantee === :trusted && StrictMode._failed(f), sub) == 1
+    @test any(f -> f.func == "subf", sub)
+    @test count(f -> f.func == "pf" && occursin("Float64", f.signature) && f.guarantee === :noalloc, sub) == 1
+    tr = [f for f in sub if occursin("Tracker", f.func) && f.guarantee === :noalloc]
+    @test !isempty(tr)
+    @test all(f -> f.status === :info && startswith(f.reason, "exempt"), tr)
+    Base.delete_method(which(getproperty, (Untrusted{N.Sub.MyT}, Symbol)))
+end
+
+@testitem "a module sweep covers a callable that subtypes Function and has no binding" begin
+    using StrictMode
+    module UnboundCallable
+    struct K <: Function end                 # a singleton with no `const k = K()` in the module
+    (::K)(x::Int) = x > 0 ? x : "neg"
+    struct KF <: Function                    # one with a field, so it has no instance
+        a::Int
+    end
+    (k::KF)(x::Int) = x > k.a ? x : "neg"
+    bound(x::Int) = x > 0 ? x : "neg"        # bound to a name: walked once, not twice
+    end
+    U = UnboundCallable
+    U.K()(1); U.KF(0)(1); U.bound(1)
+    fs = audit(U; sweep = true, guarantees = (:typestable,), dispatch_suggest = false)
+    @test StrictMode._failed(only(f for f in fs if f.func == "K"))
+    @test StrictMode._failed(only(f for f in fs if f.func == "KF"))
+    @test count(f -> f.func == "bound", fs) == 1
+    items = StrictMode._compiled_items(U; guarantees = (:typestable,))
+    @test length(items) == 3
+end
+
+@testitem "a declaration on another module's function is scoped by the module that wrote the method" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module DeclForeign
+    struct Foo
+        x::Int
+    end
+    Base.getproperty(f::Foo, s::Symbol) = s === :y ? Any[1][1] : getfield(f, s)
+    bar(x::Int) = x > 0 ? x : "neg"
+    end
+    D = DeclForeign
+    StrictMode.register_strict!(Base.getproperty, (D.Foo, Symbol); guarantees = (:typestable,))
+    StrictMode.register_strict!(D.bar, (Int,); guarantees = (:typestable,))
+    fs = audit(D)
+    @test StrictMode._failed(only(f for f in fs if f.func == "getproperty"))
+    @test StrictMode._failed(only(f for f in fs if f.func == "bar"))
+    @test Set(nameof(first(i)) for i in StrictMode._registry_items(; modules = [D])) == Set([:getproperty, :bar])
+    # A module that wrote neither method is not handed them.
+    @test isempty(StrictMode._registry_items(; modules = [Base]))
+    @test StrictMode._registry_breakdown(StrictMode._registry_items()) == [:DeclForeign => 2]
+    load = StrictMode._module_load_items(D, (:noalloc,))
+    @test only(i[3] for i in load if first(i) === Base.getproperty) == (:typestable,)
+    StrictMode.clear_declarations!()
+    Base.delete_method(which(getproperty, (D.Foo, Symbol)))
+end
+
+@testitem "a keyword body answers to the constructor or callable it belongs to" begin
+    using StrictMode
+    module KwBodies
+    using StrictMode
+    struct Tracker{T}                        # its inner constructor's keyword body has no name
+        a::Vector{T}
+        Tracker{T}(x; c = 1) where {T} = new{T}(T[x + c])
+    end
+    Tracker(x::T; c = 1) where {T} = Tracker{T}(x; c)
+    struct Scaled                            # a callable object with a keyword method
+        k::Int
+    end
+    (s::Scaled)(x; by = 2) = [s.k * x * by]
+    struct Unit end                          # a singleton callable with a keyword method
+    (::Unit)(x; by = 2) = [x * by]
+    struct Plain                             # its keyword body is held to the guarantee
+        k::Int
+    end
+    (p::Plain)(x; by = 2) = [p.k * x * by]
+    @strict_exempt :noalloc Tracker
+    @strict_exempt :noalloc Scaled
+    @strict_exempt :noalloc Unit
+    end
+    K = KwBodies
+    K.Tracker(1.0); K.Tracker{Float32}(1; c = 2); K.Scaled(1)(2; by = 3); K.Unit()(2); K.Plain(1)(2)
+    fs = audit(K; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    # Every row is named after something an exemption can name, and the exempted ones are exempt.
+    @test !any(f -> f.func == "_" || startswith(f.func, "#_#"), fs)
+    for name in ("Tracker", "Scaled", "Unit")
+        rows = [f for f in fs if f.func == name || startswith(f.func, "#$name#")]
+        @test !isempty(rows)
+        @test all(f -> f.status === :info && startswith(f.reason, "exempt"), rows)
+    end
+    plain = [f for f in fs if f.func == "Plain"]
+    @test !isempty(plain) && all(StrictMode._failed, plain)
+    # `only` and `exempt` reach the same bodies by the same names.
+    sweep(; kw...) = audit(K; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false, kw...)
+    @test isempty(sweep(; exempt = (:Plain,), only = (:Plain,)))
+    @test all(f -> f.func == "Plain", sweep(; only = (:Plain,)))
+end
+
+@testitem "a module sweep leaves functions written inside a function to that function" begin
+    using StrictMode
+    module InnerFunctions
+    using StrictMode
+    function outer(v)
+        h(y) = [y]                           # a closure that captures nothing has an instance
+        g(y; z = 1) = [y + z]                # so does its keyword body
+        a = map(x -> [x], v)
+        b = [[x] for x in v]
+        (h(1), g(1), a, b)
+    end
+    const top = map(x -> [x], [1])           # an anonymous function at top level
+    struct K <: Function end                 # a callable written as a type is swept
+    (::K)(x; by = 2) = [x * by]
+    @strict_exempt :noalloc outer
+    end
+    I = InnerFunctions
+    I.outer([1, 2]); I.K()(1)
+    fs = audit(I; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    @test all(f -> f.func in ("outer", "K"), fs)
+    @test only(f for f in fs if f.func == "outer").status === :info
+    @test !isempty(fs) && all(StrictMode._failed, (f for f in fs if f.func == "K"))
+    @test count(f -> f.func == "K", fs) == 2      # the positional method and its keyword body
+end
+
+@testitem "a method declaration accounts for a generic method at the policy line" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module MPol
+    using StrictMode
+    g(x::Integer) = x + 1
+    g(Int32(1))
+    StrictMode.register_strict!(which(g, (Integer,)); guarantees = (:noalloc,), mod = @__MODULE__)
+    @strict_policy (:noalloc,)
+    end
+    # The load check reads the declared method's compiled row, with the declaration's guarantees.
+    items = StrictMode._module_load_items(MPol, (:typestable,))
+    @test (MPol.g, (Int32,), (:noalloc,)) in items
+    @test haskey(StrictMode.method_declarations(), which(MPol.g, (Integer,)))
+    @test isempty(filter(StrictMode._failed, audit(MPol; require = :all)))
+    StrictMode.clear_declarations!()
+end

@@ -68,3 +68,30 @@ end
     @test_throws StrictViolation (@assert_owned scratch_user(1.0))         # named check still gates
     @test (@test_logs (:warn,) match_mode = :any (@strict scratch_user(2.0))) == 2.0
 end
+
+@testitem ":owned reads the method a wider invoke runs" begin
+    using StrictMode
+    const D = Dict{Symbol, Vector{Float64}}
+    @noinline looks(d::D, k::Symbol, n::Integer) = d[k]
+    @noinline looks(d::D, k::Symbol, n::Int) = Float64[]
+    @noinline owns(d::D, k::Symbol, n::Integer) = Float64[]
+    @noinline owns(d::D, k::Symbol, n::Int) = d[k]
+    # `invoke` runs the `Integer` method on an `Int`; `(D, Symbol, Int)` dispatches to the other one.
+    via_lookup(d::D, k::Symbol, n::Int) = invoke(looks, Tuple{D, Symbol, Integer}, d, k, n)
+    via_owned(d::D, k::Symbol, n::Int) = invoke(owns, Tuple{D, Symbol, Integer}, d, k, n)
+    T = (D, Symbol, Int)
+    d = D(:a => [1.0])
+    via_lookup(d, :a, 1); via_owned(d, :a, 1)
+    owned(f) = only(StrictMode.findings(f, T; guarantees = (:owned,)))
+    @test StrictMode._failed(owned(via_lookup))
+    @test owned(via_owned).status === :pass
+    # The walk to the end of the package's own code reads the same method.
+    @noinline deep_looks(d::D, k::Symbol, n::Integer) = length(d[k])
+    @noinline deep_looks(d::D, k::Symbol, n::Int) = 0
+    @noinline deep_owns(d::D, k::Symbol, n::Integer) = n
+    @noinline deep_owns(d::D, k::Symbol, n::Int) = length(d[k])
+    deep_lookup(d::D, k::Symbol, n::Int) = invoke(deep_looks, Tuple{D, Symbol, Integer}, d, k, n)
+    deep_owned(d::D, k::Symbol, n::Int) = invoke(deep_owns, Tuple{D, Symbol, Integer}, d, k, n)
+    @test StrictMode._owned_deep(Tuple{typeof(deep_lookup), T...}) === :lookup
+    @test StrictMode._owned_deep(Tuple{typeof(deep_owned), T...}) === :clean
+end

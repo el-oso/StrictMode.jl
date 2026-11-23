@@ -1,21 +1,18 @@
 @testitem "divergence_report — flags scan-vs-proof disagreement, IP-free" begin
     using StrictMode, StrictModeTest
 
-    # A callee exempt from :noalloc allocates. The scan excuses it by declaration; the AllocCheck
-    # proof does not, so the two disagree in the direction a divergence report exists to surface:
-    # the scan passes and the proof fails.
+    # A store into a `Dict` can grow its table, several calls down in Base. The scan reads Base to
+    # a fixed depth and finds nothing; the AllocCheck proof reads all of it. So the two disagree
+    # in the direction a divergence report exists to surface: the scan passes and the proof fails.
     module Quux
-    using StrictMode
     struct QuuxBox
         n::Int
     end
-    @noinline quux_grow(n::Int) = (v = Float64[]; push!(v, n); v)
-    @strict_exempt :quux_grow
-    quux_top(b::QuuxBox) = quux_grow(b.n)
+    quux_top(b::QuuxBox, d::Dict{Int, Float64}) = (d[b.n] = 1.0; nothing)
     end
-    Quux.quux_top(Quux.QuuxBox(1))
+    Quux.quux_top(Quux.QuuxBox(1), Dict{Int, Float64}())
 
-    d = divergence_report(Quux.quux_top, (Quux.QuuxBox,))
+    d = divergence_report(Quux.quux_top, (Quux.QuuxBox, Dict{Int, Float64}))
     @test !isempty(d)
     @test any(t -> t[1] === :noalloc && t[2] == false && t[3] == true, d.diverged)
 
@@ -87,4 +84,122 @@ end
     T = (typeof(c),)
     @test !StrictMode._alloc_signals(refresh!, T).alloc
     @test isempty(divergence_report(refresh!, T; guarantees = (:noalloc, :noboxing)).diverged)
+end
+
+@testitem "divergence_report lists a different cause apart from a different verdict" begin
+    using StrictMode, StrictModeTest, Test
+
+    # Both engines fail every one of these on :noalloc. `diverged` stays empty for all of them;
+    # `cause_diverged` names the guarantee only when the two codes differ.
+    module Causes
+    using StrictMode
+    mutable struct W
+        io::IOStream
+        a::Vector{Float64}
+        m::Matrix{Float64}
+    end
+    @noinline wra(w::W) = (write(w.io, w.a); 0.0)
+    @noinline wrb(w::W) = (write(w.io, w.m); 0.0)
+    const POOL = Ref(Float64[])
+    @noinline function grow!(n::Int)
+        length(POOL[]) < n && (POOL[] = zeros(n))
+        return POOL[]
+    end
+    @strict_exempt :noalloc reason = "pool" grow!
+    @noinline drive(f::F, n::Int) where {F} = (
+        s = 0.0; for i in 1:n
+            s += f(i)
+        end; s
+    )
+    # Both engines set the exempt pool aside and report what is left, the wait.
+    c_two_ex(w::W, n::Int) = drive(i -> wra(w) + wrb(w) + grow!(i)[1], n)
+    plain(n::Int) = sum(zeros(n))
+    const TW = W(open(tempname(), "w"), zeros(4), zeros(2, 2))
+    end
+    C = Causes
+    C.c_two_ex(C.TW, 2)
+    C.plain(2)
+
+    d = divergence_report(C.plain, (Int,); guarantees = (:noalloc,))
+    @test isempty(d)
+    @test isempty(d.cause_diverged)
+
+    d = divergence_report(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))
+    @test isempty(d)
+    @test isempty(d.cause_diverged)
+    @test only(StrictMode.findings(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))).code === :SM0017
+    @test only(StrictModeTest.proof_findings(C.c_two_ex, (C.W, Int); guarantees = (:noalloc,))).code === :SM0017
+
+    # A report whose engines both fail with different codes says so, and stays empty.
+    d = StrictModeTest.StrictDivergence(
+        d.diverged, [(:noalloc, :SM0017, :SM0002)], d.signature, d.return_category,
+        d.scan_signals, d.proof_signals, d.versions,
+    )
+    @test isempty(d)
+    s = sprint(show, d)
+    @test occursin("different cause", s) && occursin("SM0017", s) && occursin("SM0002", s)
+    @test !occursin("c_two_ex", s) && !occursin("grow", s)
+end
+
+@testitem "the scan and the proof read the same method below a wider invoke" begin
+    using StrictMode, StrictModeTest, Test
+
+    # `invoke` runs the `Integer` method on an `Int`, though `(W, Int)` dispatches to the other
+    # method. Both engines read the method that runs, so they agree whichever of the two allocates.
+    module WiderInvoke
+    @noinline wide(w, n::Integer) = sum(zeros(n))
+    @noinline wide(w, n::Int) = -1.0
+    alloc_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
+    @noinline clean(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline clean(w, n::Int) = sum(zeros(n))
+    clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
+    end
+    M = WiderInvoke
+    T = (Vector{Float64}, Int)
+    M.alloc_invoke([1.0], 2); M.clean_invoke([1.0], 2)
+
+    @test only(StrictMode.findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0002
+    @test only(StrictModeTest.proof_findings(M.alloc_invoke, T; guarantees = (:noalloc,))).code === :SM0002
+    d = divergence_report(M.alloc_invoke, T; guarantees = (:noalloc,))
+    @test isempty(d) && isempty(d.diverged) && isempty(d.cause_diverged)
+
+    @test only(StrictMode.findings(M.clean_invoke, T; guarantees = (:noalloc,))).status === :pass
+    @test !StrictMode._failed(only(StrictModeTest.proof_findings(M.clean_invoke, T; guarantees = (:noalloc,))))
+    d = divergence_report(M.clean_invoke, T; guarantees = (:noalloc,))
+    @test isempty(d) && isempty(d.diverged) && isempty(d.cause_diverged)
+end
+
+@testitem "a scan that ran out of bodies and a proof that found an allocation are a different cause" begin
+    using StrictMode, StrictModeTest, Test
+
+    # The allocation sits below more of the package's own callees than the scan's body budget
+    # allows, so the scan reports the call tree as unread (SM0207). AllocCheck compiles all of it
+    # and finds the allocation (SM0002). Both fail, for causes only one of them can see.
+    module LongChain
+    @noinline c6(n::Int) = sum(zeros(n))
+    @noinline c5(n::Int) = c6(n) + 1.0
+    @noinline c4(n::Int) = c5(n) + 1.0
+    @noinline c3(n::Int) = c4(n) + 1.0
+    @noinline c2(n::Int) = c3(n) + 1.0
+    @noinline c1(n::Int) = c2(n) + 1.0
+    top(n::Int) = c1(n) + 1.0
+    end
+    M = LongChain
+    M.top(2)
+    budget = StrictMode._SCAN_BODY_BUDGET[]
+    try
+        StrictMode._SCAN_BODY_BUDGET[] = 3
+        StrictMode.clear_cache!()
+        @test only(StrictMode.findings(M.top, (Int,); guarantees = (:noalloc,))).code === :SM0207
+        @test only(StrictModeTest.proof_findings(M.top, (Int,); guarantees = (:noalloc,))).code === :SM0002
+        d = divergence_report(M.top, (Int,); guarantees = (:noalloc,))
+        @test isempty(d)
+        @test isempty(d.diverged)
+        @test d.cause_diverged == [(:noalloc, :SM0207, :SM0002)]
+        s = sprint(show, d)
+        @test occursin("different cause", s) && occursin("SM0207", s) && occursin("SM0002", s)
+    finally
+        StrictMode._SCAN_BODY_BUDGET[] = budget
+        StrictMode.clear_cache!()
+    end
 end

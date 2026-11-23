@@ -136,3 +136,20 @@ end
     @test only(filter(e -> e.kind === :keyword, rc.entries)).status === :unproven
     @test only(filter(e -> e.kind === :positional, rc.entries)).status === :pass
 end
+
+@testitem "alloc_entry_report does not pass a signature that always throws" begin
+    using StrictMode, StrictModeTest
+
+    module ThrowingEntries
+    bad(x::Int) = x + "a"
+    kwreq(x::Int; n::Int) = x + n
+    clean(x::Int) = x + 1
+    end
+    T = ThrowingEntries
+    for f in (T.bad, T.kwreq)
+        e = only(x for x in StrictModeTest.alloc_entry_report(f).entries if x.kind === :positional)
+        @test e.status === :unproven
+        @test occursin("nothing on a returning path was checked", e.reason)
+    end
+    @test only(StrictModeTest.alloc_entry_report(T.clean).entries).status === :pass
+end

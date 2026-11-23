@@ -20,8 +20,11 @@ const _TC_STATEMENT_RULES =
     all(n -> isdefined(TypeContracts, n), (:_scan_trim_stmt!, :_is_trim_unsafe_callee, :_trim_truncate))
 
 function _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple))
-    ci = _TC_STATEMENT_RULES ? _typed_body(_sigtype(f, types)) : nothing
+    ci = _TC_STATEMENT_RULES ? _typed_body(_entry_key(f, types)) : nothing
     # `invoke` with the method's own argument types compiles one method for all targets; a plain call compiles one per function.
+    # A specialization has no signature that reaches it, so TypeContracts cannot be asked about it.
+    isnothing(ci) && f isa _Spec &&
+        return TypeContracts.TrimReport(string(_func_name(f), _sig_string(f, types)), [_NO_BODY_WHY], false)
     isnothing(ci) &&
         return Base.invoke(TypeContracts.trim_report, Tuple{Any, Type{<:Tuple}}, f, Tuple{types...})
     issues = String[]
@@ -40,7 +43,7 @@ function _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple))
         push!(issues, "dynamic dispatch (result inferred as `Any`): " * TypeContracts._trim_truncate(string(st)))
     end
     unique!(issues)
-    entry = string(nameof(f), _sig_string(types))
+    entry = string(_func_name(f), _sig_string(f, types))
     return TypeContracts.TrimReport(entry, issues, isempty(issues))
 end
 
@@ -67,8 +70,9 @@ end
 function _union_split_findings(@nospecialize(f), @nospecialize(types::Tuple))
     out = String[]
     limit = Core.Compiler.InferenceParams().max_union_splitting
-    sig = _sigtype(f, types)
-    ci = _typed_body(sig)
+    key = _entry_key(f, types)
+    sig = _key_sig(key)
+    ci = _typed_body(key)
     isnothing(ci) && return out       # unanalyzable here is the caller's problem to report
     for st in ci.code
         Meta.isexpr(st, :call) || continue
@@ -163,7 +167,7 @@ for a real build failure, is [`explain_trim`](@ref).
     consumer who builds it. `StrictModeTest.@test_trim_compatible` runs the real verifier.
 """
 macro assert_trim_compatible(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@assert_trim_compatible", args, (:types,))
     isempty(pos) && throw(ArgumentError("@assert_trim_compatible needs a call expression"))
     call = pos[1]
     checked = _guarantee_expr(call, _assert_trim_compatible; types = get(opts, :types, nothing))

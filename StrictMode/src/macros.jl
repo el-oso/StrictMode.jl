@@ -125,19 +125,42 @@ function _call_parts(call; types = nothing)
     )
 end
 
-# Varargs scan generalizing the `static=`/`self=` option loops: pulls any `Expr(:(=), key, val)`
-# whose `key ∈ allowed` into `opts` (raw RHS expr), everything else into `positionals` in order.
-function _macro_call(args, allowed::Tuple)
+# The options of a macro call: every `key = value` argument goes into `opts` (the raw right-hand
+# side), everything else into `positionals` in order.
+#
+# A `key = value` whose key the macro does not have is an error at expansion, naming the key and
+# the accepted ones. Taking it for a positional argument reports it as a malformed call, or as one
+# definition too many, and the option the caller meant to set stays at its default. `hidden` keys
+# are parsed and not listed: an option a macro has dropped, kept so it can be rejected by name.
+function _macro_call(name::AbstractString, args, allowed::Tuple; hidden::Tuple = ())
     positionals = Any[]
     opts = Dict{Symbol, Any}()
     for a in args
-        if Meta.isexpr(a, :(=)) && a.args[1] isa Symbol && a.args[1] in allowed
-            opts[a.args[1]] = a.args[2]
+        if Meta.isexpr(a, :(=)) && a.args[1] isa Symbol
+            key = a.args[1]
+            (key in allowed || key in hidden) || throw(ArgumentError(_unknown_option(name, key, allowed)))
+            opts[key] = a.args[2]
         else
             push!(positionals, a)
         end
     end
     return positionals, opts
+end
+
+_unknown_option(name::AbstractString, key::Symbol, allowed::Tuple) =
+    "$name: unknown option `$key`. " * (
+    isempty(allowed) ? "It takes no options." :
+        "Accepted options: " * join(("`$k`" for k in allowed), ", ") * "."
+) * " An option is written `name = value` before the call."
+
+# For a macro with a fixed argument list, which a `key = value` argument would otherwise turn
+# into a `MethodError` about the macro's own signature.
+function _reject_options(name::AbstractString, args, takes::AbstractString)
+    for a in args
+        Meta.isexpr(a, :(=)) && a.args[1] isa Symbol &&
+            throw(ArgumentError(_unknown_option(name, a.args[1], ())))
+    end
+    throw(ArgumentError("$name takes $takes, got $(length(args)) argument(s)"))
 end
 
 # Shared shape for a per-call guarantee macro that runs one check function against
@@ -315,6 +338,9 @@ function _check_stable_once_body(target, @nospecialize(f), @nospecialize(types::
         gates = true
     )
     T = length(rts) == 1 ? only(rts) : reduce(Base.promote_type, rts; init = Union{})
+    # A listed call is one its author expects to return, and it is not performed here, so nothing
+    # else would say that it cannot: a line that leaves out a required keyword argument infers so.
+    T === Union{} && _fail(:typestable, target, _ALWAYS_THROWS_WHY * " (" * _ALWAYS_THROWS_FIX * ")"; gates = true)
     _is_typestable_return(T) || _fail(
         :typestable, target, "return type is not concrete for this signature: inferred $T"
     )
@@ -430,7 +456,7 @@ macro strict(args...)
     length(args) == 1 && Meta.isexpr(args[1], :module) && return _strict_module(
         args[1], "@strict module at " * string(__source__.file) * ":" * string(__source__.line)
     )
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@strict", args, (:types,))
     isempty(pos) && throw(ArgumentError("@strict needs a call expression"))
     return _strict_expr(pos[1]; types = get(opts, :types, nothing))
 end
@@ -488,7 +514,7 @@ Keyword-argument calls and a `types = (…)` signature override are supported (s
 See also [`@strict`](@ref), which swaps the vectorization check for the owned-scratch check.
 """
 macro kernel(args...)
-    pos, opts = _macro_call(args, (:types,))
+    pos, opts = _macro_call("@kernel", args, (:types,))
     isempty(pos) && throw(ArgumentError("@kernel needs a call expression"))
     return _kernel_expr(pos[1]; types = get(opts, :types, nothing))
 end

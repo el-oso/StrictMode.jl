@@ -124,7 +124,9 @@ end
     need36(::Nothing, f::Symbol) = throw(ArgumentError("no $f"))
     @test status(kind36, (Nothing,)) === :pass
     @test status(eltype36, (Type{Int},)) === :pass
-    @test status(need36, (Nothing, Symbol)) === :pass
+    # An always-throwing method is not unstable, and not a pass either: nothing returned was
+    # checked, so a sweep carries a note for it.
+    @test status(need36, (Nothing, Symbol)) === :info
 
     # The acceptance is of a FIXED type, not of type-valued returns in general: a return that
     # varies between types is the instability this guarantee exists to catch.

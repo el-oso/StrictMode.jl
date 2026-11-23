@@ -73,8 +73,8 @@ function throw_report(mod::Module; only = nothing, exempt = ())
             continue
         end
         found = Set{Type}()
-        for tt in _method_signatures(m)
-            union!(found, _thrown_types(f, Tuple(tt)))
+        for (e, tt) in _method_entries(m, f)
+            union!(found, _thrown_types(e, tt))
         end
         isempty(found) && continue
         names = sort!(collect(found); by = string)

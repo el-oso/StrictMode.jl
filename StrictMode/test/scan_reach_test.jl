@@ -113,6 +113,32 @@ end
     @test StrictMode._failed(only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,))))
 end
 
+@testitem "a registered barrier does not excuse a callee its caller also calls directly" begin
+    using StrictMode
+    module BarrierThen
+    @noinline mk2(n) = zeros(n)
+    @noinline bar(n) = length(mk2(n))
+    then_bar(n::Int) = bar(n) + sum(mk2(n))
+    bar_then(n::Int) = sum(mk2(n)) + bar(n)
+    only_bar(n::Int) = bar(n) + 1
+    end
+    B = BarrierThen
+    B.then_bar(3); B.bar_then(3); B.only_bar(3)
+    try
+        register_alloc_barrier!(B.bar)
+        for f in (B.then_bar, B.bar_then)
+            @test StrictMode._failed(only(StrictMode.findings(f, (Int,); guarantees = (:noalloc,))))
+        end
+        @test !StrictMode._failed(only(StrictMode.findings(B.only_bar, (Int,); guarantees = (:noalloc,))))
+    finally
+        delete!(StrictMode._ALLOC_BARRIERS, B.bar)
+        store = StrictMode._store_for(Base.moduleroot(B), StrictMode._LOCAL_BARRIERS)
+        isnothing(store) || filter!(g -> g !== B.bar, store)
+        StrictMode._BARRIER_GEN[] += 1
+        StrictMode.clear_cache!()
+    end
+end
+
 @testitem "an allocation behind a registered barrier called with keywords is excused" begin
     using StrictMode
     @noinline ws_kw(::Type{T}; extra::Int = 0) where {T} = Vector{T}(undef, 64 + extra)
@@ -494,14 +520,16 @@ end
     top(x::Int) = mid(x) + 1
     plain_alloc(n::Int) = (a = Float64[]; push!(a, n); a)
     f = only(StrictMode.findings(top, (Int,); guarantees = (:noalloc,)))
-    # Whether `yield` reaches an allocation depends on Base's implementation of it: where the scan finds
-    # none, there is no scheduler finding to name, and the call passes.
-    if StrictMode._failed(f)
-        @test f.code === :SM0017
-        @test occursin("blocks in the task scheduler", f.reason)
-        @test occursin("join_pool", f.reason) || occursin("yield", f.reason)
-        @test occursin("register_alloc_barrier!", f.suggestion) && occursin("@strict_exempt", f.suggestion)
-    end
+    # `yield` can allocate (a task queue grows, a work queue is created on first use), however many
+    # scheduler calls down Base's inlining leaves that allocation.
+    @test StrictMode._failed(f)
+    @test f.code === :SM0017
+    @test occursin("blocks in the task scheduler", f.reason)
+    @test occursin("join_pool", f.reason) || occursin("yield", f.reason)
+    @test occursin("register_alloc_barrier!", f.suggestion) && occursin("@strict_exempt", f.suggestion)
+    # scheduler code that allocates nothing passes: a `SpinLock` only spins
+    spin(l::Threads.SpinLock) = (lock(l); unlock(l); nothing)
+    @test !StrictMode._failed(only(StrictMode.findings(spin, (Threads.SpinLock,); guarantees = (:noalloc,))))
     @test occursin("scheduler", StrictMode.explain(:SM0017))
     # an allocation that is not in the scheduler stays an ordinary :noalloc finding
     g = only(StrictMode.findings(plain_alloc, (Int,); guarantees = (:noalloc,)))
@@ -520,6 +548,59 @@ end
     end
 end
 
+@testitem "unlocking a ReentrantLock is a scheduler finding in every scan mode" begin
+    using StrictMode
+    # `unlock` wakes a waiter: `schedule` stores the task's result through an abstract field before
+    # it queues the task, and the queue can grow (`Base.Partr`).
+    ul(l::ReentrantLock) = (unlock(l); nothing)
+    trl(l::ReentrantLock) = (trylock(l) && unlock(l); nothing)
+    T = (ReentrantLock,)
+    for f in (ul, trl)
+        @test StrictMode._alloc_signals(f, T; mode = :alloc).alloc
+        @test StrictMode._alloc_signals(f, T; mode = :full).alloc
+        r = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+        @test StrictMode._failed(r) && r.code === :SM0017
+    end
+    # below the Base depth (`depth = -1`) the scheduler is still followed, `Base.Partr` included:
+    # `enq_work` allocates only in `Partr.multiq_insert` on some releases
+    @test StrictMode._alloc_signals(Base.enq_work, (Task,); mode = :alloc, depth = -1).alloc
+    # a lock that only spins still passes
+    spin(l::Threads.SpinLock) = (lock(l); unlock(l); nothing)
+    @test !StrictMode._failed(only(StrictMode.findings(spin, (Threads.SpinLock,); guarantees = (:noalloc,))))
+end
+
+@testitem "the function given to lock is the caller's code, whoever defined it" begin
+    using StrictMode
+    noalloc(f, T) = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+    noboxing(f, T) = only(StrictMode.findings(f, T; guarantees = (:noboxing,)))
+    R = ReentrantLock
+    # an allocation in the callable is the caller's, whether the callable's type is Base's or a closure
+    fix_under_lock(l::ReentrantLock, n::Int) = lock(Base.Fix1(zeros, n), l)
+    closure_under_lock(l::ReentrantLock, n::Int) = lock(() -> zeros(n), l)
+    for f in (fix_under_lock, closure_under_lock)
+        r = noalloc(f, (R, Int))
+        @test StrictMode._failed(r) && r.code === :SM0002
+    end
+    # so is one several Base calls down from the callable
+    sort_under_lock(l::ReentrantLock, v::Vector{Float64}) = lock(Base.Fix1(sort!, v), l)
+    r = noalloc(sort_under_lock, (R, Vector{Float64}))
+    @test StrictMode._failed(r) && r.code === :SM0002
+    # boxing in the callable is the caller's boxing
+    box_under_lock(l::ReentrantLock, v::Vector{Any}, x::Int) = (lock(() -> push!(v, x), l); nothing)
+    @test StrictMode._failed(noboxing(box_under_lock, (R, Vector{Any}, Int)))
+    # the lock's own wait is the scheduler's, and so is a wait the callable makes
+    plain(l::ReentrantLock) = (lock(l); unlock(l); nothing)
+    wait_under_lock(l::ReentrantLock, c::Threads.Condition) = lock(Base.Fix1(wait, c), l)
+    @test noalloc(plain, (R,)).code === :SM0017
+    @test noalloc(wait_under_lock, (R, Threads.Condition)).code === :SM0017
+    # a keyword body is handed its own function as an argument; that is not a callable to run
+    condwait(c::Threads.Condition) = (lock(c); try wait(c) finally unlock(c) end; nothing)
+    chtake(ch::Channel{Int}) = take!(ch)
+    @test noalloc(condwait, (Threads.Condition,)).code === :SM0017
+    @test noalloc(chtake, (Channel{Int},)).code === :SM0017
+    @test !StrictMode._failed(noboxing(plain, (R,)))
+end
+
 @testitem "a wait is SM0017 only when the call reaches no allocation outside the scheduler" begin
     using StrictMode
     @noinline join_pool() = yield()
@@ -532,6 +613,10 @@ end
     @test occursin("Sort", string(StrictMode._nonscheduler_origin(wait_then_sort, tv).signature))
     g = only(StrictMode.findings(wait_then_alloc, (Int,); guarantees = (:noalloc,)))
     @test StrictMode._failed(g) && g.code === :SM0002
+    # the package's code run by the lock is not the scheduler's, nor is what that code calls
+    alloc_under_lock(l::ReentrantLock, n::Int) = lock(() -> zeros(n), l)
+    h = only(StrictMode.findings(alloc_under_lock, (ReentrantLock, Int); guarantees = (:noalloc,)))
+    @test StrictMode._failed(h) && h.code === :SM0002
     # Whether `yield` reaches an allocation depends on Base's implementation of it; the rest needs one.
     if StrictMode._alloc_signals(only_waits, (Int,)).alloc
         @test only(StrictMode.findings(only_waits, (Int,); guarantees = (:noalloc,))).code === :SM0017
@@ -601,9 +686,93 @@ end
         i for (i, st) in pairs(ci.code)
             if st isa Expr && StrictMode._boxing_store(ci, sig, st, StrictMode._static_callee(ci, st.args[1]))
     ]
-    @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, i), stores)
+    @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, sig, i), stores)
     @test !StrictMode._failed(only(findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
     @test !StrictMode._failed(only(proof_findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
-    ci = StrictMode._typed_body(Tuple{typeof(store3!), Base.RefValue{Any}, Float64})
-    @test !any(i -> StrictMode._stmt_in_scheduler(ci, i), eachindex(ci.code))
+    sig3 = Tuple{typeof(store3!), Base.RefValue{Any}, Float64}
+    ci = StrictMode._typed_body(sig3)
+    @test !any(i -> StrictMode._stmt_in_scheduler(ci, sig3, i), eachindex(ci.code))
+end
+
+@testitem "a method reached by a wider invoke is read as the method the call runs" begin
+    using StrictMode
+    # `invoke` runs the `Integer` method on an `Int`, though the signature `(W, Int)` dispatches to
+    # the other method. Each fixture pairs the two so that reading the wrong one flips the verdict.
+    @noinline wide(w, n::Integer) = sum(zeros(n))
+    @noinline wide(w, n::Int) = -1.0
+    via_invoke(w::Vector{Float64}, n::Int) = invoke(wide, Tuple{Vector{Float64}, Integer}, w, n)
+    by_dispatch(w::Vector{Float64}, n::Int) = wide(w, n)
+    @noinline clean(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline clean(w, n::Int) = sum(zeros(n))
+    clean_invoke(w::Vector{Float64}, n::Int) = invoke(clean, Tuple{Vector{Float64}, Integer}, w, n)
+    clean_dispatch(w::Vector{Float64}, n::Int) = clean(w, n)
+    @noinline boxes(w, n::Integer) = (Base.donotdelete(Any[w, n]); 0.0)
+    @noinline boxes(w, n::Int) = -1.0
+    box_invoke(w::Vector{Float64}, n::Int) = invoke(boxes, Tuple{Vector{Float64}, Integer}, w, n)
+    T = (Vector{Float64}, Int)
+    one(f, g) = only(StrictMode.findings(f, T; guarantees = (g,)))
+
+    @test via_invoke([1.0], 3) == 0.0 && by_dispatch([1.0], 3) == -1.0
+    @test clean_invoke([1.0], 3) == 0.0 && clean_dispatch([1.0], 3) == 0.0
+    # The allocating method is invoked: the allocation is found, and named as one.
+    @test StrictMode._failed(one(via_invoke, :noalloc)) && one(via_invoke, :noalloc).code === :SM0002
+    @test occursin("wide", StrictMode._origin_note(via_invoke, T))
+    @test !StrictMode._failed(one(by_dispatch, :noalloc))
+    @test !StrictMode._failed(one(via_invoke, :noboxing))      # it allocates and boxes nothing
+    # The clean method is invoked: the call passes, though the method its signature names allocates.
+    for g in (:noalloc, :noboxing)
+        @test one(clean_invoke, g).status === :pass
+    end
+    @test StrictMode._failed(one(clean_dispatch, :noalloc))
+    @test StrictMode._failed(one(box_invoke, :noboxing)) && one(box_invoke, :noboxing).code === :SM0003
+
+    # The key of such a callee is the specialization itself; of any other, its signature.
+    body(f) = StrictMode._typed_body(Tuple{typeof(f), T...})
+    mi(f) = StrictMode._invoke_mi(only(st for st in body(f).code if Meta.isexpr(st, :invoke)).args[1])
+    @test StrictMode._callee_key(mi(via_invoke)) isa Core.MethodInstance
+    @test StrictMode._callee_key(mi(clean_dispatch)) === mi(clean_dispatch).specTypes
+    @test StrictMode._key_method(StrictMode._callee_key(mi(via_invoke))) === which(wide, (Vector{Float64}, Integer))
+end
+
+@testitem "an exempt function or a barrier reached by a wider invoke excuses what it guards in the scan" begin
+    using StrictMode
+    module WideExcused
+    using StrictMode
+    @noinline ex(w, n::Integer) = sum(zeros(n))
+    @noinline ex(w, n::Int) = -1.0
+    @strict_exempt :noalloc reason = "test" ex
+    in_exempt(w::Vector{Float64}, n::Int) = invoke(ex, Tuple{Vector{Float64}, Integer}, w, n)
+    # The exempt method that runs allocates nothing; the one its signature names does.
+    @noinline quiet(w, n::Integer) = (w[1] = n; 0.0)
+    @noinline quiet(w, n::Int) = sum(zeros(n))
+    @strict_exempt :noalloc reason = "test" quiet
+    quiet_exempt(w::Vector{Float64}, n::Int) = invoke(quiet, Tuple{Vector{Float64}, Integer}, w, n)
+    # Code handed to the exempt function and called by it stays the caller's.
+    @noinline runs(g::G, w, n::Integer) where {G} = g(w, n)
+    @noinline runs(g::G, w, n::Int) where {G} = -1.0
+    @strict_exempt :noalloc reason = "test" runs
+    @noinline mine(w, n) = sum(zeros(n))
+    handed(w::Vector{Float64}, n::Int) = invoke(runs, Tuple{typeof(mine), Vector{Float64}, Integer}, mine, w, n)
+    @noinline bar(w, n::Integer) = sum(zeros(n))
+    @noinline bar(w, n::Int) = -1.0
+    in_barrier(w::Vector{Float64}, n::Int) = invoke(bar, Tuple{Vector{Float64}, Integer}, w, n)
+    end
+    M = WideExcused
+    T = (Vector{Float64}, Int)
+    saved = copy(StrictMode._ALLOC_BARRIERS)
+    try
+        register_alloc_barrier!(M.bar)
+        one(f) = only(StrictMode.findings(f, T; guarantees = (:noalloc,)))
+        @test M.in_exempt([1.0], 2) == 0.0 && M.handed([1.0], 2) == 0.0 && M.in_barrier([1.0], 2) == 0.0
+        r = one(M.in_exempt)
+        @test r.status === :info && occursin("ex", r.reason)
+        @test one(M.quiet_exempt).status === :pass
+        r = one(M.handed)
+        @test StrictMode._failed(r) && r.code === :SM0002
+        @test one(M.in_barrier).status === :pass
+    finally
+        empty!(StrictMode._ALLOC_BARRIERS)
+        union!(StrictMode._ALLOC_BARRIERS, saved)
+        StrictMode.clear_cache!()
+    end
 end

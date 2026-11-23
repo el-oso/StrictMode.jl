@@ -123,3 +123,14 @@ end
     @test scalar_fp_loops(vector_kernel!, (Vector{Float64}, Float64)) ==
         !StrictMode._vectorized(vector_kernel!, (Vector{Float64}, Float64))
 end
+
+@testitem "a latch that names its loop header first is a loop" begin
+    using StrictMode
+    # `br i1 %c, label %HEADER, label %EXIT`: LLVM lists the back edge first as often as last.
+    first_ = "L5:\n  %a = fadd double %x, %y\n  br i1 %c, label %L5, label %L9\nL9:\n  br label %L9"
+    last_ = "L5:\n  %a = fadd double %x, %y\n  br i1 %c, label %L9, label %L5\nL9:\n  br label %L9"
+    @test length(StrictMode._loop_regions(first_)) == 2
+    @test length(StrictMode._loop_regions(last_)) == 2
+    @test StrictMode._scalar_fp_loops(first_)
+    @test StrictMode._scalar_fp_loops(last_)
+end

@@ -2,7 +2,9 @@
 # StrictMode's own static rule agrees with it.
 
 @testitem "issue #20: juliac WARNINGS are not trim failures" begin
-    using StrictMode, StrictModeTest, TrimCheck
+    using StrictMode, StrictModeTest
+    # Through StrictModeTest, which depends on TrimCheck: StrictMode's test environment does not.
+    using StrictModeTest: TrimCheck
     # `TrimVerificationErrors.errors` is a `Vector{Pair{Bool, Any}}` whose Bool is `warn`, and
     # juliac's own gate fails only on the non-warning entries. Counting warnings as failures reds
     # signatures juliac itself would build. A warnings-only raise cannot be provoked deterministically
@@ -252,6 +254,11 @@ end
     # why `direct_dependency` reads the `Base.ACTIVE_PROJECT` slot directly.
     ok3, why3 = StrictModeTest._trim_validate(StrictMode.direct_dependency, ())
     @test ok3 || error("direct_dependency is not trim-clean:\n  " * join(why3, "\n  "))
+
+    # The scan for preference keys StrictMode does not read runs from `__init__` too, and reads
+    # the preference files without a TOML parser for that reason.
+    ok4, why4 = StrictModeTest._trim_validate(StrictMode._warn_unknown_preferences, ())
+    @test ok4 || error("_warn_unknown_preferences is not trim-clean:\n  " * join(why4, "\n  "))
 end
 
 @testitem "the child loads the modules a signature needs, not the function's own" begin

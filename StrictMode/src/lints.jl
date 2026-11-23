@@ -57,14 +57,14 @@ function bang_report(mod::Module; only = nothing, exempt = (), max_depth::Int = 
         # reports every keyword-taking `f!` as a mutating method that forgot its `!`.
         name = _demangle(m.name)
         bang = endswith(String(name), "!")
-        sigs = _method_signatures(m)
-        isempty(sigs) && continue
         f = try
             _method_function(m).instance
         catch
             continue
         end
-        mutates = any(tt -> _mutates_any_arg(f, Tuple(tt); max_depth), sigs)
+        entries = _method_entries(m, f)
+        isempty(entries) && continue
+        mutates = any(e -> _mutates_any_arg(e[1], e[2]; max_depth), entries)
         bang === mutates && continue
         reason, suggestion = if mutates
             (
@@ -501,16 +501,16 @@ function conversion_report(
     out = StrictFinding[]
     methods_, _ = module_methods(mod; only, exempt)
     for m in methods_
-        sigs = _method_signatures(m)
-        isempty(sigs) && continue
         f = try
             _method_function(m).instance
         catch
             continue
         end
+        entries = _method_entries(m, f)
+        isempty(entries) && continue
         convs = Set{Tuple{Any, Any, String}}()
-        for tt in sigs
-            union!(convs, _conversions(f, Tuple(tt)))
+        for (e, tt) in entries
+            union!(convs, _conversions(e, tt))
         end
         filter!(keep, convs)
         isempty(convs) && continue
