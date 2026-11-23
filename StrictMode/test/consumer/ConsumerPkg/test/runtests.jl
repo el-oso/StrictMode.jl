@@ -110,3 +110,19 @@ end
     ConsumerPkg.cold_plan(2); ConsumerPkg.cold_plan(Int32(2))
     @test_throws StrictViolation test_compiled(ConsumerPkg; guarantees = (:noalloc,), only = [:cold_plan])
 end
+
+@testset "a method declaration names its method after a cached load" begin
+    m = which(ConsumerPkg.spread, (Integer,))
+    @test isempty(StrictMode.registered_strict())
+    @test StrictMode.method_declarations()[m].guarantees == (:noalloc,)
+    ConsumerPkg.spread(Int32(1)); invoke(ConsumerPkg.spread, Tuple{Integer}, 1)
+    rows(fs) = filter(f -> f.func == "spread", fs)
+    @test length(rows(StrictMode._findings_all())) == 2
+    proved = rows(proof_audit(:registered))
+    @test length(proved) == 2
+    @test count(f -> occursin(" via invoke of ", f.signature), proved) == 1
+    @test !any(StrictMode._failed, proved)
+    cov = filter(f -> f.func == "spread" && StrictMode._failed(f), audit(ConsumerPkg; require = :all))
+    # Only the specific sibling, which nothing declares, is undeclared.
+    @test !isempty(cov) && all(f -> f.line == which(ConsumerPkg.spread, (Int,)).line, cov)
+end

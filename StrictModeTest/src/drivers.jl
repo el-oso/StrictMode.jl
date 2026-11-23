@@ -15,6 +15,7 @@ function _trim_sigs(items)
     sigs = Tuple{Any, Vector{Any}}[]
     for (f, types, guarantees) in items
         (:trim_compatible in guarantees) || continue
+        f isa StrictMode._UncheckedMethod && continue   # reported by `_map_findings`, not compiled
         g, gtypes = try
             _backend_call(f, types)
         catch

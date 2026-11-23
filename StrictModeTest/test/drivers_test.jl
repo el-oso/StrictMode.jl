@@ -303,3 +303,78 @@ end
     @test only(f.signature for f in fs if f.func == "spare") == "(Int64)"
     @test occursin("no longer needed", only(f for f in fs if f.func == "spare").reason)
 end
+
+@testitem "a method declaration is proved at its compiled rows" begin
+    using StrictMode, StrictModeTest
+    module MProof
+    w(a::Vector{Float64}, n::Integer) = (Base.donotdelete(Any[a, n]); 0.0)
+    w(a::Vector{Float64}, n::Int) = (a[1] = n; 0.0)
+    via(a, n) = invoke(w, Tuple{Vector{Float64}, Integer}, a, n)
+    c(a::Vector{Float64}, n::Integer) = (a[1] = n; 0.0)
+    c(a::Vector{Float64}, n::Int) = (Base.donotdelete(Any[a, n]); 0.0)
+    viac(a, n) = invoke(c, Tuple{Vector{Float64}, Integer}, a, n)
+    cold(n::Integer) = n + 1
+    end
+    M = MProof
+    A = Vector{Float64}
+    M.via([1.0], 1); M.viac([1.0], 1); M.c([1.0], 1)
+    msg(f) = try
+        f()
+        ""
+    catch err
+        err isa StrictViolation || rethrow()
+        err.details
+    end
+    StrictMode.clear_declarations!()
+    try
+        # The dirty wider method fails at the row only `invoke` compiles.
+        StrictMode.register_strict!(which(M.w, (A, Integer)); guarantees = (:noalloc,))
+        m = msg(() -> test_registered(; modules = [M]))
+        @test occursin("via invoke of", m)
+        StrictMode.clear_declarations!()
+
+        # The clean wider method passes there, and its dirty specific sibling is not covered by it.
+        StrictMode.register_strict!(M.c, which(M.c, (A, Integer)); guarantees = (:noalloc,))
+        fs = test_registered(; modules = [M])
+        @test length(fs) == 1 && occursin("via invoke of", only(fs).signature)
+        m = msg(() -> test_coverage(M; only = [:c]))
+        @test occursin("c(Vector{Float64}, Int64)", m)
+        @test !occursin("via invoke of", m)
+        StrictMode.clear_declarations!()
+
+        # A declared method with nothing compiled fails the gate.
+        StrictMode.register_strict!(which(M.cold, (Integer,)))
+        @test occursin("no compiled specialization", msg(() -> test_registered(; modules = [M])))
+    finally
+        StrictMode.clear_declarations!()
+    end
+end
+
+@testitem "block and include exemptions leave a method written outside them gated" begin
+    using StrictMode, StrictModeTest
+    file = joinpath(mktempdir(), "cold.jl")
+    write(file, "grow(n::Int) = collect(1:n)\n")
+    @eval module BlkDirty
+    using StrictMode
+    @strict_exempt begin
+        grow(n::Int) = collect(1:n)
+    end
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    @eval module IncDirty
+    using StrictMode
+    @strict_exempt include($file)
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    @eval module IncClean
+    using StrictMode
+    @strict_exempt include($file)
+    grow(n::Integer) = Int(n) + 1
+    end
+    for M in (BlkDirty, IncDirty, IncClean)
+        M.grow(3); M.grow(Int32(3))
+    end
+    @test_throws StrictViolation test_compiled(BlkDirty; guarantees = (:noalloc,))
+    @test_throws StrictViolation test_compiled(IncDirty; guarantees = (:noalloc,))
+    @test test_compiled(IncClean; guarantees = (:noalloc,)) isa Vector
+end

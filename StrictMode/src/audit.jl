@@ -138,8 +138,11 @@ function _audit(
     if target === :registered
         append!(fs, _findings_all(analyze; guarantees))
         if inline_suggest || static_ownership_suggest || dispatch_suggest
-            for ((f, types), _) in declarations()
-                _is_exempt(f) && continue
+            # The registry's items: each signature declaration, and each compiled row of a declared
+            # method. An exempt function is already left out.
+            for it in _registry_items()
+                f, types = getfield(it, 1), getfield(it, 2)
+                f isa _UncheckedMethod && continue
                 try
                     inline_suggest && append!(fs, inline_suggestions(f, types))
                     static_ownership_suggest && append!(fs, static_ownership_suggestions(f, types))

@@ -133,3 +133,74 @@ end
     @test int32(W) === :info
     @test int32(N) === :fail
 end
+
+@testitem "a method declaration covers the compiled rows of that method" begin
+    using StrictMode
+    module MDecl
+    w(a::Vector{Float64}, n::Integer) = (Base.donotdelete(Any[a, n]); 0.0)   # the wider one allocates
+    w(a::Vector{Float64}, n::Int) = (a[1] = n; 0.0)
+    via(a, n) = invoke(w, Tuple{Vector{Float64}, Integer}, a, n)
+    c(a::Vector{Float64}, n::Integer) = (a[1] = n; 0.0)
+    c(a::Vector{Float64}, n::Int) = (a[1] = n; 0.0)
+    viac(a, n) = invoke(c, Tuple{Vector{Float64}, Integer}, a, n)
+    cold(n::Integer) = n + 1
+    end
+    M = MDecl
+    A = Vector{Float64}
+    M.w([1.0], 1); M.w([1.0], Int32(1)); M.via([1.0], 1)
+    M.c([1.0], 1); M.c([1.0], Int32(1)); M.viac([1.0], 1)
+    wide(x) = occursin(" via invoke of ", x.signature)
+    undeclared(name) = filter(
+        x -> x.guarantee === :coverage && x.status === :fail, audit(M; require = :all, only = [name])
+    )
+    rows(name) = filter(x -> x.func == name, StrictMode._findings_all())
+    StrictMode.clear_declarations!()
+    try
+        # Undeclared, each row of the wider method names the call that declares that method, the
+        # row compiled only through `invoke` included.
+        fs = undeclared(:w)
+        @test length(fs) == 3
+        call = "register_strict!(which(w, Tuple{Vector{Float64}, Integer}))"
+        @test count(x -> occursin(call, x.suggestion), fs) == 2
+        @test occursin(call, only(filter(wide, fs)).suggestion)
+
+        mw = which(M.w, (A, Integer))
+        StrictMode.register_strict!(mw; guarantees = (:noalloc,))
+        # Both compiled rows of the declared method count as declared; the specific sibling does not.
+        fs = undeclared(:w)
+        @test length(fs) == 1
+        @test only(fs).signature == "(Vector{Float64}, Int64)"
+        # Each row is checked by its own body, and the dirty wider method fails at both.
+        r = rows("w")
+        @test length(r) == 2
+        @test count(wide, r) == 1
+        @test any(x -> occursin("Int32", x.signature), r)
+        @test all(StrictMode._failed, r)
+        @test length(filter(x -> x.func == "w", audit(M; dispatch_suggest = false))) == 2
+        # The signature view of the declarations is unchanged.
+        @test all(k -> k isa Tuple, keys(StrictMode.declarations()))
+
+        # A clean method passes at its rows, named with its function.
+        StrictMode.register_strict!(M.c, which(M.c, (A, Integer)); guarantees = (:noalloc,))
+        r = rows("c")
+        @test length(r) == 2
+        @test !any(StrictMode._failed, r)
+
+        # A declared method with nothing compiled is reported, not passed.
+        StrictMode.register_strict!(which(M.cold, (Integer,)))
+        r = rows("cold")
+        @test !isempty(r) && all(StrictMode._failed, r)
+        @test occursin("no compiled specialization", first(r).reason)
+
+        @test_throws "is not a method of" StrictMode.register_strict!(M.c, mw)
+        @test_throws "unknown guarantee" StrictMode.register_strict!(mw; guarantees = (:nope,))
+
+        # A declaration of a method that is no longer defined fails.
+        Base.delete_method(which(M.cold, (Integer,)))
+        r = rows("cold")
+        @test !isempty(r) && all(StrictMode._failed, r)
+        @test occursin("no longer defined", first(r).reason)
+    finally
+        StrictMode.clear_declarations!()
+    end
+end

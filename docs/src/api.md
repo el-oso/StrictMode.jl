@@ -291,6 +291,7 @@ StrictMode.policy_sets
 StrictMode.guarantee_names
 StrictMode.clear_declarations!
 StrictMode.declarations
+StrictMode.method_declarations
 StrictMode.exemptions
 StrictMode._UnanalyzableSignature
 ```

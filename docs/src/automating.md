@@ -139,12 +139,18 @@ end
     make_workspace(n::Int) = Workspace(Vector{Float64}(undef, n))
 end
 
-@strict_exempt reason = "plan-time file" include("plan.jl")   # everything that file defines
+@strict_exempt reason = "plan-time file" include("plan.jl")   # each method that file defines
 ```
 
 The `include` form calls the file's own `include`, so relative paths resolve as they would have,
-and it finds the definitions by comparing the module's methods before and after — which is why a
+and it finds the methods the file defined by the world they were defined in — which is why a
 nested `include` inside `plan.jl` is covered too.
+
+The block and `include` forms exempt each method written inside them by its own signature, so a
+method of the same name written outside the block or file is still checked. In a file, a method
+whose type variables tie two arguments together (`f(x::T, y::T) where T`) has no signature that
+names exactly it, so its function is exempted by name instead, with a warning that names the
+method; in a block it is an error, as for a single definition.
 
 A single definition, `@strict_exempt plan(n::Int) = collect(1:n)`, exempts the method it writes and
 no other: its own signature is recorded, so a separate `plan(n::Integer)` elsewhere in the module is
@@ -306,8 +312,14 @@ per method:
   `test_registered` checks, and for no other. With `f(x, n::Integer)` and `f(x, n::Int)`,
   declaring `(Int, Int)` covers the second. A row the sweep lists as
   `(Int64, Int64) via invoke of (Any, Integer)` belongs to the first, and no signature dispatches
-  to it, so it is reported as undeclared: `test_compiled` checks it, and `@strict_exempt f` opts
-  it out.
+  to it, so a signature declaration cannot cover it: declare the method instead, or opt it out with
+  `@strict_exempt f`.
+- A declaration of a **method**, `register_strict!(which(f, (Any, Integer)))`, covers every row of
+  that method that has compiled, the `invoke` row included, and no row of another method.
+  `test_registered` and `audit(:registered)` read those rows from the method table when they run
+  and check each one by its own body; the method's abstract signature is never checked, since it
+  infers to `Any`. A declared method with no compiled row fails there, because nothing was
+  checked: run a workload or a `precompile` statement that compiles it first.
 
 Coverage therefore follows what actually ran. A signature that appears for the first time in a
 later run is reported then — which is the point: it was not checked before either.

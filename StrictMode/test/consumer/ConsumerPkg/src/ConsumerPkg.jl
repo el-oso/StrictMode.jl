@@ -71,4 +71,10 @@ StrictMode.register_alloc_barrier!(Base.Libc.gethostname; mod = @__MODULE__)
 @strict_exempt cold_plan(n::Int) = collect(1:n)
 cold_plan(n::Integer) = collect(1:Int(n))
 
+# A method declaration, stored here under the Method itself. Its rows are read from the method
+# table when a driver runs, so the test process compiles them, one of them only through `invoke`.
+spread(x::Integer) = Int(x) + 1
+spread(x::Int) = x + 2
+StrictMode.register_strict!(which(spread, (Integer,)); guarantees = (:noalloc,), mod = @__MODULE__)
+
 end # module

@@ -550,8 +550,14 @@ StrictMode/src/
                         each name ONE method, the one their signature selects (_declared_methods,
                         _covers via _key_method), so a wider method that an invoke compiled for the
                         same argument types is neither declared nor excused by them; such a
-                        coverage row cannot be declared at all. _coverage_findings the narrower
+                        coverage row is declared only by declaring its method. _coverage_findings the narrower
                         public-function form; _is_parametric_def keeps a `where` definition out of the registry.
+                        register_strict!(m::Method) stores the Method itself as a key in the same
+                        store (a Method is the same object after a cached load, measured on 1.12 and
+                        1.13); method_declarations() reads them, declarations() only (f, types).
+                        _method_items expands one into its compiled rows from the method table via
+                        _entry_of (a `_Spec` for an invoke-only row), or one _UncheckedMethod item
+                        (no rows, or method gone) that _map_findings turns into a :fail in both tiers.
                         _STORES/_store_for memoize each module's store so a reader never touches a
                         binding created in its own world (a Julia 1.12 warning, a later error).
                         declarations()/exemptions() union each loaded package's OWN store with this

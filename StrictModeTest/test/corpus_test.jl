@@ -203,6 +203,9 @@
     #    verdict as it is, and exempting `(W, Integer)` turns it into an `:info` note in both tiers.
     #    The definition form records a method's own signature: of the specific method it leaves the
     #    wider row's verdict as it is, and of the wider method it makes that row a note.
+    #    A declaration of the wider method by the method itself (`register_strict!(which(…))`) covers
+    #    its `invoke` row, leaving the specific method the only undeclared one, and the registry
+    #    checks that row with the same verdict as the sweep in both tiers.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
 
     # What a sweep of the helper's function reports, for a case whose helper is reached by `invoke`
@@ -212,7 +215,7 @@
         c = effect_cause(k.effect)
         v = c === :alloc ? (:fail, :SM0002) : c === :wait ? (:fail, :SM0017) : (:pass, nothing)
         return (;
-            scan = v, proof = v, others = :pass, undeclared = [true],
+            scan = v, proof = v, others = :pass, undeclared = [true], methoddecl = (; undeclared = [false], scan = v, proof = v),
             narrow = (; scan = v, proof = v), wide = (; scan = (:info, :SM0002), proof = (:info, :SM0002)),
             defnarrow = (; scan = v, proof = v), defwide = (; scan = (:info, :SM0002), proof = (:info, :SM0002)),
         )
@@ -294,6 +297,20 @@
                 finally
                     delete!(StrictMode.STRICT_REGISTRY, (M.mid, A))
                 end
+                # A declaration of the wider method by the method itself covers its `invoke` row,
+                # and the registry checks that row as that method, in both tiers.
+                mw = which(M.mid, (M.W, Integer))
+                StrictMode.register_strict!(mw; guarantees = (:noalloc,))
+                methoddecl = try
+                    items = StrictMode._registry_items(; modules = [M])
+                    (;
+                        undeclared = map(wide, filter(StrictMode._failed, StrictMode._coverage_all_findings(M; only = [:mid]))),
+                        scan = row(StrictMode._map_findings(StrictMode._scan_findings, items)),
+                        proof = row(StrictMode._map_findings(StrictModeTest._proof_analyzer(false), items)),
+                    )
+                finally
+                    delete!(StrictMode.STRICT_REGISTRY, mw)
+                end
                 function exempted(types)
                     StrictMode._exempt!(:mid; types, guarantees = (:noalloc,))
                     try
@@ -306,7 +323,7 @@
                     end
                 end
                 sweep = (;
-                    scan = row(sf), proof = row(pf), others, undeclared,
+                    scan = row(sf), proof = row(pf), others, undeclared, methoddecl,
                     narrow = exempted(A), wide = exempted((M.W, Integer)),
                     defnarrow = exempted(StrictMode._method_exempt_types(which(M.mid, A))),
                     defwide = exempted(StrictMode._method_exempt_types(which(M.mid, (M.W, Integer)))),

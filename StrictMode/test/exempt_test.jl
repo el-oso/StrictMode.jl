@@ -722,3 +722,45 @@ end
     end
     StrictMode.clear_declarations!()
 end
+
+@testitem "block and include exemptions cover the methods written inside them" begin
+    using StrictMode, Test
+    StrictMode.clear_declarations!()
+    file = joinpath(mktempdir(), "cold.jl")
+    write(
+        file, """
+        igrow(n::Int) = collect(1:n)
+        itidy(n::Int) = collect(1:n)
+        pair(x::T, y::T) where {T <: Real} = collect(1:Int(x))
+        """
+    )
+    @test_logs (:warn, r"pair.*by name"s) match_mode = :any @eval module BlkInc
+    using StrictMode
+    @strict_exempt begin
+        bgrow(n::Int) = collect(1:n)
+        btidy(n::Int) = collect(1:n)
+    end
+    bgrow(n::Integer) = collect(1:Int(n))        # allocates, written outside the block
+    btidy(n::Integer) = Int(n) + 1               # clean, written outside the block
+    @strict_exempt include($file)
+    igrow(n::Integer) = collect(1:Int(n))
+    itidy(n::Integer) = Int(n) + 1
+    end
+    M = BlkInc
+    for f in (M.bgrow, M.btidy, M.igrow, M.itidy)
+        f(3); f(Int32(3))
+        @test StrictMode._is_exempt(f, which(f, (Int,)))
+        @test !StrictMode._is_exempt(f, which(f, (Integer,)))
+    end
+    fs = audit(M; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    rows(fn, T) = filter(f -> f.func == fn && occursin(string(T), f.signature), fs)
+    for (fn, dirty) in (("bgrow", true), ("btidy", false), ("igrow", true), ("itidy", false))
+        @test !isempty(rows(fn, Int32))
+        @test any(StrictMode._failed, rows(fn, Int32)) == dirty
+        @test isempty(rows(fn, Int64))
+    end
+    # A method with tied type variables is exempted by its function's name, with a warning.
+    @test isnothing(only(x for x in StrictMode.exemptions() if x.func === :pair).types)
+    @test StrictMode._is_exempt(M.pair)
+    StrictMode.clear_declarations!()
+end

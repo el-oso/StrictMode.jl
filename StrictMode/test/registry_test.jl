@@ -544,3 +544,21 @@ end
     @test !isempty(fs) && all(StrictMode._failed, (f for f in fs if f.func == "K"))
     @test count(f -> f.func == "K", fs) == 2      # the positional method and its keyword body
 end
+
+@testitem "a method declaration accounts for a generic method at the policy line" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module MPol
+    using StrictMode
+    g(x::Integer) = x + 1
+    g(Int32(1))
+    StrictMode.register_strict!(which(g, (Integer,)); guarantees = (:noalloc,), mod = @__MODULE__)
+    @strict_policy (:noalloc,)
+    end
+    # The load check reads the declared method's compiled row, with the declaration's guarantees.
+    items = StrictMode._module_load_items(MPol, (:typestable,))
+    @test (MPol.g, (Int32,), (:noalloc,)) in items
+    @test haskey(StrictMode.method_declarations(), which(MPol.g, (Integer,)))
+    @test isempty(filter(StrictMode._failed, audit(MPol; require = :all)))
+    StrictMode.clear_declarations!()
+end
