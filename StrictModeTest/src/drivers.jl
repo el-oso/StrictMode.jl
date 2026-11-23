@@ -370,7 +370,16 @@ function _exempt_signatures(mod::Module, e::StrictMode.Exemption)
         if isnothing(e.types)
             append!(out, StrictMode._method_entries(m, f))
         elseif StrictMode._exemption_method(e, m.sig) === m
-            push!(out, (f, e.types))
+            # A signature that is not a dispatch tuple, as the definition form records for a
+            # generic method, is proved at the compiled rows within it.
+            if Base.isdispatchtuple(Tuple{e.types...})
+                push!(out, (f, e.types))
+            else
+                range = StrictMode._exemption_sig(e, m.sig)
+                for (g, tt) in StrictMode._method_entries(m, f)
+                    Tuple{StrictMode._ftype(f), tt...} <: range && push!(out, (g, tt))
+                end
+            end
         end
     end
     return out

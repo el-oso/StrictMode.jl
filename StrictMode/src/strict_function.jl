@@ -289,9 +289,16 @@ subject follows it.
 
 Subjects:
 
-- a **definition** — defines the function and exempts it. A qualified name works, so a method on a
-  foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`. That excuses the
-  methods of `Base.length` this module defines, and no other module's.
+- a **definition** — defines the method and exempts that method. Its own signature is recorded as
+  `types`, so the exemption covers the methods the definition writes (with the extra positional
+  methods of default arguments and the body of a keyword method) and no other method of the
+  function: next to `@strict_exempt f(x::Int) = …`, a separate `f(x::Integer)` is still checked. A
+  function whose every method is exempted this way is exempt as a whole. A qualified name works, so
+  a method on a foreign function can be exempted: `@strict_exempt Base.length(::Foo) = 1`. That
+  excuses that method of `Base.length`, and no other. A signature whose type variables tie two
+  arguments together (`f(x::T, y::T) where T`) has no `types` that names exactly it, and is an
+  error; use the name form or an explicit `types = (...)` there. An explicit `types` replaces the
+  definition's own.
 - a **name** — `@strict_exempt foo` or `@strict_exempt :foo`, exempting every signature of it.
 - a **block** — `@strict_exempt begin … end`, exempting every function it defines. One visible
   marker for a cold region instead of one per definition; each definition still records this line,
@@ -408,9 +415,20 @@ macro strict_exempt(args...)
         )
     )
     Meta.isexpr(arg, (:function, :(=))) || return record
-    return quote
+    isnothing(types) || return quote
         Base.@__doc__ $(esc(arg))
         $record
+        nothing
+    end
+    # The definition's own methods are exempted, each by its own signature, and no other method of
+    # the function.
+    return quote
+        $(_exempt_mark!)()
+        Base.@__doc__ $(esc(arg))
+        $(_exempt_defined!)(
+            @__MODULE__, $(esc(_strictdef_sig(arg).args[1])), $(QuoteNode(name));
+            guarantees = $(esc(gs)), reason = $(esc(reason)), file = $file, line = $line
+        )
         nothing
     end
 end

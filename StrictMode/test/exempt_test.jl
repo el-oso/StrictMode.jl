@@ -12,7 +12,8 @@
     # An exemption records WHERE it is written, so a report can send a reader to the line.
     e = only(x for x in StrictMode.exemptions() if x.func === :xcold)
     @test endswith(e.file, "exempt_test.jl") && e.line > 0
-    @test isnothing(e.guarantees) && isnothing(e.types)   # the whole function, every guarantee
+    # Every guarantee, for the method the definition wrote: its own signature.
+    @test isnothing(e.guarantees) && e.types == (Int,)
 end
 
 @testitem "exempt functions are skipped by the registry sweep" begin
@@ -47,7 +48,7 @@ end
     inner = Meta.isexpr(out, :escape) ? out.args[1] : out
     s = string(inner)
     @test occursin("register_strict!", s)               # the hot def is registered
-    @test occursin("_exempt!", s)                       # the cold def is exempted inline
+    @test occursin("_exempt_defined!", s)               # the cold def is exempted inline
     @test !occursin("@strict_exempt", s)                # …not left as a macrocall to resolve
 end
 
@@ -674,4 +675,50 @@ end
     ms, skipped = StrictMode.module_methods(A)
     @test !any(m -> m.name in (:length, :owned), ms)
     @test get(skipped, :exempt, 0) == 2
+end
+
+@testitem "a definition-form exemption covers the method it defines, not its siblings" begin
+    using StrictMode
+    StrictMode.clear_declarations!()
+    module DefOne
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = collect(1:Int(n))            # allocates, and nothing excuses it
+    @strict_exempt tidy(n::Int) = collect(1:n)
+    tidy(n::Integer) = Int(n) + 1                   # clean
+    @strict_exempt kw(n::Int; k = 1) = collect(1:(n + k))
+    @strict_exempt only1(n::Int) = collect(1:n)
+    end
+    M = DefOne
+    M.grow(3); M.grow(Int32(3)); M.tidy(3); M.tidy(Int32(3)); M.kw(2); M.only1(2)
+
+    # The definition's own signature is recorded, so the exemption names that one method.
+    @test only(x for x in StrictMode.exemptions() if x.func === :grow).types == (Int,)
+    @test StrictMode._is_exempt(M.grow, which(M.grow, (Int,)))
+    @test !StrictMode._is_exempt(M.grow, which(M.grow, (Integer,)))
+    @test !StrictMode._is_exempt(M.grow)
+
+    fs = audit(M; sweep = true, guarantees = (:noalloc,), dispatch_suggest = false)
+    rows(fn, T) = filter(f -> f.func == fn && occursin(string(T), f.signature), fs)
+    @test any(StrictMode._failed, rows("grow", Int32))        # the sibling is judged
+    @test !isempty(rows("tidy", Int32)) && !any(StrictMode._failed, rows("tidy", Int32))
+    @test isempty(rows("grow", Int64))                        # the exempt method is not swept
+
+    # A function whose every method an exemption wrote is exempt as a whole, as before: the sweep,
+    # the census and the coverage gate leave it alone, keyword body included.
+    @test StrictMode._is_exempt(M.only1) && StrictMode._is_exempt(M.kw)
+    @test !any(f -> f.func in ("kw", "only1"), fs)
+    ms, _ = StrictMode.module_methods(M)
+    @test !any(m -> StrictMode._demangle(m.name) in (:kw, :only1), ms)
+    @test count(m -> m.name === :grow, ms) == 1
+    cov = filter(StrictMode._failed, audit(M; require = :all))
+    @test !any(f -> f.func in ("kw", "only1"), cov)
+    @test !any(f -> f.func == "grow" && occursin("Int64", f.signature), cov)
+
+    # Type variables that tie two arguments together leave no tuple naming exactly that method.
+    @test_throws "ties its argument types together" @eval module DefDiag
+    using StrictMode
+    @strict_exempt pair(x::T, y::T) where {T <: Real} = x + y
+    end
+    StrictMode.clear_declarations!()
 end

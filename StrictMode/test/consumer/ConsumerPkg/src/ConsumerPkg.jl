@@ -66,4 +66,9 @@ catch err
 end
 StrictMode.register_alloc_barrier!(Base.Libc.gethostname; mod = @__MODULE__)
 
+# A definition-form exemption, stored here with the signature of the one method it writes. The
+# wider method next to it is not exempt.
+@strict_exempt cold_plan(n::Int) = collect(1:n)
+cold_plan(n::Integer) = collect(1:Int(n))
+
 end # module

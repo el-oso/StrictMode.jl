@@ -146,6 +146,10 @@ The `include` form calls the file's own `include`, so relative paths resolve as 
 and it finds the definitions by comparing the module's methods before and after — which is why a
 nested `include` inside `plan.jl` is covered too.
 
+A single definition, `@strict_exempt plan(n::Int) = collect(1:n)`, exempts the method it writes and
+no other: its own signature is recorded, so a separate `plan(n::Integer)` elsewhere in the module is
+still checked. The name form, `@strict_exempt plan`, exempts every method of the function.
+
 A guarantee named before the subject narrows the exemption. The subject is the **last** positional
 argument, which is what keeps `@strict_exempt :foo` meaning the function `foo`.
 

@@ -497,15 +497,82 @@ catch
     nothing
 end
 
+# Whether `e`'s signature names the method `m` and spans all of it, as the definition form records.
+_names_whole(e::Exemption, m::Method) =
+    _exemption_method(e, m.sig) === m && m.sig <: _exemption_sig(e, m.sig)
+
 # The coarse question the module sweeps ask: is this function, or its method `at`, opted out of
 # everything? A narrow exemption must NOT answer yes here — it would silence guarantees it never
-# claimed.
+# claimed. One that excuses every guarantee for the whole of a method answers yes for that method,
+# and for the function when it answers yes for every method of it.
 function _is_exempt(@nospecialize(f), at::Union{Nothing, Method} = nothing)
     name = _demangle(_callable_name(f))
+    by_method = false
     for (mod, e) in _scoped_exemptions()
-        e.func === name && isnothing(e.types) && isnothing(e.guarantees) && _exempt_in(mod, e, f, at) && return true
+        (e.func === name && isnothing(e.guarantees)) || continue
+        if isnothing(e.types)
+            _exempt_in(mod, e, f, at) && return true
+        elseif at isa Method
+            _names_whole(e, at) && _exempt_in(mod, e, f, at) && return true
+        else
+            by_method = true
+        end
     end
-    return false
+    (by_method && isnothing(at)) || return false
+    ms = try
+        methods(f)
+    catch
+        return false
+    end
+    return !isempty(ms) && all(m -> _is_exempt(f, m), ms)
+end
+
+# The argument types of `m`'s own signature, each with the type variables it uses bound, so that an
+# exemption with these `types` names `m` and spans exactly it. A signature whose type variables tie
+# two arguments together (`f(x::T, y::T) where T`) has no such tuple.
+function _method_exempt_types(m::Method)
+    sig = Base.unwrap_unionall(m.sig)::DataType
+    types = Tuple(Base.rewrap_unionall(p, m.sig) for p in sig.parameters[2:end])
+    full = Base.rewrap_unionall(Tuple{sig.parameters[1], types...}, m.sig)
+    (_key_method(full) === m && m.sig <: full && full <: m.sig) || throw(
+        ArgumentError(
+            "@strict_exempt: `$m` ties its argument types together through a type variable, so " *
+                "no `types = (...)` names exactly that method. Exempt the function by name " *
+                "(`@strict_exempt $(_demangle(m.name))`), or name a range with `types = (...)`."
+        )
+    )
+    return types
+end
+
+# The definition form records the world before its definition here, and `_exempt_defined!` reads
+# it afterwards to find the methods that definition added.
+# ponytail: one slot, so two tasks evaluating `@strict_exempt` definitions at once would race.
+const _EXEMPT_SINCE = Ref{UInt}(typemax(UInt))
+_exempt_mark!() = (_EXEMPT_SINCE[] = Base.get_world_counter(); nothing)
+
+# Exempt each method of `fv` that `mod` defined since `_exempt_mark!`: the ones the definition wrote,
+# including the extra positional methods of default arguments and the body of a keyword method.
+# Each is recorded with its own signature, so another method of the function stays judged.
+function _exempt_defined!(
+        mod::Module, @nospecialize(fv), name::Symbol;
+        guarantees = nothing, reason::AbstractString = "", file::AbstractString = "", line::Integer = 0
+    )
+    since = _EXEMPT_SINCE[]
+    _EXEMPT_SINCE[] = typemax(UInt)
+    fresh(m) = m.primary_world > since && m.module === mod
+    ms = Method[m for m in methods(fv) if fresh(m)]
+    for k in methods(Core.kwcall, Tuple{Any, Core.Typeof(fv), Vararg{Any}})
+        fresh(k) || continue
+        body = _kwcall_body(k)
+        isnothing(body) || append!(ms, (m for m in methods(body) if fresh(m)))
+    end
+    isempty(ms) && throw(
+        ArgumentError("@strict_exempt: the definition of `$name` added no method to `$mod`, so it names nothing to exempt")
+    )
+    for m in ms
+        _exempt!(name, mod; types = _method_exempt_types(m), guarantees, reason, file, line)
+    end
+    return nothing
 end
 
 # The precise question a verdict asks: is THIS signature opted out of THIS guarantee?
@@ -1022,9 +1089,11 @@ function _rewrite_strict_stmt(stmt, source::AbstractString = "")
                 nothing
             end
             fname = (sig !== nothing && Meta.isexpr(sig, :call) && sig.args[1] isa Symbol) ? sig.args[1] : nothing
-            out = Any[inner]
-            fname === nothing || push!(out, :($(_exempt!)($(QuoteNode(fname)), @__MODULE__)))
-            return out
+            isnothing(fname) && return Any[inner]
+            return Any[
+                :($(_exempt_mark!)()), inner,
+                :($(_exempt_defined!)(@__MODULE__, $fname, $(QuoteNode(fname)))),
+            ]
         end
         name = inner isa QuoteNode ? inner.value : inner
         return name isa Symbol ? Any[:($(_exempt!)($(QuoteNode(name)), @__MODULE__))] : Any[stmt]
@@ -1413,7 +1482,7 @@ function _module_specializations(f!::Function, mod::Module; only = nothing, exem
         (_is_exempt(f) || (exemptpred !== nothing && exemptpred(f))) && continue
         onlypred === nothing || onlypred(f) || continue
         for mth in methods(f)
-            mth.module === mod || continue
+            (mth.module === mod && !_is_exempt(f, mth)) || continue
             for mi in _specializations(mth)
                 tt = try
                     Tuple((mi.specTypes::DataType).parameters[2:end])

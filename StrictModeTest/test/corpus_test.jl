@@ -201,6 +201,8 @@
     #    declaration or a `types` exemption names the one method its signature selects: declaring
     #    `(W, Int)` leaves the wider row the only undeclared one, exempting `(W, Int)` leaves its
     #    verdict as it is, and exempting `(W, Integer)` turns it into an `:info` note in both tiers.
+    #    The definition form records a method's own signature: of the specific method it leaves the
+    #    wider row's verdict as it is, and of the wider method it makes that row a note.
     effect_cause(e) = e in (:alloc, :caught) ? :alloc : e === :iowait ? :wait : nothing
 
     # What a sweep of the helper's function reports, for a case whose helper is reached by `invoke`
@@ -212,6 +214,7 @@
         return (;
             scan = v, proof = v, others = :pass, undeclared = [true],
             narrow = (; scan = v, proof = v), wide = (; scan = (:info, :SM0002), proof = (:info, :SM0002)),
+            defnarrow = (; scan = v, proof = v), defwide = (; scan = (:info, :SM0002), proof = (:info, :SM0002)),
         )
     end
 
@@ -305,6 +308,8 @@
                 sweep = (;
                     scan = row(sf), proof = row(pf), others, undeclared,
                     narrow = exempted(A), wide = exempted((M.W, Integer)),
+                    defnarrow = exempted(StrictMode._method_exempt_types(which(M.mid, A))),
+                    defwide = exempted(StrictMode._method_exempt_types(which(M.mid, (M.W, Integer)))),
                 )
             end
             return (; name = k.name, scan, proof, proof_ae, diverged = !isempty(d), cause = !isempty(d.cause_diverged), sweep)

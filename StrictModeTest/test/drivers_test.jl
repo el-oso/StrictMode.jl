@@ -280,3 +280,26 @@ end
     @test r.mod === :ForeignGate
     Base.delete_method(which(getproperty, (Untrusted{ForeignGate.MyT}, Symbol)))
 end
+
+@testitem "a definition-form exemption leaves its sibling methods gated" begin
+    using StrictMode, StrictModeTest
+    module DefGate
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = collect(1:Int(n))
+    end
+    module DefClean
+    using StrictMode
+    @strict_exempt grow(n::Int) = collect(1:n)
+    grow(n::Integer) = Int(n) + 1
+    @strict_exempt spare(n::Integer) = Int(n) + 1     # generic, and needs no exemption
+    end
+    DefGate.grow(3); DefGate.grow(Int32(3)); DefClean.grow(3); DefClean.grow(Int32(3))
+    @test_throws StrictViolation test_compiled(DefGate; guarantees = (:noalloc,))
+    @test test_compiled(DefClean; guarantees = (:noalloc,)) isa Vector
+    # A generic definition is proved at its compiled rows: `(Int64)` here, not the abstract `(Integer)`.
+    DefClean.spare(3)
+    fs = test_exemptions(DefClean)
+    @test only(f.signature for f in fs if f.func == "spare") == "(Int64)"
+    @test occursin("no longer needed", only(f for f in fs if f.func == "spare").reason)
+end

@@ -101,3 +101,12 @@ end
         @test get(facts, name, "missing") == "true"
     end
 end
+
+@testset "a definition-form exemption names its method after a cached load" begin
+    e = only(x for x in StrictMode.exemptions() if x.func === :cold_plan)
+    @test e.types == (Int,)
+    @test StrictMode._is_exempt(ConsumerPkg.cold_plan, which(ConsumerPkg.cold_plan, (Int,)))
+    @test !StrictMode._is_exempt(ConsumerPkg.cold_plan, which(ConsumerPkg.cold_plan, (Integer,)))
+    ConsumerPkg.cold_plan(2); ConsumerPkg.cold_plan(Int32(2))
+    @test_throws StrictViolation test_compiled(ConsumerPkg; guarantees = (:noalloc,), only = [:cold_plan])
+end

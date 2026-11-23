@@ -489,7 +489,9 @@ StrictMode/src/
                         declaration infers to `Any`), @strict_stable (per-specialization instead:
                         body moves to a hidden `#f#inner`, the wrapper infers its return type via
                         promote_op so a stable specialization folds the branch away entirely),
-                        @strict_exempt (a definition, a name, a `begin … end` block, or an
+                        @strict_exempt (a definition, which exempts only the methods it writes, each
+                        by its own signature (registry.jl _exempt_defined!, which finds them by
+                        primary_world), a name, a `begin … end` block, or an
                         `include` whose definitions are found by diffing the census), @strict_policy. A
                         @strict_policy line checks only the methods defined ABOVE it and RAISES
                         when none above it is checked OR ACCOUNTED FOR (`require_methods` in
