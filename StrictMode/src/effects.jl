@@ -458,6 +458,10 @@ function — see the note on `_BASE_BARRIER_TYPES` for why `Base.OncePerTask` is
 recorded, and `barrier == false` alongside those three means "not looked for". Read it only in
 combination with a clean `alloc`/`boxing` result, which is the state where it is exhaustive.
 Location is the method's definition site.
+
+The body read is the one a call that is not inlined runs (`_run_key`): Julia's wider compilation
+signature when the method does not specialize on an argument. `wide = false` reads the exact
+signature's body instead, which is what inference of the signature, and so `:typestable`, describes.
 """
 const _AllocSignals = @NamedTuple{
     alloc::Bool, boxing::Bool, dictlookup::Bool, abscontainer::Any,
@@ -485,10 +489,11 @@ const _AllocSignals = @NamedTuple{
 const _TOP_SIGNAL_MEMO = IdDict{Any, Dict{Tuple{Int, UInt64, Symbol}, _AllocSignals}}()
 
 function _alloc_signals(
-        @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[]
+        @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :full, depth::Int = _FAST_ALLOC_DEPTH[],
+        wide::Bool = true
     )
     _sync_exemptions!()   # the memo key cannot see a change to `exempt_strict()`
-    sig = _entry_key(f, types)
+    sig = wide ? _run_key(f, types) : _entry_key(f, types)
     key = (depth, Base.get_world_counter(), mode)
     memo = @lock _SIGNAL_MEMO_LOCK begin
         bysig = get(_TOP_SIGNAL_MEMO, sig, nothing)
@@ -1232,7 +1237,7 @@ function _signal_origin(
         @nospecialize(f), @nospecialize(types::Tuple); mode::Symbol = :alloc,
         stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
-    top = _entry_key(f, types)
+    top = _run_key(f, types)
     parent = IdDict{Any, Any}()
     queue = Any[(top, _FAST_ALLOC_DEPTH[], false, mode)]
     seen = Base.IdSet{Any}()
@@ -1385,7 +1390,7 @@ end
 # reads the whole scheduler.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
     parent = IdDict{Any, Any}()
-    queue = Any[(_entry_key(f, types), false, false)]
+    queue = Any[(_run_key(f, types), false, false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
         s, caught, sched = popfirst!(queue)
@@ -2922,6 +2927,50 @@ const _SPEC_BY_SIG = "a specialization reached only through `invoke` has no sign
 
 # The key of the body the item `(f, types)` names.
 _entry_key(@nospecialize(f), @nospecialize(types)) = f isa _Spec ? f.mi : _sigtype(f, types)
+
+# The specialization a call of the entry runs when it is not inlined, when that is not the one its
+# signature names; `nothing` otherwise. Julia compiles a method for its compilation signature,
+# which widens an argument the method does not specialize on: a trailing `x...` becomes `Vararg`,
+# and a function the method only passes on becomes `Function`. A caller that inlines the entry
+# runs the exact signature's body; a dynamic call, or a call that is not inlined, runs the wider
+# one, which is what the proof's native walk reads (`Base.method_instance`). Looking it up adds the
+# specialization to the method's cache, as such a call does.
+function _widened_instance(@nospecialize(f), @nospecialize(types))
+    f isa _Spec && return nothing
+    sig = _sigtype(f, types)
+    mi = ccall(:jl_method_lookup_by_tt, Any, (Any, Csize_t, Any), sig, Base.get_world_counter(), nothing)
+    return mi isa Core.MethodInstance && mi.specTypes != sig ? mi : nothing
+end
+
+# The body key of the code a call of the entry runs: the widened specialization when there is one
+# (`_widened_instance`), the entry's own otherwise. The allocation and boxing scans read this one.
+function _run_key(@nospecialize(f), @nospecialize(types))
+    w = _widened_instance(f, types)
+    return isnothing(w) ? _entry_key(f, types) : w
+end
+
+# The sentence a finding read from the widened specialization adds, and the fix, which names the
+# widened argument: `x::Vararg{T, N} where {N}` for a trailing `x...`, `f::F where {F}` for a
+# function only passed on. Empty when the entry is not widened.
+function _widened_note(@nospecialize(f), @nospecialize(types))
+    w = _widened_instance(f, types)
+    isnothing(w) && return ""
+    exact = Base.unwrap_unionall(_sigtype(f, types)).parameters
+    wide = Base.unwrap_unionall(w.specTypes).parameters
+    fixes = String[]
+    for i in 2:length(wide)
+        p = wide[i]
+        if Base.isvarargtype(p)
+            push!(fixes, "declare the trailing varargs `x::Vararg{T, N} where {N}` (as written, `x...` compiles as `$(p)`)")
+            break
+        elseif i <= length(exact) && p != exact[i] && exact[i] <: Function
+            push!(fixes, "declare argument $(i - 1) `f::F` with `where {F}` (it is only passed on, so it compiles as `$(p)`, not `$(exact[i])`)")
+        end
+    end
+    fix = isempty(fixes) ? "force specialization on the widened argument" : join(fixes, "; ")
+    return "; read from `$(w.specTypes)`, the wider specialization Julia compiles and runs for a " *
+        "call that is not inlined, not from the exact signature. To compile the exact one, $fix"
+end
 
 # The function a `_Spec` belongs to, as `_callee` gives it.
 _spec_callee(s::_Spec) = _callee((s.mi.specTypes::DataType).parameters[1])

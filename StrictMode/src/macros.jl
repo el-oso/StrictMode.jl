@@ -182,14 +182,43 @@ function _guarantee_expr(call, runner, extra_args...; types = nothing)
     end
 end
 
-# The check call with the checked function hidden from inference. At a call site the function is a
-# constant, and the compiler propagates a constant function into the callee and on through
-# everything the callee passes it to, `@nospecialize` or not: here that is the whole scan, inferred
-# again for every call site (measured 37 ms per `@assert_noboxing` site against 6 ms). The check
-# reads the function as a value, so nothing is lost by its type being unknown.
+# The check call made through a dynamic call, with the checked function hidden from inference.
+#
+# The checked function: at a call site it is a constant, and the compiler propagates a constant
+# function into the callee and on through everything the callee passes it to, `@nospecialize` or
+# not: here that is the whole scan, inferred again for every call site (measured 37 ms per
+# `@assert_noboxing` site against 6 ms). The check reads the function as a value, so nothing is
+# lost by its type being unknown.
+#
+# The callee: a static call puts the check, and all of the scan below it, in the compiled call
+# graph of the guarded function, which AllocCheck and JET compile and walk on every path however
+# rarely it is taken (85 s for `_raw_allocs` of one `@strict` site). So the check is called through
+# `_guard_call`, which reaches it dynamically.
 function _opaque_function(body, fn)
     Meta.isexpr(body, :call) || return body
-    return Expr(:call, (a === fn ? :($(Base.inferencebarrier)($fn)) : a for a in body.args)...)
+    args = Any[a === fn ? :($(Base.inferencebarrier)($fn)) : a for a in body.args]
+    # Keyword arguments ride in a `NamedTuple` to `Core.kwcall`, so `_guard_call` has none.
+    if length(args) >= 2 && Meta.isexpr(args[2], :parameters)
+        kw = popat!(args, 2)
+        args = Any[Core.kwcall, Expr(:tuple, kw), args...]
+    end
+    return Expr(:call, _guard_call, args...)
+end
+
+# `f(args...)` through a dynamic call. The guarded body holds a static call of this small
+# `@noinline` method, which the scan skips as StrictMode's own (`_mi_is_strictmode`) and which keeps
+# the guarded function as cheap to inline as with a static call of the check; a dynamic call in the
+# guarded body itself is not (measured: `@assert_noboxing sin(x)` then fails `:inlined`).
+#
+# One method per arity, every argument `@nospecialize`d, so the guarded body calls it statically
+# with whatever it holds (the checked function is typed `Any` there). A `Vararg` method packs its
+# arguments into a tuple and a keyword method adds a keyword body, and both are allocation sites of
+# their own in the guarded function's proof; a method that specializes on its arguments is itself
+# dispatched at run time from the guarded body.
+for n in 0:8
+    local as = [Symbol(:a, i) for i in 1:n]
+    @eval @noinline _guard_call(@nospecialize(f), $((:(@nospecialize($a)) for a in as)...)) =
+        Base.inferencebarrier(f)($(as...))
 end
 
 # Wrap a check so it runs once per (call site, argument signature) instead of once per execution.
@@ -293,7 +322,7 @@ function _strict_expr(call; types = nothing, execute::Bool = true, parts = _call
     stability = execute ?
         quote
             local var"#T" = $(Base.promote_op)($(p.checkfn), $(p.types)...)
-            $(_is_typestable_return)(var"#T") || $(_stable_violation)($target, var"#T")
+            $(_is_typestable_return)(var"#T") || $(_guard_call)($(_stable_violation), $target, var"#T")
         end :
         _opaque_function(:($(_check_stable_once)($target, $(p.checkfn), $(p.types))), p.checkfn)
 

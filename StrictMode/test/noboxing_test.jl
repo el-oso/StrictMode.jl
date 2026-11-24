@@ -243,8 +243,14 @@ end
         @test occursin("inferencebarrier", s)
     end
     body = :(runner("t", fn, (Float64,)))
-    @test StrictMode._opaque_function(body, :fn).args[3] == :($(Base.inferencebarrier)(fn))
-    @test StrictMode._opaque_function(:(a + b), :fn) == :(a + b)
+    # The check is reached through `_guard_call`'s dynamic call, so the scan is not in the guarded
+    # call graph.
+    @test StrictMode._opaque_function(body, :fn).args[1:2] == [StrictMode._guard_call, :runner]
+    @test StrictMode._opaque_function(body, :fn).args[4] == :($(Base.inferencebarrier)(fn))
+    kwbody = :(runner("t", fn; depth = 2))
+    @test StrictMode._opaque_function(kwbody, :fn).args[2:4] ==
+        [Core.kwcall, :((; depth = 2)), :runner]
+    @test StrictMode._opaque_function(:x, :fn) === :x
     site() = @assert_noboxing kernel(1.0)
     @test site() == 2.0
 end

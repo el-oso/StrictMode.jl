@@ -300,13 +300,14 @@ end
     @allocated guarded(a, b)
     @test iszero(@allocated guarded(a, b))
 
-    # With checks enabled the site leaves a live `:invoke` of `_strict_scan` behind its per-site flag.
+    # With checks enabled the site leaves a live `:invoke` of `_guard_call`, the call of `_strict_scan`,
+    # behind its per-site flag.
     # Recursing into it reported the scan's own allocation, boxing, dict lookup and union phi against
     # the ENCLOSING function, which is how `@verify_strict`/`audit` flagged clean kernels.
     @test any(Base.code_typed(guarded, tt)[1][1].code) do st
         Meta.isexpr(st, :invoke) || return false
         mi = st.args[1] isa Core.CodeInstance ? st.args[1].def : st.args[1]
-        mi isa Core.MethodInstance && mi.def isa Method && mi.def.name === :_strict_scan
+        mi isa Core.MethodInstance && mi.def isa Method && mi.def.name === :_guard_call
     end
     for s in (StrictMode._alloc_signals(kernel, tt), StrictMode._alloc_signals(guarded, tt))
         @test !s.alloc

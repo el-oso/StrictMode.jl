@@ -64,7 +64,7 @@ function _typestable_fast(target, @nospecialize(f), @nospecialize(types::Tuple))
     # question it asks, so it gates. This one is an IR signal: a guarded `@warn` inside an
     # otherwise-clean numeric function reads as depth-0 boxing while JET's optimization analysis
     # passes it, and that shape must not be able to abort a build.
-    sig = _alloc_signals(f, types; depth = 0)
+    sig = _alloc_signals(f, types; depth = 0, wide = false)
     if sig.boxing
         cause = _instability_cause(f, types)
         why = isnothing(cause) ? "" : "\n  " * _cause_reason(cause...) * "\n  → " * _cause_suggestion(cause[1])

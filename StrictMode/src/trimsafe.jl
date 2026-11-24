@@ -20,7 +20,8 @@ const _TC_STATEMENT_RULES =
     all(n -> isdefined(TypeContracts, n), (:_scan_trim_stmt!, :_is_trim_unsafe_callee, :_trim_truncate))
 
 function _base_trim_report(@nospecialize(f), @nospecialize(types::Tuple))
-    ci = _TC_STATEMENT_RULES ? _typed_body(_entry_key(f, types)) : nothing
+    # The body a call that is not inlined runs (`_run_key`), as juliac compiles a callee.
+    ci = _TC_STATEMENT_RULES ? _typed_body(_run_key(f, types)) : nothing
     # `invoke` with the method's own argument types compiles one method for all targets; a plain call compiles one per function.
     # A specialization has no signature that reaches it, so TypeContracts cannot be asked about it.
     isnothing(ci) && f isa _Spec &&
