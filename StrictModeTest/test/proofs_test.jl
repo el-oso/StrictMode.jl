@@ -100,24 +100,19 @@ end
     @test_typestable guarded29(a, b)
 
     # An all-paths proof of a GUARDED signature cannot pass while checks are enabled, and the
-    # contract is that it says so rather than quietly blaming the kernel. With checks on, the
-    # guard's reporting path is in the compiled call graph, and every allocation left in it is
-    # Base's string machinery — `takestring!`, `_string_n`, `StringMemory` — whose backtrace
-    # truncates at a shared call site before reaching any StrictMode frame. Measured here: 919 of
-    # 919 remaining instances are unattributable, so no filter on this side can tell them from the
-    # kernel's own, and `ignore_barrier` does not apply (it covers one-time-init guards).
+    # contract is that it says so rather than quietly blaming the kernel. The guard reaches its
+    # check through a dynamic call in `StrictMode._guard_call`, so the check itself is not compiled
+    # into the proof; that call is what remains, and every kept site is in it.
     #
-    # Asserted rather than recorded as broken: if the attribution ever returns, `@test_noalloc`
-    # stops raising and this fails loudly — the same tripwire, as a test that passes today.
+    # Asserted rather than recorded as broken: if the guard stops leaving a site, `@test_noalloc`
+    # stops raising and this fails loudly.
     kept29 = StrictModeTest._raw_allocs(guarded29, (Vector{Float64}, Vector{Float64}))
     @test !isempty(kept29)
-    @test all(StrictModeTest._is_unattributed, kept29)
-    # ... which is what the proof's warning about a guard counts
-    all29 = StrictModeTest._raw_allocs_unfiltered(guarded29, (Vector{Float64}, Vector{Float64}))
-    @test StrictModeTest._guard_unattributed(all29, kept29) == length(kept29)
+    @test all(StrictModeTest._in_guard_call, kept29)
+    @test any(a -> a isa StrictModeTest.AllocCheck.DynamicDispatch, kept29)
     @test_throws StrictMode.StrictViolation (@test_noalloc guarded29(a, b))
     # What does hold on every version: the inner kernel is provably clean on its own, which is the
-    # verdict to reach for while a guarded signature cannot be attributed.
+    # verdict to reach for while a guarded signature cannot pass.
     @test test_signatures(
         [(dot29, (Vector{Float64}, Vector{Float64}))];
         guarantees = (:noalloc,)
@@ -129,6 +124,7 @@ end
     dirty29(n::Int) = (v = Vector{Float64}(undef, n); SINK29[] = v; length(v))
     gdirty29(n::Int) = @strict dirty29(n)
     gdirty29(4)
+    @test any(!StrictModeTest._in_guard_call, StrictModeTest._raw_allocs(gdirty29, (Int,)))
     @test_throws StrictViolation (@test_noalloc gdirty29(4))
 
     # An unguarded allocating call is unaffected either way.
@@ -301,14 +297,19 @@ end
 
 @testitem "the proof warns about a guard only for a body that has one" begin
     using StrictMode, StrictModeTest
-    # A wait has no guard, and its unattributed sites are Base's: AllocCheck stops at a shared call
-    # site in the scheduler. The proof drops other sites (a clock read), which is not a guard either.
+    # A wait has no guard, and its sites are Base's; the proof also drops sites that are no guard (a
+    # clock read). The warning names only sites in a guard's call.
     waits() = (yield(); nothing)
     all = StrictModeTest._raw_allocs_unfiltered(waits, ())
     kept = StrictModeTest._raw_allocs(waits, ())
     @test !any(StrictModeTest._is_guard_alloc, all)
-    @test any(StrictModeTest._is_unattributed, kept)
-    @test StrictModeTest._guard_unattributed(all, kept) == 0
+    @test !isempty(kept)
+    @test !any(StrictModeTest._in_guard_call, kept)
+    @test_logs StrictModeTest._raw_allocs(waits, ())
+    # while every site a guarded body keeps is in the guard's call, which is what the warning counts
+    gw(x::Float64) = @strict sin(x)
+    gw(1.0)
+    @test Base.all(StrictModeTest._in_guard_call, StrictModeTest._raw_allocs(gw, (Float64,)))
 end
 
 @testitem "a C varargs call is not reported as dispatch" begin

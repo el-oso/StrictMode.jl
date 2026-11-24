@@ -81,7 +81,10 @@ end
 # graph, and AllocCheck and JET both analyze every path regardless of how often it is taken. Left
 # in, the guard makes `@test_noalloc`/`@test_typestable` fail on the enclosing function, which is
 # the measurement issue #29 is about: a package that guards its hot kernels could not then prove
-# those kernels clean.
+# those kernels clean. The branch reaches the check through a dynamic call in
+# `StrictMode._guard_call`, so neither proof compiles the check itself; JET's report of that call
+# is dropped with the frame (`_is_guard_report`), and AllocCheck's sites in it are kept and named
+# (`_in_guard_call`).
 #
 # Excluding it is sound in the direction that matters. `_strict_scan` is StrictMode's own analysis
 # code, not the user's, and it cannot run in a build with checks off — the whole branch is erased by
@@ -112,9 +115,13 @@ function _is_guard_report(@nospecialize(rep))
         mi = fr.linfo
         mi isa Core.MethodInstance || return false
         d = mi.def
-        return d isa Method && d.name === _GUARD_FRAME
+        return d isa Method && (d.name === _GUARD_FRAME || _is_guard_call(d))
     end
 end
+
+# `StrictMode._guard_call`, through which a guard calls its check: its one dynamic call is the
+# guard's, whatever it reaches.
+_is_guard_call(d::Method) = d.module === StrictMode && d.name === :_guard_call
 
 # AllocCheck takes a function value. A callable object known by its type alone is checked through
 # `StrictMode._call_through`, which takes the callable as its first argument and makes the call:
@@ -571,18 +578,17 @@ end
 function _raw_allocs(@nospecialize(f), @nospecialize(types))
     all = _raw_allocs_unfiltered(f, types)
     kept = filter(a -> !_is_guard_alloc(a) && !_nonallocating_runtime_call(a), all)
-    # AllocCheck's backtrace walk stops at the first instruction reached from several call sites,
-    # recording a `"multiple call sites"` frame instead. An instance that ends there cannot be
-    # attributed to the guard frame or to the kernel, and the guard branch builds diagnostic strings
-    # through exactly such shared helpers. Saying so is the difference between a verdict a reader
-    # can act on and one that blames the kernel for StrictMode's own code.
-    n = _guard_unattributed(all, kept)
+    # A guard calls its check through `StrictMode._guard_call`, a dynamic call on a cold branch. The
+    # check's own frame is dropped above; the call itself stays, because an all-paths proof cannot
+    # rule it out. Saying so is the difference between a verdict a reader can act on and one that
+    # blames the kernel for StrictMode's own code.
+    n = count(_in_guard_call, kept)
     if n > 0
         @warn "StrictModeTest: `$(StrictMode._func_name(f))` contains a StrictMode guard, and " *
-            "AllocCheck could not attribute $n of its $(length(kept)) remaining allocation(s) to " *
-            "a single call site. Those may belong to the guard rather than to the code it guards. " *
-            "Prove the guarded call directly (`test_signatures([(inner, types)])`) for a verdict " *
-            "that is only about your kernel." maxlog = 1
+            "$n of its $(length(kept)) remaining allocation site(s) are the guard's dynamic call " *
+            "of its check (`StrictMode._guard_call`), which runs once per signature but which an " *
+            "all-paths proof counts. Prove the guarded call directly " *
+            "(`test_signatures([(inner, types)])`) for a verdict that is only about your kernel." maxlog = 1
     end
     return kept
 end
@@ -595,18 +601,14 @@ const _NONALLOCATING_RUNTIME = (:jl_hrtime, :jl_current_exception)
 _nonallocating_runtime_call(@nospecialize(a)) =
     a isa AllocCheck.AllocatingRuntimeCall && Symbol(a.name) in _NONALLOCATING_RUNTIME
 
-# How many of the `kept` sites AllocCheck could not attribute, counted only when `all` holds a site of
-# the guard frame. Other filters drop sites too (`_nonallocating_runtime_call`), and a body without a
-# guard has no guard to blame for what it cannot attribute.
-_guard_unattributed(all, kept) = any(_is_guard_alloc, all) ? count(_is_unattributed, kept) : 0
-
-# Does this instance's attribution stop at AllocCheck's shared-call-site marker?
-_is_unattributed(@nospecialize(inst)) =
-    hasproperty(inst, :backtrace) &&
-    any(
-    fr -> fr isa Base.StackTraces.StackFrame && fr.func === Symbol("multiple call sites"),
-    inst.backtrace
-)
+# Is this instance in a guard's call of its check: does its backtrace pass through
+# `StrictMode._guard_call`?
+_in_guard_call(@nospecialize(inst)) =
+    hasproperty(inst, :backtrace) && any(inst.backtrace) do fr
+    fr isa Base.StackTraces.StackFrame || return false
+    mi = fr.linfo
+    return mi isa Core.MethodInstance && mi.def isa Method && _is_guard_call(mi.def)
+end
 
 # Is this AllocCheck instance a *boxing* / dynamic-dispatch allocation (driven by type
 # uncertainty), as opposed to a legitimate typed heap allocation (a `Vector`, `Memory`, …)?

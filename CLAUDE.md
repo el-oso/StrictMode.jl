@@ -42,7 +42,19 @@ StrictMode/src/
                         constant at the call site is constant-propagated through the whole scan and
                         inferred again per site, @nospecialize or not (37 ms per @assert_noboxing site
                         against 6 ms). findings() does the same on entry. Do NOT hand a runner the bare
-                        p.checkfn; the flag and promote_op still need the function itself
+                        p.checkfn; the flag and promote_op still need the function itself. Every guard
+                        (_opaque_function, and @strict's _stable_violation) calls its check through
+                        _guard_call: a static :invoke of a small @noinline method, one per arity with
+                        every argument @nospecialize'd (keywords go to Core.kwcall as a NamedTuple),
+                        which makes the one DYNAMIC call of the check. A static call put the whole
+                        scan in the guarded function's call graph, which AllocCheck compiled (85 s per
+                        @strict site, 0.1 s now). Do NOT make the dynamic call in the guarded body
+                        itself (it stops the guarded function inlining: :inlined fails), nor give
+                        _guard_call a Vararg or keywords (more allocation sites in the proof), nor let
+                        it specialize (the guarded body then dispatches to it at run time). The scan
+                        skips _guard_call as StrictMode's own (_mi_is_strictmode); JET's report in it
+                        is dropped (_is_guard_report); AllocCheck's sites in it are kept and named
+                        (_in_guard_call), so a guarded proof still fails, on the guard's call alone
   preferences.jl      — checks_enabled/enable_checks!/disable_checks!/proofs_loaded, _gate (the
                         zero-cost compile-time expansion switch), assert_enabled, _announce_tier
                         (the load-time banner naming which TIER a session is in), direct_dependency
@@ -925,9 +937,9 @@ StrictModeTest/       — the PROOF tier, a SEPARATE package, sibling subfolder,
                         load unless StrictMode.checks_enabled() (otherwise every @assert_* is a
                         bare call, nothing registers, and test_registered() sweeps an empty
                         registry and passes), then announces the proof tier.
-  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _raw_allocs warns that
-                        unattributed sites may be the guard's only when a site of the guard frame was
-                        dropped (_guard_unattributed): a wait has unattributed sites and no guard. A
+  src/proofs.jl       — _raw_allocs/_is_boxing/_checked_allocs (AllocCheck), _raw_allocs warns when
+                        kept sites are in a guard's call of its check (_in_guard_call: a backtrace
+                        through StrictMode._guard_call), naming how many. A
                         callable object known
                         by its type alone (StrictMode._Callable) is proved through _check_allocs
                         (AllocCheck on StrictMode._call_through, the wrapper frame then dropped

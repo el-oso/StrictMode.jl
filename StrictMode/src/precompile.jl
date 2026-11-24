@@ -67,14 +67,15 @@ function _run_workload()
         _map_findings(_scan_findings, items)
         _auto_check_module(PrecompileWorkload, (:typestable, :noalloc); only = _WORKLOAD_FUNCTIONS)
         _auto_check_module(PrecompileWorkload, (:typestable, :trim_compatible); only = _WORKLOAD_FUNCTIONS)
-        # What a `@verify_strict` block runs for each call it lists, on a call that passes, one that
-        # allocates and one that blocks, so the warnings and the walk that words them are compiled too.
+        # What a `@verify_strict` block runs for each call it lists, through `_guard_call` as a guard
+        # calls it, on a call that passes, one that allocates and one that blocks, so the warnings and
+        # the walk that words them are compiled too.
         for (f, types) in (
                 (PrecompileWorkload.kernel, (Vector{Float64}, Int)),
                 (PrecompileWorkloadAllocating.grow, (Int,)), (PrecompileWorkloadKernels.block, ()),
             )
-            _check_stable_once("workload", f, types)
-            _strict_scan("workload", f, types)
+            _guard_call(_check_stable_once, "workload", f, types)
+            _guard_call(_strict_scan, "workload", f, types)
         end
         findings(PrecompileWorkloadKernels.block, (); guarantees = (:noalloc,))
         findings(
