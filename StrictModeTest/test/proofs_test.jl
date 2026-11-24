@@ -1693,3 +1693,38 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "issue #41: both tiers fail the wider specialization a call runs, and name the fix" begin
+    using StrictMode, StrictModeTest
+    # Julia compiles a method for its compilation signature, which widens an argument the method
+    # does not specialize on. A call that is not inlined runs the widened body, which dispatches at
+    # run time here; the proof's native walk reads that body, and so does the scan.
+    @inline input_type(x::Real) = typeof(x)
+    @inline result_type(a, x...) = promote_type(typeof(a), map(input_type, x)...)
+    @inline result_type_n(a, x::Vararg{Any, N}) where {N} = promote_type(typeof(a), map(input_type, x)...)
+    @noinline inner(c, x) = c(x) * 2.0
+    passes_on(combine, x::Float64) = inner(combine, x) + 1.0
+    passes_on_f(combine::F, x::Float64) where {F} = inner(combine, x) + 1.0
+    V = (Float32, Float32, Float32)
+    P = (typeof(sin), Float64)
+    gs = (:noalloc, :noboxing)
+    for (f, T, fix) in ((result_type, V, "x::Vararg{T, N} where {N}"), (passes_on, P, "`f::F` with `where {F}`"))
+        proof = StrictModeTest.proof_findings(f, T; guarantees = gs)
+        scan = StrictMode.findings(f, T; guarantees = gs)
+        for fs in (proof, scan)
+            @test all(StrictMode._failed, fs)
+            @test [x.code for x in fs] == [:SM0002, :SM0003]
+            @test all(x -> occursin("wider specialization", x.reason) && occursin(fix, x.reason), fs)
+        end
+        @test_throws StrictMode.StrictViolation test_signatures([(f, T)]; guarantees = gs)
+        d = StrictModeTest.divergence_report(f, T)
+        @test isempty(d.diverged) && isempty(d.cause_diverged)
+    end
+    for (f, T) in ((result_type_n, V), (passes_on_f, P))
+        @test isempty(StrictModeTest._native_dispatches(f, T))
+        @test test_signatures([(f, T)]; guarantees = gs) isa Vector{StrictMode.StrictFinding}
+        @test !any(StrictMode._failed, StrictMode.findings(f, T; guarantees = gs))
+        d = StrictModeTest.divergence_report(f, T)
+        @test isempty(d.diverged) && isempty(d.cause_diverged)
+    end
+end

@@ -303,6 +303,18 @@ StrictMode/src/
                         :invokes exactly that mi; JET takes the mi itself. A _Spec is reported as
                         `(types) via invoke of (method arg types)` (_sig_string(f, types)), so its
                         key differs from the dispatched row's and ordinary rows are unchanged.
+                        RUN KEYS (issue #41): a call that is not inlined runs the method's
+                        COMPILATION signature, which widens what the method does not specialize on
+                        (`x...` -> Vararg, a function only passed on -> Function).
+                        _widened_instance looks it up (jl_method_lookup_by_tt, what
+                        Base.method_instance and the proof's native walk use) and _run_key names it
+                        as a MethodInstance key when it differs from the entry's. _alloc_signals
+                        (so :noalloc, :noboxing, :owned, @strict's scan), _signal_origin,
+                        _nonscheduler_origin and _base_trim_report read the RUN key; the
+                        :typestable layers pass `wide = false` and read the exact one, as JET and
+                        inference do. _widened_note names the wider signature and the fix
+                        (`x::Vararg{T, N} where {N}`, `f::F where {F}`) in both tiers' messages
+                        (StrictModeTest's _widened_sites_note, for a site the walk found below it).
                         _skip_mask is what a body scan leaves out: _deadend_mask (no path returns
                         under ignore_throw; an EnterNode reaches its catch_dest, and every statement
                         of a try region does too, via _try_handlers, so a throw a returning catch

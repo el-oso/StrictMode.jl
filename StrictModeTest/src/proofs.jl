@@ -452,6 +452,18 @@ end
 # What this does not report: a value boxed to be passed to a widened callee, with no dispatch.
 _native_dispatches(@nospecialize(f), @nospecialize(types)) = first(_native_walk(f, types))
 
+# When the native walk entered the wider specialization Julia compiles for the signature
+# (`StrictMode._widened_instance`) and one of `sites` was found below it, the sentence that names
+# it and the fix (`StrictMode._widened_note`); empty otherwise. AllocCheck's own sites are in the
+# exact specialization and do not count.
+function _widened_sites_note(@nospecialize(f), @nospecialize(types), sites)
+    w = StrictMode._widened_instance(f, types)
+    isnothing(w) && return ""
+    below(a) = hasproperty(a, :backtrace) &&
+        any(fr -> fr isa Base.StackTraces.StackFrame && fr.linfo === w, a.backtrace)
+    return any(below, sites) ? StrictMode._widened_note(f, types) : ""
+end
+
 # The dispatches `_native_dispatches` reports, and whether a body it read holds a statement a caught
 # throw reaches (`_caught_mask`). A callee called from a try region whose handler can return is read
 # in a caught context, with no statement skipped, as the scan reads it (`StrictMode._skip_mask`).
@@ -1811,7 +1823,8 @@ function _proof_findings(
                     push!(
                         out, _mkproof(
                             md, fn, sg, g, !isempty(allocs),
-                            "allocates ($(length(allocs)) site(s))" * (isempty(note) ? "" : "." * note), file, line
+                            "allocates ($(length(allocs)) site(s))" * _widened_sites_note(f, types, allocs) *
+                                (isempty(note) ? "" : "." * note), file, line
                         )
                     )
                 end
@@ -1824,7 +1837,8 @@ function _proof_findings(
                 file, line = _first_loc(allocs, true)
                 push!(
                     out, _mkproof(
-                        md, fn, sg, g, !isempty(boxing), "boxing / dynamic dispatch", file, line
+                        md, fn, sg, g, !isempty(boxing),
+                        "boxing / dynamic dispatch" * _widened_sites_note(f, types, boxing), file, line
                     )
                 )
             end
@@ -1911,7 +1925,7 @@ function _typestable_finding(target, @nospecialize(f), @nospecialize(types::Tupl
     # not dynamic dispatch, so `@report_opt` is silent at every signature. Without this the proof
     # would be WEAKER than the scan it is supposed to settle — `@assert_typestable` catches it and
     # `@test_typestable` would wave it through.
-    unionphi = StrictMode._alloc_signals(f, types; depth = 0).unionphi
+    unionphi = StrictMode._alloc_signals(f, types; depth = 0, wide = false).unionphi
     return _mkproof(
         md, fn, sg, :typestable, unionphi,
         "a union-typed local carries a member that must be boxed to flow through it " *

@@ -41,7 +41,7 @@ function _strict_report(target, @nospecialize(f), @nospecialize(types::Tuple))
     end
     rt = isempty(rts) ? Any : reduce((a, b) -> Union{a, b}, rts)
     signals, local_boxing, scan_error = try
-        (_alloc_signals(f, types), _alloc_signals(f, types; depth = 0).boxing, nothing)
+        (_alloc_signals(f, types), _alloc_signals(f, types; depth = 0, wide = false).boxing, nothing)
     catch err
         err isa StrictViolation && rethrow()
         (nothing, false, sprint(showerror, err))

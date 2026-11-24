@@ -170,7 +170,7 @@ function _assert_noboxing(target, @nospecialize(f), @nospecialize(types::Tuple))
     sig = _alloc_signals(f, types; mode = :boxing)
     _unread_fail(:noboxing, target, sig) && return nothing
     if sig.boxing || !isnothing(sig.abscontainer)
-        _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig))
+        _fail(:noboxing, target, _box_msg("boxing / dynamic dispatch (value-free IR scan)", sig) * _widened_note(f, types))
     elseif _truncated_fail(:noboxing, target, sig)
     else
         _barrier_info(:noboxing, target, sig.barrier_box)

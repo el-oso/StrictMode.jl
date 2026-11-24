@@ -155,7 +155,7 @@ function _instability_cause(@nospecialize(f), @nospecialize(types::Tuple))
     rts = _return_types(f, Tuple(types))
     if length(rts) == 1 && _is_typestable_return(only(rts))
         sig0 = try
-            _alloc_signals(f, types; depth = 0)
+            _alloc_signals(f, types; depth = 0, wide = false)
         catch
             nothing
         end

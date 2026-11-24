@@ -114,3 +114,35 @@ end
     cp!(view(x, 1:5), view(x, 3:7))
     @test (@allocated cp!(view(x, 1:5), view(x, 3:7))) > 0
 end
+
+@testitem "issue #41: the scan reads the wider specialization a call runs" begin
+    using StrictMode
+    # Julia compiles a method for its compilation signature, which widens an argument the method
+    # does not specialize on: a trailing `x...` becomes `Vararg`, a function only passed on becomes
+    # `Function`. A call that is not inlined runs that body, and here it dispatches at run time.
+    @inline input_type(x::Real) = typeof(x)
+    @inline result_type(a, x...) = promote_type(typeof(a), map(input_type, x)...)
+    @inline result_type_n(a, x::Vararg{Any, N}) where {N} = promote_type(typeof(a), map(input_type, x)...)
+    @noinline inner(c, x) = c(x) * 2.0
+    passes_on(combine, x::Float64) = inner(combine, x) + 1.0
+    passes_on_f(combine::F, x::Float64) where {F} = inner(combine, x) + 1.0
+    V = (Float32, Float32, Float32)
+    P = (typeof(sin), Float64)
+    status(f, T, g) = only(StrictMode.findings(f, T; guarantees = (g,)))
+    for (f, T, fix) in ((result_type, V, "x::Vararg{T, N} where {N}"), (passes_on, P, "`f::F` with `where {F}`"))
+        a, b = status(f, T, :noalloc), status(f, T, :noboxing)
+        @test StrictMode._failed(a) && a.code === :SM0002
+        @test StrictMode._failed(b) && b.code === :SM0003
+        for x in (a, b)
+            @test occursin("wider specialization", x.reason)
+            @test occursin(fix, x.reason)
+        end
+        # The exact signature's own body is what :typestable reads, and it is stable.
+        @test !StrictMode._failed(status(f, T, :typestable))
+    end
+    for (f, T) in ((result_type_n, V), (passes_on_f, P))
+        @test isnothing(StrictMode._widened_instance(f, T))
+        @test !StrictMode._failed(status(f, T, :noalloc))
+        @test !StrictMode._failed(status(f, T, :noboxing))
+    end
+end

@@ -156,7 +156,7 @@ function _alloc_message(@nospecialize(f), @nospecialize(types::Tuple), sig, base
         isnothing(so) ||
             return string(_code(:noalloc, :scheduler), " ", _scheduler_reason(so), " ", uppercasefirst(_SCHEDULER_SUGGESTION))
     end
-    return string(_code(:noalloc), " ", _box_msg(base, sig), _origin_note(f, types))
+    return string(_code(:noalloc), " ", _box_msg(base, sig), _origin_note(f, types), _widened_note(f, types))
 end
 
 const _GUARANTEES = (
@@ -363,7 +363,7 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
     # instability — only a direct dynamic `:call` is. So typestable uses depth-0 (this-level) boxing;
     # noalloc/noboxing keep the full-depth signal (a callee's runtime alloc/dispatch IS a real cost).
     # Matches JET's optimization analysis (it flags dynamic dispatch, not resolved invokes).
-    local_sig = (:typestable in guarantees) ? _alloc_signals(f, types; depth = 0) : nothing
+    local_sig = (:typestable in guarantees) ? _alloc_signals(f, types; depth = 0, wide = false) : nothing
     local_boxing = isnothing(local_sig) ? false : local_sig.boxing
     # F39: a union-typed local with a member that must be boxed to flow through it. Signature-
     # independent, because the union comes from branch structure rather than from the argument types.
@@ -414,7 +414,8 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
             elseif !isnothing(so)
                 push!(out, _scheduler_finding(md, fn, sg, g, sig, so))
             else
-                push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("allocates / boxes (value-free IR scan)", sig), sig.file, sig.line))
+                reason = _box_msg("allocates / boxes (value-free IR scan)", sig) * (fail ? _widened_note(f, types) : "")
+                push!(out, _mkfinding(md, fn, sg, g, fail, reason, sig.file, sig.line))
             end
         elseif g === :noboxing
             fail = boxsig.boxing || !isnothing(boxsig.abscontainer)
@@ -426,7 +427,8 @@ function _findings_fast(@nospecialize(f), @nospecialize(types::Tuple), guarantee
                 push!(out, _barrier_note(md, fn, sg, g, boxsig.barrier_box, boxsig.file, boxsig.line))
                 continue
             end
-            push!(out, _mkfinding(md, fn, sg, g, fail, _box_msg("boxing / dynamic dispatch (value-free IR scan)", boxsig), boxsig.file, boxsig.line))
+            reason = _box_msg("boxing / dynamic dispatch (value-free IR scan)", boxsig) * (fail ? _widened_note(f, types) : "")
+            push!(out, _mkfinding(md, fn, sg, g, fail, reason, boxsig.file, boxsig.line))
         elseif g === :trim_compatible
             r = _trim_report(f, types)
             m = try
