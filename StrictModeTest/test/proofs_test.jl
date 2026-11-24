@@ -1728,3 +1728,57 @@ end
         @test isempty(d.diverged) && isempty(d.cause_diverged)
     end
 end
+
+@testitem "a rethrown exception built on a line that also returns is an error path" begin
+    using StrictMode, StrictModeTest, Test
+
+    module SharedLine
+    struct Grid; n::Int; cap::Vector{Int}; end
+    # The `DimensionMismatch` is built on the line of the size check that passes, so an allocation
+    # site's line alone does not tell the two apart.
+    function refill!(g::Grid, x::AbstractVector)
+        length(x) == g.n || throw(DimensionMismatch(lazy"x has $(length(x)), expected $(g.n)"))
+        isempty(g.cap) && throw(DimensionMismatch("the capacity vector is empty"))
+        m = sum(x) > 0 ? 3 : 1
+        m <= length(g.cap) || throw(ArgumentError(lazy"$m exceeds $(length(g.cap))"))
+        g.cap[1] = m
+        return g
+    end
+    function checked!(g::Grid, x::AbstractVector)
+        length(x) == g.n || throw(DimensionMismatch(lazy"x has $(length(x)), expected $(g.n)"))
+        g.cap[1] = length(x)
+        return g
+    end
+    # The handler returns for an `ArgumentError` and rethrows the `DimensionMismatch`.
+    function refresh(g::Grid, x)::Bool
+        try
+            refill!(g, x)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    function refresh_checked(g::Grid, x)::Bool
+        try
+            checked!(g, x)
+        catch err
+            err isa ArgumentError || rethrow()
+            return false
+        end
+        return true
+    end
+    end
+
+    g = SharedLine.Grid(2, [0, 0]); x = [1.0, 2.0]
+    T = (typeof(g), typeof(x))
+    SharedLine.refresh(g, x); SharedLine.refresh_checked(g, x)
+    # The `ArgumentError` the handler returns for allocates on a returning path; the rethrown
+    # `DimensionMismatch` does not count.
+    built = [a.type for a in first(StrictModeTest._checked_allocs(SharedLine.refresh, T)) if hasproperty(a, :type)]
+    @test ArgumentError in built
+    @test !(DimensionMismatch in built)
+    @test !(Tuple{String, Int, String, Int} in built)
+    fs = proof_findings(SharedLine.refresh_checked, T; guarantees = (:noalloc,))
+    @test !any(StrictMode._failed, fs)
+end

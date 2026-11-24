@@ -200,9 +200,10 @@ function _caught_sites(extra)
         ctx = false
         inhandler = false
         inner = nothing
-        for (mi, g, c) in Iterators.reverse(groups)
+        built = a isa AllocCheck.AllocationSite && a.type isa Type ? a.type : nothing
+        for (k, (mi, g, c)) in Iterators.reverse(pairs(groups))
             inner = get!(() -> _body_classes(interp, mi, ctx), bodies, (mi, ctx))
-            cls, rctx = _location_class(inner, g, c)
+            cls, rctx = _location_class(inner, g, c, k == 1 ? built : nothing)
             cls === :dead && return false
             if cls === :caught
                 ctx = StrictMode._join_caught(ctx, rctx)
@@ -270,7 +271,19 @@ function _body_classes(interp, mi::Core.MethodInstance, ctx = false)
         Meta.isexpr(st, :invoke) ? StrictMode._invoke_mi(st.args[1]) : nothing for st in src.code
     ]
     refs = Any[_quiet_stmt(src, mi.specTypes, st) for st in src.code]
-    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs, refs)
+    news = Any[_built_type(src, i) for i in eachindex(src.code)]
+    return (classes, [_stmt_lines(src, mi, i) for i in eachindex(src.code)], invoked, ctxs, refs, news)
+end
+
+# The type statement `i` builds: a `:new`, or a call of the type's own constructor (AllocCheck reports
+# an allocation in a constructor it compiles inline at the caller's line). `nothing` otherwise.
+function _built_type(src::Core.CodeInfo, i::Int)
+    st = src.code[i]
+    T = StrictMode._unwrap_lattice(src.ssavaluetypes[i])
+    Meta.isexpr(st, :new) && return T
+    Meta.isexpr(st, :invoke) && length(st.args) >= 2 || return nothing
+    c = st.args[2]
+    return (c isa Type ? c : StrictMode._static_callee(src, c)) === T ? T : nothing
 end
 
 # For a statement that allocates nothing on its way to returning normally: the reference type of a
@@ -307,12 +320,33 @@ _stmt_lines(src::Core.CodeInfo, mi::Core.MethodInstance, pc::Int) =
 # `:handler`, then `:live`. A group that matches no statement is `:live`: it says nothing either way.
 # For a group that called `callee` (the next group in), only the statements that invoke it are read
 # when one matches: lines alone cannot tell a call in a try body from one in its handler written on
-# the same line. The class comes with the caught context of the `:caught` statements matched, joined.
+# the same line. Likewise for the group an object is allocated in (`built`, its type), only the
+# `:new` statements of that type are read when one matches, and the highest class among them is
+# taken: a throw's exception is often built on the line of the check that passes. The class comes with the caught context of the `:caught`
+# statements matched, joined.
 const _CLASS_RANK = Dict(:dead => 0, :live => 1, :handler => 2, :caught => 3)
 
-function _location_class(body, group::Vector{Base.StackTraces.StackFrame}, callee = nothing)
+function _location_class(body, group::Vector{Base.StackTraces.StackFrame}, callee = nothing, built = nothing)
     isnothing(body) && return (:live, false)
-    classes, stacks, invoked, ctxs = body
+    classes, stacks, invoked, ctxs, _, news = body
+    if !isnothing(built)
+        # A constructor inlined into the body puts its `:new` one level deeper than the frames
+        # AllocCheck reports, so either list of lines may be the prefix of the other.
+        want = [fr.line for fr in Iterators.reverse(group)]
+        cls, ctx = :dead, false
+        found = false
+        for i in eachindex(classes)
+            news[i] === built || continue
+            s = stacks[i]
+            n = min(length(s), length(want))
+            (n > 0 && view(s, 1:n) == view(want, 1:n)) || continue
+            found = true
+            c = classes[i]
+            _CLASS_RANK[c] > _CLASS_RANK[cls] && (cls = c)
+            c === :caught && (ctx = StrictMode._join_caught(ctx, ctxs[i]))
+        end
+        found && return (cls, ctx)
+    end
     if !isnothing(callee)
         best, cls, ctx = _location_class(classes, stacks, ctxs, group, i -> invoked[i] === callee)
         best > 0 && return (cls, ctx)
