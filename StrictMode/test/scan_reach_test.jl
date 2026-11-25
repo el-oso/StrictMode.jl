@@ -682,9 +682,10 @@ end
     own_result!(t::Task, x::Int) = (t.result = x; nothing)
     sig = Tuple{typeof(own_result!), Task, Int}
     ci = StrictMode._typed_body(sig)
+    # Under coverage the body also holds `:code_coverage_effect` statements, which have no arguments.
     stores = [
         i for (i, st) in pairs(ci.code)
-            if st isa Expr && StrictMode._boxing_store(ci, sig, st, StrictMode._static_callee(ci, st.args[1]))
+            if st isa Expr && !isempty(st.args) && StrictMode._boxing_store(ci, sig, st, StrictMode._static_callee(ci, st.args[1]))
     ]
     @test !isempty(stores) && all(i -> StrictMode._stmt_in_scheduler(ci, sig, i), stores)
     @test !StrictMode._failed(only(findings(own_result!, (Task, Int); guarantees = (:noboxing,))))
