@@ -1114,6 +1114,10 @@ function _format_allocs(results; header = "call provably allocates")
     return String(take!(io))
 end
 
+# The file name of a frame's file, split at either separator: Base's files are recorded with the
+# platform's own (`./task.jl`, `.\task.jl` on Windows).
+_file_name(@nospecialize(file)) = last(split(string(file), ('/', '\\')))
+
 # An allocation site that lies in Base's task, lock or condition code: on the way from the allocation out
 # to the nearest frame of the package's own code, the calls pass through that code. This is what a wait,
 # a yield or a lock does, and what the value-free scan reports as its own kind. A callable the
@@ -1130,13 +1134,13 @@ function _scheduler_site(@nospecialize(a))
             break
         end
         # An inlined frame carries no method instance, only its file. Base's own files are recorded
-        # relative to the image ("./lock.jl"): any other file is the package's code (the function
-        # given to `lock`, inlined into it), and the walk ends there too.
+        # relative to the image ("./lock.jl", or `.\lock.jl` on Windows): any other file is the package's
+        # code (the function given to `lock`, inlined into it), and the walk ends there too.
         if fr isa Base.StackTraces.StackFrame && isnothing(mi) && fr.inlined &&
-                !startswith(string(fr.file), "./")
+                !(startswith(string(fr.file), "./") || startswith(string(fr.file), ".\\"))
             break
         end
-        if fr isa Base.StackTraces.StackFrame && basename(string(fr.file)) in StrictMode._SCHEDULER_FILES
+        if fr isa Base.StackTraces.StackFrame && _file_name(fr.file) in StrictMode._SCHEDULER_FILES
             mi isa Core.MethodInstance && !isnothing(prev) && _calls_argument(mi, prev) && break
             sched = true
         end

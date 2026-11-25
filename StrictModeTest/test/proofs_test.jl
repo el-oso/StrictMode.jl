@@ -1805,3 +1805,15 @@ end
         @test Set(got[2]) == Set(want[2])
     end
 end
+
+@testitem "an inlined Base frame is Base's whichever path separator the platform writes" begin
+    using StrictModeTest, AllocCheck
+    own_result!(t::Task, x::Int) = (t.result = x; nothing)
+    site = only(check_allocs(own_result!, (Task, Int)))
+    @test StrictModeTest._scheduler_site(site)
+    # Windows records Base's files as `.\task.jl`.
+    win(fr) = Base.StackTraces.StackFrame(fr.func, Symbol(replace(string(fr.file), "./" => ".\\")), fr.line,
+        fr.linfo, fr.from_c, fr.inlined, fr.pointer)
+    @test any(fr -> startswith(string(fr.file), "./"), site.backtrace)
+    @test StrictModeTest._scheduler_site((; backtrace = map(win, site.backtrace)))
+end
