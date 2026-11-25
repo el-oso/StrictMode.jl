@@ -180,7 +180,7 @@ end
     n = migration_report(root; io = buf)
     out = String(take!(buf))
     @test n == 1
-    @test occursin("false at precompile", out) && occursin("src/P.jl:1", out)
+    @test occursin("false at precompile", out) && occursin(joinpath("src", "P.jl") * ":1", out)   # `relpath` uses the platform separator
     @test occursin("delete the guard", StrictMode._NO_GATE_NEEDED)
 end
 

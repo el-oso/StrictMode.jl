@@ -814,8 +814,14 @@ end
     @test_throws "no typed body" StrictMode.effects(g, (Int,))
     @test_throws StrictViolation @assert_effects g(1.0) (:effect_free, :terminates, :consistent) types = (Int,)
     @test_throws "no typed body" @assert_effects g(1.0) (:effect_free,) types = (Int,)
-    @test StrictMode.effect_holds(StrictMode.effects(g, (Float64,)), :effect_free)
-    @test (@assert_effects g(1.0) (:effect_free,)) === 2.0
+    # Coverage instrumentation writes a counter, and the compiler reports that as a side effect.
+    if iszero(Base.JLOptions().code_coverage)
+        @test StrictMode.effect_holds(StrictMode.effects(g, (Float64,)), :effect_free)
+        @test (@assert_effects g(1.0) (:effect_free,)) === 2.0
+    else
+        @test !StrictMode.effect_holds(StrictMode.effects(g, (Float64,)), :effect_free)
+        @test_throws StrictViolation @assert_effects g(1.0) (:effect_free,)
+    end
 end
 
 @testitem "a throw raised in a callee that a catch handles is not an error path" begin

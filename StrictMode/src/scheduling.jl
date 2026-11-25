@@ -62,6 +62,8 @@ const _FORWARDER_PURE = (:getfield, :tuple, :isdefined, :(===), :typeassert, :is
 function _forwarder_trivial(@nospecialize(s))
     (isnothing(s) || s isa Core.SSAValue || s isa Core.Argument || s isa Core.PiNode ||
         s isa QuoteNode || s isa GlobalRef) && return true
+    # A counter that `--code-coverage` adds; it does no work of the forwarder.
+    Meta.isexpr(s, :code_coverage_effect) && return true
     s isa Expr || return false                    # a GotoNode, GotoIfNot or PhiNode is control flow
     s.head === :call || return false
     c = s.args[1]
