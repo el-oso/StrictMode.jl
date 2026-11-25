@@ -1782,3 +1782,26 @@ end
     fs = proof_findings(SharedLine.refresh_checked, T; guarantees = (:noalloc,))
     @test !any(StrictMode._failed, fs)
 end
+
+@testitem "one compile gives the sites of both AllocCheck runs" begin
+    using StrictModeTest, AllocCheck
+    module OneCompile
+    @noinline function h(n::Int)
+        try
+            n < 0 && throw(ArgumentError("bad n = $n"))
+            Float64(n)
+        catch
+            0.0
+        end
+    end
+    f(n::Int) = h(n) + sum(zeros(n))
+    end
+    OneCompile.f(2)
+    want = (check_allocs(OneCompile.f, (Int,)), check_allocs(OneCompile.f, (Int,); ignore_throw = false))
+    @test length(want[2]) > length(want[1]) > 0
+    for internals in (true, false)
+        got = StrictModeTest._allocs_both(OneCompile.f, Tuple{Int}; internals)
+        @test Set(got[1]) == Set(want[1])
+        @test Set(got[2]) == Set(want[2])
+    end
+end

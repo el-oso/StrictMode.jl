@@ -144,10 +144,11 @@ function _check_allocs(@nospecialize(f), @nospecialize(types); caught::Bool = fa
     callable && StrictMode._which(f, types)
     wrapped = callable || f isa StrictMode._Spec
     target, tt = callable ? (StrictMode._call_through, (StrictMode._ftype(f), types...)) : _backend_call(f, types)
-    allocs = AllocCheck.check_allocs(target, tt; ignore_throw)
     if ignore_throw && caught
-        every = AllocCheck.check_allocs(target, tt; ignore_throw = false)
+        allocs, every = _allocs_both(target, Base.to_tuple_type(tt))
         append!(allocs, _caught_sites(filter(a -> !(a in allocs), every)))
+    else
+        allocs = AllocCheck.check_allocs(target, tt; ignore_throw)
     end
     # The wrapper's frame is not the callable's code, and every reader of a backtrace asks whose code a
     # site is in.
@@ -157,6 +158,39 @@ function _check_allocs(@nospecialize(f), @nospecialize(types); caught::Bool = fa
         end
     end
     return allocs
+end
+
+# AllocCheck's internals that `check_allocs` is built from. `_allocs_both` falls back to two
+# `check_allocs` calls without them.
+const _ALLOCCHECK_INTERNALS = all(s -> isdefined(AllocCheck, s), (:alloc_config, :optimize!, :find_allocs!, :GPUCompiler, :LLVM))
+
+# The sites `check_allocs` finds with `ignore_throw = true` and with `false`, from ONE compile.
+# `ignore_throw` is read only when the sites are collected, so the call graph is compiled and
+# optimized once (most of a proof's time) and the optimized module is read twice, through a copy
+# since `find_allocs!` changes the module it reads. The steps are `check_allocs`'s own.
+function _allocs_both(@nospecialize(func), @nospecialize(tt::Type{<:Tuple}); internals::Bool = _ALLOCCHECK_INTERNALS)
+    internals || return (AllocCheck.check_allocs(func, tt), AllocCheck.check_allocs(func, tt; ignore_throw = false))
+    hasmethod(func, tt) || throw(MethodError(func, tt))
+    GPUCompiler, LLVM = AllocCheck.GPUCompiler, AllocCheck.LLVM
+    source = GPUCompiler.methodinstance(Base._stable_typeof(func), tt)
+    config = AllocCheck.alloc_config(:specfunc; validate = false, optimize = false, cleanup = false)
+    return GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, GPUCompiler.CompilerJob(source, config))
+        entry = meta.entry.name     # after the optimizer has run, `meta.entry.name` is empty
+        try
+            AllocCheck.optimize!(mod)
+            mod2 = copy(mod)
+            quiet = try
+                AllocCheck.find_allocs!(mod2, meta, entry; ignore_throw = true, invoke_entry = false)
+            finally
+                LLVM.dispose(mod2)
+            end
+            every = AllocCheck.find_allocs!(mod, meta, entry; ignore_throw = false, invoke_entry = false)
+            (quiet, every)
+        finally
+            LLVM.dispose(mod)
+        end
+    end
 end
 
 # Runtime calls that allocate only the exception they throw. Without `ignore_throw`, AllocCheck
