@@ -14,4 +14,11 @@ using TestItemRunner
 #
 # Filter to one item by name:
 #   @run_package_tests filter = ti -> occursin(r"#27", ti.name)
-@run_package_tests filter = ti -> startswith(ti.filename, joinpath(@__DIR__, ""))
+#
+# `Pkg.test(; test_args = ["corpus"])` runs only the `:noalloc` corpus and `["rest"]` everything
+# else, so the two halves can run as two processes at once; no argument runs both.
+const PART = isempty(ARGS) ? "all" : only(ARGS)
+PART in ("all", "corpus", "rest") || error("test argument must be \"corpus\" or \"rest\", got \"$PART\"")
+const CORPUS = joinpath(@__DIR__, "corpus_test.jl")
+in_part(file) = PART == "all" || (PART == "corpus") == (file == CORPUS)
+@run_package_tests filter = ti -> startswith(ti.filename, joinpath(@__DIR__, "")) && in_part(ti.filename)
