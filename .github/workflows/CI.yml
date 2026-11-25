@@ -110,9 +110,11 @@ jobs:
         run: |
           part() { julia --project=StrictModeTest -e "import Pkg; Pkg.test(; julia_args = [\"--check-bounds=yes\"], test_args = [\"$1\"])"; }
           part corpus > corpus.log 2>&1 &
-          corpus=$!
-          part rest; rest=$?
-          wait $corpus; corpus=$?
+          corpus_pid=$!
+          # The step runs under `bash -e`: a bare failing command would end it before the other part's
+          # result and log are read.
+          rest=0; part rest || rest=$?
+          corpus=0; wait $corpus_pid || corpus=$?
           cat corpus.log
           echo "rest: exit $rest, corpus: exit $corpus"
           [ $rest -eq 0 ] && [ $corpus -eq 0 ]
