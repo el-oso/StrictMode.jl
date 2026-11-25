@@ -100,8 +100,22 @@ jobs:
       # resolution fails for every consumer. `Pkg.test()` carries the path from the workspace
       # manifest, and a stale manifest — not a missing source — is what makes a direct activation
       # of test/ resolve something else.
+      #
+      # The `:noalloc` corpus is about half the suite's time, so it runs as its own process beside
+      # the rest (runtests.jl reads the part from `test_args`). Peak memory measured on Linux with
+      # 1.13: 1.9 GB for the corpus and 2.7 GB for the rest, within the 7 GB of the macOS runner.
+      # The corpus log is printed after the rest finishes, so the two outputs do not interleave.
       - name: StrictModeTest suite
-        run: julia --project=StrictModeTest -e 'import Pkg; Pkg.test(; julia_args = ["--check-bounds=yes"])'
+        shell: bash
+        run: |
+          part() { julia --project=StrictModeTest -e "import Pkg; Pkg.test(; julia_args = [\"--check-bounds=yes\"], test_args = [\"$1\"])"; }
+          part corpus > corpus.log 2>&1 &
+          corpus=$!
+          part rest; rest=$?
+          wait $corpus; corpus=$?
+          cat corpus.log
+          echo "rest: exit $rest, corpus: exit $corpus"
+          [ $rest -eq 0 ] && [ $corpus -eq 0 ]
       # The consumer layout, end to end: StrictMode in a package's own Project.toml with
       # @strict_function in its src/, StrictModeTest only in its test/. Needs a real precompile of a
       # second package, so it is its own step rather than part of the main suite. It is the only
