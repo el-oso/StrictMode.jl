@@ -1,6 +1,6 @@
 name = "StrictModeTest"
 uuid = "a64655d1-1e86-453c-b761-1219f9f51c2b"
-version = "0.5.21"
+version = "0.5.22"
 authors = ["el-oso <15278831+el-oso@users.noreply.github.com>"]
 
 [deps]
