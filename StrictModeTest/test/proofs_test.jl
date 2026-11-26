@@ -1811,9 +1811,9 @@ end
     own_result!(t::Task, x::Int) = (t.result = x; nothing)
     site = only(check_allocs(own_result!, (Task, Int)))
     @test StrictModeTest._scheduler_site(site)
-    # Windows records Base's files as `.\task.jl`.
+    # Windows records Base's files as `.\task.jl`; elsewhere the backtrace is rewritten to that form.
     win(fr) = Base.StackTraces.StackFrame(fr.func, Symbol(replace(string(fr.file), "./" => ".\\")), fr.line,
         fr.linfo, fr.from_c, fr.inlined, fr.pointer)
-    @test any(fr -> startswith(string(fr.file), "./"), site.backtrace)
+    @test any(fr -> startswith(string(fr.file), "./") || startswith(string(fr.file), ".\\"), site.backtrace)
     @test StrictModeTest._scheduler_site((; backtrace = map(win, site.backtrace)))
 end
