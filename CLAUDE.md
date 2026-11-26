@@ -212,8 +212,11 @@ StrictMode/src/
                         which still decides a user closure inside a `lock` that itself inlined.
                         _in_scheduler: Base task/lock code contributes no boxing — AllocCheck reports
                         a dynamic dispatch in `trypoptask` for some callers and not others, so it is
-                        not a usable signal. _ccall_ref_only accepts the `jl_value_ptr` pointer of an
-                        explicit unsafe_convert while it stays confined to ccalls),
+                        not a usable signal. _ccall_ref_only judges a mutable object C code sees as
+                        Julia's stack-allocation pass does (llvm-alloc-opt.cpp): its address taken
+                        (jl_value_ptr) is not followed and keeps it on the stack unless its type holds
+                        a reference; as a declared ccall argument it escapes, as a GC root it does not.
+                        StrictModeTest's PointerCorpus checks both tiers against that rule),
                         ignore_throw/set_ignore_throw! (both tiers honor it), _DICT_ACCESSORS,
                         register_alloc_barrier!/_is_base_barrier_type/_mi_is_barrier (issue #14
                         one-time-init allocation barriers: OncePerProcess/OncePerThread auto-
@@ -1359,7 +1362,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F74 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F75 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

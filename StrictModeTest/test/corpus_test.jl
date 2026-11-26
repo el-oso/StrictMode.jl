@@ -418,3 +418,97 @@ end
         @test o == e
     end
 end
+
+# A generated corpus for an object that C code, or Julia code through a raw pointer, can see: every
+# combination of what the object holds, how its memory is reached, and, for a pointer Julia code
+# uses itself, what is done with that pointer. The expected verdict comes from the rules of Julia's
+# own stack-allocation pass (src/llvm-alloc-opt.cpp), never from either engine.
+@testmodule PointerCorpus begin
+    using StrictMode, StrictModeTest
+
+    const KINDS = (:plain, :ref)         # bytes and an Int; the same plus a String field
+    const HANDOFFS = (:julia, :ccall_ptr, :ccall_ref, :ccall_any)
+    const USES = (:load_store, :offset, :stored, :returned, :unpreserved)
+
+    struct Case
+        name::String
+        kind::Symbol
+        handoff::Symbol
+        use::Symbol          # one of USES when handoff === :julia, else :none
+    end
+
+    function cases()
+        out = Case[]
+        for k in KINDS, h in HANDOFFS, u in (h === :julia ? USES : (:none,))
+            push!(out, Case(join(("p", k, h, u), "_"), k, h, u))
+        end
+        return out
+    end
+
+    function source(c::Case)
+        tail = c.kind === :ref ? " + sizeof(h.s)" : ""
+        body = if c.handoff === :ccall_ptr
+            "GC.@preserve h ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), dptr(h), 0, 1)\n    return h.n$tail"
+        elseif c.handoff === :ccall_ref
+            "ccall(:memset, Ptr{Cvoid}, (Ref{D}, Cint, Csize_t), h, 0, 1)\n    return h.n$tail"
+        elseif c.handoff === :ccall_any
+            "return Int(ccall(:jl_object_id, UInt, (Any,), h) % 7) + h.n$tail"
+        elseif c.use === :load_store
+            "GC.@preserve h unsafe_store!(dptr(h), x % UInt8, 1)\n    return Int(GC.@preserve h unsafe_load(dptr(h), 1)) + h.n$tail"
+        elseif c.use === :offset
+            "GC.@preserve h unsafe_store!(dptr(h) + 3, 0x01)\n    return Int(GC.@preserve h unsafe_load(dptr(h) + 5 - 2)) + h.n$tail"
+        elseif c.use === :stored
+            "GC.@preserve h unsafe_store!(Ptr{Ptr{UInt8}}(pointer_from_objref(SLOT)), dptr(h))\n    return h.n$tail"
+        elseif c.use === :returned
+            "return GC.@preserve h dptr(h) + (h.n$tail)"
+        else
+            "unsafe_store!(dptr(h), 0x01, 1)\n    return Int(unsafe_load(dptr(h), 1)) + h.n$tail"
+        end
+        return """
+        module M_$(c.name)
+        mutable struct D
+            d::NTuple{16, UInt8}
+            n::Int
+            $(c.kind === :ref ? "s::String" : "")
+            D() = new()
+        end
+        const SLOT = Ref(Ptr{UInt8}(C_NULL))
+        dptr(h::D) = Ptr{UInt8}(pointer_from_objref(h)) + fieldoffset(D, 1)
+        function caller(x::Int, s::String)
+            h = D(); h.n = x
+            $(c.kind === :ref ? "h.s = s" : "")
+            $body
+        end
+        end
+        """
+    end
+
+    # P1 An object handed to a call as a declared argument escapes: it is allocated.
+    # P2 Taking its address (`pointer_from_objref`, and a `Ref{T}` argument of a `ccall`) is not
+    #    followed further, so what is done with the pointer does not matter: the object stays on the
+    #    stack unless it holds a reference, and then it is allocated.
+    # A reference field the optimizer removes (a constant stored and never read back) leaves the
+    # object on the stack while P2 says allocated; the cases store and read an argument instead.
+    allocates(c::Case) = c.handoff === :ccall_any || c.kind === :ref
+    expected(c::Case) = (; name = c.name, scan = allocates(c) ? (:fail, :SM0002) : (:pass, nothing),
+                         proof = allocates(c) ? (:fail, :SM0002) : (:pass, nothing))
+
+    verdict(f) = f.status === :pass ? (:pass, nothing) : (f.status, f.code)
+
+    function observe(c::Case, M::Module)
+        M.caller(3, "ab")
+        return (; name = c.name,
+                scan = verdict(only(StrictMode.findings(M.caller, (Int, String); guarantees = (:noalloc,)))),
+                proof = verdict(only(StrictModeTest.proof_findings(M.caller, (Int, String); guarantees = (:noalloc,)))))
+    end
+
+    observed(c::Case, into::Module) =
+        Base.invokelatest(observe, c, Base.include_string(into, source(c), c.name * ".jl")::Module)
+    run(into::Module) = [(expected(c), observed(c, into)) for c in cases()]
+end
+
+@testitem "noalloc corpus: an object's memory reached by C or a raw pointer" setup = [PointerCorpus] begin
+    for (e, o) in PointerCorpus.run(@__MODULE__)
+        @test o == e
+    end
+end

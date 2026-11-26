@@ -65,8 +65,10 @@ end
     through_pointer(1.0); pointer_escapes(1.0)
     @test iszero(@allocated through_pointer(2.0))
     @test !StrictMode._alloc_signals(through_pointer, (Float64,)).alloc
-    # A pointer kept past the call is a different shape, and the scan still reports the Ref.
-    @test StrictMode._alloc_signals(pointer_escapes, (Float64,)).alloc
+    # Julia does not follow the pointer once the address is taken, so keeping it past the call
+    # leaves the Ref on the stack too.
+    @test iszero(@allocated pointer_escapes(2.0))
+    @test !StrictMode._alloc_signals(pointer_escapes, (Float64,)).alloc
 end
 
 @testitem "an allocation-only scan agrees with the full scan on allocation and boxing" begin

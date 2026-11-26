@@ -2013,29 +2013,21 @@ function _immutable_escapes(ci, @nospecialize(sig), uses, dead, i::Int, seen::Bi
     return false
 end
 
-# `Base.unsafe_convert(Ptr, ref)` lowers to a `jl_value_ptr` call on the `Ref` and a `bitcast` of the
-# result. The pointer is confined when everything it reaches is a `bitcast` that is itself confined,
-# or a `ccall`; a pointer stored, returned or passed to a Julia call may outlive the frame.
-function _ptr_confined(ci, uses, i::Int)
-    for (j, _) in uses[i]
-        st = ci.code[j]
-        if Meta.isexpr(st, :foreigncall)
-            continue
-        elseif Meta.isexpr(st, :call) && _static_callee(ci, st.args[1]) === Core.bitcast
-            _ptr_confined(ci, uses, j) || return false
-        else
-            return false
-        end
-    end
-    return true
-end
-
-function _ccall_ref_only(ci, uses, i::Int)
+# A mutable object that only C code sees, judged as Julia's stack-allocation pass judges it
+# (src/llvm-alloc-opt.cpp): taking its address (`pointer_from_objref`, which `unsafe_convert` of a
+# `Ref` lowers to, a `jl_value_ptr` call) is not followed any further, so whatever is done with the
+# pointer does not matter; an object whose address is taken stays on the heap only when it holds
+# references. The object as a GC root of a `ccall` is a preserve; as a declared argument it escapes.
+function _ccall_ref_only(ci, uses, i::Int, @nospecialize(nt))
     sawccall = false
     for (j, k) in uses[i]
         st = ci.code[j]
         if Meta.isexpr(st, :foreigncall)
-            occursin("jl_value_ptr", string(st.args[1])) && !_ptr_confined(ci, uses, j) && return false
+            if occursin("jl_value_ptr", string(st.args[1]))
+                nt isa DataType && Base.datatype_pointerfree(nt) || return false
+            elseif k < 6 + length(st.args[3])   # arguments start at 6; the GC roots follow them
+                return false
+            end
             sawccall = true
         elseif Meta.isexpr(st, :gc_preserve_begin)
             continue
@@ -2058,7 +2050,7 @@ function _new_allocates(ci, @nospecialize(sig), ssauses, dead, i::Int, newsdead)
     Base.isbitstype(nt) && return false
     _boxes_into_field(ci, sig, st, nt) && return true
     nt isa DataType && !ismutabletype(nt) && return _immutable_escapes(ci, sig, ssauses(), dead, i)
-    _ccall_ref_only(ci, ssauses(), i) && return false
+    _ccall_ref_only(ci, ssauses(), i, nt) && return false
     return !newsdead()
 end
 
