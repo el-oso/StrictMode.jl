@@ -1238,6 +1238,8 @@ function _signal_origin(
         stops::Union{Nothing, Vector{Any}} = nothing, first_only::Bool = false
     )
     top = _run_key(f, types)
+    # Each key gets one parent, the first body seen calling it, and the entry gets none, so the
+    # parents form a tree and rebuilding a path ends at the entry; a recursive call does not loop.
     parent = IdDict{Any, Any}()
     queue = Any[(top, _FAST_ALLOC_DEPTH[], false, mode)]
     seen = Base.IdSet{Any}()
@@ -1269,9 +1271,9 @@ function _signal_origin(
             (depth > 0 || (depth < 0 && user)) || continue
             sub = user ? depth : (depth > 1 ? depth - 1 : -1)
             k = _callee_key(mi)
-            haskey(parent, k) || (parent[k] = s)
+            (k === top || haskey(parent, k)) || (parent[k] = s)
             for h in ex.handed
-                haskey(parent, h) || (parent[h] = k)
+                (h === top || haskey(parent, h)) || (parent[h] = k)
                 push!(queue, (h, sub, c, m))
             end
             ex.kind === :exempt || push!(queue, (k, sub, c, m))
@@ -1389,8 +1391,9 @@ end
 # callees only when they are that callable or are called from it inlined, since following the rest
 # reads the whole scheduler.
 function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
-    parent = IdDict{Any, Any}()
-    queue = Any[(_run_key(f, types), false, false)]
+    top = _run_key(f, types)
+    parent = IdDict{Any, Any}()   # a tree, as in _signal_origin
+    queue = Any[(top, false, false)]
     seen = Base.IdSet{Any}()
     while !isempty(queue)
         s, caught, sched = popfirst!(queue)
@@ -1418,9 +1421,9 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             arg = sched && (_calls_argument(s, mi.specTypes) || !_stmt_in_scheduler(ci, s, j::Int, true, unsplit))
             (sched && !arg) && continue
             k = _callee_key(mi)
-            haskey(parent, k) || (parent[k] = s)
+            (k === top || haskey(parent, k)) || (parent[k] = s)
             for h in ex.handed
-                haskey(parent, h) || (parent[h] = k)
+                (h === top || haskey(parent, h)) || (parent[h] = k)
                 push!(queue, (h, c, false))
             end
             ex.kind === :exempt || push!(queue, (k, c, !arg && _in_scheduler(mi)))

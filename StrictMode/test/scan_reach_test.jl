@@ -779,3 +779,24 @@ end
         StrictMode.clear_cache!()
     end
 end
+
+@testitem "the origin walks end on a recursive call" begin
+    using StrictMode
+    # A body that calls itself, or a cycle of two, must not give the entry a parent: rebuilding the
+    # path to an allocation would then go round the cycle without end.
+    function walk!(out::Vector{Int}, d::Dict{Int, Vector{Int}}, k::Int)
+        push!(out, k)
+        for c in get(d, k, Int[])
+            walk!(out, d, c)
+        end
+        return nothing
+    end
+    ping(v::Vector{Int}, n::Int) = n <= 0 ? push!(v, n) : pong(v, n - 1)
+    pong(v::Vector{Int}, n::Int) = n <= 0 ? push!(v, n) : ping(v, n - 1)
+    for (f, T) in ((walk!, (Vector{Int}, Dict{Int, Vector{Int}}, Int)), (ping, (Vector{Int}, Int)))
+        @test StrictMode._failed(only(StrictMode.findings(f, T; guarantees = (:noalloc,))))
+        o = StrictMode._signal_origin(f, T)
+        @test !isempty(o) && all(r -> length(r.path) <= 2, o)
+        @test !ismissing(StrictMode._nonscheduler_origin(f, T))
+    end
+end
