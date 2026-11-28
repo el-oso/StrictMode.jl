@@ -783,7 +783,8 @@ end
 @testitem "the origin walks end on a recursive call" begin
     using StrictMode
     # A body that calls itself, or a cycle of two, must not give the entry a parent: rebuilding the
-    # path to an allocation would then go round the cycle without end.
+    # path to an allocation would then go round the cycle without end. The allocation is in a helper
+    # the entry calls, so both walks rebuild a path through the entry.
     function walk!(out::Vector{Int}, d::Dict{Int, Vector{Int}}, k::Int)
         push!(out, k)
         for c in get(d, k, Int[])
@@ -791,12 +792,16 @@ end
         end
         return nothing
     end
-    ping(v::Vector{Int}, n::Int) = n <= 0 ? push!(v, n) : pong(v, n - 1)
-    pong(v::Vector{Int}, n::Int) = n <= 0 ? push!(v, n) : ping(v, n - 1)
-    for (f, T) in ((walk!, (Vector{Int}, Dict{Int, Vector{Int}}, Int)), (ping, (Vector{Int}, Int)))
+    @noinline grow!(v::Vector{Int}) = (push!(v, 1); nothing)
+    rec(v::Vector{Int}, n::Int) = n <= 0 ? grow!(v) : rec(v, n - 1)
+    mrec(v::Vector{Int}, n::Int) = n <= 0 ? grow!(v) : nrec(v, n - 1)
+    nrec(v::Vector{Int}, n::Int) = n <= 0 ? grow!(v) : mrec(v, n - 1)
+    for (f, T) in ((walk!, (Vector{Int}, Dict{Int, Vector{Int}}, Int)), (rec, (Vector{Int}, Int)), (mrec, (Vector{Int}, Int)))
         @test StrictMode._failed(only(StrictMode.findings(f, T; guarantees = (:noalloc,))))
+        top = StrictMode._run_key(f, T)
         o = StrictMode._signal_origin(f, T)
-        @test !isempty(o) && all(r -> length(r.path) <= 2, o)
-        @test !ismissing(StrictMode._nonscheduler_origin(f, T))
+        @test !isempty(o) && all(r -> isempty(r.path) || first(r.path) === top, o)
+        n = StrictMode._nonscheduler_origin(f, T)
+        @test !ismissing(n) && !isnothing(n) && (isempty(n.path) || first(n.path) === top)
     end
 end

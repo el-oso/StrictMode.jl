@@ -149,7 +149,10 @@ StrictMode/src/
                         holds COMPRESSED: it is what was compiled when the record was made, and differs
                         from a fresh inference of the same signature (measured on 7 of 316 bodies), so
                         a verdict would change once a call has run. _signal_origin's per-body scan is
-                        memoized (_ORIGIN_MEMO): every warning walks the graph below its call.
+                        memoized (_ORIGIN_MEMO): every warning walks the graph below its call. Its parent map, and
+                        _nonscheduler_origin's, is a TREE: the entry gets no parent and a key gets one,
+                        so a recursive call cannot loop the path rebuild, which raises if it runs
+                        longer than the map.
                         Every inference here goes through _code_typed/_return_types/
                         _infer_effects; do not call Base.return_types or Base.code_typed directly.
                         Do not destructure tuples whose type names a consumer's function (`for (f, t) in

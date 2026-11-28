@@ -1253,6 +1253,7 @@ function _signal_origin(
             path = Any[]
             c = s
             while haskey(parent, c)
+                length(path) < length(parent) || error("the path to $s does not end at the entry: the parents hold a cycle")
                 c = parent[c]
                 pushfirst!(path, c)
             end
@@ -1409,6 +1410,7 @@ function _nonscheduler_origin(@nospecialize(f), @nospecialize(types::Tuple))
             path = Any[]
             c = s
             while haskey(parent, c)
+                length(path) < length(parent) || error("the path to $s does not end at the entry: the parents hold a cycle")
                 c = parent[c]
                 pushfirst!(path, c)
             end
