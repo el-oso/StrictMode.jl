@@ -754,8 +754,13 @@ Julia cannot skip the dict probe: the type is an ordinary value at runtime, and 
 dict's contents are not knowable while compiling. Base works the method way — `one(::Type{T})`
 was never going to be a dict.
 
-The idea comes from a Linux-kernel principle: *data has a clear static owner, reached through
-that owner — never a global registry*. In real code the owned value is usually a workspace:
+The idea comes from the Linux kernel's driver core, which Greg Kroah-Hartman maintains, and it is
+plain C there. A device's private data is kept on the device itself: the driver stores it with
+`dev_set_drvdata(dev, priv)` and reads it back with `dev_get_drvdata(dev)`, and a structure
+embedded in another finds its owner with `container_of`. The data is reached through the object
+that owns it, not looked up in a table keyed by that object. In Julia the owner is the type, and
+the path through it is dispatch: the method for `Float64` returns the `Float64` value. In real
+code the owned value is usually a workspace:
 
 ```julia
 const _WS_F64 = Workspace{Float64}()
