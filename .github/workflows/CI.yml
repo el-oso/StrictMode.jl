@@ -106,6 +106,9 @@ jobs:
       # 1.13: 1.9 GB for the corpus and 2.7 GB for the rest, within the 7 GB of the macOS runner.
       # The corpus log is printed after the rest finishes, so the two outputs do not interleave.
       - name: StrictModeTest suite
+        # On Windows AllocCheck reports the jl_setjmp call of every `try` as an allocation
+        # (JuliaLang/AllocCheck.jl#124), which fails the proofs of code that has one.
+        continue-on-error: ${{ runner.os == 'Windows' }}
         shell: bash
         run: |
           part() { julia --project=StrictModeTest -e "import Pkg; Pkg.test(; julia_args = [\"--check-bounds=yes\"], test_args = [\"$1\"])"; }
