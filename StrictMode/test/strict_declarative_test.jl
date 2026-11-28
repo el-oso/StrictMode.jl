@@ -103,19 +103,23 @@ end
     StrictMode.clear_declarations!()
 end
 
-@testitem "@strict_policy raises when it has nothing to check at its line" begin
+@testitem "@strict_policy warns when it has nothing to check at its line" begin
     using StrictMode
 
     load(src) = Core.eval(@__MODULE__, Meta.parse(src))
     unstable = "later(x::Int) = x > 0 ? 1 : \"s\""
 
-    # A policy checks the methods defined ABOVE it. Written first, it finds none, and loading on
-    # would read as a module that satisfies its policy: the unstable method below is never read.
-    @test_throws "@strict_policy checked nothing: no method is defined above this line in `PolFirst`" load("module PolFirst; using StrictMode; @strict_policy :typestable; $unstable; end")
-    @test_throws "place `@strict_policy` at the end of the module, or use `@strict module`" load("module PolFirstB; using StrictMode; @strict_policy :typestable; $unstable; end")
-    # The same with a filter: there is nothing above it for the name to match yet.
-    @test_throws "no method is defined above this line in `PolFirstOnly`" load("module PolFirstOnly; using StrictMode; @strict_policy :typestable only = (:later,); $unstable; end")
-    @test_throws "no method is defined above this line" load("module PolFirstExempt; using StrictMode; @strict_policy :typestable exempt = (:later,); $unstable; end")
+    # A policy checks the methods defined ABOVE it. Written first it finds none, and it warns and
+    # loads: a new package may state its rules before it has functions. The method below is not read.
+    nothing_yet(m) = (:warn, Regex("checks nothing yet: no function is defined above this line in `$m`"))
+    @test_logs nothing_yet("PolFirst") load("module PolFirst; using StrictMode; @strict_policy :typestable; $unstable; end")
+    @test_logs nothing_yet("PolFirstOnly") load("module PolFirstOnly; using StrictMode; @strict_policy :typestable only = (:later,); $unstable; end")
+    @test_logs nothing_yet("PolFirstExempt") load("module PolFirstExempt; using StrictMode; @strict_policy :typestable exempt = (:later,); $unstable; end")
+    # So does a scoped line whose Regex or predicate matches no function yet, beside a policy that
+    # does check something: a module with no `!` function under a rule for the `!` functions.
+    no_match = (:warn, r"checks nothing yet: `only` matches no function defined above this line in `PolNoBang")
+    @test_logs no_match load("module PolNoBang; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable; @strict_policy :noalloc only = r\"!\$\"; end")
+    @test_logs no_match load("module PolNoBangF; using StrictMode; ok(x::Int) = x + 1; @strict_policy :typestable; @strict_policy :noalloc only = f -> endswith(string(nameof(f)), \"!\"); end")
 
     # Written last, it reads the method.
     @test_throws StrictMode.StrictViolation load("module PolLast; using StrictMode; $unstable; @strict_policy :typestable; end")
@@ -148,8 +152,8 @@ end
     @test load("module AccCallable; using StrictMode; struct C; k::Int; end; (c::C)(x::AbstractVector) = c.k * sum(x); @strict_policy :typestable; end") isa Module
     @test load("module AccMacro; using StrictMode; macro twice(x); esc(:(2 * \$x)); end; @strict_policy :typestable; end") isa Module
 
-    # Still nothing to check: nothing above the line, or only generic methods nobody declared.
-    @test_throws "no method is defined above this line in `AccNothing`" load("module AccNothing; using StrictMode; @strict_policy :typestable; g(x::Int) = x; end")
+    # Nothing above the line warns; only generic methods nobody declared raise.
+    @test_logs (:warn, r"checks nothing yet: no function is defined above this line in `AccNothing`") load("module AccNothing; using StrictMode; @strict_policy :typestable; g(x::Int) = x; end")
     @test_throws "1 method(s) are defined above this line in `AccGeneric`, and none is checked or accounted for" load("module AccGeneric; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
     @test_throws "`@strict_function signatures = [...]`" load("module AccGenericB; using StrictMode; gen(x::AbstractVector) = sum(x); @strict_policy :typestable; end")
     # An exemption from none of the policy's guarantees does not account for the method.

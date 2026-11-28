@@ -523,14 +523,16 @@ StrictMode/src/
                         by its own signature (registry.jl _exempt_defined!, which finds them by
                         primary_world), a name, a `begin … end` block, or an
                         `include` whose definitions are found by diffing the census), @strict_policy. A
-                        @strict_policy line checks only the methods defined ABOVE it and RAISES
-                        when none above it is checked OR ACCOUNTED FOR (`require_methods` in
-                        _auto_check_module, _policy_unaccounted: nothing above it, or only
-                        undeclared generic methods; a method exempt from EVERY policy guarantee
+                        @strict_policy line checks only the methods defined ABOVE it. With no
+                        function to check there (none defined, or none its `only` Regex or
+                        predicate matches: _only_matches_nothing) it WARNS and loads; it RAISES
+                        when functions are there and none is checked OR ACCOUNTED FOR (`require_methods` in
+                        _auto_check_module, _policy_unaccounted: only undeclared generic
+                        methods; a method exempt from EVERY policy guarantee
                         (one exemption or several; `types = (...)` narrowing still
                         counts), one declared with `signatures = [...]`, a constructor, a
-                        macro and a callable object's method are all accounted for): written
-                        first it would load cleanly over a module it never read. `check = false` does not raise.
+                        macro and a callable object's method are all accounted for). A name LIST in `only`
+                        that matches nothing still raises, as a likely misspelling. `check = false` does not raise.
                         A callable object WITH FIELDS is never checked at load (no instance —
                         _module_load_items skips it); sweeps and proofs cover it. A singleton
                         callable has an instance and is checked like a function
@@ -1365,7 +1367,7 @@ JULIA_LOAD_PATH="@:@stdlib" julia --project=StrictMode/test/standalone StrictMod
 
 ## FEEDBACK.md
 
-Documents dogfooding findings (F1–F76 as of this writing — check the file's own status table for
+Documents dogfooding findings (F1–F77 as of this writing — check the file's own status table for
 the current count, it moves faster than this file) from the PureFFT.jl and BlazingPorts.jl/QR
 campaigns. Most findings are ✅ closed; a few are 🔴 open by design (e.g. F29/F30 — necessary-but-
 not-sufficient axes `kernel_report`/the guarantees don't yet cover: data-dependent load latency,

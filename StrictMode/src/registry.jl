@@ -1126,10 +1126,14 @@ function _auto_check_module(
     CHECKS_ENABLED || return nothing
     # A `@strict_policy` line checks the methods defined above it. With none there, a filter has
     # nothing to match yet, so this is asked before the names are.
+    # A line with no function to check yet (a new module, or no function its `only` matches) warns
+    # and loads: the rule is in place for the functions defined above it later.
     if require_methods
         ms, skipped = module_methods(mod; include_exempt = true)
         (isempty(ms) && iszero(sum(values(skipped); init = 0))) &&
-            throw(ArgumentError(_policy_checked_nothing(mod, 0)))
+            return _warn_policy_empty(mod, source, "no function is defined above this line")
+        _only_matches_nothing(mod, only) &&
+            return _warn_policy_empty(mod, source, "`only` matches no function defined above this line")
     end
     items = _module_load_items(mod, policy; only, exempt)
     if require_methods && isempty(items)
@@ -1142,6 +1146,21 @@ function _auto_check_module(
     source == "" || (fs = [f.policy == "" ? _restamp(f, source) : f for f in fs])
     _report_at_load(fs, :strict_module, string(nameof(mod)))
     _release_after_load_check()
+    return nothing
+end
+
+# Whether a `@strict_policy` line's `only` filter (a Regex or a predicate) matches no function in `mod`.
+# A list of names is not judged here: a name that matches nothing is more likely misspelled, and
+# `_check_name_filters` raises on it.
+function _only_matches_nothing(mod::Module, only)
+    only isa Regex && return !any(n -> occursin(only, string(n)), _module_function_names(mod))
+    only isa Function || return false
+    return isempty(first(module_methods(mod; only, include_exempt = true)))
+end
+
+function _warn_policy_empty(mod::Module, source::AbstractString, what::String)
+    at = source == "" ? "@strict_policy" : source
+    @warn "$at checks nothing yet: $what in `$(nameof(mod))`. It checks the functions defined above it once there are some."
     return nothing
 end
 

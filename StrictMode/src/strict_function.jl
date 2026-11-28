@@ -606,9 +606,10 @@ end
 
 Every definition the module has made **by that line** is checked, including those in `include`d
 files: the check reads the module's methods, not the text of its body, and it runs where the macro
-is written. A method defined below the line is not read. A policy raises an `ArgumentError` when
-no method above its line is checked or accounted for: written first in a module it would load
-cleanly over methods it never looked at. A method is accounted for when it is exempt, when its
+is written. A method defined below the line is not read. A policy with no function to check
+at its line (none defined above it, or none its `only` Regex or predicate matches) warns and loads,
+so a package can state its rules before it has the functions they cover. One with methods above its
+line, none of them checked or accounted for, raises an `ArgumentError`. A method is accounted for when it is exempt, when its
 instantiations are declared with `@strict_function signatures = [...]`, or when it is a
 constructor, a macro or a callable object's method. An exemption accounts for a method only when
 it covers every guarantee in the policy, alone or with others: under `:default`,
